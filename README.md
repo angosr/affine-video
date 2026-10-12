@@ -29,6 +29,10 @@ utility. The track also freezes a positive `minimum_frontier_gain`; score change
 experimentally calibrated resolution receive no utility and cannot be amplified by chain weight
 caps.
 
+A newer provisional challenge does not displace the same hotkey's previously confirmed result.
+It replaces that result only after a rollout succeeds or a deterministic participant failure is
+recorded, so exhausted infrastructure retries cannot remove an already earned weight.
+
 An already active `repo_id + revision` is rejected before downloading it again. Different
 repositories that contain identical weights are rejected after canonical tensor hashing. A model
 whose earlier challenge ended in `SYSTEM_FAILED` may be submitted again; infrastructure failure

@@ -322,6 +322,50 @@ def test_later_participant_failure_replaces_previous_score_with_zero(tmp_path) -
         assert store.leaderboard()[0].final_score == 0
 
 
+def test_provisional_and_system_failure_preserve_previous_success(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
+        advance_to_rollout(store, older, 30)
+        store.complete_challenge(
+            older,
+            ChallengeState.SUCCEEDED,
+            final_score=0.8,
+            attention_cost=0.2,
+            occurred_at_ms=40,
+        )
+        advance_to_scoring(store, newer, 50)
+        local = store.claim_next_scoring("local", lease_ms=100, now_ms=60)
+        assert local is not None and local.challenge_id == newer
+        store.publish_provisional(
+            newer,
+            local.lease_token,
+            final_score=0.9,
+            attention_cost=0.1,
+            score_block=120,
+            schedule_rollout=True,
+            occurred_at_ms=61,
+        )
+
+        current = store.leaderboard()[0]
+        assert current.challenge_id == older
+        assert current.final_score == 0.8
+        assert current.provisional is False
+
+        rollout = store.claim_next_scoring("rollout", lease_ms=100, now_ms=62)
+        assert rollout is not None and rollout.challenge_id == newer
+        store.fail_leased_system(
+            newer,
+            rollout.lease_token,
+            error_code="ROLLOUT_RUNNER_FAILURE",
+            error_summary="GPU worker unavailable",
+            occurred_at_ms=63,
+        )
+
+        assert store.get_challenge(newer).state is ChallengeState.SYSTEM_FAILED
+        assert store.leaderboard()[0].challenge_id == older
+
+
 def test_stage_score_replay_must_be_identical(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)

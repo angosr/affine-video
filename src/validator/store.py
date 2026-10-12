@@ -1210,7 +1210,8 @@ class ChallengeStore:
             )
             current_entry = self._connection.execute(
                 """
-                SELECT challenge_id, block_height, extrinsic_index, event_index
+                SELECT challenge_id, block_height, extrinsic_index, event_index,
+                       provisional
                 FROM leaderboard WHERE hotkey = ?
                 """,
                 (row["hotkey"],),
@@ -1228,7 +1229,7 @@ class ChallengeStore:
             if (
                 current_position is None
                 or current_entry["challenge_id"] == identifier
-                or position > current_position
+                or (position > current_position and bool(current_entry["provisional"]))
             ):
                 self._update_leaderboard_locked(
                     identifier,
