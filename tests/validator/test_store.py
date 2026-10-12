@@ -160,6 +160,49 @@ def test_database_binds_challenges_to_one_track_spec(tmp_path) -> None:
         ChallengeStore(path, track_spec_digest="cd" * 32)
 
 
+def test_concurrent_workers_bind_the_same_track_idempotently(tmp_path) -> None:
+    path = tmp_path / "validator.db"
+    digest = "ab" * 32
+    with ChallengeStore(path):
+        pass
+    start = Barrier(8)
+
+    def bind_track(_worker: int) -> None:
+        start.wait()
+        with ChallengeStore(path, track_spec_digest=digest):
+            pass
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        list(workers.map(bind_track, range(8)))
+
+    with ChallengeStore(path) as store:
+        assert store.track_spec_digest() == digest
+
+
+def test_concurrent_conflicting_track_bind_has_one_winner(tmp_path) -> None:
+    path = tmp_path / "validator.db"
+    with ChallengeStore(path):
+        pass
+    start = Barrier(2)
+
+    def bind_track(digest: str) -> str | None:
+        start.wait()
+        try:
+            with ChallengeStore(path, track_spec_digest=digest):
+                return None
+        except RuntimeError as exc:
+            return str(exc)
+
+    digests = ("ab" * 32, "cd" * 32)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        outcomes = list(workers.map(bind_track, digests))
+
+    assert outcomes.count(None) == 1
+    assert sum("different track" in outcome for outcome in outcomes if outcome is not None) == 1
+    with ChallengeStore(path) as store:
+        assert store.track_spec_digest() in digests
+
+
 def test_chain_cursor_is_contiguous_and_persistent(tmp_path) -> None:
     path = tmp_path / "validator.db"
     first_hash = "0x" + "ab" * 32

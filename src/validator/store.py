@@ -24,6 +24,8 @@ from validator.queue import (
     submission_id as derive_submission_id,
 )
 
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
+
 
 @dataclass(frozen=True, slots=True)
 class SubmissionRecord:
@@ -155,13 +157,15 @@ class ChallengeStore:
         *,
         track_spec_digest: str | None = None,
     ) -> None:
-        self._connection = sqlite3.connect(Path(path), timeout=30)
+        self._connection = sqlite3.connect(
+            Path(path), timeout=_SQLITE_BUSY_TIMEOUT_MS / 1_000
+        )
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA busy_timeout = 30000")
+        self._connection.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
         self._connection.execute("PRAGMA foreign_keys = ON")
         try:
             self._initialize()
-            self._connection.execute("PRAGMA journal_mode = WAL")
+            _enable_wal(self._connection)
             if track_spec_digest is not None:
                 self.bind_track_spec(track_spec_digest)
         except Exception:
@@ -323,17 +327,24 @@ class ChallengeStore:
         except ValueError as exc:
             raise ValueError("track specification digest must be hexadecimal") from exc
         normalized = digest.lower()
-        row = self._connection.execute(
-            "SELECT value FROM store_metadata WHERE key = 'track_spec_digest'"
-        ).fetchone()
-        if row is not None and row["value"] != normalized:
-            raise RuntimeError("database is already bound to a different track specification")
-        if row is None:
-            self._connection.execute(
-                "INSERT INTO store_metadata (key, value) VALUES ('track_spec_digest', ?)",
-                (normalized,),
-            )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM store_metadata WHERE key = 'track_spec_digest'"
+            ).fetchone()
+            if row is not None and row["value"] != normalized:
+                raise RuntimeError(
+                    "database is already bound to a different track specification"
+                )
+            if row is None:
+                self._connection.execute(
+                    "INSERT INTO store_metadata (key, value) VALUES ('track_spec_digest', ?)",
+                    (normalized,),
+                )
             self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def track_spec_digest(self) -> str | None:
         row = self._connection.execute(
@@ -1831,6 +1842,26 @@ def _timestamp(value: int | None) -> int:
     if timestamp < 0:
         raise ValueError("timestamp must be non-negative")
     return timestamp
+
+
+def _enable_wal(connection: sqlite3.Connection) -> None:
+    """Enable WAL despite SQLite's non-waiting journal-mode lock race."""
+
+    deadline = time.monotonic() + _SQLITE_BUSY_TIMEOUT_MS / 1_000
+    while True:
+        try:
+            row = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+        except sqlite3.OperationalError as exc:
+            error_code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+            if error_code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+            continue
+        if row is None or str(row[0]).lower() != "wal":
+            raise RuntimeError("validator database could not enable WAL mode")
+        return
 
 
 def _block_hash(value: str) -> str:
