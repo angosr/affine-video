@@ -6,11 +6,12 @@ import hashlib
 import json
 import zipfile
 from collections.abc import Mapping
-from math import isfinite
+from math import isfinite, prod
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from numpy.lib.format import read_array_header_1_0, read_array_header_2_0, read_magic
 
 from scoring.evaluate import route_stratified_sample_indices
 from scoring.local import ExactCase, ScreenCase
@@ -26,6 +27,7 @@ def validate_screen_cache(
     expected_sha256: str,
     max_bytes: int,
     max_blocks: int,
+    head_dim: int,
     routes: tuple[str, ...],
     strata: Mapping[str, float],
 ) -> None:
@@ -42,6 +44,7 @@ def validate_screen_cache(
         strata=strata,
         sample_count=None,
         max_blocks=max_blocks,
+        head_dim=head_dim,
     )
 
 
@@ -51,6 +54,7 @@ def validate_exact_cache(
     expected_sha256: str,
     max_bytes: int,
     max_blocks: int,
+    head_dim: int,
     routes: tuple[str, ...],
     strata: Mapping[str, float],
     sample_count: int | None,
@@ -68,6 +72,7 @@ def validate_exact_cache(
         strata=strata,
         sample_count=sample_count,
         max_blocks=max_blocks,
+        head_dim=head_dim,
     )
 
 
@@ -241,12 +246,17 @@ def _validate_cache_index(
     strata: Mapping[str, float],
     sample_count: int | None,
     max_blocks: int,
+    head_dim: int,
 ) -> None:
     if type(max_blocks) is not int or max_blocks <= 0:
         raise ValueError("maximum block budget must be a positive integer")
+    if type(head_dim) is not int or head_dim <= 0:
+        raise ValueError("attention head dimension must be a positive integer")
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
     try:
-        with np.load(cache_path, allow_pickle=False) as archive:
+        with np.load(cache_path, allow_pickle=False) as archive, zipfile.ZipFile(
+            cache_path
+        ) as zipped:
             metadata = _metadata(archive, expected_format=expected_format)
             cases = [
                 _object(raw_case, case_fields, f"{expected_format} case")
@@ -276,6 +286,12 @@ def _validate_cache_index(
                         raise CacheLoadError("exact case epsilon must be finite and positive")
                 prefix = f"case_{index:06d}"
                 expected.update(f"{prefix}_{field}" for field in array_fields)
+                _validate_case_headers(
+                    zipped,
+                    prefix=prefix,
+                    expected_format=expected_format,
+                    head_dim=head_dim,
+                )
                 valid_keys = _array(archive, f"{prefix}_valid_keys")
                 if (
                     valid_keys.ndim != 1
@@ -325,7 +341,11 @@ def _verify_archive(path: str | Path, expected_sha256: str, max_bytes: int) -> P
         if digest.digest() != expected:
             raise CacheLoadError("cache sha256 does not match the track specification")
         with zipfile.ZipFile(cache_path) as archive:
-            decoded_bytes = sum(item.file_size for item in archive.infolist())
+            members = archive.infolist()
+            names = [item.filename for item in members]
+            if len(names) != len(set(names)):
+                raise CacheLoadError("cache archive contains duplicate members")
+            decoded_bytes = sum(item.file_size for item in members)
             if decoded_bytes > max_bytes:
                 raise CacheLoadError("cache decoded size exceeds the track limit")
     except CacheLoadError:
@@ -360,6 +380,90 @@ def _array(archive: Any, name: str) -> np.ndarray:
         raise CacheLoadError("cache arrays cannot contain objects")
     value.setflags(write=False)
     return value
+
+
+def _validate_case_headers(
+    archive: zipfile.ZipFile,
+    *,
+    prefix: str,
+    expected_format: str,
+    head_dim: int,
+) -> None:
+    if expected_format == "veda-screen-cache":
+        q_shape, q_dtype = _array_header(archive, f"{prefix}_q_descriptors")
+        k_shape, k_dtype = _array_header(archive, f"{prefix}_k_descriptors")
+        teacher_shape, teacher_dtype = _array_header(
+            archive, f"{prefix}_teacher_distribution"
+        )
+        valid_shape, valid_dtype = _array_header(archive, f"{prefix}_valid_keys")
+        descriptor_dim = 3 * head_dim
+        valid = (
+            len(q_shape) == 2
+            and len(k_shape) == 2
+            and q_shape[0] > 0
+            and k_shape[0] > 0
+            and q_shape[1] == descriptor_dim
+            and k_shape[1] == descriptor_dim
+            and teacher_shape == (q_shape[0], k_shape[0])
+            and valid_shape == (k_shape[0],)
+            and _floating(q_dtype)
+            and _floating(k_dtype)
+            and _floating(teacher_dtype)
+            and valid_dtype == np.dtype(np.bool_)
+        )
+    elif expected_format == "veda-exact-cache":
+        q_shape, q_dtype = _array_header(archive, f"{prefix}_q")
+        k_shape, k_dtype = _array_header(archive, f"{prefix}_k")
+        v_shape, v_dtype = _array_header(archive, f"{prefix}_v")
+        dense_shape, dense_dtype = _array_header(archive, f"{prefix}_dense")
+        valid_shape, valid_dtype = _array_header(archive, f"{prefix}_valid_keys")
+        valid = (
+            len(q_shape) == 3
+            and len(k_shape) == 3
+            and all(dimension > 0 for dimension in (*q_shape, *k_shape))
+            and q_shape[-1] == head_dim
+            and k_shape[-1] == head_dim
+            and v_shape == k_shape
+            and dense_shape == q_shape
+            and valid_shape == (k_shape[0],)
+            and _floating(q_dtype)
+            and _floating(k_dtype)
+            and _floating(v_dtype)
+            and _floating(dense_dtype)
+            and valid_dtype == np.dtype(np.bool_)
+        )
+    else:
+        raise AssertionError("unsupported cache format")
+    if not valid:
+        raise CacheLoadError("cache case array headers are incompatible with the track")
+
+
+def _array_header(archive: zipfile.ZipFile, name: str) -> tuple[tuple[int, ...], np.dtype]:
+    member_name = f"{name}.npy"
+    try:
+        member = archive.getinfo(member_name)
+        with archive.open(member) as file:
+            version = read_magic(file)
+            if version == (1, 0):
+                shape, _fortran_order, dtype = read_array_header_1_0(file)
+            elif version == (2, 0):
+                shape, _fortran_order, dtype = read_array_header_2_0(file)
+            else:
+                raise CacheLoadError("cache array uses an unsupported NPY format")
+            data_offset = file.tell()
+    except CacheLoadError:
+        raise
+    except (KeyError, OSError, ValueError, EOFError) as exc:
+        raise CacheLoadError("cache array header cannot be read") from exc
+    if dtype.hasobject:
+        raise CacheLoadError("cache arrays cannot contain objects")
+    if member.file_size - data_offset != prod(shape) * dtype.itemsize:
+        raise CacheLoadError("cache array payload does not match its header")
+    return shape, dtype
+
+
+def _floating(dtype: np.dtype) -> bool:
+    return np.issubdtype(dtype, np.floating)
 
 
 def _exact_keys(archive: Any, expected: set[str]) -> None:

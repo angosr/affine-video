@@ -45,6 +45,7 @@ def test_loads_hash_pinned_screen_cache_without_objects(tmp_path) -> None:
         expected_sha256=digest(path),
         max_bytes=100_000,
         max_blocks=3,
+        head_dim=2,
         routes=("route0",),
         strata={"all": 1.0},
     )
@@ -59,6 +60,17 @@ def test_loads_hash_pinned_screen_cache_without_objects(tmp_path) -> None:
             expected_sha256=digest(path),
             max_bytes=100_000,
             max_blocks=4,
+            head_dim=2,
+            routes=("route0",),
+            strata={"all": 1.0},
+        )
+    with pytest.raises(CacheLoadError, match="array headers"):
+        validate_screen_cache(
+            path,
+            expected_sha256=digest(path),
+            max_bytes=100_000,
+            max_blocks=3,
+            head_dim=3,
             routes=("route0",),
             strata={"all": 1.0},
         )
@@ -87,6 +99,7 @@ def test_loads_exact_cache_and_rejects_digest_or_decoded_size(tmp_path) -> None:
         expected_sha256=digest(path),
         max_bytes=100_000,
         max_blocks=3,
+        head_dim=2,
         routes=("route0",),
         strata={"all": 1.0},
         sample_count=1,
@@ -100,6 +113,18 @@ def test_loads_exact_cache_and_rejects_digest_or_decoded_size(tmp_path) -> None:
             expected_sha256=digest(path),
             max_bytes=100_000,
             max_blocks=4,
+            head_dim=2,
+            routes=("route0",),
+            strata={"all": 1.0},
+            sample_count=1,
+        )
+    with pytest.raises(CacheLoadError, match="array headers"):
+        validate_exact_cache(
+            path,
+            expected_sha256=digest(path),
+            max_bytes=100_000,
+            max_blocks=3,
+            head_dim=3,
             routes=("route0",),
             strata={"all": 1.0},
             sample_count=1,
@@ -120,8 +145,8 @@ def test_cache_index_rejects_unknown_route_and_insufficient_cases(tmp_path) -> N
                 "cases": [{"route": "route0", "stratum": "all"}],
             }
         ),
-        case_000000_q_descriptors=np.ones((1, 2), dtype=np.float32),
-        case_000000_k_descriptors=np.ones((2, 2), dtype=np.float32),
+        case_000000_q_descriptors=np.ones((1, 6), dtype=np.float32),
+        case_000000_k_descriptors=np.ones((2, 6), dtype=np.float32),
         case_000000_teacher_distribution=np.full((1, 2), 0.5, dtype=np.float32),
         case_000000_valid_keys=np.ones(2, dtype=np.bool_),
     )
@@ -129,6 +154,7 @@ def test_cache_index_rejects_unknown_route_and_insufficient_cases(tmp_path) -> N
         "expected_sha256": digest(path),
         "max_bytes": 100_000,
         "max_blocks": 1,
+        "head_dim": 2,
         "strata": {"all": 1.0},
     }
 
@@ -143,5 +169,6 @@ def test_cache_index_rejects_unknown_route_and_insufficient_cases(tmp_path) -> N
             expected_sha256=digest(path),
             max_bytes=100_000,
             max_blocks=1,
+            head_dim=2,
             strata={"all": 0.5, "missing": 0.5},
         )
