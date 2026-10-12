@@ -83,6 +83,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     try:
+        if arguments.netuid < 0 or arguments.netuid > 0xFFFF:
+            raise ValueError("netuid must fit in an unsigned 16-bit integer")
+        if not arguments.network:
+            raise ValueError("network cannot be empty")
         submission = ModelSubmission(arguments.repo_id, arguments.revision)
         payload = submission.encode()
         if not arguments.execute:

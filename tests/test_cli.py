@@ -32,6 +32,47 @@ def test_miner_preview_does_not_open_chain(capsys) -> None:
     assert output["payload_bytes"] <= 128
 
 
+@pytest.mark.parametrize("netuid", ["-1", "65536"])
+def test_miner_preview_rejects_invalid_netuid(netuid, capsys) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        main(
+            [
+                "miner",
+                "submit",
+                "--repo-id",
+                "owner/model",
+                "--revision",
+                "12" * 20,
+                "--netuid",
+                netuid,
+            ]
+        )
+
+    assert stopped.value.code == 1
+    assert "unsigned 16-bit" in capsys.readouterr().err
+
+
+def test_miner_preview_rejects_empty_network(capsys) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        main(
+            [
+                "miner",
+                "submit",
+                "--repo-id",
+                "owner/model",
+                "--revision",
+                "12" * 20,
+                "--netuid",
+                "7",
+                "--network",
+                "",
+            ]
+        )
+
+    assert stopped.value.code == 1
+    assert "network cannot be empty" in capsys.readouterr().err
+
+
 def test_miner_execute_forwards_chain_arguments(monkeypatch, capsys) -> None:
     called = {}
 
