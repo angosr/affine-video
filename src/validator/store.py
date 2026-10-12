@@ -1539,7 +1539,13 @@ class ChallengeStore:
         stage_rows = self._connection.execute(
             """
             SELECT stage, next_state, score, attention_cost, score_block, created_at_ms
-            FROM stage_scores WHERE challenge_id = ? ORDER BY created_at_ms, stage
+            FROM stage_scores WHERE challenge_id = ?
+            ORDER BY CASE stage
+                         WHEN 'SCREENING' THEN 0
+                         WHEN 'SCORING' THEN 1
+                         WHEN 'ROLLOUT' THEN 2
+                         ELSE 3
+                     END
             """,
             (row["challenge_id"],),
         ).fetchall()
