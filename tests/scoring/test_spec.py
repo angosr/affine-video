@@ -123,6 +123,15 @@ def test_unknown_fields_and_invalid_budget_order_are_rejected() -> None:
     with pytest.raises(TrackSpecError, match="cannot hold"):
         parse_track_spec(impossible_size)
 
+    header_too_large = valid_spec()
+    header_too_large["model"]["max_bytes"] = 255
+    with pytest.raises(TrackSpecError, match="cannot hold"):
+        parse_track_spec(header_too_large)
+
+    exact_minimum_size = valid_spec()
+    exact_minimum_size["model"]["max_bytes"] = 256
+    assert parse_track_spec(exact_minimum_size).model.max_bytes == 256
+
     undersampled = valid_spec()
     undersampled["scoring"]["stratum_weights"] = {f"layer-{index}": 0.2 for index in range(5)}
     undersampled["scoring"]["local_sample_count"] = 3

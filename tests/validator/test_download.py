@@ -130,3 +130,51 @@ def test_revision_resolution_must_match_submitted_commit(tmp_path) -> None:
 
     assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
     assert caught.value.temporary is True
+
+
+def test_truncated_download_is_temporary_instead_of_participant_failure(tmp_path) -> None:
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model",
+            "12" * 20,
+            cache_dir=tmp_path,
+            max_bytes=10,
+            api=FakeApi([sibling(size=7)]),
+            http_client=FakeClient(),
+        )
+
+    assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
+    assert caught.value.temporary is True
+    assert not list(tmp_path.glob(".partial-*"))
+
+
+def test_malformed_repository_metadata_is_temporary(tmp_path) -> None:
+    malformed = SimpleNamespace(rfilename="selector.safetensors", size="6", lfs=None)
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model",
+            "12" * 20,
+            cache_dir=tmp_path,
+            max_bytes=10,
+            api=FakeApi([malformed]),
+            http_client=FakeClient(),
+        )
+
+    assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
+    assert caught.value.temporary is True
+
+
+def test_malformed_lfs_metadata_is_temporary(tmp_path) -> None:
+    malformed = SimpleNamespace(rfilename="selector.safetensors", size=None, lfs="bad")
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model",
+            "12" * 20,
+            cache_dir=tmp_path,
+            max_bytes=10,
+            api=FakeApi([malformed]),
+            http_client=FakeClient(),
+        )
+
+    assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
+    assert caught.value.temporary is True

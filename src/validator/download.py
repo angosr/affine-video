@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -89,14 +90,48 @@ def download_public_model(
             temporary=True,
         )
 
-    sibling = next(
-        (item for item in (info.siblings or ()) if item.rfilename == MODEL_FILENAME), None
-    )
+    try:
+        sibling = next(
+            (
+                item
+                for item in (info.siblings or ())
+                if item.rfilename == MODEL_FILENAME
+            ),
+            None,
+        )
+    except (AttributeError, TypeError) as exc:
+        raise ModelDownloadError(
+            "DOWNLOAD_TEMPORARY_FAILURE",
+            "Hugging Face returned invalid repository metadata",
+            temporary=True,
+        ) from exc
     if sibling is None:
         raise ModelDownloadError("MODEL_FILE_MISSING", f"{MODEL_FILENAME} is missing")
-    declared_size = sibling.size
-    if declared_size is None and sibling.lfs is not None:
-        declared_size = sibling.lfs.get("size")
+    try:
+        declared_size = sibling.size
+        lfs = sibling.lfs
+    except AttributeError as exc:
+        raise ModelDownloadError(
+            "DOWNLOAD_TEMPORARY_FAILURE",
+            "Hugging Face returned invalid model file metadata",
+            temporary=True,
+        ) from exc
+    if declared_size is None and lfs is not None:
+        if not isinstance(lfs, Mapping):
+            raise ModelDownloadError(
+                "DOWNLOAD_TEMPORARY_FAILURE",
+                "Hugging Face returned invalid model file metadata",
+                temporary=True,
+            )
+        declared_size = lfs.get("size")
+    if declared_size is not None and (
+        type(declared_size) is not int or declared_size < 0
+    ):
+        raise ModelDownloadError(
+            "DOWNLOAD_TEMPORARY_FAILURE",
+            "Hugging Face returned invalid model size metadata",
+            temporary=True,
+        )
     if declared_size is not None and declared_size > max_bytes:
         raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
 
@@ -128,6 +163,12 @@ def download_public_model(
                         raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
                     digest.update(chunk)
                     output.write(chunk)
+            if declared_size is not None and received != declared_size:
+                raise ModelDownloadError(
+                    "DOWNLOAD_TEMPORARY_FAILURE",
+                    "downloaded model size does not match repository metadata",
+                    temporary=True,
+                )
             output.flush()
             os.fsync(output.fileno())
 

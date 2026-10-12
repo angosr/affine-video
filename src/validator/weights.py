@@ -151,7 +151,11 @@ def plan_weights(
     if not isfinite(max_weight) or not 0 < max_weight <= 1:
         raise ValueError("maximum weight must be within (0, 1]")
     eligible_entries = [
-        entry for entry in entries if entry.hotkey in uid_by_hotkey and not entry.provisional
+        entry
+        for entry in entries
+        if entry.hotkey in uid_by_hotkey
+        and not entry.provisional
+        and entry.score_block <= current_block
     ]
     utilities = frontier_gains(eligible_entries, minimum_gain=minimum_frontier_gain)
     caps: dict[str, float] = {}

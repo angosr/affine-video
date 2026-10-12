@@ -190,7 +190,7 @@ def test_weight_update_waits_for_submission_scan_to_reach_snapshot(monkeypatch) 
     assert submitted == []
 
 
-def test_plan_excludes_provisional_and_deregistered_entries() -> None:
+def test_plan_excludes_provisional_deregistered_and_future_entries() -> None:
     plan = plan_weights(
         [
             entry("provisional", 0.95, 5, provisional=True),
@@ -198,8 +198,17 @@ def test_plan_excludes_provisional_and_deregistered_entries() -> None:
             entry("bob", 0.6, 20),
             entry("carol", 0.9, 30),
             entry("deregistered", 1.0, 40),
+            LeaderboardEntry(
+                hotkey="future",
+                challenge_id="challenge-future",
+                final_score=1.0,
+                attention_cost=0.1,
+                score_block=101,
+                provisional=False,
+                position=ChainPosition(50, 0, 0),
+            ),
         ],
-        uid_by_hotkey={"alice": 8, "bob": 2, "carol": 5},
+        uid_by_hotkey={"alice": 8, "bob": 2, "carol": 5, "future": 9},
         current_block=100,
         min_allowed_weights=3,
         max_weight=0.6,

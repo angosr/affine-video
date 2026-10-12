@@ -156,9 +156,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     except ValueError as exc:
         raise TrackSpecError(str(exc)) from exc
     max_model_bytes = _integer(model_raw["max_bytes"], "model max_bytes", minimum=1)
-    item_size = 2 if selector.storage_dtype == "float16" else 4
-    tensor_bytes = sum(prod(tensor.shape) * item_size for tensor in selector.tensor_schema.values())
-    if tensor_bytes + 8 >= max_model_bytes:
+    if _minimum_safetensors_bytes(selector) > max_model_bytes:
         raise TrackSpecError("model max_bytes cannot hold the fixed selector tensors")
 
     base_raw = _object(root["base_model"], {"repo_id", "revision"}, "base_model")
@@ -416,3 +414,21 @@ def _canonical_json(value: Any) -> bytes:
         ensure_ascii=True,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _minimum_safetensors_bytes(selector: SelectorArchitecture) -> int:
+    item_size = 2 if selector.storage_dtype == "float16" else 4
+    dtype = "F16" if selector.storage_dtype == "float16" else "F32"
+    offset = 0
+    header: dict[str, Any] = {}
+    for name, tensor in sorted(selector.tensor_schema.items()):
+        size = prod(tensor.shape) * item_size
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(tensor.shape),
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+    encoded_header = _canonical_json(header)
+    padded_header_bytes = (len(encoded_header) + 7) // 8 * 8
+    return 8 + padded_header_bytes + offset
