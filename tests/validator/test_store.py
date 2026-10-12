@@ -366,6 +366,55 @@ def test_provisional_and_system_failure_preserve_previous_success(tmp_path) -> N
         assert store.leaderboard()[0].challenge_id == older
 
 
+def test_reward_entries_keep_improvement_history_for_current_successes(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        alice_first, _ = store.add_submission(
+            submission_at(100, hotkey="alice"), occurred_at_ms=10
+        )
+        bob, _ = store.add_submission(
+            submission_at(110, hotkey="bob"), occurred_at_ms=11
+        )
+        alice_upgrade, _ = store.add_submission(
+            submission_at(120, hotkey="alice"), occurred_at_ms=12
+        )
+        for index, (identifier, score) in enumerate(
+            ((alice_first, 0.6), (bob, 0.8), (alice_upgrade, 0.9)),
+            start=1,
+        ):
+            advance_to_rollout(store, identifier, 20 + index * 10)
+            store.complete_challenge(
+                identifier,
+                ChallengeState.SUCCEEDED,
+                final_score=score,
+                attention_cost=0.2,
+                score_block=120,
+                occurred_at_ms=29 + index * 10,
+            )
+
+        history = store.reward_entries()
+        assert [(item.hotkey, item.final_score) for item in history] == [
+            ("alice", 0.6),
+            ("bob", 0.8),
+            ("alice", 0.9),
+        ]
+
+        alice_failure, _ = store.add_submission(
+            submission_at(130, hotkey="alice"), occurred_at_ms=70
+        )
+        store.transition(alice_failure, ChallengeState.FETCHING, occurred_at_ms=71)
+        store.complete_challenge(
+            alice_failure,
+            ChallengeState.PARTICIPANT_FAILED,
+            error_code="MODEL_SCHEMA_INVALID",
+            score_block=130,
+            occurred_at_ms=72,
+        )
+
+        assert [(item.hotkey, item.final_score) for item in store.reward_entries()] == [
+            ("bob", 0.8)
+        ]
+
+
 def test_stage_score_replay_must_be_identical(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)

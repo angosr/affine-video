@@ -1320,6 +1320,59 @@ class ChallengeStore:
             for row in rows
         ]
 
+    def reward_entries(self) -> list[LeaderboardEntry]:
+        """Return chronological successful improvements for currently valid hotkeys."""
+
+        rows = self._connection.execute(
+            """
+            SELECT submission.hotkey, challenge.challenge_id,
+                   challenge.final_score, challenge.attention_cost,
+                   challenge.score_block,
+                   submission.block_height, submission.extrinsic_index,
+                   submission.event_index
+            FROM challenges challenge
+            JOIN submissions submission
+              ON submission.submission_id = challenge.submission_id
+            JOIN leaderboard current_entry
+              ON current_entry.hotkey = submission.hotkey
+            JOIN challenges current_challenge
+              ON current_challenge.challenge_id = current_entry.challenge_id
+            WHERE challenge.state = ?
+              AND current_challenge.state = ?
+              AND current_entry.provisional = 0
+              AND (
+                    submission.block_height < current_entry.block_height
+                 OR (
+                        submission.block_height = current_entry.block_height
+                    AND submission.extrinsic_index < current_entry.extrinsic_index
+                 )
+                 OR (
+                        submission.block_height = current_entry.block_height
+                    AND submission.extrinsic_index = current_entry.extrinsic_index
+                    AND submission.event_index <= current_entry.event_index
+                 )
+              )
+            ORDER BY submission.block_height,
+                     submission.extrinsic_index,
+                     submission.event_index
+            """,
+            (ChallengeState.SUCCEEDED, ChallengeState.SUCCEEDED),
+        ).fetchall()
+        return [
+            LeaderboardEntry(
+                hotkey=row["hotkey"],
+                challenge_id=row["challenge_id"],
+                final_score=row["final_score"],
+                attention_cost=row["attention_cost"],
+                score_block=row["score_block"],
+                provisional=False,
+                position=ChainPosition(
+                    row["block_height"], row["extrinsic_index"], row["event_index"]
+                ),
+            )
+            for row in rows
+        ]
+
     def create_weight_run(
         self,
         *,

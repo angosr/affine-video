@@ -60,6 +60,20 @@ def test_frontier_gains_ignore_numerical_dust() -> None:
     assert gains == pytest.approx({"first": 0.6, "material": 0.002})
 
 
+def test_frontier_gains_accumulate_same_hotkey_improvements() -> None:
+    gains = frontier_gains(
+        [
+            entry("alice", 0.6, 10),
+            entry("bob", 0.8, 20),
+            entry("alice", 0.9, 30),
+        ],
+        minimum_gain=0.001,
+    )
+
+    assert gains == pytest.approx({"alice": 0.7, "bob": 0.2})
+    assert sum(gains.values()) == pytest.approx(0.9)
+
+
 def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
     calls: list[object] = []
 
@@ -116,7 +130,7 @@ def test_weight_update_obeys_block_interval_and_submits_one_snapshot(monkeypatch
     monkeypatch.setattr(weights_module, "read_weight_chain_state", fake_state)
     monkeypatch.setattr(weights_module, "submit_recorded_weights", fake_submit)
     store = SimpleNamespace(
-        leaderboard=lambda: [entry("alice", 0.8, 100)],
+        reward_entries=lambda: [entry("alice", 0.8, 100)],
         latest_weight_run=lambda: None,
         chain_cursor=lambda: (120, "0x" + "12" * 32),
     )
@@ -169,7 +183,7 @@ def test_weight_update_waits_for_submission_scan_to_reach_snapshot(monkeypatch) 
     monkeypatch.setattr(weights_module, "submit_recorded_weights", fake_submit)
     store = SimpleNamespace(
         chain_cursor=lambda: (119, "0x" + "11" * 32),
-        leaderboard=lambda: [entry("alice", 0.8, 100)],
+        reward_entries=lambda: [entry("alice", 0.8, 100)],
         latest_weight_run=lambda: None,
     )
 

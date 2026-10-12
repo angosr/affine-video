@@ -25,9 +25,10 @@ controls evaluation cost; it is not a ranking signal. Local scores remain provis
 no chain weight until a full rollout succeeds. The independent rollout supplies the authoritative
 final score; the fixed local panel is only a cost gate. Chain utility is the final-score improvement
 over earlier successful submissions, so later behaviorally identical copies have no marginal
-utility. The track also freezes a positive `minimum_frontier_gain`; score changes below that
-experimentally calibrated resolution receive no utility and cannot be amplified by chain weight
-caps.
+utility. Successive frontier improvements submitted by the same hotkey are accumulated for that
+hotkey, so moving an upgrade to a fresh hotkey does not preserve extra utility. The track also
+freezes a positive `minimum_frontier_gain`; score changes below that experimentally calibrated
+resolution receive no utility and cannot be amplified by chain weight caps.
 
 A newer provisional challenge does not displace the same hotkey's previously confirmed result.
 It replaces that result only after a rollout succeeds or a deterministic participant failure is

@@ -117,7 +117,7 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         snapshot = store.public_snapshot()
         challenge = snapshot["challenges"][0]
         plan = plan_weights(
-            store.leaderboard(),
+            store.reward_entries(),
             uid_by_hotkey={HOTKEY: 4},
             current_block=100,
             min_allowed_weights=1,

@@ -119,16 +119,12 @@ def frontier_gains(
     ordered = sorted(entries, key=lambda entry: entry.position)
     frontier = 0.0
     gains: dict[str, float] = {}
-    seen: set[str] = set()
     for entry in ordered:
-        if entry.hotkey in seen:
-            raise ValueError("leaderboard contains a duplicate hotkey")
-        seen.add(entry.hotkey)
         if not isfinite(entry.final_score) or not 0 <= entry.final_score <= 1:
             raise ValueError("leaderboard scores must be finite and within [0, 1]")
         gain = entry.final_score - frontier
         if gain >= minimum_gain:
-            gains[entry.hotkey] = gain
+            gains[entry.hotkey] = gains.get(entry.hotkey, 0.0) + gain
             frontier = entry.final_score
     return gains
 
@@ -317,7 +313,7 @@ async def update_weights(
     if latest is not None and chain.finalized_block < latest.source_block + effective_interval:
         return None
     plan = plan_weights(
-        store.leaderboard(),
+        store.reward_entries(),
         uid_by_hotkey=chain.uid_by_hotkey,
         current_block=chain.finalized_block,
         min_allowed_weights=chain.min_allowed_weights,
