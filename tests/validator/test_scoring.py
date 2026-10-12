@@ -13,7 +13,6 @@ from scoring.spec import (
     BaseModelSpec,
     BudgetSpec,
     CacheSpec,
-    ChainWeightSpec,
     ModelSpec,
     ScoringSpec,
     TrackSpec,
@@ -66,13 +65,11 @@ def sample_task() -> LeasedChallenge:
         repo_id="owner/model",
         revision="12" * 20,
         position=ChainPosition(100, 0, 0),
-        seed_block_hash="0x" + "34" * 32,
         lease_token="lease",
         lease_expires_at_ms=1000,
         attempts=1,
         model_path="/cache/model.safetensors",
         file_sha256="ab" * 32,
-        current_score=None,
     )
 
 
@@ -161,7 +158,7 @@ def test_scoring_stages_advance_and_finish_with_one_leaderboard_result(tmp_path)
                 ChallengeState.SUCCEEDED,
                 score=0.6,
                 attention_cost=0.25,
-                metrics={"audit_factor": 0.9},
+                metrics={"video_quality": 0.9},
             ),
             now_ms=40,
         )
@@ -213,14 +210,12 @@ def test_local_result_can_wait_provisionally_before_rollout(tmp_path) -> None:
         assert result is not None and result.state is ChallengeState.PROVISIONAL
         assert store.leaderboard()[0].provisional is True
         assert (
-            store.claim_next_scoring("other", current_finalized_block=110, lease_ms=100, now_ms=31)
+            store.claim_next_scoring("other", lease_ms=100, now_ms=31)
             is None
         )
 
         store.schedule_rollout(identifier, occurred_at_ms=40)
-        rollout = store.claim_next_scoring(
-            "audit", current_finalized_block=110, lease_ms=100, now_ms=41
-        )
+        rollout = store.claim_next_scoring("audit", lease_ms=100, now_ms=41)
         assert rollout is not None
         assert rollout.state is ChallengeState.ROLLOUT
 
@@ -333,36 +328,30 @@ def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> 
         model_path,
     )
     track = TrackSpec(
-        schema_version=1,
         track_id="test",
         netuid=7,
         track_start_block=1,
         submission_cooldown_blocks=1,
-        seed_delay_blocks=1,
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
         cache=CacheSpec("34" * 32, 100_000, "56" * 32, 1_000_000),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
-            screen_sample_count=2,
             local_sample_count=2,
             tail_mean_weight=0.8,
             stratum_weights=(("all", 1.0),),
             screening_threshold=0.0,
             rollout_threshold=1.0,
-            q_floor=0.0,
-            gamma=1.0,
             bootstrap_confidence=0.95,
             bootstrap_resamples=20,
             bootstrap_seed=7,
         ),
-        weights=ChainWeightSpec(100, 500, 0.2),
         digest="ab" * 32,
     )
 
     screen_cases: list[ScreenCase] = []
     exact_cases: list[ExactCase] = []
-    for seed in (1, 2):
+    for seed in (1, 2, 3, 4):
         generator = np.random.default_rng(seed)
         q = generator.normal(size=(2, 2, 2)).astype(np.float32)
         k = generator.normal(size=(3, 2, 2)).astype(np.float32)
@@ -390,6 +379,14 @@ def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> 
     first = evaluator(screening_task)
     second = evaluator(screening_task)
     local = evaluator(replace(screening_task, state=ChallengeState.SCORING))
+    other_submission = evaluator(
+        replace(
+            screening_task,
+            submission_id="78" * 32,
+            state=ChallengeState.SCORING,
+            position=ChainPosition(200, 1, 0),
+        )
+    )
 
     with pytest.raises(TemporaryScoringError) as changed:
         evaluator(replace(screening_task, file_sha256="00" * 32))
@@ -397,8 +394,9 @@ def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> 
     assert first == second
     assert changed.value.code == "SCORING_MODEL_CHANGED"
     assert first.next_state is ChallengeState.SCORING
-    assert first.metrics["sample_count"] == 2
+    assert first.metrics["sample_count"] == 4
     assert local.next_state is ChallengeState.PROVISIONAL
+    assert local == other_submission
     assert 0 <= local.score <= 1
     assert local.metrics["sample_count"] == 2
 
@@ -407,17 +405,11 @@ def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> 
         screen_cases,
         exact_cases,
         rollout=lambda _task, _selector, _track: RolloutResult(
-            audit_factor=0.5,
+            final_score=0.5,
             attention_cost=0.4,
             metrics={"video_quality": 0.8},
         ),
-    )(
-        replace(
-            screening_task,
-            state=ChallengeState.ROLLOUT,
-            current_score=0.6,
-        )
-    )
+    )(replace(screening_task, state=ChallengeState.ROLLOUT))
     assert audited.next_state is ChallengeState.SUCCEEDED
-    assert audited.score == pytest.approx(0.3)
-    assert audited.metrics == {"audit_factor": 0.5, "video_quality": 0.8}
+    assert audited.score == pytest.approx(0.5)
+    assert audited.metrics == {"video_quality": 0.8}

@@ -79,7 +79,6 @@ async def run_validator(
         max_bytes=track.cache.screen_max_bytes,
         routes=track.model.selector.routes,
         strata=track.scoring.stratum_weight_map,
-        sample_count=track.scoring.screen_sample_count,
     )
     validate_exact_cache(
         exact_cache,
@@ -111,7 +110,6 @@ async def run_validator(
                     netuid=track.netuid,
                     track_start_block=track.track_start_block,
                     cooldown_blocks=track.submission_cooldown_blocks,
-                    seed_delay_blocks=track.seed_delay_blocks,
                     admission_settings=admission_settings,
                     scoring_settings=scoring_settings,
                     evaluator=evaluator,
@@ -130,9 +128,6 @@ async def run_validator(
                             wallet_path=wallet_path,
                             mechid=mechid,
                             version_key=version_key,
-                            half_life_blocks=track.weights.freshness_half_life_blocks,
-                            max_age_blocks=track.weights.max_age_blocks,
-                            provisional_max_weight=track.weights.provisional_max_weight,
                             interval_blocks=weight_interval_blocks,
                         )
                         result = CycleResult(
@@ -164,7 +159,6 @@ async def process_cycle(
     netuid: int,
     track_start_block: int,
     cooldown_blocks: int,
-    seed_delay_blocks: int,
     admission_settings: AdmissionSettings,
     scoring_settings: ScoringSettings,
     evaluator: Callable[[LeasedChallenge], StageOutcome],
@@ -183,14 +177,12 @@ async def process_cycle(
         netuid=netuid,
         track_start_block=track_start_block,
         cooldown_blocks=cooldown_blocks,
-        seed_delay_blocks=seed_delay_blocks,
         max_blocks=max_scan_blocks,
     )
     finalized_block = await client.finalized_block()
     admission = process_next_admission(
         store,
         worker_id=f"{worker_id}:admission",
-        current_finalized_block=finalized_block,
         settings=admission_settings,
         downloader=downloader,
         model_validator=model_validator,

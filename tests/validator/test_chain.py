@@ -108,7 +108,7 @@ def test_scanner_advances_persistent_cursor_in_bounded_batches(tmp_path) -> None
         assert empty.blocks_scanned == 0
         assert store.chain_cursor() == (102, blocks[102][0])
         challenge = store.public_snapshot()["challenges"][0]
-        assert challenge["seed_block_hash"] == blocks[100][0]
+        assert challenge["block_height"] == 100
 
 
 def test_scanner_does_not_advance_cursor_past_failed_block(tmp_path) -> None:

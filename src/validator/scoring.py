@@ -14,15 +14,14 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
-from scoring.cache import CacheLoadError, sample_exact_cache, sample_screen_cache
-from scoring.evaluate import challenge_seed, stratified_sample_indices
+from scoring.cache import CacheLoadError, load_screen_cache, sample_exact_cache
+from scoring.evaluate import panel_seed, route_stratified_sample_indices
 from scoring.local import (
     ExactCase,
     ScreenCase,
     evaluate_selector_local,
     evaluate_selector_screen,
 )
-from scoring.metrics import quality_score
 from scoring.model import ModelValidationError
 from scoring.selector import FixedSelector, load_selector
 from scoring.spec import TrackSpec
@@ -97,13 +96,13 @@ class ScoringOutcome:
 
 @dataclass(frozen=True, slots=True)
 class RolloutResult:
-    audit_factor: float
+    final_score: float
     attention_cost: float
     metrics: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        if not isfinite(self.audit_factor) or not 0 <= self.audit_factor <= 1:
-            raise ValueError("rollout audit factor must be within [0, 1]")
+        if not isfinite(self.final_score) or not 0 <= self.final_score <= 1:
+            raise ValueError("rollout final score must be within [0, 1]")
         if not isfinite(self.attention_cost) or self.attention_cost < 0:
             raise ValueError("rollout attention cost must be finite and non-negative")
 
@@ -138,21 +137,12 @@ class TrackEvaluator:
         except ModelValidationError as exc:
             raise ParticipantScoringError(exc.code, str(exc)) from exc
 
-        seed = challenge_seed(
-            self.track.digest,
-            task.submission_id,
-            task.seed_block_hash,
-        )
         scoring = self.track.scoring
         try:
             if task.state is ChallengeState.SCREENING:
-                cases = _cases_for_stage(
-                    self.screen_cases,
-                    count=scoring.screen_sample_count,
-                    seed=seed ^ 0x53435245,
-                    strata=scoring.stratum_weight_map,
-                    presampled=self.presampled,
-                )
+                cases = tuple(self.screen_cases)
+                if not cases:
+                    raise ValueError("screen cache is empty")
                 result = evaluate_selector_screen(
                     selector,
                     cases,
@@ -178,10 +168,11 @@ class TrackEvaluator:
                     },
                 )
             if task.state is ChallengeState.SCORING:
-                cases = _cases_for_stage(
+                cases = _exact_cases_for_stage(
                     self.exact_cases,
                     count=scoring.local_sample_count,
-                    seed=seed ^ 0x4C4F4341,
+                    seed=panel_seed(self.track.digest, stage="exact"),
+                    routes=self.track.model.selector.routes,
                     strata=scoring.stratum_weight_map,
                     presampled=self.presampled,
                 )
@@ -195,12 +186,6 @@ class TrackEvaluator:
                     bootstrap_resamples=scoring.bootstrap_resamples,
                     bootstrap_seed=scoring.bootstrap_seed,
                 )
-                score = quality_score(
-                    local_lcb=result.lower_bound,
-                    q_floor=scoring.q_floor,
-                    gamma=scoring.gamma,
-                    audit_factor=1.0,
-                )
                 target = (
                     ChallengeState.ROLLOUT
                     if self.rollout is not None and result.lower_bound >= scoring.rollout_threshold
@@ -208,7 +193,7 @@ class TrackEvaluator:
                 )
                 return StageOutcome(
                     target,
-                    score,
+                    result.lower_bound,
                     scoring.budgets[-1].calibrated_cost,
                     {
                         "local_score": result.aggregate.score,
@@ -222,10 +207,6 @@ class TrackEvaluator:
                     raise TemporaryScoringError(
                         "ROLLOUT_UNAVAILABLE", "rollout evaluator is not configured"
                     )
-                if task.current_score is None:
-                    raise TemporaryScoringError(
-                        "ROLLOUT_SCORE_MISSING", "provisional score is unavailable"
-                    )
                 rollout = self.rollout(task, selector, self.track)
                 if not isinstance(rollout, RolloutResult):
                     raise TemporaryScoringError(
@@ -233,9 +214,9 @@ class TrackEvaluator:
                     )
                 return StageOutcome(
                     ChallengeState.SUCCEEDED,
-                    task.current_score * rollout.audit_factor,
+                    rollout.final_score,
                     rollout.attention_cost,
-                    {**rollout.metrics, "audit_factor": rollout.audit_factor},
+                    rollout.metrics,
                 )
         except (ParticipantScoringError, TemporaryScoringError):
             raise
@@ -261,20 +242,12 @@ class FileTrackEvaluator:
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         try:
-            seed = challenge_seed(
-                self.track.digest,
-                task.submission_id,
-                task.seed_block_hash,
-            )
             scoring = self.track.scoring
             if task.state is ChallengeState.SCREENING:
-                screen_cases = sample_screen_cache(
+                screen_cases = load_screen_cache(
                     self.screen_cache,
                     expected_sha256=self.track.cache.screen_sha256,
                     max_bytes=self.track.cache.screen_max_bytes,
-                    count=scoring.screen_sample_count,
-                    seed=seed ^ 0x53435245,
-                    strata=scoring.stratum_weight_map,
                 )
                 exact_cases: Sequence[ExactCase] = ()
             elif task.state is ChallengeState.SCORING:
@@ -284,7 +257,8 @@ class FileTrackEvaluator:
                     expected_sha256=self.track.cache.exact_sha256,
                     max_bytes=self.track.cache.exact_max_bytes,
                     count=scoring.local_sample_count,
-                    seed=seed ^ 0x4C4F4341,
+                    seed=panel_seed(self.track.digest, stage="exact"),
+                    routes=self.track.model.selector.routes,
                     strata=scoring.stratum_weight_map,
                 )
             else:
@@ -422,7 +396,6 @@ def process_next_scoring(
     now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
     task = store.claim_next_scoring(
         worker_id,
-        current_finalized_block=current_finalized_block,
         lease_ms=settings.lease_ms,
         now_ms=now,
     )
@@ -550,31 +523,25 @@ def _defer_or_fail(
     return ChallengeState.SYSTEM_DEFERRED
 
 
-def _sample_stratified[T: (ScreenCase, ExactCase)](
-    cases: Sequence[T],
-    count: int,
-    seed: int,
-    strata: Mapping[str, float],
-) -> tuple[T, ...]:
-    indices = stratified_sample_indices(
-        [case.stratum for case in cases],
-        count,
-        seed,
-        strata,
-    )
-    return tuple(cases[index] for index in indices)
-
-
-def _cases_for_stage[T: (ScreenCase, ExactCase)](
-    cases: Sequence[T],
+def _exact_cases_for_stage(
+    cases: Sequence[ExactCase],
     *,
     count: int,
     seed: int,
+    routes: tuple[str, ...],
     strata: Mapping[str, float],
     presampled: bool,
-) -> tuple[T, ...]:
+) -> tuple[ExactCase, ...]:
     if not presampled:
-        return _sample_stratified(cases, count, seed, strata)
+        indices = route_stratified_sample_indices(
+            [case.route for case in cases],
+            [case.stratum for case in cases],
+            count,
+            seed,
+            routes,
+            strata,
+        )
+        return tuple(cases[index] for index in indices)
     if len(cases) != count:
         raise ValueError("sampled cache returned the wrong number of cases")
     return tuple(cases)

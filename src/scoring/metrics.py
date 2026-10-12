@@ -7,25 +7,6 @@ from itertools import pairwise
 from math import fsum, isfinite, log
 
 
-def quality_score(*, local_lcb: float, q_floor: float, gamma: float, audit_factor: float) -> float:
-    """Normalize local quality and apply the fixed rollout audit factor."""
-
-    values = (local_lcb, q_floor, gamma, audit_factor)
-    if not all(isfinite(value) for value in values):
-        raise ValueError("score inputs must be finite")
-    if not 0 <= local_lcb <= 1:
-        raise ValueError("local_lcb must be within [0, 1]")
-    if not 0 <= q_floor < 1:
-        raise ValueError("q_floor must be within [0, 1)")
-    if gamma <= 0:
-        raise ValueError("gamma must be positive")
-    if not 0 <= audit_factor <= 1:
-        raise ValueError("audit_factor must be within [0, 1]")
-
-    normalized = min(1.0, max(0.0, (local_lcb - q_floor) / (1.0 - q_floor)))
-    return normalized**gamma * audit_factor
-
-
 def relative_squared_error(
     dense: Sequence[float], sparse: Sequence[float], *, epsilon: float
 ) -> float:

@@ -8,6 +8,7 @@ to validate video quality or wall-clock GPU speed.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import math
@@ -35,7 +36,7 @@ class Case:
     v: np.ndarray  # [nk, tile, d]
     dense: np.ndarray  # [nq, tile, d]
     mass: np.ndarray  # [nq, nk], rows sum to one
-    peak: np.ndarray  # [nq, nk]
+    teacher: np.ndarray  # [nq, nk], Veda max-pooled distribution; rows sum to one
     avg_q: np.ndarray
     avg_k: np.ndarray
     trip_q: np.ndarray
@@ -67,8 +68,9 @@ def dense_attention(
     out = (attn @ vf).reshape(nq, tile, d)
     a4 = attn.reshape(nq, tile, nk, tile)
     mass = a4.sum(axis=3).mean(axis=1)
-    peak = a4.max(axis=(1, 3))
-    return out.astype(np.float32), mass.astype(np.float32), peak.astype(np.float32)
+    teacher = a4.max(axis=(1, 3))
+    teacher /= teacher.sum(axis=1, keepdims=True)
+    return out.astype(np.float32), mass.astype(np.float32), teacher.astype(np.float32)
 
 
 def sparse_row(qrow: np.ndarray, k: np.ndarray, v: np.ndarray, selected: np.ndarray) -> np.ndarray:
@@ -115,10 +117,10 @@ def make_case(
         v[salient, 0] += 0.8 * direction
         v[salient, 1] -= 0.8 * direction
 
-    dense, mass, peak = dense_attention(q, k, v)
+    dense, mass, teacher = dense_attention(q, k, v)
     avg_q, trip_q = descriptors(q)
     avg_k, trip_k = descriptors(k)
-    return Case(q, k, v, dense, mass, peak, avg_q, avg_k, trip_q, trip_k)
+    return Case(q, k, v, dense, mass, teacher, avg_q, avg_k, trip_q, trip_k)
 
 
 def pair_features(qdesc: np.ndarray, kdesc: np.ndarray) -> np.ndarray:
@@ -138,7 +140,7 @@ def build_xy(cases: list[Case], kind: str) -> tuple[np.ndarray, np.ndarray]:
     for case in cases:
         qd, kd = (case.avg_q, case.avg_k) if kind == "avg" else (case.trip_q, case.trip_k)
         xs.append(pair_features(qd, kd))
-        ys.append(np.log(case.mass.reshape(-1) + 1e-6))
+        ys.append(np.log(case.teacher.reshape(-1) + 1e-6))
     return np.concatenate(xs), np.concatenate(ys).astype(np.float32)
 
 
@@ -255,14 +257,27 @@ def evaluate_scores(
     for cidx, case in enumerate(cases):
         scores = scorer(case)
         for bidx, budget in enumerate(budgets):
-            errs = row_errors(case, allocate(scores, budget, adaptive=adaptive))
+            errs = row_errors(
+                case,
+                allocate(scores, budget, adaptive=adaptive, force_anchor=adaptive),
+            )
             per_case_q[cidx, bidx] = quality_from_errors(errs)
     for bidx in range(len(budgets)):
         # Aggregate all case/query errors exactly as the design proposes.
         all_err = []
         for case in cases:
             scores = scorer(case)
-            all_err.extend(row_errors(case, allocate(scores, budgets[bidx], adaptive=adaptive)))
+            all_err.extend(
+                row_errors(
+                    case,
+                    allocate(
+                        scores,
+                        budgets[bidx],
+                        adaptive=adaptive,
+                        force_anchor=adaptive,
+                    ),
+                )
+            )
         per_budget_q.append(quality_from_errors(np.asarray(all_err)))
     return np.asarray(per_budget_q), per_case_q
 
@@ -397,12 +412,12 @@ def evaluate_marginal_allocator(
     }
 
 
-def retained_mass(case: Case, mask: np.ndarray) -> float:
-    return float(np.mean(np.sum(case.mass * mask, axis=1)))
+def retained_teacher_probability(case: Case, mask: np.ndarray) -> float:
+    return float(np.mean(np.sum(case.teacher * mask, axis=1)))
 
 
 def proxy_correlation(cases: list[Case], budgets: list[int], seed: int) -> dict:
-    qualities, masses, recalls = [], [], []
+    qualities, probabilities, recalls = [], [], []
     candidate_case_scores = []
     candidate_params = []
     budget = budgets[1]
@@ -412,21 +427,25 @@ def proxy_correlation(cases: list[Case], budgets: list[int], seed: int) -> dict:
         q_values, m_values, r_values = [], [], []
         for cidx, case in enumerate(cases):
             local_rng = np.random.default_rng(seed + 1000 * idx + cidx)
-            scores = np.log(case.mass + 1e-6) + noise * local_rng.normal(size=case.mass.shape)
+            scores = np.log(case.teacher + 1e-6) + noise * local_rng.normal(
+                size=case.teacher.shape
+            )
             scores += bias_scale * local_rng.normal(size=(case.mass.shape[0], 1))
-            mask = allocate(scores, budget, adaptive=True)
+            mask = allocate(scores, budget, adaptive=False, force_anchor=False)
             errs = row_errors(case, mask)
             q_values.append(quality_from_errors(errs))
-            m_values.append(retained_mass(case, mask))
-            oracle = allocate(case.mass, budget, adaptive=True)
+            m_values.append(retained_teacher_probability(case, mask))
+            oracle = allocate(case.teacher, budget, adaptive=False, force_anchor=False)
             r_values.append(float(np.logical_and(mask, oracle).sum() / budget))
         qualities.append(float(np.mean(q_values)))
-        masses.append(float(np.mean(m_values)))
+        probabilities.append(float(np.mean(m_values)))
         recalls.append(float(np.mean(r_values)))
         candidate_case_scores.append(q_values)
         candidate_params.append(noise)
     return {
-        "mass_vs_exact_quality_spearman": float(spearmanr(masses, qualities).statistic),
+        "teacher_probability_vs_exact_quality_spearman": float(
+            spearmanr(probabilities, qualities).statistic
+        ),
         "recall_vs_exact_quality_spearman": float(spearmanr(recalls, qualities).statistic),
         "candidate_quality_range": [float(min(qualities)), float(max(qualities))],
         "candidate_case_scores": np.asarray(candidate_case_scores),
@@ -437,8 +456,8 @@ def proxy_correlation(cases: list[Case], budgets: list[int], seed: int) -> dict:
 def exact_oracle_experiment(seed: int, ncases: int = 120) -> dict:
     rng = np.random.default_rng(seed)
     kkeep = 2
-    exact_errors, mass_errors, peak_errors = [], [], []
-    mass_exact, peak_exact = 0, 0
+    exact_errors, mass_errors, teacher_errors = [], [], []
+    mass_exact, teacher_exact = 0, 0
     rows = 0
     for _ in range(ncases):
         case = make_case(rng, nq=3, nk=6, tile=3, d=6)
@@ -453,26 +472,26 @@ def exact_oracle_experiment(seed: int, ncases: int = 120) -> dict:
             best_idx = int(np.argmin(errors))
             best = set(choices[best_idx])
             mass = set(np.argsort(-case.mass[i], kind="stable")[:kkeep].tolist())
-            peak = set(np.argsort(-case.peak[i], kind="stable")[:kkeep].tolist())
+            teacher = set(np.argsort(-case.teacher[i], kind="stable")[:kkeep].tolist())
             exact_errors.append(errors[best_idx])
             mass_errors.append(errors[choices.index(tuple(sorted(mass)))])
-            peak_errors.append(errors[choices.index(tuple(sorted(peak)))])
+            teacher_errors.append(errors[choices.index(tuple(sorted(teacher)))])
             mass_exact += int(mass == best)
-            peak_exact += int(peak == best)
+            teacher_exact += int(teacher == best)
             rows += 1
     exact_mean = float(np.mean(exact_errors))
     return {
         "rows": rows,
         "exact_mean_relative_squared_error": exact_mean,
         "mass_topk_mean_relative_squared_error": float(np.mean(mass_errors)),
-        "peak_topk_mean_relative_squared_error": float(np.mean(peak_errors)),
+        "teacher_topk_mean_relative_squared_error": float(np.mean(teacher_errors)),
         "mass_exact_mask_rate": mass_exact / rows,
-        "peak_exact_mask_rate": peak_exact / rows,
+        "teacher_exact_mask_rate": teacher_exact / rows,
         "mass_excess_error_vs_exact": float(
             (np.mean(mass_errors) - exact_mean) / (exact_mean + EPS)
         ),
-        "peak_excess_error_vs_exact": float(
-            (np.mean(peak_errors) - exact_mean) / (exact_mean + EPS)
+        "teacher_excess_error_vs_exact": float(
+            (np.mean(teacher_errors) - exact_mean) / (exact_mean + EPS)
         ),
     }
 
@@ -483,8 +502,8 @@ def cache_precision_experiment(cases: list[Case], model, kind: str, budget: int)
         s32 = model_scores(model, case, kind, quantized=False)
         s16 = model_scores(model, case, kind, quantized=True)
         score_rhos.append(float(spearmanr(s32.reshape(-1), s16.reshape(-1)).statistic))
-        m32 = allocate(s32, budget, adaptive=True)
-        m16 = allocate(s16, budget, adaptive=True)
+        m32 = allocate(s32, budget, adaptive=False, force_anchor=False)
+        m16 = allocate(s16, budget, adaptive=False, force_anchor=False)
         mask_agree.append(float(np.mean(m32 == m16)))
 
         q16 = case.q.astype(np.float16).astype(np.float32)
@@ -498,7 +517,7 @@ def cache_precision_experiment(cases: list[Case], model, kind: str, budget: int)
             v16,
             d16,
             case.mass,
-            case.peak,
+            case.teacher,
             case.avg_q,
             case.avg_k,
             case.trip_q,
@@ -536,8 +555,110 @@ def bootstrap_stability(case_scores: np.ndarray, seed: int) -> dict:
     return result
 
 
+def repeated_submission_lottery(case_scores: np.ndarray, seed: int) -> dict:
+    """Quantify best-of-many bias when every submission receives a new panel."""
+
+    rng = np.random.default_rng(seed)
+    candidate = case_scores[np.argmax(np.var(case_scores, axis=1))]
+    panel_size = 20
+    trials = 1000
+    result = {"full_score": float(np.mean(candidate)), "panel_size": panel_size}
+    for attempts in (1, 5, 20, 100):
+        best_scores = []
+        for _ in range(trials):
+            scores = [
+                float(np.mean(candidate[rng.choice(len(candidate), panel_size, replace=False)]))
+                for _ in range(attempts)
+            ]
+            best_scores.append(max(scores))
+        result[str(attempts)] = {
+            "mean_best_score": float(np.mean(best_scores)),
+            "mean_optimism": float(np.mean(best_scores) - np.mean(candidate)),
+            "p95_best_score": float(np.percentile(best_scores, 95)),
+        }
+    return result
+
+
+def clone_attack_experiment(seed: int) -> dict:
+    """Show why exact weight hashes and score-proportional rewards are insufficient."""
+
+    rng = np.random.default_rng(seed)
+    descriptor_dim, hidden_dim, projection_dim = 6, 8, 4
+    descriptors = rng.normal(size=(12, descriptor_dim)).astype(np.float32)
+    hidden_weight = rng.normal(size=(hidden_dim, descriptor_dim)).astype(np.float32)
+    hidden_bias = rng.normal(size=hidden_dim).astype(np.float32)
+    output_weight = rng.normal(size=(projection_dim, hidden_dim)).astype(np.float32)
+    output_bias = rng.normal(size=projection_dim).astype(np.float32)
+    permutation = rng.permutation(hidden_dim)
+
+    def project(weight1, bias1, weight2):
+        hidden = np.maximum(descriptors @ weight1.T + bias1, 0)
+        return hidden @ weight2.T + output_bias
+
+    original = project(hidden_weight, hidden_bias, output_weight)
+    permuted = project(
+        hidden_weight[permutation],
+        hidden_bias[permutation],
+        output_weight[:, permutation],
+    )
+    original_bytes = b"".join(
+        array.tobytes() for array in (hidden_weight, hidden_bias, output_weight, output_bias)
+    )
+    permuted_bytes = b"".join(
+        array.tobytes()
+        for array in (
+            hidden_weight[permutation],
+            hidden_bias[permutation],
+            output_weight[:, permutation],
+            output_bias,
+        )
+    )
+    score = 0.8
+    clone_counts = (1, 5, 20)
+    return {
+        "different_weight_hashes": hashlib.sha256(original_bytes).digest()
+        != hashlib.sha256(permuted_bytes).digest(),
+        "max_projection_difference": float(np.max(np.abs(original - permuted))),
+        "top2_agreement": float(
+            np.mean(
+                np.argsort(-original, axis=1, kind="stable")[:, :2]
+                == np.argsort(-permuted, axis=1, kind="stable")[:, :2]
+            )
+        ),
+        "clone_share_under_score_proportional_rewards": {
+            str(count): count * score / ((count + 1) * score) for count in clone_counts
+        },
+        "clone_frontier_gain_after_original": 0.0,
+    }
+
+
+def teacher_proxy_counterexample() -> dict:
+    """Construct a case where retained teacher probability reverses output quality."""
+
+    teacher = np.asarray([0.45, 0.45, 0.10], dtype=np.float64)
+    values = np.asarray([-1.0, 1.0, 0.0], dtype=np.float64)
+    dense = float(teacher @ values)
+    high_mass_output = float(values[0])
+    low_mass_output = float(values[2])
+    return {
+        "dense_output": dense,
+        "high_mass_choice": {
+            "retained_teacher_probability": float(teacher[0]),
+            "squared_output_error": (high_mass_output - dense) ** 2,
+        },
+        "low_mass_choice": {
+            "retained_teacher_probability": float(teacher[2]),
+            "squared_output_error": (low_mass_output - dense) ** 2,
+        },
+        "proxy_order_reversed": bool(
+            teacher[0] > teacher[2]
+            and (high_mass_output - dense) ** 2 > (low_mass_output - dense) ** 2
+        ),
+    }
+
+
 def budget_grid_stability(cases: list[Case], seed: int) -> dict:
-    grids = ([16, 24, 32], [16, 20, 24, 28, 32])
+    grids = ([8, 24, 40], [8, 16, 24, 32, 40])
     all_scores = []
     for grid in grids:
         candidates = []
@@ -546,11 +667,18 @@ def budget_grid_stability(cases: list[Case], seed: int) -> dict:
             values = []
             for cidx, case in enumerate(cases):
                 local_rng = np.random.default_rng(seed + 1000 * idx + cidx)
-                score = np.log(case.mass + 1e-6) + noise * local_rng.normal(size=case.mass.shape)
+                score = np.log(case.teacher + 1e-6) + noise * local_rng.normal(
+                    size=case.teacher.shape
+                )
                 q = []
                 for b in grid:
                     q.append(
-                        quality_from_errors(row_errors(case, allocate(score, b, adaptive=True)))
+                        quality_from_errors(
+                            row_errors(
+                                case,
+                                allocate(score, b, adaptive=False, force_anchor=False),
+                            )
+                        )
                     )
                 values.append(log_cost_auc(q, grid))
             candidates.append(float(np.mean(values)))
@@ -614,7 +742,7 @@ def seed_sensitivity_experiment() -> dict:
             "trip_minus_avg": log_cost_auc(trip_fixed, budgets) - log_cost_auc(avg_q, budgets),
             "naive_adaptive_minus_fixed": (trip_adaptive - trip_fixed).tolist(),
             "mass_excess_error_vs_exact": exact["mass_excess_error_vs_exact"],
-            "peak_excess_error_vs_exact": exact["peak_excess_error_vs_exact"],
+            "teacher_excess_error_vs_exact": exact["teacher_excess_error_vs_exact"],
         }
     return result
 
@@ -647,9 +775,9 @@ def main() -> None:
         pred, target = [], []
         for case in test_cases:
             pred.extend(scorer(case).reshape(-1))
-            target.extend(np.log(case.mass.reshape(-1) + 1e-6))
+            target.extend(np.log(case.teacher.reshape(-1) + 1e-6))
         model_results[name] = {
-            "mass_logit_spearman": float(spearmanr(pred, target).statistic),
+            "teacher_logit_spearman": float(spearmanr(pred, target).statistic),
             "fixed_quality_by_budget": fixed_q.tolist(),
             "adaptive_quality_by_budget": adaptive_q.tolist(),
             "adaptive_minus_fixed": (adaptive_q - fixed_q).tolist(),
@@ -658,25 +786,29 @@ def main() -> None:
         }
 
     def oracle_scorer(case: Case) -> np.ndarray:
-        return np.log(case.mass + 1e-6)
+        return np.log(case.teacher + 1e-6)
 
     oracle_fixed, _ = evaluate_scores(test_cases, oracle_scorer, budgets, adaptive=False)
     oracle_adaptive, _ = evaluate_scores(test_cases, oracle_scorer, budgets, adaptive=True)
 
     proxy = proxy_correlation(test_cases, budgets, SEED + 10)
-    stability = bootstrap_stability(proxy.pop("candidate_case_scores"), SEED + 11)
+    candidate_case_scores = proxy.pop("candidate_case_scores")
+    stability = bootstrap_stability(candidate_case_scores, SEED + 11)
 
     results = {
         "scope": {
             "validated": [
                 "deterministic budget allocator",
                 "multiple-budget scoring mechanics",
-                "attention-mass proxy correlation on synthetic attention",
+                "max-pooled teacher proxy correlation on synthetic attention",
                 "TripPool information advantage on synthetic peaked attention",
                 "float16 cache fidelity on small attention tensors",
                 "exact versus heuristic oracle gap on tiny problems",
                 "adaptive versus fixed allocation on equal block budgets",
                 "sample-size and ranking stability on synthetic candidates",
+                "repeated-submission selection bias",
+                "exact-hash clone bypass through hidden-unit permutation",
+                "max-pooled teacher screening counterexample",
             ],
             "not_validated": [
                 "GPU block count versus latency",
@@ -698,7 +830,7 @@ def main() -> None:
         "allocator_safety": allocator_safety_test(),
         "anchor_ablation": anchor_ablation(test_cases, trip_model, budgets),
         "models": model_results,
-        "oracle_mass": {
+        "oracle_teacher": {
             "fixed_quality_by_budget": oracle_fixed.tolist(),
             "adaptive_quality_by_budget": oracle_adaptive.tolist(),
             "adaptive_minus_fixed": (oracle_adaptive - oracle_fixed).tolist(),
@@ -710,6 +842,11 @@ def main() -> None:
         "exact_oracle": exact_oracle_experiment(SEED + 20),
         "cache_float16": cache_precision_experiment(test_cases, trip_model, "trip", budgets[1]),
         "bootstrap_stability": stability,
+        "repeated_submission_lottery": repeated_submission_lottery(
+            candidate_case_scores, SEED + 12
+        ),
+        "clone_attack": clone_attack_experiment(SEED + 13),
+        "teacher_proxy_counterexample": teacher_proxy_counterexample(),
         "budget_grid_stability": budget_grid_stability(test_cases[:60], SEED + 30),
         "seed_sensitivity": seed_sensitivity_experiment(),
         "timing": {

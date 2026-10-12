@@ -68,7 +68,6 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
         first = process_next_admission(
             store,
             worker_id="admission",
-            current_finalized_block=101,
             settings=settings(tmp_path),
             now_ms=100,
             downloader=model_downloader(model),
@@ -80,7 +79,6 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
         second = process_next_admission(
             store,
             worker_id="admission",
-            current_finalized_block=101,
             settings=settings(tmp_path),
             now_ms=200,
             downloader=model_downloader(model),
@@ -104,7 +102,6 @@ def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:
         outcome = process_next_admission(
             store,
             worker_id="admission",
-            current_finalized_block=100,
             settings=settings(tmp_path),
             now_ms=100,
             downloader=unavailable,
@@ -113,14 +110,10 @@ def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:
         assert outcome is not None and outcome.status is AdmissionStatus.DEFERRED
         assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_DEFERRED
         assert (
-            store.claim_next_admission(
-                "other", current_finalized_block=100, lease_ms=1_000, now_ms=30_099
-            )
+            store.claim_next_admission("other", lease_ms=1_000, now_ms=30_099)
             is None
         )
-        retry = store.claim_next_admission(
-            "other", current_finalized_block=100, lease_ms=1_000, now_ms=30_100
-        )
+        retry = store.claim_next_admission("other", lease_ms=1_000, now_ms=30_100)
         assert retry is not None and retry.state is ChallengeState.FETCHING
 
 
@@ -134,7 +127,6 @@ def test_repeated_download_infrastructure_failure_becomes_system_failed(tmp_path
         outcome = process_next_admission(
             store,
             worker_id="admission",
-            current_finalized_block=100,
             settings=configured,
             now_ms=100,
             downloader=unavailable,
@@ -154,7 +146,6 @@ def test_permanent_download_failure_records_zero_score(tmp_path) -> None:
         outcome = process_next_admission(
             store,
             worker_id="admission",
-            current_finalized_block=100,
             settings=settings(tmp_path),
             now_ms=100,
             downloader=missing,

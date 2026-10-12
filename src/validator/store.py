@@ -24,9 +24,6 @@ from validator.queue import (
     submission_id as derive_submission_id,
 )
 
-_SCHEMA_VERSION = 1
-_PUBLIC_SCHEMA_VERSION = 1
-
 
 @dataclass(frozen=True, slots=True)
 class SubmissionRecord:
@@ -103,13 +100,11 @@ class LeasedChallenge:
     repo_id: str
     revision: str
     position: ChainPosition
-    seed_block_hash: str
     lease_token: str
     lease_expires_at_ms: int
     attempts: int
     model_path: str | None
     file_sha256: str | None
-    current_score: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,10 +167,10 @@ class ChallengeStore:
         self.close()
 
     def _initialize(self) -> None:
-        version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, _SCHEMA_VERSION):
-            raise RuntimeError(f"unsupported database schema version: {version}")
-        if version == _SCHEMA_VERSION:
+        initialized = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chain_cursor'"
+        ).fetchone()
+        if initialized is not None:
             return
 
         self._connection.executescript(
@@ -220,8 +215,6 @@ class ChallengeStore:
                 score_block INTEGER,
                 provisional INTEGER NOT NULL DEFAULT 0
                     CHECK (provisional IN (0, 1)),
-                eligible_block INTEGER NOT NULL,
-                seed_block_hash TEXT,
                 lease_token TEXT,
                 lease_expires_at_ms INTEGER,
                 resume_state TEXT,
@@ -299,7 +292,6 @@ class ChallengeStore:
             CREATE INDEX challenges_state_order ON challenges (state, created_at_ms);
             CREATE INDEX weight_runs_created ON weight_runs (created_at_ms);
 
-            PRAGMA user_version = 1;
             """
         )
 
@@ -377,7 +369,6 @@ class ChallengeStore:
         submission: SubmissionRecord,
         *,
         cooldown_blocks: int = 0,
-        seed_delay_blocks: int = 0,
         occurred_at_ms: int | None = None,
     ) -> tuple[str, bool]:
         """Create a queued challenge, returning ``(challenge_id, inserted)``.
@@ -386,8 +377,8 @@ class ChallengeStore:
         for different content is treated as database corruption.
         """
 
-        if cooldown_blocks < 0 or seed_delay_blocks < 0:
-            raise ValueError("cooldown and seed delay blocks must be non-negative")
+        if cooldown_blocks < 0:
+            raise ValueError("cooldown blocks must be non-negative")
         timestamp = _timestamp(occurred_at_ms)
         identifier = challenge_id(submission.submission_id)
         values = (
@@ -469,16 +460,14 @@ class ChallengeStore:
             self._connection.execute(
                 """
                 INSERT INTO challenges (
-                    challenge_id, submission_id, state, eligible_block, seed_block_hash,
-                    track_spec_digest, created_at_ms, updated_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    challenge_id, submission_id, state, track_spec_digest,
+                    created_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     identifier,
                     submission.submission_id,
                     ChallengeState.QUEUED,
-                    submission.position.block + seed_delay_blocks,
-                    submission.block_hash if seed_delay_blocks == 0 else None,
                     self.track_spec_digest(),
                     timestamp,
                     timestamp,
@@ -523,43 +512,10 @@ class ChallengeStore:
             raise
         return identifier, True
 
-    def record_seed_block(self, block_height: int, block_hash: str) -> int:
-        """Bind eligible challenges to the finalized block used for sample selection."""
-
-        if block_height < 0:
-            raise ValueError("seed block height must be non-negative")
-        normalized_hash = _block_hash(block_hash)
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            conflict = self._connection.execute(
-                """
-                SELECT challenge_id FROM challenges
-                WHERE eligible_block = ? AND seed_block_hash IS NOT NULL
-                      AND seed_block_hash != ?
-                LIMIT 1
-                """,
-                (block_height, normalized_hash),
-            ).fetchone()
-            if conflict is not None:
-                raise RuntimeError("seed block hash conflicts with the recorded finalized chain")
-            changed = self._connection.execute(
-                """
-                UPDATE challenges SET seed_block_hash = ?
-                WHERE eligible_block = ? AND seed_block_hash IS NULL
-                """,
-                (normalized_hash, block_height),
-            ).rowcount
-            self._connection.commit()
-        except Exception:
-            self._connection.rollback()
-            raise
-        return changed
-
     def claim_next_admission(
         self,
         worker_id: str,
         *,
-        current_finalized_block: int,
         lease_ms: int,
         now_ms: int | None = None,
     ) -> LeasedChallenge | None:
@@ -570,7 +526,6 @@ class ChallengeStore:
             stages=(ChallengeState.FETCHING, ChallengeState.VALIDATING),
             include_queued=True,
             strict_fifo=True,
-            current_finalized_block=current_finalized_block,
             lease_ms=lease_ms,
             now_ms=now_ms,
         )
@@ -579,7 +534,6 @@ class ChallengeStore:
         self,
         worker_id: str,
         *,
-        current_finalized_block: int,
         lease_ms: int,
         now_ms: int | None = None,
     ) -> LeasedChallenge | None:
@@ -594,7 +548,6 @@ class ChallengeStore:
             ),
             include_queued=False,
             strict_fifo=False,
-            current_finalized_block=current_finalized_block,
             lease_ms=lease_ms,
             now_ms=now_ms,
         )
@@ -1334,7 +1287,7 @@ class ChallengeStore:
                        c.error_code, c.error_summary, c.final_score, c.attention_cost,
                        c.score_block,
                        c.file_sha256, c.model_digest, c.model_size_bytes,
-                       c.track_spec_digest, c.provisional, c.seed_block_hash,
+                       c.track_spec_digest, c.provisional,
                        c.created_at_ms, c.updated_at_ms,
                        s.hotkey, s.repo_id, s.revision, s.block_height,
                        s.extrinsic_index, s.event_index
@@ -1348,11 +1301,7 @@ class ChallengeStore:
         except Exception:
             self._connection.rollback()
             raise
-        return {
-            "schema_version": _PUBLIC_SCHEMA_VERSION,
-            "leaderboard": leaderboard,
-            "challenges": challenges,
-        }
+        return {"leaderboard": leaderboard, "challenges": challenges}
 
     def _finish_weight_run(
         self,
@@ -1399,7 +1348,7 @@ class ChallengeStore:
                    c.error_code, c.error_summary, c.final_score, c.attention_cost,
                    c.score_block,
                    c.file_sha256, c.model_digest, c.model_size_bytes,
-                   c.track_spec_digest, c.provisional, c.seed_block_hash,
+                   c.track_spec_digest, c.provisional,
                    c.created_at_ms, c.updated_at_ms,
                    s.hotkey, s.repo_id, s.revision, s.block_height,
                    s.extrinsic_index, s.event_index
@@ -1424,7 +1373,7 @@ class ChallengeStore:
         ).fetchall()
         stage_rows = self._connection.execute(
             """
-            SELECT stage, score, attention_cost, metrics_json, created_at_ms
+            SELECT stage, score, attention_cost, created_at_ms
             FROM stage_scores WHERE challenge_id = ? ORDER BY created_at_ms, stage
             """,
             (row["challenge_id"],),
@@ -1446,7 +1395,6 @@ class ChallengeStore:
             "model_digest": row["model_digest"],
             "model_size_bytes": row["model_size_bytes"],
             "track_spec_digest": row["track_spec_digest"],
-            "seed_block_hash": row["seed_block_hash"],
             "provisional": bool(row["provisional"]),
             "final_score": row["final_score"],
             "attention_cost": row["attention_cost"],
@@ -1458,7 +1406,6 @@ class ChallengeStore:
                     "stage": stage["stage"],
                     "score": stage["score"],
                     "attention_cost": stage["attention_cost"],
-                    "metrics": _public_stage_metrics(stage["stage"], stage["metrics_json"]),
                     "created_at_ms": stage["created_at_ms"],
                 }
                 for stage in stage_rows
@@ -1534,14 +1481,13 @@ class ChallengeStore:
         stages: tuple[ChallengeState, ...],
         include_queued: bool,
         strict_fifo: bool,
-        current_finalized_block: int,
         lease_ms: int,
         now_ms: int | None,
     ) -> LeasedChallenge | None:
         if not worker_id:
             raise ValueError("worker id cannot be empty")
-        if current_finalized_block < 0 or lease_ms <= 0:
-            raise ValueError("finalized block and lease duration are invalid")
+        if lease_ms <= 0:
+            raise ValueError("lease duration must be positive")
         now = _timestamp(now_ms)
         direct_states = (ChallengeState.QUEUED, *stages) if include_queued else stages
         direct_placeholders = ",".join("?" for _ in direct_states)
@@ -1554,7 +1500,6 @@ class ChallengeStore:
             ChallengeState.SYSTEM_DEFERRED,
             *stages,
             now,
-            current_finalized_block,
         ]
         if not strict_fifo:
             parameters.append(now)
@@ -1567,7 +1512,7 @@ class ChallengeStore:
                        c.lease_token, c.lease_expires_at_ms,
                        c.resume_state, c.attempts, s.hotkey, s.repo_id, s.revision,
                        s.block_height, s.extrinsic_index, s.event_index,
-                       c.model_path, c.file_sha256, c.seed_block_hash, c.final_score
+                       c.model_path, c.file_sha256
                 FROM challenges c
                 JOIN submissions s ON s.submission_id = c.submission_id
                 WHERE (
@@ -1577,8 +1522,6 @@ class ChallengeStore:
                         AND c.retry_after_ms <= ?
                     )
                 )
-                AND c.eligible_block <= ?
-                AND c.seed_block_hash IS NOT NULL
                 {lease_filter}
                 ORDER BY s.block_height, s.extrinsic_index, s.event_index
                 LIMIT 1
@@ -1639,13 +1582,11 @@ class ChallengeStore:
                 position=ChainPosition(
                     row["block_height"], row["extrinsic_index"], row["event_index"]
                 ),
-                seed_block_hash=row["seed_block_hash"],
                 lease_token=token,
                 lease_expires_at_ms=expires,
                 attempts=row["attempts"] + 1,
                 model_path=row["model_path"],
                 file_sha256=row["file_sha256"],
-                current_score=row["final_score"],
             )
         except Exception:
             self._connection.rollback()
@@ -1734,22 +1675,6 @@ def _timestamp(value: int | None) -> int:
     if timestamp < 0:
         raise ValueError("timestamp must be non-negative")
     return timestamp
-
-
-def _public_stage_metrics(stage: str, metrics_json: str) -> dict[str, Any]:
-    allowed = {
-        ChallengeState.SCREENING: {"upper_bound", "budget_scores", "sample_count"},
-        ChallengeState.SCORING: {
-            "local_score",
-            "lower_bound",
-            "budget_scores",
-            "sample_count",
-        },
-        ChallengeState.ROLLOUT: {"audit_factor"},
-    }
-    metrics = json.loads(metrics_json)
-    fields = allowed.get(ChallengeState(stage), set())
-    return {key: metrics[key] for key in sorted(fields) if key in metrics}
 
 
 def _block_hash(value: str) -> str:

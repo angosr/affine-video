@@ -36,7 +36,6 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
             "netuid": 7,
             "track_start_block": 100,
             "cooldown_blocks": 10,
-            "seed_delay_blocks": 0,
             "admission_settings": AdmissionSettings(
                 cache_dir=tmp_path / "cache",
                 max_model_bytes=10_000,

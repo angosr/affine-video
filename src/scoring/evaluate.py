@@ -19,7 +19,7 @@ class BudgetEvidence:
 
     budget: int
     calibrated_cost: float
-    errors_by_stratum: Mapping[str, Sequence[float]]
+    errors_by_group: Mapping[str, Sequence[float]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +28,7 @@ class BudgetScore:
     calibrated_cost: float
     aggregate_error: float
     quality: float
-    stratum_tail_errors: Mapping[str, float]
+    group_tail_errors: Mapping[str, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,19 +37,16 @@ class LocalScore:
     budgets: tuple[BudgetScore, ...]
 
 
-def challenge_seed(
-    track_spec_digest: str,
-    submission_id: str,
-    seed_block_hash: str,
-) -> int:
-    """Derive the deterministic hidden-sample seed fixed by the challenge record."""
+def panel_seed(track_spec_digest: str, *, stage: str) -> int:
+    """Derive one common hidden-panel seed for every submission on a track."""
 
-    components = (
-        _hex_bytes(track_spec_digest, name="track specification digest"),
-        _hex_bytes(submission_id, name="submission identifier"),
-        _hex_bytes(seed_block_hash, name="seed block hash"),
-    )
-    return int.from_bytes(sha256(b"".join(components)).digest(), "big")
+    if not stage or not stage.isascii():
+        raise ValueError("panel stage must be non-empty ASCII")
+    digest = sha256()
+    digest.update(b"veda-panel-seed\0")
+    digest.update(_hex_bytes(track_spec_digest, name="track specification digest"))
+    digest.update(stage.encode("ascii"))
+    return int.from_bytes(digest.digest(), "big")
 
 
 def stratified_sample_indices(
@@ -64,6 +61,11 @@ def stratified_sample_indices(
         raise ValueError("sample count cannot cover the frozen strata")
     if not strata:
         raise ValueError("at least one frozen stratum is required")
+    if (
+        any(not isfinite(weight) or weight <= 0 for weight in strata.values())
+        or abs(fsum(strata.values()) - 1.0) > 1e-12
+    ):
+        raise ValueError("stratum weights must be positive and sum to one")
     groups: dict[str, list[int]] = {stratum: [] for stratum in strata}
     for index, stratum in enumerate(case_strata):
         if stratum not in groups:
@@ -72,17 +74,55 @@ def stratified_sample_indices(
     if any(not indices for indices in groups.values()):
         raise ValueError("cache does not cover every frozen stratum")
 
+    allocations = {stratum: 1 for stratum in strata}
+    for _ in range(count - len(strata)):
+        chosen = max(
+            sorted(strata),
+            key=lambda stratum: (strata[stratum] * count - allocations[stratum], stratum),
+        )
+        allocations[chosen] += 1
+    if any(allocations[stratum] > len(groups[stratum]) for stratum in strata):
+        raise ValueError("cache does not contain the frozen allocation for every stratum")
+
     generator = random.Random(seed)
     selected: list[int] = []
     for stratum in sorted(groups):
         candidates = groups[stratum].copy()
         generator.shuffle(candidates)
-        selected.append(candidates[0])
-    selected_set = set(selected)
-    remaining = [index for index in range(len(case_strata)) if index not in selected_set]
-    generator.shuffle(remaining)
-    selected.extend(remaining[: count - len(selected)])
+        selected.extend(candidates[: allocations[stratum]])
+    generator.shuffle(selected)
     return tuple(selected)
+
+
+def route_stratified_sample_indices(
+    case_routes: Sequence[str],
+    case_strata: Sequence[str],
+    count: int,
+    seed: int,
+    routes: Sequence[str],
+    strata: Mapping[str, float],
+) -> tuple[int, ...]:
+    """Sample by route and stratum so no selector route can evade evaluation."""
+
+    if len(case_routes) != len(case_strata):
+        raise ValueError("case routes and strata must be aligned")
+    if not routes or len(set(routes)) != len(routes):
+        raise ValueError("routes must be non-empty and unique")
+    route_index = {route: index for index, route in enumerate(routes)}
+    stratum_index = {stratum: index for index, stratum in enumerate(strata)}
+    labels: list[str] = []
+    for route, stratum in zip(case_routes, case_strata, strict=True):
+        if route not in route_index:
+            raise ValueError("case references an unknown route")
+        if stratum not in stratum_index:
+            raise ValueError("case references an unknown stratum")
+        labels.append(f"{route_index[route]}:{stratum_index[stratum]}")
+    cell_weights = {
+        f"{route_position}:{stratum_index[stratum]}": weight / len(routes)
+        for route_position in range(len(routes))
+        for stratum, weight in strata.items()
+    }
+    return stratified_sample_indices(labels, count, seed, cell_weights)
 
 
 def trip_pool(tiles: np.ndarray) -> np.ndarray:
@@ -202,21 +242,21 @@ def tail_error(errors: Sequence[float], *, mean_weight: float) -> float:
 def evaluate_local(
     evidence: Sequence[BudgetEvidence],
     *,
-    stratum_weights: Mapping[str, float],
+    group_weights: Mapping[str, float],
     tail_mean_weight: float,
 ) -> LocalScore:
     """Aggregate fixed-budget exact-cache evidence into the local score."""
 
     if len(evidence) < 3:
         raise ValueError("local evaluation requires at least three budgets")
-    expected_strata = set(stratum_weights)
-    if not expected_strata:
-        raise ValueError("at least one stratum is required")
+    expected_groups = set(group_weights)
+    if not expected_groups:
+        raise ValueError("at least one evaluation group is required")
     if (
-        any(not isfinite(weight) or weight <= 0 for weight in stratum_weights.values())
-        or abs(fsum(stratum_weights.values()) - 1.0) > 1e-12
+        any(not isfinite(weight) or weight <= 0 for weight in group_weights.values())
+        or abs(fsum(group_weights.values()) - 1.0) > 1e-12
     ):
-        raise ValueError("stratum weights must be positive and sum to one")
+        raise ValueError("group weights must be positive and sum to one")
     if not isfinite(tail_mean_weight) or not 0 <= tail_mean_weight <= 1:
         raise ValueError("tail mean weight must be within [0, 1]")
 
@@ -228,24 +268,24 @@ def evaluate_local(
             raise ValueError("budgets must be strictly increasing")
         if not isfinite(item.calibrated_cost) or item.calibrated_cost <= previous_cost:
             raise ValueError("calibrated costs must be finite and strictly increasing")
-        if set(item.errors_by_stratum) != expected_strata:
-            raise ValueError("every budget must contain the exact frozen strata")
+        if set(item.errors_by_group) != expected_groups:
+            raise ValueError("every budget must contain the exact evaluation groups")
 
         tails = {
-            stratum: tail_error(
-                item.errors_by_stratum[stratum],
+            group: tail_error(
+                item.errors_by_group[group],
                 mean_weight=tail_mean_weight,
             )
-            for stratum in sorted(expected_strata)
+            for group in sorted(expected_groups)
         }
-        aggregate = fsum(stratum_weights[stratum] * tails[stratum] for stratum in tails)
+        aggregate = fsum(group_weights[group] * tails[group] for group in tails)
         budgets.append(
             BudgetScore(
                 budget=item.budget,
                 calibrated_cost=item.calibrated_cost,
                 aggregate_error=aggregate,
                 quality=1.0 / (1.0 + aggregate),
-                stratum_tail_errors=tails,
+                group_tail_errors=tails,
             )
         )
         previous_budget = item.budget
@@ -258,80 +298,28 @@ def evaluate_local(
     return LocalScore(score=score, budgets=tuple(budgets))
 
 
-def bootstrap_mean_lower_bound(
-    values: Sequence[float],
-    *,
-    confidence: float,
-    resamples: int,
-    seed: int,
-) -> float:
-    """Return a deterministic percentile-bootstrap lower bound for the mean."""
-
-    checked = _finite_unit_interval(values, name="bootstrap values")
-    if not isfinite(confidence) or not 0 < confidence < 1:
-        raise ValueError("confidence must be within (0, 1)")
-    if resamples <= 0:
-        raise ValueError("resample count must be positive")
-    if seed < 0:
-        raise ValueError("bootstrap seed must be non-negative")
-
-    generator = random.Random(seed)
-    count = len(checked)
-    means = [
-        fsum(checked[generator.randrange(count)] for _ in range(count)) / count
-        for _ in range(resamples)
-    ]
-    return percentile(means, 1 - confidence)
-
-
-def bootstrap_mean_upper_bound(
-    values: Sequence[float],
-    *,
-    confidence: float,
-    resamples: int,
-    seed: int,
-) -> float:
-    """Return a deterministic percentile-bootstrap upper bound for the mean."""
-
-    checked = _finite_unit_interval(values, name="bootstrap values")
-    if not isfinite(confidence) or not 0 < confidence < 1:
-        raise ValueError("confidence must be within (0, 1)")
-    if resamples <= 0:
-        raise ValueError("resample count must be positive")
-    if seed < 0:
-        raise ValueError("bootstrap seed must be non-negative")
-
-    generator = random.Random(seed)
-    count = len(checked)
-    means = [
-        fsum(checked[generator.randrange(count)] for _ in range(count)) / count
-        for _ in range(resamples)
-    ]
-    return percentile(means, confidence)
-
-
 def stratified_bootstrap_bound(
-    values_by_stratum: Mapping[str, Sequence[float]],
+    values_by_group: Mapping[str, Sequence[float]],
     *,
-    stratum_weights: Mapping[str, float],
+    group_weights: Mapping[str, float],
     confidence: float,
     resamples: int,
     seed: int,
     upper: bool,
 ) -> float:
-    """Bootstrap a fixed-weight macro mean while resampling within each stratum."""
+    """Bootstrap a fixed-weight macro mean while resampling within each group."""
 
-    if set(values_by_stratum) != set(stratum_weights) or not values_by_stratum:
-        raise ValueError("bootstrap values must cover the exact frozen strata")
+    if set(values_by_group) != set(group_weights) or not values_by_group:
+        raise ValueError("bootstrap values must cover the exact evaluation groups")
     checked = {
-        stratum: _finite_unit_interval(values, name=f"bootstrap stratum {stratum}")
-        for stratum, values in values_by_stratum.items()
+        group: _finite_unit_interval(values, name=f"bootstrap group {group}")
+        for group, values in values_by_group.items()
     }
     if (
-        any(not isfinite(weight) or weight <= 0 for weight in stratum_weights.values())
-        or abs(fsum(stratum_weights.values()) - 1.0) > 1e-12
+        any(not isfinite(weight) or weight <= 0 for weight in group_weights.values())
+        or abs(fsum(group_weights.values()) - 1.0) > 1e-12
     ):
-        raise ValueError("stratum weights must be positive and sum to one")
+        raise ValueError("group weights must be positive and sum to one")
     if not isfinite(confidence) or not 0 < confidence < 1:
         raise ValueError("confidence must be within (0, 1)")
     if resamples <= 0 or seed < 0:
@@ -341,10 +329,10 @@ def stratified_bootstrap_bound(
     statistics: list[float] = []
     for _ in range(resamples):
         macro = 0.0
-        for stratum in sorted(checked):
-            values = checked[stratum]
+        for group in sorted(checked):
+            values = checked[group]
             mean = fsum(values[generator.randrange(len(values))] for _ in values) / len(values)
-            macro += stratum_weights[stratum] * mean
+            macro += group_weights[group] * mean
         statistics.append(macro)
     return percentile(statistics, confidence if upper else 1 - confidence)
 

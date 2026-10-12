@@ -64,7 +64,6 @@ def process_next_admission(
     store: ChallengeStore,
     *,
     worker_id: str,
-    current_finalized_block: int,
     settings: AdmissionSettings,
     now_ms: int | None = None,
     downloader: Callable[..., DownloadedModel] = download_public_model,
@@ -75,7 +74,6 @@ def process_next_admission(
     now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
     task = store.claim_next_admission(
         worker_id,
-        current_finalized_block=current_finalized_block,
         lease_ms=settings.lease_ms,
         now_ms=now,
     )

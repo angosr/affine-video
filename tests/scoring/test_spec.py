@@ -7,12 +7,10 @@ from scoring.spec import TrackSpecError, load_track_spec, parse_track_spec
 
 def valid_spec() -> dict:
     return {
-        "schema_version": 1,
         "track_id": "veda-test-v1",
         "netuid": 7,
         "track_start_block": 100,
         "submission_cooldown_blocks": 50,
-        "seed_delay_blocks": 10,
         "model": {
             "filename": "selector.safetensors",
             "max_bytes": 1024,
@@ -41,22 +39,14 @@ def valid_spec() -> dict:
                 {"blocks": 4, "calibrated_cost": 2.0},
                 {"blocks": 8, "calibrated_cost": 4.0},
             ],
-            "screen_sample_count": 100,
             "local_sample_count": 20,
             "tail_mean_weight": 0.8,
             "stratum_weights": {"layer-0": 0.5, "layer-1": 0.5},
             "screening_threshold": 0.5,
             "rollout_threshold": 0.7,
-            "q_floor": 0.4,
-            "gamma": 2.0,
             "bootstrap_confidence": 0.95,
             "bootstrap_resamples": 1000,
             "bootstrap_seed": 7,
-        },
-        "weights": {
-            "freshness_half_life_blocks": 1000,
-            "max_age_blocks": 5000,
-            "provisional_max_weight": 0.1,
         },
     }
 
@@ -77,7 +67,7 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
 def test_score_affecting_change_changes_digest() -> None:
     first = valid_spec()
     second = valid_spec()
-    second["scoring"]["gamma"] = 3.0
+    second["scoring"]["rollout_threshold"] = 0.8
 
     assert parse_track_spec(first).digest != parse_track_spec(second).digest
 
@@ -117,14 +107,20 @@ def test_unknown_fields_and_invalid_budget_order_are_rejected() -> None:
 
     undersampled = valid_spec()
     undersampled["scoring"]["stratum_weights"] = {f"layer-{index}": 0.2 for index in range(5)}
-    undersampled["scoring"]["screen_sample_count"] = 3
+    undersampled["scoring"]["local_sample_count"] = 3
     with pytest.raises(TrackSpecError, match="cover every"):
         parse_track_spec(undersampled)
+
+    uncovered_route = valid_spec()
+    uncovered_route["model"]["selector"]["routes"] = ["route-a", "route-b"]
+    uncovered_route["scoring"]["local_sample_count"] = 3
+    with pytest.raises(TrackSpecError, match="every route"):
+        parse_track_spec(uncovered_route)
 
 
 def test_loader_rejects_duplicate_json_fields(tmp_path) -> None:
     path = tmp_path / "track_spec.json"
-    path.write_text('{"schema_version":1,"schema_version":1}', encoding="utf-8")
+    path.write_text('{"track_id":"a","track_id":"b"}', encoding="utf-8")
 
     with pytest.raises(TrackSpecError, match="duplicate"):
         load_track_spec(path)

@@ -24,6 +24,6 @@ def test_export_writes_one_atomic_snapshot(tmp_path) -> None:
 
     snapshot = json.loads(target.read_text())
     assert target.name == "snapshot.json"
-    assert snapshot["schema_version"] == 1
+    assert set(snapshot) == {"leaderboard", "challenges"}
     assert snapshot["challenges"][0]["repo_id"] == "owner/model"
     assert not list((tmp_path / "public").glob(".snapshot-*"))

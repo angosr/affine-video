@@ -24,7 +24,6 @@ async def scan_finalized_blocks(
     netuid: int,
     track_start_block: int,
     cooldown_blocks: int,
-    seed_delay_blocks: int = 0,
     max_blocks: int = 100,
 ) -> ScanResult:
     """Scan one bounded batch and commit the cursor after each complete block."""
@@ -33,8 +32,6 @@ async def scan_finalized_blocks(
         raise ValueError("track start block must be non-negative")
     if cooldown_blocks < 0:
         raise ValueError("cooldown blocks must be non-negative")
-    if seed_delay_blocks < 0:
-        raise ValueError("seed delay blocks must be non-negative")
     if max_blocks <= 0:
         raise ValueError("max blocks must be positive")
 
@@ -66,9 +63,7 @@ async def scan_finalized_blocks(
             store.add_submission(
                 submission,
                 cooldown_blocks=cooldown_blocks,
-                seed_delay_blocks=seed_delay_blocks,
             )
-        store.record_seed_block(block_height, block_hash)
         try:
             store.advance_chain_cursor(block_height, block_hash)
         except ValueError:

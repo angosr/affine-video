@@ -1,5 +1,3 @@
-import sqlite3
-
 import pytest
 
 from validator.queue import ChainPosition, ChallengeState, submission_id
@@ -129,16 +127,6 @@ def test_submission_record_rejects_mismatched_identifier() -> None:
         )
 
 
-def test_unknown_schema_version_is_rejected(tmp_path) -> None:
-    path = tmp_path / "validator.db"
-    connection = sqlite3.connect(path)
-    connection.execute("PRAGMA user_version = 99")
-    connection.close()
-
-    with pytest.raises(RuntimeError, match="schema version"):
-        ChallengeStore(path)
-
-
 def test_database_binds_challenges_to_one_track_spec(tmp_path) -> None:
     path = tmp_path / "validator.db"
     digest = "ab" * 32
@@ -215,12 +203,17 @@ def advance_to_scoring(store: ChallengeStore, identifier: str, timestamp: int) -
     store.transition(identifier, ChallengeState.SCORING, occurred_at_ms=timestamp + 3)
 
 
+def advance_to_rollout(store: ChallengeStore, identifier: str, timestamp: int) -> None:
+    advance_to_scoring(store, identifier, timestamp)
+    store.transition(identifier, ChallengeState.ROLLOUT, occurred_at_ms=timestamp + 4)
+
+
 def test_later_chain_position_wins_even_when_scoring_finishes_first(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
-        advance_to_scoring(store, older, 30)
-        advance_to_scoring(store, newer, 40)
+        advance_to_rollout(store, older, 30)
+        advance_to_rollout(store, newer, 40)
 
         store.complete_challenge(
             newer,
@@ -247,7 +240,7 @@ def test_later_participant_failure_replaces_previous_score_with_zero(tmp_path) -
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
-        advance_to_scoring(store, older, 30)
+        advance_to_rollout(store, older, 30)
         store.complete_challenge(
             older,
             ChallengeState.SUCCEEDED,
@@ -273,9 +266,7 @@ def test_stage_score_replay_must_be_identical(tmp_path) -> None:
         store.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=11)
         store.transition(identifier, ChallengeState.VALIDATING, occurred_at_ms=12)
         store.transition(identifier, ChallengeState.SCREENING, occurred_at_ms=13)
-        task = store.claim_next_scoring(
-            "worker", current_finalized_block=100, lease_ms=100, now_ms=14
-        )
+        task = store.claim_next_scoring("worker", lease_ms=100, now_ms=14)
         assert task is not None
         assert store.record_stage_score(
             identifier,
@@ -313,12 +304,8 @@ def test_stale_worker_cannot_write_stage_score(tmp_path) -> None:
         store.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=11)
         store.transition(identifier, ChallengeState.VALIDATING, occurred_at_ms=12)
         store.transition(identifier, ChallengeState.SCREENING, occurred_at_ms=13)
-        stale = store.claim_next_scoring(
-            "worker-a", current_finalized_block=100, lease_ms=10, now_ms=20
-        )
-        current = store.claim_next_scoring(
-            "worker-b", current_finalized_block=100, lease_ms=10, now_ms=30
-        )
+        stale = store.claim_next_scoring("worker-a", lease_ms=10, now_ms=20)
+        current = store.claim_next_scoring("worker-b", lease_ms=10, now_ms=30)
         assert stale is not None and current is not None
 
         with pytest.raises(RuntimeError, match="lease"):
@@ -393,44 +380,20 @@ def test_failed_weight_run_keeps_attempt_for_audit(tmp_path) -> None:
         assert failed.block_hash is None
 
 
-def test_seed_delay_and_expired_admission_lease_recovery(tmp_path) -> None:
+def test_expired_admission_lease_is_recovered(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
-        identifier, _ = store.add_submission(
-            submission_at(100), seed_delay_blocks=10, occurred_at_ms=10
-        )
-
-        assert (
-            store.claim_next_admission(
-                "worker-a", current_finalized_block=109, lease_ms=50, now_ms=100
-            )
-            is None
-        )
-        assert (
-            store.claim_next_admission(
-                "worker-a", current_finalized_block=110, lease_ms=50, now_ms=100
-            )
-            is None
-        )
-        seed_hash = "0x" + "34" * 32
-        assert store.record_seed_block(110, seed_hash) == 1
-        first = store.claim_next_admission(
-            "worker-a", current_finalized_block=110, lease_ms=50, now_ms=100
-        )
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        first = store.claim_next_admission("worker-a", lease_ms=50, now_ms=100)
         assert first is not None
         assert first.challenge_id == identifier
         assert first.state is ChallengeState.FETCHING
-        assert first.seed_block_hash == seed_hash
         assert first.attempts == 1
 
         assert (
-            store.claim_next_admission(
-                "worker-b", current_finalized_block=110, lease_ms=50, now_ms=149
-            )
+            store.claim_next_admission("worker-b", lease_ms=50, now_ms=149)
             is None
         )
-        reclaimed = store.claim_next_admission(
-            "worker-b", current_finalized_block=110, lease_ms=50, now_ms=150
-        )
+        reclaimed = store.claim_next_admission("worker-b", lease_ms=50, now_ms=150)
         assert reclaimed is not None
         assert reclaimed.challenge_id == identifier
         assert reclaimed.lease_token != first.lease_token
@@ -453,27 +416,11 @@ def test_seed_delay_and_expired_admission_lease_recovery(tmp_path) -> None:
         )
 
 
-def test_seed_block_binding_is_idempotent_and_rejects_conflicts(tmp_path) -> None:
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        identifier, _ = store.add_submission(
-            submission_at(100), seed_delay_blocks=10, occurred_at_ms=10
-        )
-        seed_hash = "0x" + "34" * 32
-
-        assert store.record_seed_block(110, seed_hash.upper().replace("0X", "0x")) == 1
-        assert store.record_seed_block(110, seed_hash) == 0
-        assert store.public_challenge(identifier)["seed_block_hash"] == seed_hash
-        with pytest.raises(RuntimeError, match="conflicts"):
-            store.record_seed_block(110, "0x" + "56" * 32)
-
-
 def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         second_id, _ = store.add_submission(submission_at(101, hotkey="hk2"), occurred_at_ms=20)
-        first = store.claim_next_admission(
-            "worker", current_finalized_block=101, lease_ms=100, now_ms=100
-        )
+        first = store.claim_next_admission("worker", lease_ms=100, now_ms=100)
         assert first is not None
         store.defer_leased(
             first_id,
@@ -484,9 +431,7 @@ def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> No
             occurred_at_ms=110,
         )
 
-        second = store.claim_next_admission(
-            "worker", current_finalized_block=101, lease_ms=100, now_ms=150
-        )
+        second = store.claim_next_admission("worker", lease_ms=100, now_ms=150)
         assert second is not None
         assert second.challenge_id == second_id
         store.advance_leased(
@@ -504,9 +449,7 @@ def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> No
             occurred_at_ms=152,
         )
 
-        retry = store.claim_next_admission(
-            "worker", current_finalized_block=101, lease_ms=100, now_ms=200
-        )
+        retry = store.claim_next_admission("worker", lease_ms=100, now_ms=200)
         assert retry is not None
         assert retry.challenge_id == first_id
         assert retry.state is ChallengeState.FETCHING
@@ -521,18 +464,12 @@ def test_scoring_claims_can_run_in_parallel_and_reject_stale_completion(tmp_path
             store.transition(identifier, ChallengeState.VALIDATING, occurred_at_ms=31)
             store.transition(identifier, ChallengeState.SCREENING, occurred_at_ms=32)
 
-        first = store.claim_next_scoring(
-            "score-a", current_finalized_block=101, lease_ms=50, now_ms=100
-        )
-        second = store.claim_next_scoring(
-            "score-b", current_finalized_block=101, lease_ms=50, now_ms=100
-        )
+        first = store.claim_next_scoring("score-a", lease_ms=50, now_ms=100)
+        second = store.claim_next_scoring("score-b", lease_ms=50, now_ms=100)
         assert first is not None and first.challenge_id == first_id
         assert second is not None and second.challenge_id == second_id
 
-        reclaimed = store.claim_next_scoring(
-            "score-c", current_finalized_block=101, lease_ms=50, now_ms=150
-        )
+        reclaimed = store.claim_next_scoring("score-c", lease_ms=50, now_ms=150)
         assert reclaimed is not None and reclaimed.challenge_id == first_id
         with pytest.raises(RuntimeError, match="lease"):
             store.complete_challenge(
@@ -552,9 +489,7 @@ def test_scoring_claims_can_run_in_parallel_and_reject_stale_completion(tmp_path
 def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
-        lease = store.claim_next_admission(
-            "secret-worker", current_finalized_block=100, lease_ms=1_000, now_ms=20
-        )
+        lease = store.claim_next_admission("secret-worker", lease_ms=1_000, now_ms=20)
         assert lease is not None
         store.record_downloaded_model(
             identifier,
@@ -571,9 +506,7 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
             model_digest="cd" * 32,
             occurred_at_ms=22,
         )
-        scoring = store.claim_next_scoring(
-            "score-worker", current_finalized_block=100, lease_ms=1_000, now_ms=23
-        )
+        scoring = store.claim_next_scoring("score-worker", lease_ms=1_000, now_ms=23)
         assert scoring is not None
         store.record_stage_score(
             identifier,
@@ -611,11 +544,6 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
                 "stage": ChallengeState.SCREENING,
                 "score": 0.7,
                 "attention_cost": 3.0,
-                "metrics": {
-                    "budget_scores": [0.6, 0.7, 0.8],
-                    "sample_count": 12,
-                    "upper_bound": 0.8,
-                },
                 "created_at_ms": 24,
             }
         ]

@@ -13,6 +13,21 @@ The repository does not yet contain a real Video DiT rollout backend or a frozen
 track/cache bundle, so it is not ready for a live competition and chain weight submission must
 remain disabled outside test environments.
 
+All submissions on one track are compared on the same exact hidden panel. The sample covers every
+selector route and scoring stratum. Screening runs over the complete lightweight cache and only
+controls evaluation cost; it is not a ranking signal. Local scores remain provisional and receive
+no chain weight until a full rollout succeeds. The independent rollout supplies the authoritative
+final score; the fixed local panel is only a cost gate. Chain utility is the final-score improvement
+over earlier successful submissions, so later behaviorally identical copies have no marginal
+utility.
+
+Before live rewards are enabled, the rollout score must be validated against real paired videos.
+The rollout panel must rotate and successful incumbents must be re-audited before each reward epoch;
+otherwise public scores turn a fixed hidden set into a black-box training oracle. The submission
+flow also needs an ownership proof or commit-reveal step to prevent repository front-running.
+Neither condition can be established by the current CPU-only tests or implemented by the current
+single-phase submission payload.
+
 Run the current test suite with `uv run pytest`.
 
 Preview a Miner submission without accessing a wallet or network:

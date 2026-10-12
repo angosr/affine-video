@@ -3,15 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from scoring.metrics import quality_score
 from validator import weights as weights_module
 from validator.queue import ChainPosition
 from validator.store import ChallengeStore, LeaderboardEntry, WeightRunState
 from validator.weights import (
     WeightReceipt,
     WeightSubmissionError,
-    chain_utility,
-    freshness_factor,
+    frontier_gains,
     plan_weights,
     read_weight_chain_state,
     submit_recorded_weights,
@@ -39,33 +37,13 @@ def entry(
     )
 
 
-def test_quality_score_applies_floor_gamma_and_audit() -> None:
-    score = quality_score(local_lcb=0.8, q_floor=0.5, gamma=2.0, audit_factor=0.75)
-
-    assert score == pytest.approx(0.27)
-    assert chain_utility(final_score=score, freshness=0.5) == pytest.approx(0.135)
-
-
-def test_quality_below_floor_is_zero() -> None:
-    assert quality_score(local_lcb=0.4, q_floor=0.5, gamma=2, audit_factor=1) == 0
-
-
-def test_freshness_uses_blocks_and_hard_expiry() -> None:
-    assert freshness_factor(
-        current_block=200,
-        score_block=100,
-        half_life_blocks=100,
-        max_age_blocks=500,
-    ) == pytest.approx(0.5)
-    assert (
-        freshness_factor(
-            current_block=600,
-            score_block=100,
-            half_life_blocks=100,
-            max_age_blocks=500,
-        )
-        == 0
+def test_frontier_gains_telescope_and_give_copies_no_extra_utility() -> None:
+    gains = frontier_gains(
+        [entry("copy", 0.6, 30), entry("first", 0.6, 10), entry("better", 0.9, 20)]
     )
+
+    assert gains == pytest.approx({"first": 0.6, "better": 0.3})
+    assert sum(gains.values()) == pytest.approx(0.9)
 
 
 def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
@@ -136,9 +114,6 @@ def test_weight_update_obeys_block_interval_and_submits_one_snapshot(monkeypatch
             network="test",
             wallet_name="validator",
             hotkey_name="default",
-            half_life_blocks=100,
-            max_age_blocks=500,
-            provisional_max_weight=0.5,
             interval_blocks=10,
         )
     )
@@ -155,9 +130,6 @@ def test_weight_update_obeys_block_interval_and_submits_one_snapshot(monkeypatch
             network="test",
             wallet_name="validator",
             hotkey_name="default",
-            half_life_blocks=100,
-            max_age_blocks=500,
-            provisional_max_weight=0.5,
             interval_blocks=10,
         )
     )
@@ -165,31 +137,28 @@ def test_weight_update_obeys_block_interval_and_submits_one_snapshot(monkeypatch
     assert len(submitted) == 1
 
 
-def test_plan_filters_and_caps_before_uid_ordering() -> None:
+def test_plan_excludes_provisional_and_deregistered_entries() -> None:
     plan = plan_weights(
         [
-            entry("alice", 0.9, 100, provisional=True),
-            entry("bob", 0.6, 100),
-            entry("carol", 0.3, 100),
-            entry("expired", 1.0, 1),
-            entry("deregistered", 1.0, 100),
+            entry("provisional", 0.95, 5, provisional=True),
+            entry("alice", 0.3, 10),
+            entry("bob", 0.6, 20),
+            entry("carol", 0.9, 30),
+            entry("deregistered", 1.0, 40),
         ],
-        uid_by_hotkey={"alice": 8, "bob": 2, "carol": 5, "expired": 9},
+        uid_by_hotkey={"alice": 8, "bob": 2, "carol": 5},
         current_block=100,
-        half_life_blocks=100,
-        max_age_blocks=50,
         min_allowed_weights=3,
         max_weight=0.6,
-        provisional_max_weight=0.2,
     )
 
     assert plan is not None
     assert plan.hotkeys == ("bob", "carol", "alice")
     assert plan.uids == (2, 5, 8)
-    assert plan.weights == pytest.approx((8 / 15, 4 / 15, 0.2))
+    assert plan.weights == pytest.approx((1 / 3, 1 / 3, 1 / 3))
 
 
-def test_freshness_starts_when_scoring_finishes_not_when_submitted() -> None:
+def test_old_score_remains_eligible_while_track_is_unchanged() -> None:
     delayed = LeaderboardEntry(
         hotkey="alice",
         challenge_id="challenge-alice",
@@ -204,8 +173,6 @@ def test_freshness_starts_when_scoring_finishes_not_when_submitted() -> None:
         [delayed],
         uid_by_hotkey={"alice": 7},
         current_block=110,
-        half_life_blocks=100,
-        max_age_blocks=50,
         min_allowed_weights=1,
         max_weight=1.0,
     )
@@ -215,12 +182,10 @@ def test_freshness_starts_when_scoring_finishes_not_when_submitted() -> None:
 
 
 def test_plan_returns_none_when_count_or_caps_are_infeasible() -> None:
-    entries = [entry("alice", 1.0, 100), entry("bob", 1.0, 100)]
+    entries = [entry("alice", 0.5, 10), entry("bob", 1.0, 20)]
     arguments = {
         "uid_by_hotkey": {"alice": 1, "bob": 2},
         "current_block": 100,
-        "half_life_blocks": 100,
-        "max_age_blocks": 500,
     }
 
     assert plan_weights(entries, min_allowed_weights=3, max_weight=1.0, **arguments) is None
@@ -229,11 +194,9 @@ def test_plan_returns_none_when_count_or_caps_are_infeasible() -> None:
 
 def test_plan_rejects_weights_that_disappear_during_sdk_quantization() -> None:
     plan = plan_weights(
-        [entry("alice", 1.0, 100), entry("bob", 1e-10, 100)],
+        [entry("alice", 0.5, 10), entry("bob", 0.5000000001, 20)],
         uid_by_hotkey={"alice": 1, "bob": 2},
         current_block=100,
-        half_life_blocks=100,
-        max_age_blocks=500,
         min_allowed_weights=2,
         max_weight=1.0,
     )
@@ -244,11 +207,9 @@ def test_plan_rejects_weights_that_disappear_during_sdk_quantization() -> None:
 def test_plan_rejects_duplicate_uid_mapping() -> None:
     with pytest.raises(ValueError, match="same UID"):
         plan_weights(
-            [entry("alice", 1.0, 100), entry("bob", 1.0, 100)],
+            [entry("alice", 0.5, 10), entry("bob", 1.0, 20)],
             uid_by_hotkey={"alice": 3, "bob": 3},
             current_block=100,
-            half_life_blocks=100,
-            max_age_blocks=500,
             min_allowed_weights=2,
             max_weight=0.6,
         )
@@ -306,11 +267,9 @@ def test_submit_weights_uses_intent_and_waits_for_finalization(monkeypatch) -> N
     monkeypatch.setattr(weights_module.bt, "Wallet", FakeWallet)
     monkeypatch.setattr(weights_module.bt, "Client", FakeClient)
     plan = plan_weights(
-        [entry("alice", 1.0, 100), entry("bob", 1.0, 100)],
+        [entry("alice", 0.5, 10), entry("bob", 1.0, 20)],
         uid_by_hotkey={"alice": 1, "bob": 2},
         current_block=100,
-        half_life_blocks=100,
-        max_age_blocks=500,
         min_allowed_weights=2,
         max_weight=0.6,
     )
@@ -365,8 +324,6 @@ def test_submit_weights_surfaces_chain_failure(monkeypatch) -> None:
         [entry("alice", 1.0, 100)],
         uid_by_hotkey={"alice": 1},
         current_block=100,
-        half_life_blocks=100,
-        max_age_blocks=500,
         min_allowed_weights=1,
         max_weight=1.0,
     )
@@ -397,8 +354,6 @@ def test_recorded_submission_persists_finalized_result(monkeypatch, tmp_path) ->
         [entry("alice", 1.0, 100)],
         uid_by_hotkey={"alice": 1},
         current_block=100,
-        half_life_blocks=100,
-        max_age_blocks=500,
         min_allowed_weights=1,
         max_weight=1.0,
     )

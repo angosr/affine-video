@@ -55,14 +55,11 @@ class CacheSpec:
 @dataclass(frozen=True, slots=True)
 class ScoringSpec:
     budgets: tuple[BudgetSpec, ...]
-    screen_sample_count: int
     local_sample_count: int
     tail_mean_weight: float
     stratum_weights: tuple[tuple[str, float], ...]
     screening_threshold: float
     rollout_threshold: float
-    q_floor: float
-    gamma: float
     bootstrap_confidence: float
     bootstrap_resamples: int
     bootstrap_seed: int
@@ -73,25 +70,15 @@ class ScoringSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class ChainWeightSpec:
-    freshness_half_life_blocks: int
-    max_age_blocks: int
-    provisional_max_weight: float
-
-
-@dataclass(frozen=True, slots=True)
 class TrackSpec:
-    schema_version: int
     track_id: str
     netuid: int
     track_start_block: int
     submission_cooldown_blocks: int
-    seed_delay_blocks: int
     model: ModelSpec
     base_model: BaseModelSpec
     cache: CacheSpec
     scoring: ScoringSpec
-    weights: ChainWeightSpec
     digest: str
 
 
@@ -114,23 +101,17 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     root = _object(
         raw,
         {
-            "schema_version",
             "track_id",
             "netuid",
             "track_start_block",
             "submission_cooldown_blocks",
-            "seed_delay_blocks",
             "model",
             "base_model",
             "cache",
             "scoring",
-            "weights",
         },
         "track specification",
     )
-    schema_version = _integer(root["schema_version"], "schema_version", minimum=1)
-    if schema_version != 1:
-        raise TrackSpecError("unsupported track specification schema version")
     track_id = _nonempty_string(root["track_id"], "track_id")
     netuid = _integer(root["netuid"], "netuid", minimum=0)
     if netuid > 0xFFFF:
@@ -194,14 +175,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         root["scoring"],
         {
             "budgets",
-            "screen_sample_count",
             "local_sample_count",
             "tail_mean_weight",
             "stratum_weights",
             "screening_threshold",
             "rollout_threshold",
-            "q_floor",
-            "gamma",
             "bootstrap_confidence",
             "bootstrap_resamples",
             "bootstrap_seed",
@@ -242,26 +220,13 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     )
     if abs(fsum(weight for _, weight in strata) - 1.0) > 1e-12:
         raise TrackSpecError("stratum weights must sum to one")
-    screen_sample_count = _integer(
-        scoring_raw["screen_sample_count"], "screen_sample_count", minimum=1
-    )
     local_sample_count = _integer(
         scoring_raw["local_sample_count"], "local_sample_count", minimum=1
     )
-    if min(screen_sample_count, local_sample_count) < len(strata):
-        raise TrackSpecError("sample counts must cover every scoring stratum")
+    if local_sample_count < len(routes) * len(strata):
+        raise TrackSpecError("local sample count must cover every route and scoring stratum")
 
-    weights_raw = _object(
-        root["weights"],
-        {
-            "freshness_half_life_blocks",
-            "max_age_blocks",
-            "provisional_max_weight",
-        },
-        "weights",
-    )
     spec_without_digest = {
-        "schema_version": schema_version,
         "track_id": track_id,
         "netuid": netuid,
         "track_start_block": _integer(root["track_start_block"], "track_start_block", minimum=0),
@@ -270,7 +235,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "submission_cooldown_blocks",
             minimum=0,
         ),
-        "seed_delay_blocks": _integer(root["seed_delay_blocks"], "seed_delay_blocks", minimum=0),
         "model": {
             "filename": "selector.safetensors",
             "max_bytes": max_model_bytes,
@@ -298,14 +262,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "budgets": [
                 {"blocks": item.blocks, "calibrated_cost": item.calibrated_cost} for item in budgets
             ],
-            "screen_sample_count": screen_sample_count,
             "local_sample_count": local_sample_count,
             "tail_mean_weight": _unit(scoring_raw["tail_mean_weight"], "tail_mean_weight"),
             "stratum_weights": dict(strata),
             "screening_threshold": _unit(scoring_raw["screening_threshold"], "screening_threshold"),
             "rollout_threshold": _unit(scoring_raw["rollout_threshold"], "rollout_threshold"),
-            "q_floor": _unit(scoring_raw["q_floor"], "q_floor", include_one=False),
-            "gamma": _number(scoring_raw["gamma"], "gamma", minimum_exclusive=0),
             "bootstrap_confidence": _unit(
                 scoring_raw["bootstrap_confidence"],
                 "bootstrap_confidence",
@@ -319,31 +280,15 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             ),
             "bootstrap_seed": _integer(scoring_raw["bootstrap_seed"], "bootstrap_seed", minimum=0),
         },
-        "weights": {
-            "freshness_half_life_blocks": _integer(
-                weights_raw["freshness_half_life_blocks"],
-                "freshness_half_life_blocks",
-                minimum=1,
-            ),
-            "max_age_blocks": _integer(weights_raw["max_age_blocks"], "max_age_blocks", minimum=1),
-            "provisional_max_weight": _unit(
-                weights_raw["provisional_max_weight"],
-                "provisional_max_weight",
-                include_zero=False,
-            ),
-        },
     }
     digest = hashlib.sha256(_canonical_json(spec_without_digest)).hexdigest()
     scoring = spec_without_digest["scoring"]
     cache = spec_without_digest["cache"]
-    chain_weights = spec_without_digest["weights"]
     return TrackSpec(
-        schema_version=schema_version,
         track_id=track_id,
         netuid=netuid,
         track_start_block=spec_without_digest["track_start_block"],
         submission_cooldown_blocks=spec_without_digest["submission_cooldown_blocks"],
-        seed_delay_blocks=spec_without_digest["seed_delay_blocks"],
         model=ModelSpec(
             filename="selector.safetensors",
             max_bytes=spec_without_digest["model"]["max_bytes"],
@@ -358,22 +303,14 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         ),
         scoring=ScoringSpec(
             budgets=budgets,
-            screen_sample_count=scoring["screen_sample_count"],
             local_sample_count=scoring["local_sample_count"],
             tail_mean_weight=scoring["tail_mean_weight"],
             stratum_weights=strata,
             screening_threshold=scoring["screening_threshold"],
             rollout_threshold=scoring["rollout_threshold"],
-            q_floor=scoring["q_floor"],
-            gamma=scoring["gamma"],
             bootstrap_confidence=scoring["bootstrap_confidence"],
             bootstrap_resamples=scoring["bootstrap_resamples"],
             bootstrap_seed=scoring["bootstrap_seed"],
-        ),
-        weights=ChainWeightSpec(
-            freshness_half_life_blocks=chain_weights["freshness_half_life_blocks"],
-            max_age_blocks=chain_weights["max_age_blocks"],
-            provisional_max_weight=chain_weights["provisional_max_weight"],
         ),
         digest=digest,
     )

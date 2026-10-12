@@ -3,30 +3,63 @@ import pytest
 
 from scoring.evaluate import (
     BudgetEvidence,
-    bootstrap_mean_lower_bound,
-    bootstrap_mean_upper_bound,
-    challenge_seed,
     evaluate_local,
+    panel_seed,
     percentile,
     reference_attention,
+    route_stratified_sample_indices,
     stable_top_k,
     stratified_bootstrap_bound,
+    stratified_sample_indices,
     tail_error,
     trip_pool,
 )
 
 
-def test_challenge_seed_binds_all_three_immutable_inputs() -> None:
+def test_panel_seed_is_common_to_the_track_and_stage() -> None:
     track = "11" * 32
-    submission = "22" * 32
-    block = "0x" + "33" * 32
 
-    first = challenge_seed(track, submission, block)
+    first = panel_seed(track, stage="exact")
 
-    assert first == challenge_seed(track.upper(), submission, block.upper().replace("0X", "0x"))
-    assert first != challenge_seed(track, submission, "0x" + "44" * 32)
+    assert first == panel_seed(track.upper(), stage="exact")
+    assert first != panel_seed(track, stage="rollout")
     with pytest.raises(ValueError, match="32 bytes"):
-        challenge_seed("11", submission, block)
+        panel_seed("11", stage="exact")
+
+
+def test_stratified_sampling_follows_frozen_weights_not_cache_frequency() -> None:
+    case_strata = ["rare"] * 10 + ["common"] * 90
+
+    selected = stratified_sample_indices(
+        case_strata,
+        count=20,
+        seed=7,
+        strata={"rare": 0.5, "common": 0.5},
+    )
+
+    assert sum(case_strata[index] == "rare" for index in selected) == 10
+    assert sum(case_strata[index] == "common" for index in selected) == 10
+
+
+def test_route_stratified_sampling_covers_every_route_and_stratum() -> None:
+    routes = ["a", "a", "a", "a", "b", "b", "b", "b"]
+    strata = ["x", "x", "y", "y", "x", "x", "y", "y"]
+
+    selected = route_stratified_sample_indices(
+        routes,
+        strata,
+        count=4,
+        seed=7,
+        routes=("a", "b"),
+        strata={"x": 0.5, "y": 0.5},
+    )
+
+    assert {(routes[index], strata[index]) for index in selected} == {
+        ("a", "x"),
+        ("a", "y"),
+        ("b", "x"),
+        ("b", "y"),
+    }
 
 
 def test_trip_pool_uses_mean_max_and_min_in_fixed_order() -> None:
@@ -90,7 +123,7 @@ def test_local_score_macro_averages_strata_then_integrates_cost() -> None:
             BudgetEvidence(2, 2.0, {"a": [0.5, 0.5], "b": [1.5, 1.5]}),
             BudgetEvidence(4, 4.0, {"a": [0.0, 0.0], "b": [1.0, 1.0]}),
         ],
-        stratum_weights={"a": 0.75, "b": 0.25},
+        group_weights={"a": 0.75, "b": 0.25},
         tail_mean_weight=0.8,
     )
 
@@ -106,61 +139,20 @@ def test_local_score_rejects_missing_stratum_and_two_budget_shortcut() -> None:
                 BudgetEvidence(1, 1.0, {"a": [1.0]}),
                 BudgetEvidence(2, 2.0, {"a": [0.5]}),
             ],
-            stratum_weights={"a": 1.0},
+            group_weights={"a": 1.0},
             tail_mean_weight=0.8,
         )
 
-    with pytest.raises(ValueError, match="exact frozen strata"):
+    with pytest.raises(ValueError, match="exact evaluation groups"):
         evaluate_local(
             [
                 BudgetEvidence(1, 1.0, {"a": [1.0]}),
                 BudgetEvidence(2, 2.0, {"a": [0.5], "b": [0.5]}),
                 BudgetEvidence(3, 3.0, {"a": [0.1]}),
             ],
-            stratum_weights={"a": 1.0},
+            group_weights={"a": 1.0},
             tail_mean_weight=0.8,
         )
-
-
-def test_bootstrap_lower_bound_is_reproducible_and_below_mean() -> None:
-    values = [0.55, 0.65, 0.75, 0.85]
-
-    first = bootstrap_mean_lower_bound(
-        values,
-        confidence=0.95,
-        resamples=1000,
-        seed=123,
-    )
-    second = bootstrap_mean_lower_bound(
-        values,
-        confidence=0.95,
-        resamples=1000,
-        seed=123,
-    )
-
-    assert first == second
-    assert first == pytest.approx(0.6)
-    assert first < sum(values) / len(values)
-
-
-def test_bootstrap_upper_bound_is_reproducible_and_above_mean() -> None:
-    values = [0.55, 0.65, 0.75, 0.85]
-
-    first = bootstrap_mean_upper_bound(
-        values,
-        confidence=0.95,
-        resamples=1000,
-        seed=123,
-    )
-    second = bootstrap_mean_upper_bound(
-        values,
-        confidence=0.95,
-        resamples=1000,
-        seed=123,
-    )
-
-    assert first == second
-    assert first > sum(values) / len(values)
 
 
 def test_stratified_bootstrap_keeps_frozen_macro_weights() -> None:
@@ -169,7 +161,7 @@ def test_stratified_bootstrap_keeps_frozen_macro_weights() -> None:
 
     lower = stratified_bootstrap_bound(
         values,
-        stratum_weights=weights,
+        group_weights=weights,
         confidence=0.95,
         resamples=100,
         seed=7,
@@ -177,7 +169,7 @@ def test_stratified_bootstrap_keeps_frozen_macro_weights() -> None:
     )
     upper = stratified_bootstrap_bound(
         values,
-        stratum_weights=weights,
+        group_weights=weights,
         confidence=0.95,
         resamples=100,
         seed=7,

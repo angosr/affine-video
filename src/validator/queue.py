@@ -149,7 +149,6 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
         {
             ChallengeState.ROLLOUT,
             ChallengeState.PROVISIONAL,
-            ChallengeState.SUCCEEDED,
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
             ChallengeState.SYSTEM_FAILED,

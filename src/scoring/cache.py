@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from scoring.evaluate import stratified_sample_indices
+from scoring.evaluate import route_stratified_sample_indices
 from scoring.local import ExactCase, ScreenCase
 
 
@@ -27,7 +27,6 @@ def validate_screen_cache(
     max_bytes: int,
     routes: tuple[str, ...],
     strata: Mapping[str, float],
-    sample_count: int,
 ) -> None:
     """Validate the lightweight cache index without materializing case arrays."""
 
@@ -37,10 +36,10 @@ def validate_screen_cache(
         max_bytes=max_bytes,
         expected_format="veda-screen-cache",
         case_fields={"route", "stratum"},
-        array_fields=("q_descriptors", "k_descriptors", "teacher_mass", "valid_keys"),
+        array_fields=("q_descriptors", "k_descriptors", "teacher_distribution", "valid_keys"),
         routes=routes,
         strata=strata,
-        sample_count=sample_count,
+        sample_count=None,
     )
 
 
@@ -51,7 +50,7 @@ def validate_exact_cache(
     max_bytes: int,
     routes: tuple[str, ...],
     strata: Mapping[str, float],
-    sample_count: int,
+    sample_count: int | None,
 ) -> None:
     """Validate the exact cache index without materializing case arrays."""
 
@@ -75,40 +74,6 @@ def load_screen_cache(
     max_bytes: int,
 ) -> tuple[ScreenCase, ...]:
     """Load a hash-pinned lightweight cache without pickle support."""
-
-    return _load_screen_cache(path, expected_sha256, max_bytes)
-
-
-def sample_screen_cache(
-    path: str | Path,
-    *,
-    expected_sha256: str,
-    max_bytes: int,
-    count: int,
-    seed: int,
-    strata: Mapping[str, float],
-) -> tuple[ScreenCase, ...]:
-    """Load only the deterministic lightweight sample needed by one challenge."""
-
-    return _load_screen_cache(
-        path,
-        expected_sha256,
-        max_bytes,
-        count=count,
-        seed=seed,
-        strata=strata,
-    )
-
-
-def _load_screen_cache(
-    path: str | Path,
-    expected_sha256: str,
-    max_bytes: int,
-    *,
-    count: int | None = None,
-    seed: int = 0,
-    strata: Mapping[str, float] | None = None,
-) -> tuple[ScreenCase, ...]:
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
     try:
         with np.load(cache_path, allow_pickle=False) as archive:
@@ -117,34 +82,33 @@ def _load_screen_cache(
                 _object(raw_case, {"route", "stratum"}, "screen case")
                 for raw_case in metadata["cases"]
             ]
-            indices = _selected_indices(cases, count=count, seed=seed, strata=strata)
-            selected = set(indices)
             expected = {"metadata"}
-            loaded: dict[int, ScreenCase] = {}
+            loaded: list[ScreenCase] = []
             for index, case in enumerate(cases):
                 prefix = f"case_{index:06d}"
                 names = {
                     "q": f"{prefix}_q_descriptors",
                     "k": f"{prefix}_k_descriptors",
-                    "mass": f"{prefix}_teacher_mass",
+                    "teacher": f"{prefix}_teacher_distribution",
                     "valid": f"{prefix}_valid_keys",
                 }
                 expected.update(names.values())
-                if index in selected:
-                    loaded[index] = ScreenCase(
+                loaded.append(
+                    ScreenCase(
                         route=_string(case["route"], "screen route"),
                         stratum=_string(case["stratum"], "screen stratum"),
                         q_descriptors=_array(archive, names["q"]),
                         k_descriptors=_array(archive, names["k"]),
-                        teacher_mass=_array(archive, names["mass"]),
+                        teacher_distribution=_array(archive, names["teacher"]),
                         valid_keys=_array(archive, names["valid"]),
                     )
+                )
             _exact_keys(archive, expected)
     except CacheLoadError:
         raise
     except (OSError, ValueError, KeyError) as exc:
         raise CacheLoadError("screen cache arrays cannot be read") from exc
-    return tuple(loaded[index] for index in indices)
+    return tuple(loaded)
 
 
 def load_exact_cache(
@@ -165,6 +129,7 @@ def sample_exact_cache(
     max_bytes: int,
     count: int,
     seed: int,
+    routes: tuple[str, ...],
     strata: Mapping[str, float],
 ) -> tuple[ExactCase, ...]:
     """Load only the deterministic exact sample needed by one challenge."""
@@ -175,6 +140,7 @@ def sample_exact_cache(
         max_bytes,
         count=count,
         seed=seed,
+        routes=routes,
         strata=strata,
     )
 
@@ -186,6 +152,7 @@ def _load_exact_cache(
     *,
     count: int | None = None,
     seed: int = 0,
+    routes: tuple[str, ...] | None = None,
     strata: Mapping[str, float] | None = None,
 ) -> tuple[ExactCase, ...]:
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
@@ -196,7 +163,13 @@ def _load_exact_cache(
                 _object(raw_case, {"route", "stratum", "epsilon"}, "exact case")
                 for raw_case in metadata["cases"]
             ]
-            indices = _selected_indices(cases, count=count, seed=seed, strata=strata)
+            indices = _selected_indices(
+                cases,
+                count=count,
+                seed=seed,
+                routes=routes,
+                strata=strata,
+            )
             selected = set(indices)
             expected = {"metadata"}
             loaded: dict[int, ExactCase] = {}
@@ -233,14 +206,23 @@ def _selected_indices(
     *,
     count: int | None,
     seed: int,
+    routes: tuple[str, ...] | None,
     strata: Mapping[str, float] | None,
 ) -> tuple[int, ...]:
     if count is None:
         return tuple(range(len(cases)))
-    if strata is None:
-        raise ValueError("strata are required for sampled cache loading")
+    if routes is None or strata is None:
+        raise ValueError("routes and strata are required for sampled cache loading")
+    case_routes = tuple(_string(case["route"], "case route") for case in cases)
     case_strata = tuple(_string(case["stratum"], "case stratum") for case in cases)
-    return stratified_sample_indices(case_strata, count, seed, strata)
+    return route_stratified_sample_indices(
+        case_routes,
+        case_strata,
+        count,
+        seed,
+        routes,
+        strata,
+    )
 
 
 def _validate_cache_index(
@@ -253,7 +235,7 @@ def _validate_cache_index(
     array_fields: tuple[str, ...],
     routes: tuple[str, ...],
     strata: Mapping[str, float],
-    sample_count: int,
+    sample_count: int | None,
 ) -> None:
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
     try:
@@ -264,6 +246,7 @@ def _validate_cache_index(
                 for raw_case in metadata["cases"]
             ]
             expected = {"metadata"}
+            case_routes: list[str] = []
             case_strata: list[str] = []
             route_set = set(routes)
             for index, case in enumerate(cases):
@@ -273,6 +256,7 @@ def _validate_cache_index(
                     raise CacheLoadError("cache references an unknown selector route")
                 if stratum not in strata:
                     raise CacheLoadError("cache references an unknown scoring stratum")
+                case_routes.append(route)
                 case_strata.append(stratum)
                 if "epsilon" in case:
                     epsilon = case["epsilon"]
@@ -285,7 +269,20 @@ def _validate_cache_index(
                         raise CacheLoadError("exact case epsilon must be finite and positive")
                 prefix = f"case_{index:06d}"
                 expected.update(f"{prefix}_{field}" for field in array_fields)
-            stratified_sample_indices(case_strata, sample_count, 0, strata)
+            coverage_count = len(routes) * len(strata) if sample_count is None else sample_count
+            try:
+                route_stratified_sample_indices(
+                    case_routes,
+                    case_strata,
+                    coverage_count,
+                    0,
+                    routes,
+                    strata,
+                )
+            except ValueError as exc:
+                raise CacheLoadError(
+                    "cache does not cover every route and frozen stratum"
+                ) from exc
             _exact_keys(archive, expected)
     except CacheLoadError:
         raise

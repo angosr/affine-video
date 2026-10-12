@@ -105,35 +105,28 @@ async def read_weight_chain_state(client: Any, *, netuid: int) -> WeightChainSta
     )
 
 
-def freshness_factor(
-    *,
-    current_block: int,
-    score_block: int,
-    half_life_blocks: int,
-    max_age_blocks: int,
-) -> float:
-    """Return block-based exponential freshness, with a hard expiry."""
+def frontier_gains(entries: Iterable[LeaderboardEntry]) -> dict[str, float]:
+    """Credit only score improvements over earlier on-chain submissions.
 
-    if current_block < 0 or score_block < 0:
-        raise ValueError("block heights must be non-negative")
-    if score_block > current_block:
-        raise ValueError("score block cannot be newer than the source block")
-    if half_life_blocks <= 0 or max_age_blocks <= 0:
-        raise ValueError("freshness limits must be positive")
-    age = current_block - score_block
-    if age >= max_age_blocks:
-        return 0.0
-    return 2.0 ** (-age / half_life_blocks)
+    Gains telescope to the best score, so copied or Sybil-split models cannot
+    multiply their total utility merely by occupying more hotkeys.
+    """
 
-
-def chain_utility(*, final_score: float, freshness: float) -> float:
-    """Apply block-based freshness to a leaderboard score."""
-
-    if not isfinite(final_score) or not isfinite(freshness):
-        raise ValueError("utility inputs must be finite")
-    if not 0 <= final_score <= 1 or not 0 <= freshness <= 1:
-        raise ValueError("utility inputs must be within [0, 1]")
-    return final_score * freshness
+    ordered = sorted(entries, key=lambda entry: entry.position)
+    frontier = 0.0
+    gains: dict[str, float] = {}
+    seen: set[str] = set()
+    for entry in ordered:
+        if entry.hotkey in seen:
+            raise ValueError("leaderboard contains a duplicate hotkey")
+        seen.add(entry.hotkey)
+        if not isfinite(entry.final_score) or not 0 <= entry.final_score <= 1:
+            raise ValueError("leaderboard scores must be finite and within [0, 1]")
+        gain = entry.final_score - frontier
+        if gain > 0:
+            gains[entry.hotkey] = gain
+            frontier = entry.final_score
+    return gains
 
 
 def plan_weights(
@@ -141,11 +134,8 @@ def plan_weights(
     *,
     uid_by_hotkey: Mapping[str, int],
     current_block: int,
-    half_life_blocks: int,
-    max_age_blocks: int,
     min_allowed_weights: int,
     max_weight: float,
-    provisional_max_weight: float | None = None,
 ) -> WeightPlan | None:
     """Build a chain-ready vector, or return None when it is infeasible."""
 
@@ -155,34 +145,24 @@ def plan_weights(
         raise ValueError("minimum allowed weights must be non-negative")
     if not isfinite(max_weight) or not 0 < max_weight <= 1:
         raise ValueError("maximum weight must be within (0, 1]")
-    if provisional_max_weight is None:
-        provisional_max_weight = max_weight
-    if not isfinite(provisional_max_weight) or not 0 < provisional_max_weight <= max_weight:
-        raise ValueError("provisional maximum must be within (0, max_weight]")
-
-    utilities: dict[str, float] = {}
+    eligible_entries = [
+        entry for entry in entries if entry.hotkey in uid_by_hotkey and not entry.provisional
+    ]
+    utilities = frontier_gains(eligible_entries)
     caps: dict[str, float] = {}
     seen_uids: dict[int, str] = {}
-    for entry in entries:
+    for entry in eligible_entries:
         uid = uid_by_hotkey.get(entry.hotkey)
         if uid is None:
-            continue
+            raise AssertionError("eligible entry lost its UID")
         if uid < 0 or uid > 0xFFFF:
             raise ValueError("UIDs must fit in an unsigned 16-bit integer")
         other = seen_uids.setdefault(uid, entry.hotkey)
         if other != entry.hotkey:
             raise ValueError("multiple hotkeys map to the same UID")
-        freshness = freshness_factor(
-            current_block=current_block,
-            score_block=entry.score_block,
-            half_life_blocks=half_life_blocks,
-            max_age_blocks=max_age_blocks,
-        )
-        utility = chain_utility(final_score=entry.final_score, freshness=freshness)
-        if utility == 0:
+        if entry.hotkey not in utilities:
             continue
-        utilities[entry.hotkey] = utility
-        caps[entry.hotkey] = provisional_max_weight if entry.provisional else max_weight
+        caps[entry.hotkey] = max_weight
 
     required = max(1, min_allowed_weights)
     if len(utilities) < required or sum(caps.values()) < 1 - 1e-12:
@@ -309,9 +289,6 @@ async def update_weights(
     network: str,
     wallet_name: str,
     hotkey_name: str,
-    half_life_blocks: int,
-    max_age_blocks: int,
-    provisional_max_weight: float,
     interval_blocks: int,
     wallet_path: str | None = None,
     mechid: int = 0,
@@ -330,11 +307,8 @@ async def update_weights(
         store.leaderboard(),
         uid_by_hotkey=chain.uid_by_hotkey,
         current_block=chain.finalized_block,
-        half_life_blocks=half_life_blocks,
-        max_age_blocks=max_age_blocks,
         min_allowed_weights=chain.min_allowed_weights,
         max_weight=chain.max_weight,
-        provisional_max_weight=provisional_max_weight,
     )
     if plan is None:
         return None

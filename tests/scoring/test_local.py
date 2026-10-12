@@ -16,6 +16,15 @@ def zero_selector() -> FixedSelector:
     return FixedSelector(architecture, weights)
 
 
+def zero_selector_for(routes: tuple[str, ...]) -> FixedSelector:
+    architecture = SelectorArchitecture(routes, 6, 2, 2, "float32")
+    weights = {
+        name: np.zeros(tensor.shape, dtype=np.float32)
+        for name, tensor in architecture.tensor_schema.items()
+    }
+    return FixedSelector(architecture, weights)
+
+
 def exact_case(seed: int, *, stratum: str = "all") -> ExactCase:
     generator = np.random.default_rng(seed)
     q = generator.normal(size=(2, 2, 2)).astype(np.float32)
@@ -91,7 +100,7 @@ def test_exact_local_scoring_rejects_unknown_stratum_and_oversized_budget() -> N
         )
 
 
-def test_lightweight_screening_scores_retained_teacher_mass() -> None:
+def test_lightweight_screening_scores_retained_teacher_distribution() -> None:
     case = exact_case(1)
     q_desc = np.concatenate((case.q.mean(1), case.q.max(1), case.q.min(1)), axis=-1).astype(
         np.float32
@@ -113,3 +122,41 @@ def test_lightweight_screening_scores_retained_teacher_mass() -> None:
 
     assert result.budget_scores == pytest.approx((0.4, 0.7, 1.0))
     assert result.score == pytest.approx(result.upper_bound)
+
+
+def test_screening_macro_averages_routes_instead_of_cache_frequency() -> None:
+    descriptors = np.ones((1, 6), dtype=np.float32)
+    valid = np.ones(3, dtype=np.bool_)
+    cases = [
+        ScreenCase(
+            "route0",
+            "all",
+            descriptors,
+            np.ones((3, 6), dtype=np.float32),
+            np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+            valid,
+        )
+    ]
+    cases.extend(
+        ScreenCase(
+            "route1",
+            "all",
+            descriptors,
+            np.ones((3, 6), dtype=np.float32),
+            np.array([[0.0, 0.5, 0.5]], dtype=np.float32),
+            valid,
+        )
+        for _ in range(3)
+    )
+
+    result = evaluate_selector_screen(
+        zero_selector_for(("route0", "route1")),
+        cases,
+        (BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
+        stratum_weights={"all": 1.0},
+        bootstrap_confidence=0.95,
+        bootstrap_resamples=20,
+        bootstrap_seed=7,
+    )
+
+    assert result.budget_scores == pytest.approx((0.5, 0.75, 1.0))
