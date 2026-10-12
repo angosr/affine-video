@@ -272,8 +272,10 @@ def test_stage_score_replay_must_be_identical(tmp_path) -> None:
             identifier,
             task.lease_token,
             ChallengeState.SCREENING,
+            next_state=ChallengeState.SCORING,
             score=0.7,
             attention_cost=0.2,
+            score_block=100,
             metrics={"samples": 4},
             occurred_at_ms=20,
         )
@@ -281,8 +283,10 @@ def test_stage_score_replay_must_be_identical(tmp_path) -> None:
             identifier,
             task.lease_token,
             ChallengeState.SCREENING,
+            next_state=ChallengeState.SCORING,
             score=0.7,
             attention_cost=0.2,
+            score_block=100,
             metrics={"samples": 4},
             occurred_at_ms=30,
         )
@@ -291,8 +295,10 @@ def test_stage_score_replay_must_be_identical(tmp_path) -> None:
                 identifier,
                 task.lease_token,
                 ChallengeState.SCREENING,
+                next_state=ChallengeState.SCORING,
                 score=0.8,
                 attention_cost=0.2,
+                score_block=100,
                 metrics={"samples": 4},
                 occurred_at_ms=40,
             )
@@ -313,8 +319,10 @@ def test_stale_worker_cannot_write_stage_score(tmp_path) -> None:
                 identifier,
                 stale.lease_token,
                 ChallengeState.SCREENING,
+                next_state=ChallengeState.SCORING,
                 score=0.7,
                 attention_cost=0.2,
+                score_block=100,
                 metrics={},
                 occurred_at_ms=31,
             )
@@ -322,8 +330,10 @@ def test_stale_worker_cannot_write_stage_score(tmp_path) -> None:
             identifier,
             current.lease_token,
             ChallengeState.SCREENING,
+            next_state=ChallengeState.SCORING,
             score=0.7,
             attention_cost=0.2,
+            score_block=100,
             metrics={},
             occurred_at_ms=32,
         )
@@ -512,8 +522,10 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
             identifier,
             scoring.lease_token,
             ChallengeState.SCREENING,
+            next_state=ChallengeState.SCORING,
             score=0.7,
             attention_cost=3.0,
+            score_block=100,
             metrics={
                 "upper_bound": 0.8,
                 "budget_scores": [0.6, 0.7, 0.8],
@@ -542,9 +554,29 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
         assert challenge["stages"] == [
             {
                 "stage": ChallengeState.SCREENING,
+                "next_state": ChallengeState.SCORING,
                 "score": 0.7,
                 "attention_cost": 3.0,
+                "score_block": 100,
                 "created_at_ms": 24,
             }
         ]
         assert challenge["events"][-1]["error_summary"] == "frozen cache is unavailable"
+
+
+def test_public_challenge_reads_state_and_history_from_one_snapshot(monkeypatch, tmp_path) -> None:
+    database = tmp_path / "validator.db"
+    with ChallengeStore(database) as store, ChallengeStore(database) as writer:
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        original = store._public_challenge_row
+
+        def racing_read(row):
+            writer.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=20)
+            return original(row)
+
+        monkeypatch.setattr(store, "_public_challenge_row", racing_read)
+        challenge = store.public_challenge(identifier)
+
+        assert challenge["state"] == ChallengeState.QUEUED
+        assert [event["state"] for event in challenge["events"]] == [ChallengeState.QUEUED]
+        assert writer.get_challenge(identifier).state is ChallengeState.FETCHING

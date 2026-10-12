@@ -399,51 +399,63 @@ def process_next_scoring(
     if task is None:
         return None
 
-    try:
-        result = evaluator(task)
-        require_transition(task.state, result.next_state)
-    except ParticipantScoringError as exc:
-        store.complete_challenge(
+    recorded = store.stage_score(task.challenge_id, task.state)
+    if recorded is None:
+        try:
+            result = evaluator(task)
+            require_transition(task.state, result.next_state)
+        except ParticipantScoringError as exc:
+            store.complete_challenge(
+                task.challenge_id,
+                ChallengeState.PARTICIPANT_FAILED,
+                error_code=exc.code,
+                error_summary=str(exc),
+                occurred_at_ms=now,
+                lease_token=task.lease_token,
+                score_block=current_finalized_block,
+            )
+            return ScoringOutcome(
+                task.challenge_id,
+                ChallengeState.PARTICIPANT_FAILED,
+                exc.code,
+            )
+        except TemporaryScoringError as exc:
+            state = _defer_or_fail(store, task, settings, now, code=exc.code, summary=str(exc))
+            return ScoringOutcome(task.challenge_id, state, exc.code)
+        except Exception as exc:
+            state = _defer_or_fail(
+                store,
+                task,
+                settings,
+                now,
+                code="SCORING_WORKER_FAILURE",
+                summary=str(exc) or type(exc).__name__,
+            )
+            return ScoringOutcome(
+                task.challenge_id,
+                state,
+                "SCORING_WORKER_FAILURE",
+            )
+        store.record_stage_score(
             task.challenge_id,
-            ChallengeState.PARTICIPANT_FAILED,
-            error_code=exc.code,
-            error_summary=str(exc),
-            occurred_at_ms=now,
-            lease_token=task.lease_token,
+            task.lease_token,
+            task.state,
+            next_state=result.next_state,
+            score=result.score,
+            attention_cost=result.attention_cost,
             score_block=current_finalized_block,
+            metrics=result.metrics,
+            occurred_at_ms=now,
         )
-        return ScoringOutcome(
-            task.challenge_id,
-            ChallengeState.PARTICIPANT_FAILED,
-            exc.code,
+        result_score_block = current_finalized_block
+    else:
+        result = StageOutcome(
+            recorded.next_state,
+            recorded.score,
+            recorded.attention_cost,
+            recorded.metrics,
         )
-    except TemporaryScoringError as exc:
-        state = _defer_or_fail(store, task, settings, now, code=exc.code, summary=str(exc))
-        return ScoringOutcome(task.challenge_id, state, exc.code)
-    except Exception as exc:
-        state = _defer_or_fail(
-            store,
-            task,
-            settings,
-            now,
-            code="SCORING_WORKER_FAILURE",
-            summary=str(exc) or type(exc).__name__,
-        )
-        return ScoringOutcome(
-            task.challenge_id,
-            state,
-            "SCORING_WORKER_FAILURE",
-        )
-
-    store.record_stage_score(
-        task.challenge_id,
-        task.lease_token,
-        task.state,
-        score=result.score,
-        attention_cost=result.attention_cost,
-        metrics=result.metrics,
-        occurred_at_ms=now,
-    )
+        result_score_block = recorded.score_block
     if (
         result.next_state in {ChallengeState.PROVISIONAL, ChallengeState.ROLLOUT}
         and task.state is ChallengeState.SCORING
@@ -453,7 +465,7 @@ def process_next_scoring(
             task.lease_token,
             final_score=result.score,
             attention_cost=result.attention_cost,
-            score_block=current_finalized_block,
+            score_block=result_score_block,
             schedule_rollout=result.next_state is ChallengeState.ROLLOUT,
             occurred_at_ms=now,
         )
@@ -465,7 +477,7 @@ def process_next_scoring(
             attention_cost=result.attention_cost,
             occurred_at_ms=now,
             lease_token=task.lease_token,
-            score_block=current_finalized_block,
+            score_block=result_score_block,
         )
     elif result.next_state is ChallengeState.SCREENED_OUT:
         store.complete_challenge(
@@ -475,7 +487,7 @@ def process_next_scoring(
             error_summary="screening upper bound is below the fixed threshold",
             occurred_at_ms=now,
             lease_token=task.lease_token,
-            score_block=current_finalized_block,
+            score_block=result_score_block,
         )
     else:
         store.advance_leased(

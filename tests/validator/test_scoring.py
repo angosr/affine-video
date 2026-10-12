@@ -178,6 +178,43 @@ def test_scoring_stages_advance_and_finish_with_one_leaderboard_result(tmp_path)
         ]
 
 
+def test_recorded_stage_result_resumes_without_repeating_evaluation(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_screening(store)
+        store.transition(identifier, ChallengeState.SCORING, occurred_at_ms=14)
+        interrupted = store.claim_next_scoring("first", lease_ms=10, now_ms=20)
+        assert interrupted is not None
+        store.record_stage_score(
+            identifier,
+            interrupted.lease_token,
+            ChallengeState.SCORING,
+            next_state=ChallengeState.PROVISIONAL,
+            score=0.8,
+            attention_cost=0.1,
+            score_block=100,
+            metrics={"lower_bound": 0.8},
+            occurred_at_ms=21,
+        )
+
+        def must_not_repeat(_task):
+            raise AssertionError("a durable stage result must not be evaluated again")
+
+        resumed = process_next_scoring(
+            store,
+            worker_id="second",
+            current_finalized_block=250,
+            settings=ScoringSettings(lease_ms=10),
+            evaluator=must_not_repeat,
+            now_ms=30,
+        )
+
+        assert resumed is not None and resumed.state is ChallengeState.PROVISIONAL
+        challenge = store.get_challenge(identifier)
+        assert challenge.state is ChallengeState.PROVISIONAL
+        assert challenge.score_block == 100
+        assert challenge.attempts == 2
+
+
 def test_local_result_can_wait_provisionally_before_rollout(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier = ready_for_screening(store)

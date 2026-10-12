@@ -64,6 +64,22 @@ def test_downloads_anonymously_into_content_addressed_cache(tmp_path) -> None:
     assert not list(tmp_path.glob(".partial-*"))
 
 
+def test_download_persists_an_absolute_cache_path(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    downloaded = download_public_model(
+        "owner/model",
+        "12" * 20,
+        cache_dir="relative-cache",
+        max_bytes=10,
+        api=FakeApi([sibling(size=6)]),
+        http_client=FakeClient(),
+    )
+
+    assert downloaded.path.is_absolute()
+    assert downloaded.path.parent == (tmp_path / "relative-cache").resolve()
+
+
 def test_metadata_size_rejects_before_download(tmp_path) -> None:
     client = FakeClient()
     with pytest.raises(ModelDownloadError) as caught:

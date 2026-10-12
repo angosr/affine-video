@@ -100,7 +100,7 @@ def download_public_model(
     if declared_size is not None and declared_size > max_bytes:
         raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
 
-    cache = Path(cache_dir)
+    cache = Path(cache_dir).resolve()
     cache.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=".partial-", dir=cache)
     temporary = Path(temporary_name)

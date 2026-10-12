@@ -81,6 +81,16 @@ class ChallengeEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class RecordedStageScore:
+    stage: ChallengeState
+    next_state: ChallengeState
+    score: float
+    attention_cost: float
+    score_block: int
+    metrics: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class LeaderboardEntry:
     hotkey: str
     challenge_id: str
@@ -244,8 +254,10 @@ class ChallengeStore:
             CREATE TABLE stage_scores (
                 challenge_id TEXT NOT NULL REFERENCES challenges(challenge_id),
                 stage TEXT NOT NULL,
+                next_state TEXT NOT NULL,
                 score REAL NOT NULL,
                 attention_cost REAL NOT NULL,
+                score_block INTEGER NOT NULL,
                 metrics_json TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (challenge_id, stage)
@@ -906,8 +918,10 @@ class ChallengeStore:
         lease_token: str,
         stage: ChallengeState,
         *,
+        next_state: ChallengeState,
         score: float,
         attention_cost: float,
+        score_block: int,
         metrics: Mapping[str, Any],
         occurred_at_ms: int | None = None,
     ) -> bool:
@@ -919,6 +933,7 @@ class ChallengeStore:
             ChallengeState.ROLLOUT,
         }:
             raise ValueError("stage does not produce a score")
+        require_transition(stage, next_state)
         if (
             not isfinite(score)
             or not isfinite(attention_cost)
@@ -926,18 +941,42 @@ class ChallengeStore:
             or attention_cost < 0
         ):
             raise ValueError("stage score or attention cost is out of range")
+        if type(score_block) is not int or score_block < 0:
+            raise ValueError("score block must be a non-negative integer")
         timestamp = _timestamp(occurred_at_ms)
         metrics_json = _json(metrics)
-        values = (identifier, stage, score, attention_cost, metrics_json)
+        values = (
+            identifier,
+            stage,
+            next_state,
+            score,
+            attention_cost,
+            score_block,
+            metrics_json,
+        )
 
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             current = self._require_lease_locked(identifier, lease_token)
             if current is not stage:
                 raise ValueError("challenge is not in the scored stage")
+            submission = self._connection.execute(
+                """
+                SELECT s.block_height
+                FROM challenges c
+                JOIN submissions s ON s.submission_id = c.submission_id
+                WHERE c.challenge_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if submission is None:
+                raise KeyError(identifier)
+            if score_block < submission["block_height"]:
+                raise ValueError("score block cannot precede the submission block")
             existing = self._connection.execute(
                 """
-                SELECT challenge_id, stage, score, attention_cost, metrics_json
+                SELECT challenge_id, stage, next_state, score, attention_cost,
+                       score_block, metrics_json
                 FROM stage_scores WHERE challenge_id = ? AND stage = ?
                 """,
                 (identifier, stage),
@@ -950,8 +989,9 @@ class ChallengeStore:
             self._connection.execute(
                 """
                 INSERT INTO stage_scores (
-                    challenge_id, stage, score, attention_cost, metrics_json, created_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    challenge_id, stage, next_state, score, attention_cost,
+                    score_block, metrics_json, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (*values, timestamp),
             )
@@ -960,6 +1000,32 @@ class ChallengeStore:
             self._connection.rollback()
             raise
         return True
+
+    def stage_score(
+        self, identifier: str, stage: ChallengeState
+    ) -> RecordedStageScore | None:
+        """Return a durable stage result left before its state transition."""
+
+        row = self._connection.execute(
+            """
+            SELECT stage, next_state, score, attention_cost, score_block, metrics_json
+            FROM stage_scores WHERE challenge_id = ? AND stage = ?
+            """,
+            (identifier, stage),
+        ).fetchone()
+        if row is None:
+            return None
+        recorded_stage = ChallengeState(row["stage"])
+        next_state = ChallengeState(row["next_state"])
+        require_transition(recorded_stage, next_state)
+        return RecordedStageScore(
+            stage=recorded_stage,
+            next_state=next_state,
+            score=row["score"],
+            attention_cost=row["attention_cost"],
+            score_block=row["score_block"],
+            metrics=json.loads(row["metrics_json"]),
+        )
 
     def complete_challenge(
         self,
@@ -1402,26 +1468,33 @@ class ChallengeStore:
     def public_challenge(self, identifier: str) -> dict[str, Any]:
         """Return one public challenge record and its state history."""
 
-        row = self._connection.execute(
-            """
-            SELECT c.challenge_id, c.submission_id, c.state,
-                   c.total_attempts AS attempts,
-                   c.error_code, c.error_summary, c.final_score, c.attention_cost,
-                   c.score_block,
-                   c.file_sha256, c.model_digest, c.model_size_bytes,
-                   c.track_spec_digest, c.provisional,
-                   c.created_at_ms, c.updated_at_ms,
-                   s.hotkey, s.repo_id, s.revision, s.block_height,
-                   s.extrinsic_index, s.event_index
-            FROM challenges c
-            JOIN submissions s ON s.submission_id = c.submission_id
-            WHERE c.challenge_id = ?
-            """,
-            (identifier,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(identifier)
-        return self._public_challenge_row(row)
+        self._connection.execute("BEGIN")
+        try:
+            row = self._connection.execute(
+                """
+                SELECT c.challenge_id, c.submission_id, c.state,
+                       c.total_attempts AS attempts,
+                       c.error_code, c.error_summary, c.final_score, c.attention_cost,
+                       c.score_block,
+                       c.file_sha256, c.model_digest, c.model_size_bytes,
+                       c.track_spec_digest, c.provisional,
+                       c.created_at_ms, c.updated_at_ms,
+                       s.hotkey, s.repo_id, s.revision, s.block_height,
+                       s.extrinsic_index, s.event_index
+                FROM challenges c
+                JOIN submissions s ON s.submission_id = c.submission_id
+                WHERE c.challenge_id = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(identifier)
+            result = self._public_challenge_row(row)
+            self._connection.commit()
+            return result
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def _public_challenge_row(self, row: sqlite3.Row) -> dict[str, Any]:
         events = self._connection.execute(
@@ -1434,7 +1507,7 @@ class ChallengeStore:
         ).fetchall()
         stage_rows = self._connection.execute(
             """
-            SELECT stage, score, attention_cost, created_at_ms
+            SELECT stage, next_state, score, attention_cost, score_block, created_at_ms
             FROM stage_scores WHERE challenge_id = ? ORDER BY created_at_ms, stage
             """,
             (row["challenge_id"],),
@@ -1465,8 +1538,10 @@ class ChallengeStore:
             "stages": [
                 {
                     "stage": stage["stage"],
+                    "next_state": stage["next_state"],
                     "score": stage["score"],
                     "attention_cost": stage["attention_cost"],
+                    "score_block": stage["score_block"],
                     "created_at_ms": stage["created_at_ms"],
                 }
                 for stage in stage_rows
