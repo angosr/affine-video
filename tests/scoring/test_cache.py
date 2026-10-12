@@ -44,6 +44,7 @@ def test_loads_hash_pinned_screen_cache_without_objects(tmp_path) -> None:
         path,
         expected_sha256=digest(path),
         max_bytes=100_000,
+        max_blocks=3,
         routes=("route0",),
         strata={"all": 1.0},
     )
@@ -52,6 +53,15 @@ def test_loads_hash_pinned_screen_cache_without_objects(tmp_path) -> None:
     assert cases[0].route == "route0"
     assert cases[0].stratum == "all"
     assert cases[0].q_descriptors.flags.writeable is False
+    with pytest.raises(CacheLoadError, match="maximum block budget"):
+        validate_screen_cache(
+            path,
+            expected_sha256=digest(path),
+            max_bytes=100_000,
+            max_blocks=4,
+            routes=("route0",),
+            strata={"all": 1.0},
+        )
 
 
 def test_loads_exact_cache_and_rejects_digest_or_decoded_size(tmp_path) -> None:
@@ -76,6 +86,7 @@ def test_loads_exact_cache_and_rejects_digest_or_decoded_size(tmp_path) -> None:
         path,
         expected_sha256=digest(path),
         max_bytes=100_000,
+        max_blocks=3,
         routes=("route0",),
         strata={"all": 1.0},
         sample_count=1,
@@ -83,6 +94,16 @@ def test_loads_exact_cache_and_rejects_digest_or_decoded_size(tmp_path) -> None:
 
     assert len(cases) == 1
     assert cases[0].epsilon == 1e-6
+    with pytest.raises(CacheLoadError, match="maximum block budget"):
+        validate_exact_cache(
+            path,
+            expected_sha256=digest(path),
+            max_bytes=100_000,
+            max_blocks=4,
+            routes=("route0",),
+            strata={"all": 1.0},
+            sample_count=1,
+        )
     with pytest.raises(CacheLoadError, match="sha256"):
         load_exact_cache(path, expected_sha256="00" * 32, max_bytes=100_000)
     with pytest.raises(CacheLoadError, match="decoded size"):
@@ -107,6 +128,7 @@ def test_cache_index_rejects_unknown_route_and_insufficient_cases(tmp_path) -> N
     arguments = {
         "expected_sha256": digest(path),
         "max_bytes": 100_000,
+        "max_blocks": 1,
         "strata": {"all": 1.0},
     }
 
@@ -120,5 +142,6 @@ def test_cache_index_rejects_unknown_route_and_insufficient_cases(tmp_path) -> N
             routes=("route0",),
             expected_sha256=digest(path),
             max_bytes=100_000,
+            max_blocks=1,
             strata={"all": 0.5, "missing": 0.5},
         )

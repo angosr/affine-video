@@ -25,6 +25,7 @@ def validate_screen_cache(
     *,
     expected_sha256: str,
     max_bytes: int,
+    max_blocks: int,
     routes: tuple[str, ...],
     strata: Mapping[str, float],
 ) -> None:
@@ -40,6 +41,7 @@ def validate_screen_cache(
         routes=routes,
         strata=strata,
         sample_count=None,
+        max_blocks=max_blocks,
     )
 
 
@@ -48,6 +50,7 @@ def validate_exact_cache(
     *,
     expected_sha256: str,
     max_bytes: int,
+    max_blocks: int,
     routes: tuple[str, ...],
     strata: Mapping[str, float],
     sample_count: int | None,
@@ -64,6 +67,7 @@ def validate_exact_cache(
         routes=routes,
         strata=strata,
         sample_count=sample_count,
+        max_blocks=max_blocks,
     )
 
 
@@ -236,7 +240,10 @@ def _validate_cache_index(
     routes: tuple[str, ...],
     strata: Mapping[str, float],
     sample_count: int | None,
+    max_blocks: int,
 ) -> None:
+    if type(max_blocks) is not int or max_blocks <= 0:
+        raise ValueError("maximum block budget must be a positive integer")
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
     try:
         with np.load(cache_path, allow_pickle=False) as archive:
@@ -269,6 +276,15 @@ def _validate_cache_index(
                         raise CacheLoadError("exact case epsilon must be finite and positive")
                 prefix = f"case_{index:06d}"
                 expected.update(f"{prefix}_{field}" for field in array_fields)
+                valid_keys = _array(archive, f"{prefix}_valid_keys")
+                if (
+                    valid_keys.ndim != 1
+                    or valid_keys.dtype != np.bool_
+                    or np.count_nonzero(valid_keys) < max_blocks
+                ):
+                    raise CacheLoadError(
+                        "cache case cannot satisfy the maximum block budget"
+                    )
             coverage_count = len(routes) * len(strata) if sample_count is None else sample_count
             try:
                 route_stratified_sample_indices(

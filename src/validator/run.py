@@ -99,6 +99,7 @@ async def run_validator(
         screen_cache,
         expected_sha256=track.cache.screen_sha256,
         max_bytes=track.cache.screen_max_bytes,
+        max_blocks=track.scoring.budgets[-1].blocks,
         routes=track.model.selector.routes,
         strata=track.scoring.stratum_weight_map,
     )
@@ -106,6 +107,7 @@ async def run_validator(
         exact_cache,
         expected_sha256=track.cache.exact_sha256,
         max_bytes=track.cache.exact_max_bytes,
+        max_blocks=track.scoring.budgets[-1].blocks,
         routes=track.model.selector.routes,
         strata=track.scoring.stratum_weight_map,
         sample_count=track.scoring.local_sample_count,
