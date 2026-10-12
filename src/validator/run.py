@@ -126,6 +126,8 @@ async def run_validator(
     scoring_settings = ScoringSettings(lease_ms=ceil(evaluator.timeout_seconds * 1000) + 60_000)
 
     with ChallengeStore(database, track_spec_digest=track.digest) as store:
+        if rollout is not None:
+            store.schedule_qualified_rollouts(track.scoring.rollout_threshold)
         async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
             while True:
                 result = await process_cycle(

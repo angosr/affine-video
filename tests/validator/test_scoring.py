@@ -252,7 +252,10 @@ def test_local_result_can_wait_provisionally_before_rollout(tmp_path) -> None:
             is None
         )
 
-        store.schedule_rollout(identifier, occurred_at_ms=40)
+        assert store.schedule_qualified_rollouts(0.8, occurred_at_ms=39) == 0
+        assert store.get_challenge(identifier).state is ChallengeState.PROVISIONAL
+        assert store.schedule_qualified_rollouts(0.7, occurred_at_ms=40) == 1
+        assert store.schedule_qualified_rollouts(0.7, occurred_at_ms=40) == 0
         rollout = store.claim_next_scoring("audit", lease_ms=100, now_ms=41)
         assert rollout is not None
         assert rollout.state is ChallengeState.ROLLOUT

@@ -1244,20 +1244,53 @@ class ChallengeStore:
             self._connection.rollback()
             raise
 
-    def schedule_rollout(
+    def schedule_qualified_rollouts(
         self,
-        identifier: str,
+        minimum_score: float,
         *,
         occurred_at_ms: int | None = None,
-    ) -> None:
-        """Move one published provisional result into the rollout queue."""
+    ) -> int:
+        """Queue every qualifying provisional result for an available rollout."""
 
-        self.transition(
-            identifier,
-            ChallengeState.ROLLOUT,
-            occurred_at_ms=occurred_at_ms,
-            details={"scheduled": True},
-        )
+        if not isfinite(minimum_score) or not 0 <= minimum_score <= 1:
+            raise ValueError("rollout threshold must be finite and within [0, 1]")
+        timestamp = _timestamp(occurred_at_ms)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT c.challenge_id
+                FROM challenges c
+                JOIN stage_scores score
+                  ON score.challenge_id = c.challenge_id
+                 AND score.stage = ?
+                JOIN submissions submission
+                  ON submission.submission_id = c.submission_id
+                WHERE c.state = ? AND score.score >= ?
+                ORDER BY submission.block_height,
+                         submission.extrinsic_index,
+                         submission.event_index
+                """,
+                (
+                    ChallengeState.SCORING,
+                    ChallengeState.PROVISIONAL,
+                    minimum_score,
+                ),
+            ).fetchall()
+            for row in rows:
+                self._transition_locked(
+                    row["challenge_id"],
+                    ChallengeState.ROLLOUT,
+                    timestamp=timestamp,
+                    error_code=None,
+                    error_summary=None,
+                    details={"scheduled": True},
+                )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        return len(rows)
 
     def leaderboard(self) -> list[LeaderboardEntry]:
         rows = self._connection.execute(

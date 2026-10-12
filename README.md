@@ -73,9 +73,11 @@ uv run veda validator run \
 The local rollout runner is not a service: Validator starts the executable directly, sends one
 JSON request on stdin, and reads one JSON result from stdout. The track digest pins both the runner
 file and the hidden rollout panel by SHA-256. Omitting both paths leaves qualifying results
-provisional. Without `--once` the command continues polling. Chain weight submission is disabled by
-default and is rejected unless rollout is configured; add `--submit-weights`, `--wallet-name`,
-`--hotkey`, and optionally `--wallet-path` only on the signing Validator.
+provisional. Starting the same frozen track later with both paths automatically queues provisional
+results whose saved local lower bound meets the rollout threshold. Without `--once` the command
+continues polling. Chain weight submission is disabled by default and is rejected unless rollout is
+configured; add `--submit-weights`, `--wallet-name`, `--hotkey`, and optionally `--wallet-path` only
+on the signing Validator.
 
 Weight submission is also held back while the finalized-block scanner is catching up, so an
 incomplete historical view can never produce a chain weight vector.
