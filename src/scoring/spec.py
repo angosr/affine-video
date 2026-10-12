@@ -67,6 +67,7 @@ class ScoringSpec:
     stratum_weights: tuple[tuple[str, float], ...]
     screening_threshold: float
     rollout_threshold: float
+    minimum_frontier_gain: float
     bootstrap_confidence: float
     bootstrap_resamples: int
     bootstrap_seed: int
@@ -188,6 +189,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "stratum_weights",
             "screening_threshold",
             "rollout_threshold",
+            "minimum_frontier_gain",
             "bootstrap_confidence",
             "bootstrap_resamples",
             "bootstrap_seed",
@@ -281,6 +283,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "stratum_weights": dict(strata),
             "screening_threshold": _unit(scoring_raw["screening_threshold"], "screening_threshold"),
             "rollout_threshold": _unit(scoring_raw["rollout_threshold"], "rollout_threshold"),
+            "minimum_frontier_gain": _unit(
+                scoring_raw["minimum_frontier_gain"],
+                "minimum_frontier_gain",
+                include_zero=False,
+            ),
             "bootstrap_confidence": _unit(
                 scoring_raw["bootstrap_confidence"],
                 "bootstrap_confidence",
@@ -328,6 +335,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             stratum_weights=strata,
             screening_threshold=scoring["screening_threshold"],
             rollout_threshold=scoring["rollout_threshold"],
+            minimum_frontier_gain=scoring["minimum_frontier_gain"],
             bootstrap_confidence=scoring["bootstrap_confidence"],
             bootstrap_resamples=scoring["bootstrap_resamples"],
             bootstrap_seed=scoring["bootstrap_seed"],

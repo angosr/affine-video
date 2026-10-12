@@ -137,6 +137,19 @@ print(json.dumps({
     assert caught.value.code == "ROLLOUT_RESPONSE_INVALID"
 
 
+def test_process_rollout_rejects_oversized_response_without_buffering_it(tmp_path) -> None:
+    rollout, task, track, _panel = build(
+        tmp_path,
+        """import sys
+sys.stdout.write("x" * (1024 * 1024 + 1))""",
+    )
+
+    with pytest.raises(RolloutTemporaryError) as caught:
+        rollout(task, None, track)
+
+    assert caught.value.code == "ROLLOUT_RESPONSE_INVALID"
+
+
 def test_process_rollout_rechecks_panel_and_kills_timeout(tmp_path) -> None:
     rollout, task, track, panel = build(
         tmp_path,

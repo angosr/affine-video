@@ -161,6 +161,44 @@ def test_same_reference_can_retry_after_earlier_participant_failure(tmp_path) ->
         assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
 
 
+def test_same_model_can_retry_after_earlier_system_failure(tmp_path) -> None:
+    model = tmp_path / "selector.safetensors"
+    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, model)
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        first_id, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        first = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=settings(tmp_path),
+            now_ms=100,
+            downloader=model_downloader(model),
+        )
+        assert first is not None and first.status is AdmissionStatus.ACCEPTED
+
+        scoring = store.claim_next_scoring("scoring", lease_ms=100, now_ms=101)
+        assert scoring is not None
+        store.fail_leased_system(
+            first_id,
+            scoring.lease_token,
+            error_code="SCORING_WORKER_FAILURE",
+            error_summary="worker unavailable",
+            occurred_at_ms=102,
+        )
+
+        second_id, _ = store.add_submission(submission_at(101, "hk2"), occurred_at_ms=2)
+        retried = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=settings(tmp_path),
+            now_ms=200,
+            downloader=model_downloader(model),
+        )
+
+        assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
+        assert store.get_challenge(second_id).state is ChallengeState.SCREENING
+
+
 def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:
     def unavailable(*_args, **_kwargs):
         raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "temporary outage", temporary=True)

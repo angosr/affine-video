@@ -48,6 +48,7 @@ def valid_spec() -> dict:
             "stratum_weights": {"layer-0": 0.5, "layer-1": 0.5},
             "screening_threshold": 0.5,
             "rollout_threshold": 0.7,
+            "minimum_frontier_gain": 0.001,
             "bootstrap_confidence": 0.95,
             "bootstrap_resamples": 1000,
             "bootstrap_seed": 7,
@@ -67,6 +68,7 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.scoring.stratum_weight_map == {"layer-0": 0.5, "layer-1": 0.5}
     assert first.base_model.revision == "12" * 20
     assert first.rollout.panel_sha256 == "9a" * 32
+    assert first.scoring.minimum_frontier_gain == 0.001
 
 
 def test_score_affecting_change_changes_digest() -> None:
@@ -75,6 +77,17 @@ def test_score_affecting_change_changes_digest() -> None:
     second["scoring"]["rollout_threshold"] = 0.8
 
     assert parse_track_spec(first).digest != parse_track_spec(second).digest
+
+
+def test_minimum_frontier_gain_must_be_positive_and_changes_digest() -> None:
+    invalid = valid_spec()
+    invalid["scoring"]["minimum_frontier_gain"] = 0
+    with pytest.raises(TrackSpecError, match="unit interval"):
+        parse_track_spec(invalid)
+
+    changed = valid_spec()
+    changed["scoring"]["minimum_frontier_gain"] = 0.002
+    assert parse_track_spec(changed).digest != parse_track_spec(valid_spec()).digest
 
 
 def test_selector_semantics_are_explicit_and_frozen() -> None:

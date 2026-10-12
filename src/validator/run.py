@@ -151,6 +151,7 @@ async def run_validator(
                             mechid=mechid,
                             version_key=version_key,
                             interval_blocks=weight_interval_blocks,
+                            minimum_frontier_gain=track.scoring.minimum_frontier_gain,
                         )
                         result = CycleResult(
                             result.finalized_block,

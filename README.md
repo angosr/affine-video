@@ -25,10 +25,14 @@ controls evaluation cost; it is not a ranking signal. Local scores remain provis
 no chain weight until a full rollout succeeds. The independent rollout supplies the authoritative
 final score; the fixed local panel is only a cost gate. Chain utility is the final-score improvement
 over earlier successful submissions, so later behaviorally identical copies have no marginal
-utility.
+utility. The track also freezes a positive `minimum_frontier_gain`; score changes below that
+experimentally calibrated resolution receive no utility and cannot be amplified by chain weight
+caps.
 
 An already active `repo_id + revision` is rejected before downloading it again. Different
-repositories that contain identical weights are rejected after canonical tensor hashing.
+repositories that contain identical weights are rejected after canonical tensor hashing. A model
+whose earlier challenge ended in `SYSTEM_FAILED` may be submitted again; infrastructure failure
+does not reserve its content digest permanently.
 
 Before live rewards are enabled, the rollout score must be validated against real paired videos.
 The rollout panel must rotate and successful incumbents must be re-audited before each reward epoch;
@@ -72,6 +76,9 @@ file and the hidden rollout panel by SHA-256. Omitting both paths leaves qualify
 provisional. Without `--once` the command continues polling. Chain weight submission is disabled by
 default and is rejected unless rollout is configured; add `--submit-weights`, `--wallet-name`,
 `--hotkey`, and optionally `--wallet-path` only on the signing Validator.
+
+Weight submission is also held back while the finalized-block scanner is catching up, so an
+incomplete historical view can never produce a chain weight vector.
 
 The runner request contains the challenge and model-file digests, the validated model path, the
 pinned panel path, and the track's base-model revision, budgets, selector dimensions, and digest.

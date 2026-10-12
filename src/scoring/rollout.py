@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
@@ -154,34 +155,38 @@ class ProcessRollout:
             ensure_ascii=True,
             allow_nan=False,
         ).encode("ascii")
-        try:
-            process = subprocess.Popen(
-                [str(runner)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            raise RolloutTemporaryError(
-                "ROLLOUT_RUNNER_UNAVAILABLE", "rollout runner could not be started"
-            ) from exc
-        try:
-            stdout, _stderr = process.communicate(encoded, timeout=self.timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
+        with tempfile.TemporaryFile() as response_file:
+            try:
+                process = subprocess.Popen(
+                    [str(runner)],
+                    stdin=subprocess.PIPE,
+                    stdout=response_file,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise RolloutTemporaryError(
+                    "ROLLOUT_RUNNER_UNAVAILABLE", "rollout runner could not be started"
+                ) from exc
+            try:
+                process.communicate(encoded, timeout=self.timeout_seconds)
+            except subprocess.TimeoutExpired as exc:
+                _kill_process_group(process)
+                process.communicate()
+                raise RolloutTemporaryError(
+                    "ROLLOUT_TIMEOUT", "rollout runner exceeded the wall-clock limit"
+                ) from exc
             _kill_process_group(process)
-            process.communicate()
-            raise RolloutTemporaryError(
-                "ROLLOUT_TIMEOUT", "rollout runner exceeded the wall-clock limit"
-            ) from exc
+            if os.fstat(response_file.fileno()).st_size > _MAX_RESPONSE_BYTES:
+                raise RolloutTemporaryError(
+                    "ROLLOUT_RESPONSE_INVALID", "rollout response exceeds the byte limit"
+                )
+            response_file.seek(0)
+            stdout = response_file.read(_MAX_RESPONSE_BYTES + 1)
         if process.returncode != 0:
             raise RolloutTemporaryError(
                 "ROLLOUT_RUNNER_FAILURE",
                 f"rollout runner exited with status {process.returncode}",
-            )
-        if len(stdout) > _MAX_RESPONSE_BYTES:
-            raise RolloutTemporaryError(
-                "ROLLOUT_RESPONSE_INVALID", "rollout response exceeds the byte limit"
             )
         response = _response(stdout)
         _verify_binding(response, task, track)

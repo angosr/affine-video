@@ -105,13 +105,17 @@ async def read_weight_chain_state(client: Any, *, netuid: int) -> WeightChainSta
     )
 
 
-def frontier_gains(entries: Iterable[LeaderboardEntry]) -> dict[str, float]:
+def frontier_gains(
+    entries: Iterable[LeaderboardEntry], *, minimum_gain: float
+) -> dict[str, float]:
     """Credit only score improvements over earlier on-chain submissions.
 
     Gains telescope to the best score, so copied or Sybil-split models cannot
     multiply their total utility merely by occupying more hotkeys.
     """
 
+    if not isfinite(minimum_gain) or not 0 < minimum_gain <= 1:
+        raise ValueError("minimum frontier gain must be within (0, 1]")
     ordered = sorted(entries, key=lambda entry: entry.position)
     frontier = 0.0
     gains: dict[str, float] = {}
@@ -123,7 +127,7 @@ def frontier_gains(entries: Iterable[LeaderboardEntry]) -> dict[str, float]:
         if not isfinite(entry.final_score) or not 0 <= entry.final_score <= 1:
             raise ValueError("leaderboard scores must be finite and within [0, 1]")
         gain = entry.final_score - frontier
-        if gain > 0:
+        if gain >= minimum_gain:
             gains[entry.hotkey] = gain
             frontier = entry.final_score
     return gains
@@ -136,6 +140,7 @@ def plan_weights(
     current_block: int,
     min_allowed_weights: int,
     max_weight: float,
+    minimum_frontier_gain: float,
 ) -> WeightPlan | None:
     """Build a chain-ready vector, or return None when it is infeasible."""
 
@@ -148,7 +153,7 @@ def plan_weights(
     eligible_entries = [
         entry for entry in entries if entry.hotkey in uid_by_hotkey and not entry.provisional
     ]
-    utilities = frontier_gains(eligible_entries)
+    utilities = frontier_gains(eligible_entries, minimum_gain=minimum_frontier_gain)
     caps: dict[str, float] = {}
     seen_uids: dict[int, str] = {}
     for entry in eligible_entries:
@@ -290,6 +295,7 @@ async def update_weights(
     wallet_name: str,
     hotkey_name: str,
     interval_blocks: int,
+    minimum_frontier_gain: float,
     wallet_path: str | None = None,
     mechid: int = 0,
     version_key: int = 0,
@@ -299,6 +305,9 @@ async def update_weights(
     if interval_blocks <= 0:
         raise ValueError("weight interval must be positive")
     chain = await read_weight_chain_state(client, netuid=netuid)
+    cursor = store.chain_cursor()
+    if cursor is None or cursor[0] != chain.finalized_block:
+        return None
     latest = store.latest_weight_run()
     effective_interval = max(interval_blocks, chain.weights_rate_limit)
     if latest is not None and chain.finalized_block < latest.source_block + effective_interval:
@@ -309,6 +318,7 @@ async def update_weights(
         current_block=chain.finalized_block,
         min_allowed_weights=chain.min_allowed_weights,
         max_weight=chain.max_weight,
+        minimum_frontier_gain=minimum_frontier_gain,
     )
     if plan is None:
         return None

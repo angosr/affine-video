@@ -628,6 +628,28 @@ def clone_attack_experiment(seed: int) -> dict:
     }
 
 
+def frontier_dust_experiment() -> dict:
+    """Show how chain caps can magnify otherwise negligible score gains."""
+
+    scores = [0.8 + index * 1e-7 for index in range(10)]
+    gains = [
+        scores[0],
+        *(right - left for left, right in zip(scores[:-1], scores[1:], strict=True)),
+    ]
+    cap = 0.1
+    threshold = 0.001
+    rewarded = [gains[0], *(gain for gain in gains[1:] if gain >= threshold)]
+    return {
+        "score_step": 1e-7,
+        "raw_dust_utility_share": float(sum(gains[1:]) / sum(gains)),
+        "dust_weight_share_after_point_one_cap": 9 * cap,
+        "minimum_gain_example": threshold,
+        "eligible_count_after_minimum_gain": len(rewarded),
+        "remaining_capacity_after_minimum_gain": len(rewarded) * cap,
+        "weight_vector_feasible_after_filter": len(rewarded) * cap >= 1,
+    }
+
+
 def teacher_proxy_counterexample() -> dict:
     """Construct a case where retained teacher probability reverses output quality."""
 
@@ -804,6 +826,7 @@ def main() -> None:
                 "sample-size and ranking stability on synthetic candidates",
                 "repeated-submission selection bias",
                 "exact-hash clone bypass through Veda residual-projection scaling",
+                "frontier dust amplification under chain weight caps",
                 "max-pooled teacher screening counterexample",
             ],
             "not_validated": [
@@ -812,6 +835,7 @@ def main() -> None:
                 "proxy score versus real video quality",
                 "selector-only quality without adapters in a real Video DiT",
                 "public Veda checkpoint compatibility",
+                "minimum frontier gain calibration from real rollout repeatability",
             ],
         },
         "dimensions": {
@@ -842,6 +866,7 @@ def main() -> None:
             candidate_case_scores, SEED + 12
         ),
         "clone_attack": clone_attack_experiment(SEED + 13),
+        "frontier_dust": frontier_dust_experiment(),
         "teacher_proxy_counterexample": teacher_proxy_counterexample(),
         "budget_grid_stability": budget_grid_stability(test_cases[:60], SEED + 30),
         "seed_sensitivity": seed_sensitivity_experiment(),

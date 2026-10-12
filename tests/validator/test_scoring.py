@@ -344,6 +344,7 @@ def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> 
             stratum_weights=(("all", 1.0),),
             screening_threshold=0.0,
             rollout_threshold=1.0,
+            minimum_frontier_gain=0.001,
             bootstrap_confidence=0.95,
             bootstrap_resamples=20,
             bootstrap_seed=7,

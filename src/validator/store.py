@@ -688,21 +688,38 @@ class ChallengeStore:
             if current is not ChallengeState.VALIDATING:
                 raise ValueError("challenge is not validating")
             owner = self._connection.execute(
-                "SELECT challenge_id FROM model_owners WHERE model_digest = ?",
+                """
+                SELECT o.challenge_id, c.state
+                FROM model_owners o
+                JOIN challenges c ON c.challenge_id = o.challenge_id
+                WHERE o.model_digest = ?
+                """,
                 (model_digest,),
             ).fetchone()
             self._connection.execute(
                 "UPDATE challenges SET model_digest = ? WHERE challenge_id = ?",
                 (model_digest, identifier),
             )
-            if owner is not None:
+            if (
+                owner is not None
+                and ChallengeState(owner["state"]) is not ChallengeState.SYSTEM_FAILED
+            ):
                 self._connection.commit()
                 return ModelRegistration(False, owner["challenge_id"])
 
-            self._connection.execute(
-                "INSERT INTO model_owners (model_digest, challenge_id) VALUES (?, ?)",
-                (model_digest, identifier),
-            )
+            if owner is None:
+                self._connection.execute(
+                    "INSERT INTO model_owners (model_digest, challenge_id) VALUES (?, ?)",
+                    (model_digest, identifier),
+                )
+            else:
+                self._connection.execute(
+                    """
+                    UPDATE model_owners SET challenge_id = ?
+                    WHERE model_digest = ? AND challenge_id = ?
+                    """,
+                    (identifier, model_digest, owner["challenge_id"]),
+                )
             self._transition_locked(
                 identifier,
                 ChallengeState.SCREENING,

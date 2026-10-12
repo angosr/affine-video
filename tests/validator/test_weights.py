@@ -39,11 +39,25 @@ def entry(
 
 def test_frontier_gains_telescope_and_give_copies_no_extra_utility() -> None:
     gains = frontier_gains(
-        [entry("copy", 0.6, 30), entry("first", 0.6, 10), entry("better", 0.9, 20)]
+        [entry("copy", 0.6, 30), entry("first", 0.6, 10), entry("better", 0.9, 20)],
+        minimum_gain=0.001,
     )
 
     assert gains == pytest.approx({"first": 0.6, "better": 0.3})
     assert sum(gains.values()) == pytest.approx(0.9)
+
+
+def test_frontier_gains_ignore_numerical_dust() -> None:
+    gains = frontier_gains(
+        [
+            entry("first", 0.6, 10),
+            entry("dust", 0.6005, 20),
+            entry("material", 0.602, 30),
+        ],
+        minimum_gain=0.001,
+    )
+
+    assert gains == pytest.approx({"first": 0.6, "material": 0.002})
 
 
 def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
@@ -104,6 +118,7 @@ def test_weight_update_obeys_block_interval_and_submits_one_snapshot(monkeypatch
     store = SimpleNamespace(
         leaderboard=lambda: [entry("alice", 0.8, 100)],
         latest_weight_run=lambda: None,
+        chain_cursor=lambda: (120, "0x" + "12" * 32),
     )
 
     result = asyncio.run(
@@ -115,6 +130,7 @@ def test_weight_update_obeys_block_interval_and_submits_one_snapshot(monkeypatch
             wallet_name="validator",
             hotkey_name="default",
             interval_blocks=10,
+            minimum_frontier_gain=0.001,
         )
     )
 
@@ -131,10 +147,47 @@ def test_weight_update_obeys_block_interval_and_submits_one_snapshot(monkeypatch
             wallet_name="validator",
             hotkey_name="default",
             interval_blocks=10,
+            minimum_frontier_gain=0.001,
         )
     )
     assert skipped is None
     assert len(submitted) == 1
+
+
+def test_weight_update_waits_for_submission_scan_to_reach_snapshot(monkeypatch) -> None:
+    async def fake_state(_client, *, netuid: int):
+        assert netuid == 7
+        return weights_module.WeightChainState(120, {"alice": 4}, 1, 1.0, 10)
+
+    submitted = []
+
+    async def fake_submit(*args, **kwargs):
+        submitted.append((args, kwargs))
+        raise AssertionError("weights must not be submitted while the scanner is behind")
+
+    monkeypatch.setattr(weights_module, "read_weight_chain_state", fake_state)
+    monkeypatch.setattr(weights_module, "submit_recorded_weights", fake_submit)
+    store = SimpleNamespace(
+        chain_cursor=lambda: (119, "0x" + "11" * 32),
+        leaderboard=lambda: [entry("alice", 0.8, 100)],
+        latest_weight_run=lambda: None,
+    )
+
+    result = asyncio.run(
+        update_weights(
+            object(),
+            store,
+            netuid=7,
+            network="test",
+            wallet_name="validator",
+            hotkey_name="default",
+            interval_blocks=10,
+            minimum_frontier_gain=0.001,
+        )
+    )
+
+    assert result is None
+    assert submitted == []
 
 
 def test_plan_excludes_provisional_and_deregistered_entries() -> None:
@@ -150,6 +203,7 @@ def test_plan_excludes_provisional_and_deregistered_entries() -> None:
         current_block=100,
         min_allowed_weights=3,
         max_weight=0.6,
+        minimum_frontier_gain=0.001,
     )
 
     assert plan is not None
@@ -175,6 +229,7 @@ def test_old_score_remains_eligible_while_track_is_unchanged() -> None:
         current_block=110,
         min_allowed_weights=1,
         max_weight=1.0,
+        minimum_frontier_gain=0.001,
     )
 
     assert plan is not None
@@ -186,6 +241,7 @@ def test_plan_returns_none_when_count_or_caps_are_infeasible() -> None:
     arguments = {
         "uid_by_hotkey": {"alice": 1, "bob": 2},
         "current_block": 100,
+        "minimum_frontier_gain": 0.001,
     }
 
     assert plan_weights(entries, min_allowed_weights=3, max_weight=1.0, **arguments) is None
@@ -199,6 +255,7 @@ def test_plan_rejects_weights_that_disappear_during_sdk_quantization() -> None:
         current_block=100,
         min_allowed_weights=2,
         max_weight=1.0,
+        minimum_frontier_gain=1e-12,
     )
 
     assert plan is None
@@ -212,6 +269,7 @@ def test_plan_rejects_duplicate_uid_mapping() -> None:
             current_block=100,
             min_allowed_weights=2,
             max_weight=0.6,
+            minimum_frontier_gain=0.001,
         )
 
 
@@ -272,6 +330,7 @@ def test_submit_weights_uses_intent_and_waits_for_finalization(monkeypatch) -> N
         current_block=100,
         min_allowed_weights=2,
         max_weight=0.6,
+        minimum_frontier_gain=0.001,
     )
     assert plan is not None
 
@@ -326,6 +385,7 @@ def test_submit_weights_surfaces_chain_failure(monkeypatch) -> None:
         current_block=100,
         min_allowed_weights=1,
         max_weight=1.0,
+        minimum_frontier_gain=0.001,
     )
     assert plan is not None
 
@@ -356,6 +416,7 @@ def test_recorded_submission_persists_finalized_result(monkeypatch, tmp_path) ->
         current_block=100,
         min_allowed_weights=1,
         max_weight=1.0,
+        minimum_frontier_gain=0.001,
     )
     assert plan is not None
 
