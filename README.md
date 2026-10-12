@@ -79,6 +79,8 @@ default and is rejected unless rollout is configured; add `--submit-weights`, `-
 
 Weight submission is also held back while the finalized-block scanner is catching up, so an
 incomplete historical view can never produce a chain weight vector.
+The database atomically reserves each netuid, mechanism, and finalized source block before
+signing, preventing two Validator processes that share it from submitting the same snapshot.
 
 The runner request contains the challenge and model-file digests, the validated model path, the
 pinned panel path, and the track's base-model revision, budgets, selector dimensions, and digest.

@@ -390,6 +390,27 @@ def test_failed_weight_run_keeps_attempt_for_audit(tmp_path) -> None:
         assert failed.block_hash is None
 
 
+def test_weight_snapshot_can_only_be_reserved_once_across_connections(tmp_path) -> None:
+    path = tmp_path / "validator.db"
+    arguments = {
+        "netuid": 7,
+        "mechid": 0,
+        "source_block": 100,
+        "hotkeys": ("alice",),
+        "uids": (1,),
+        "weights": (1.0,),
+        "occurred_at_ms": 1,
+    }
+
+    with ChallengeStore(path) as first, ChallengeStore(path) as second:
+        reserved = first.create_weight_run(**arguments)
+
+        with pytest.raises(RuntimeError, match="already has a transaction attempt"):
+            second.create_weight_run(**arguments)
+
+        assert first.weight_runs() == [reserved]
+
+
 def test_expired_admission_lease_is_recovered(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)

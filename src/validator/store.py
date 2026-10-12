@@ -296,7 +296,8 @@ class ChallengeStore:
                 block_hash TEXT,
                 message TEXT,
                 created_at_ms INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL
+                updated_at_ms INTEGER NOT NULL,
+                UNIQUE (netuid, mechid, source_block)
             );
 
             CREATE INDEX submissions_chain_order
@@ -1298,27 +1299,41 @@ class ChallengeStore:
 
         timestamp = _timestamp(occurred_at_ms)
         identifier = secrets.token_hex(16)
-        self._connection.execute(
-            """
-            INSERT INTO weight_runs (
-                run_id, netuid, mechid, source_block, hotkeys_json, uids_json,
-                weights_json, state, created_at_ms, updated_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                identifier,
-                netuid,
-                mechid,
-                source_block,
-                json.dumps(hotkeys, separators=(",", ":")),
-                json.dumps(uids, separators=(",", ":")),
-                json.dumps(weights, separators=(",", ":")),
-                WeightRunState.PLANNED,
-                timestamp,
-                timestamp,
-            ),
-        )
-        self._connection.commit()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self._connection.execute(
+                """
+                SELECT run_id FROM weight_runs
+                WHERE netuid = ? AND mechid = ? AND source_block = ?
+                """,
+                (netuid, mechid, source_block),
+            ).fetchone()
+            if existing is not None:
+                raise RuntimeError("weight snapshot already has a transaction attempt")
+            self._connection.execute(
+                """
+                INSERT INTO weight_runs (
+                    run_id, netuid, mechid, source_block, hotkeys_json, uids_json,
+                    weights_json, state, created_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identifier,
+                    netuid,
+                    mechid,
+                    source_block,
+                    json.dumps(hotkeys, separators=(",", ":")),
+                    json.dumps(uids, separators=(",", ":")),
+                    json.dumps(weights, separators=(",", ":")),
+                    WeightRunState.PLANNED,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
         return self.weight_run(identifier)
 
     def finalize_weight_run(
