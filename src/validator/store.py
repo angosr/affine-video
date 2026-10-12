@@ -155,12 +155,13 @@ class ChallengeStore:
         *,
         track_spec_digest: str | None = None,
     ) -> None:
-        self._connection = sqlite3.connect(Path(path))
+        self._connection = sqlite3.connect(Path(path), timeout=30)
         self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA busy_timeout = 30000")
         self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA journal_mode = WAL")
         try:
             self._initialize()
+            self._connection.execute("PRAGMA journal_mode = WAL")
             if track_spec_digest is not None:
                 self.bind_track_spec(track_spec_digest)
         except Exception:
@@ -185,18 +186,20 @@ class ChallengeStore:
 
         self._connection.executescript(
             """
-            CREATE TABLE chain_cursor (
+            BEGIN IMMEDIATE;
+
+            CREATE TABLE IF NOT EXISTS chain_cursor (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 block_height INTEGER NOT NULL CHECK (block_height >= 0),
                 block_hash TEXT NOT NULL
             );
 
-            CREATE TABLE store_metadata (
+            CREATE TABLE IF NOT EXISTS store_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
 
-            CREATE TABLE submissions (
+            CREATE TABLE IF NOT EXISTS submissions (
                 submission_id TEXT PRIMARY KEY,
                 hotkey TEXT NOT NULL,
                 netuid INTEGER NOT NULL,
@@ -212,7 +215,7 @@ class ChallengeStore:
                 UNIQUE (block_height, extrinsic_index, event_index)
             );
 
-            CREATE TABLE challenges (
+            CREATE TABLE IF NOT EXISTS challenges (
                 challenge_id TEXT PRIMARY KEY,
                 submission_id TEXT NOT NULL UNIQUE REFERENCES submissions(submission_id),
                 state TEXT NOT NULL,
@@ -238,7 +241,7 @@ class ChallengeStore:
                 updated_at_ms INTEGER NOT NULL
             );
 
-            CREATE TABLE challenge_events (
+            CREATE TABLE IF NOT EXISTS challenge_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 challenge_id TEXT NOT NULL REFERENCES challenges(challenge_id),
                 sequence INTEGER NOT NULL CHECK (sequence >= 0),
@@ -251,7 +254,7 @@ class ChallengeStore:
                 UNIQUE (challenge_id, sequence)
             );
 
-            CREATE TABLE stage_scores (
+            CREATE TABLE IF NOT EXISTS stage_scores (
                 challenge_id TEXT NOT NULL REFERENCES challenges(challenge_id),
                 stage TEXT NOT NULL,
                 next_state TEXT NOT NULL,
@@ -263,7 +266,7 @@ class ChallengeStore:
                 PRIMARY KEY (challenge_id, stage)
             );
 
-            CREATE TABLE leaderboard (
+            CREATE TABLE IF NOT EXISTS leaderboard (
                 hotkey TEXT PRIMARY KEY,
                 challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id),
                 submission_id TEXT NOT NULL REFERENCES submissions(submission_id),
@@ -278,12 +281,12 @@ class ChallengeStore:
                 updated_at_ms INTEGER NOT NULL
             );
 
-            CREATE TABLE model_owners (
+            CREATE TABLE IF NOT EXISTS model_owners (
                 model_digest TEXT PRIMARY KEY,
                 challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id)
             );
 
-            CREATE TABLE weight_runs (
+            CREATE TABLE IF NOT EXISTS weight_runs (
                 run_id TEXT PRIMARY KEY,
                 netuid INTEGER NOT NULL,
                 mechid INTEGER NOT NULL,
@@ -300,11 +303,13 @@ class ChallengeStore:
                 UNIQUE (netuid, mechid, source_block)
             );
 
-            CREATE INDEX submissions_chain_order
+            CREATE INDEX IF NOT EXISTS submissions_chain_order
                 ON submissions (block_height, extrinsic_index, event_index);
-            CREATE INDEX challenges_state_order ON challenges (state, created_at_ms);
-            CREATE INDEX weight_runs_created ON weight_runs (created_at_ms);
+            CREATE INDEX IF NOT EXISTS challenges_state_order
+                ON challenges (state, created_at_ms);
+            CREATE INDEX IF NOT EXISTS weight_runs_created ON weight_runs (created_at_ms);
 
+            COMMIT;
             """
         )
 

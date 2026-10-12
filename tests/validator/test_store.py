@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 
 from validator.queue import ChainPosition, ChallengeState, submission_id
@@ -90,6 +93,22 @@ def test_state_survives_reopen(tmp_path) -> None:
     with ChallengeStore(path) as reopened:
         assert reopened.get_challenge(identifier).state is ChallengeState.FETCHING
         assert len(reopened.challenge_events(identifier)) == 2
+
+
+def test_concurrent_first_open_initializes_database_once(tmp_path) -> None:
+    path = tmp_path / "validator.db"
+    start = Barrier(8)
+
+    def open_store(_worker: int) -> None:
+        start.wait()
+        with ChallengeStore(path):
+            pass
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        list(workers.map(open_store, range(8)))
+
+    with ChallengeStore(path) as store:
+        assert store.chain_cursor() is None
 
 
 def test_conflicting_replay_is_rejected(tmp_path) -> None:
