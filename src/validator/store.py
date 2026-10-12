@@ -552,6 +552,50 @@ class ChallengeStore:
             now_ms=now_ms,
         )
 
+    def earlier_reference_owner(self, identifier: str) -> str | None:
+        """Return the earliest still-valid challenge for the same immutable HF reference."""
+
+        row = self._connection.execute(
+            """
+            SELECT earlier_challenge.challenge_id
+            FROM challenges current_challenge
+            JOIN submissions current_submission
+              ON current_submission.submission_id = current_challenge.submission_id
+            JOIN submissions earlier_submission
+              ON earlier_submission.repo_id = current_submission.repo_id
+             AND earlier_submission.revision = current_submission.revision
+             AND earlier_submission.admitted = 1
+             AND (
+                    earlier_submission.block_height < current_submission.block_height
+                 OR (
+                        earlier_submission.block_height = current_submission.block_height
+                    AND earlier_submission.extrinsic_index
+                        < current_submission.extrinsic_index
+                 )
+                 OR (
+                        earlier_submission.block_height = current_submission.block_height
+                    AND earlier_submission.extrinsic_index
+                        = current_submission.extrinsic_index
+                    AND earlier_submission.event_index < current_submission.event_index
+                 )
+             )
+            JOIN challenges earlier_challenge
+              ON earlier_challenge.submission_id = earlier_submission.submission_id
+            WHERE current_challenge.challenge_id = ?
+              AND earlier_challenge.state NOT IN (?, ?)
+            ORDER BY earlier_submission.block_height,
+                     earlier_submission.extrinsic_index,
+                     earlier_submission.event_index
+            LIMIT 1
+            """,
+            (
+                identifier,
+                ChallengeState.PARTICIPANT_FAILED,
+                ChallengeState.SYSTEM_FAILED,
+            ),
+        ).fetchone()
+        return None if row is None else row["challenge_id"]
+
     def advance_leased(
         self,
         identifier: str,

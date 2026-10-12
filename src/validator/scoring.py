@@ -23,6 +23,11 @@ from scoring.local import (
     evaluate_selector_screen,
 )
 from scoring.model import ModelValidationError
+from scoring.rollout import (
+    RolloutParticipantError,
+    RolloutResult,
+    RolloutTemporaryError,
+)
 from scoring.selector import FixedSelector, load_selector
 from scoring.spec import TrackSpec
 from validator.queue import ChallengeState, require_transition
@@ -92,19 +97,6 @@ class ScoringOutcome:
     challenge_id: str
     state: ChallengeState
     code: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class RolloutResult:
-    final_score: float
-    attention_cost: float
-    metrics: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        if not isfinite(self.final_score) or not 0 <= self.final_score <= 1:
-            raise ValueError("rollout final score must be within [0, 1]")
-        if not isfinite(self.attention_cost) or self.attention_cost < 0:
-            raise ValueError("rollout attention cost must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,7 +199,12 @@ class TrackEvaluator:
                     raise TemporaryScoringError(
                         "ROLLOUT_UNAVAILABLE", "rollout evaluator is not configured"
                     )
-                rollout = self.rollout(task, selector, self.track)
+                try:
+                    rollout = self.rollout(task, selector, self.track)
+                except RolloutParticipantError as exc:
+                    raise ParticipantScoringError(exc.code, str(exc)) from exc
+                except RolloutTemporaryError as exc:
+                    raise TemporaryScoringError(exc.code, str(exc)) from exc
                 if not isinstance(rollout, RolloutResult):
                     raise TemporaryScoringError(
                         "ROLLOUT_RESULT_INVALID", "rollout returned an invalid result"

@@ -137,6 +137,10 @@ def test_validator_run_forwards_explicit_runtime_paths(monkeypatch, tmp_path) ->
             str(tmp_path / "screen.npz"),
             "--exact-cache",
             str(tmp_path / "exact.npz"),
+            "--rollout-runner",
+            str(tmp_path / "rollout"),
+            "--rollout-panel",
+            str(tmp_path / "panel.json"),
             "--archive-endpoint",
             "wss://archive-1.example",
             "--archive-endpoint",
@@ -147,6 +151,8 @@ def test_validator_run_forwards_explicit_runtime_paths(monkeypatch, tmp_path) ->
 
     assert called["once"] is True
     assert called["network"] == "finney"
+    assert called["rollout_runner"] == str(tmp_path / "rollout")
+    assert called["rollout_panel"] == str(tmp_path / "panel.json")
     assert called["archive_endpoints"] == [
         "wss://archive-1.example",
         "wss://archive-2.example",

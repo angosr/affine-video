@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 
 import numpy as np
+import pytest
 from safetensors.numpy import save_file
 
 from miner.submit import ModelSubmission
@@ -9,7 +10,7 @@ from scoring.model import TensorSpec
 from validator.admission import AdmissionSettings, AdmissionStatus
 from validator.download import DownloadedModel
 from validator.queue import ChallengeState
-from validator.run import process_cycle
+from validator.run import process_cycle, run_validator
 from validator.scoring import ScoringSettings, StageOutcome
 from validator.store import ChallengeStore
 
@@ -60,3 +61,23 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
         assert second.scoring.state is ChallengeState.PROVISIONAL
         assert store.leaderboard()[0].final_score == 0.7
         assert store.leaderboard()[0].provisional is True
+
+
+def test_weight_submission_requires_authoritative_rollout_configuration(tmp_path) -> None:
+    arguments = {
+        "track_spec": tmp_path / "missing-track.json",
+        "database": tmp_path / "validator.db",
+        "model_cache": tmp_path / "models",
+        "screen_cache": tmp_path / "screen.npz",
+        "exact_cache": tmp_path / "exact.npz",
+        "rollout_runner": None,
+        "rollout_panel": None,
+        "network": "test",
+        "archive_endpoints": None,
+        "worker_id": "validator",
+        "submit_chain_weights": True,
+        "once": True,
+    }
+
+    with pytest.raises(ValueError, match="require an authoritative rollout"):
+        asyncio.run(run_validator(**arguments))

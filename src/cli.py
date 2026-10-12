@@ -52,12 +52,15 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--model-cache", required=True)
     run.add_argument("--screen-cache", required=True)
     run.add_argument("--exact-cache", required=True)
+    run.add_argument("--rollout-runner")
+    run.add_argument("--rollout-panel")
     run.add_argument("--network", default="finney")
     run.add_argument("--archive-endpoint", dest="archive_endpoints", action="append")
     run.add_argument("--worker-id", default="validator")
     run.add_argument("--poll-seconds", default=12.0, type=float)
     run.add_argument("--max-scan-blocks", default=100, type=int)
     run.add_argument("--scoring-timeout-seconds", default=1800.0, type=float)
+    run.add_argument("--rollout-timeout-seconds", default=1500.0, type=float)
     run.add_argument("--scoring-max-memory-bytes", type=int)
     run.add_argument("--scoring-max-cpu-seconds", type=int)
     run.add_argument("--submit-weights", action="store_true")
@@ -129,12 +132,15 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
                     model_cache=arguments.model_cache,
                     screen_cache=arguments.screen_cache,
                     exact_cache=arguments.exact_cache,
+                    rollout_runner=arguments.rollout_runner,
+                    rollout_panel=arguments.rollout_panel,
                     network=arguments.network,
                     archive_endpoints=arguments.archive_endpoints,
                     worker_id=arguments.worker_id,
                     poll_seconds=arguments.poll_seconds,
                     max_scan_blocks=arguments.max_scan_blocks,
                     scoring_timeout_seconds=arguments.scoring_timeout_seconds,
+                    rollout_timeout_seconds=arguments.rollout_timeout_seconds,
                     scoring_max_memory_bytes=arguments.scoring_max_memory_bytes,
                     scoring_max_cpu_seconds=arguments.scoring_max_cpu_seconds,
                     submit_chain_weights=arguments.submit_weights,

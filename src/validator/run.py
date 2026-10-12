@@ -13,6 +13,7 @@ import bittensor as bt
 
 from scoring.cache import validate_exact_cache, validate_screen_cache
 from scoring.model import ValidatedModel, validate_model
+from scoring.rollout import ProcessRollout
 from scoring.spec import load_track_spec
 from validator.admission import (
     AdmissionOutcome,
@@ -50,12 +51,15 @@ async def run_validator(
     model_cache: str | Path,
     screen_cache: str | Path,
     exact_cache: str | Path,
+    rollout_runner: str | Path | None,
+    rollout_panel: str | Path | None,
     network: str,
     archive_endpoints: list[str] | None,
     worker_id: str,
     poll_seconds: float = 12.0,
     max_scan_blocks: int = 100,
     scoring_timeout_seconds: float = 30 * 60,
+    rollout_timeout_seconds: float = 25 * 60,
     scoring_max_memory_bytes: int | None = None,
     scoring_max_cpu_seconds: int | None = None,
     submit_chain_weights: bool = False,
@@ -72,7 +76,25 @@ async def run_validator(
 
     if poll_seconds <= 0:
         raise ValueError("poll interval must be positive")
+    if (rollout_runner is None) != (rollout_panel is None):
+        raise ValueError("rollout runner and panel must be configured together")
+    if submit_chain_weights and rollout_runner is None:
+        raise ValueError("chain weights require an authoritative rollout runner")
+    if rollout_runner is not None and rollout_timeout_seconds >= scoring_timeout_seconds:
+        raise ValueError("rollout timeout must be shorter than the scoring process timeout")
     track = load_track_spec(track_spec)
+    rollout = (
+        ProcessRollout(
+            runner=str(rollout_runner),
+            panel=str(rollout_panel),
+            runner_sha256=track.rollout.runner_sha256,
+            panel_sha256=track.rollout.panel_sha256,
+            panel_max_bytes=track.rollout.panel_max_bytes,
+            timeout_seconds=rollout_timeout_seconds,
+        )
+        if rollout_runner is not None and rollout_panel is not None
+        else None
+    )
     validate_screen_cache(
         screen_cache,
         expected_sha256=track.cache.screen_sha256,
@@ -94,7 +116,7 @@ async def run_validator(
         tensor_schema=track.model.tensor_schema,
     )
     evaluator = IsolatedEvaluator(
-        FileTrackEvaluator(track, str(screen_cache), str(exact_cache)),
+        FileTrackEvaluator(track, str(screen_cache), str(exact_cache), rollout=rollout),
         timeout_seconds=scoring_timeout_seconds,
         max_memory_bytes=scoring_max_memory_bytes,
         max_cpu_seconds=scoring_max_cpu_seconds,

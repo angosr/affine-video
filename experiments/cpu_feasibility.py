@@ -580,39 +580,35 @@ def repeated_submission_lottery(case_scores: np.ndarray, seed: int) -> dict:
 
 
 def clone_attack_experiment(seed: int) -> dict:
-    """Show why exact weight hashes and score-proportional rewards are insufficient."""
+    """Show why exact weight hashes and score-proportional rewards are insufficient.
+
+    Veda's residual projection has a simple functional symmetry on mean-only
+    predictors. Scaling the complete Q embedding by ``a`` and the complete K
+    embedding by ``1/a`` leaves every dot product unchanged while changing both
+    submitted tensors.
+    """
 
     rng = np.random.default_rng(seed)
-    descriptor_dim, hidden_dim, projection_dim = 6, 8, 4
-    descriptors = rng.normal(size=(12, descriptor_dim)).astype(np.float32)
-    hidden_weight = rng.normal(size=(hidden_dim, descriptor_dim)).astype(np.float32)
-    hidden_bias = rng.normal(size=hidden_dim).astype(np.float32)
-    output_weight = rng.normal(size=(projection_dim, hidden_dim)).astype(np.float32)
-    output_bias = rng.normal(size=projection_dim).astype(np.float32)
-    permutation = rng.permutation(hidden_dim)
+    dim = 4
+    q = rng.normal(size=(12, 3 * dim)).astype(np.float32)
+    k = rng.normal(size=(12, 3 * dim)).astype(np.float32)
+    original_q = np.zeros((3 * dim, dim), dtype=np.float32)
+    original_k = np.zeros((3 * dim, dim), dtype=np.float32)
+    scale = np.float32(2.0)
+    cloned_q = original_q.copy()
+    cloned_k = original_k.copy()
+    cloned_q[:dim] = np.eye(dim, dtype=np.float32) * (scale - 1)
+    cloned_k[:dim] = np.eye(dim, dtype=np.float32) * (1 / scale - 1)
 
-    def project(weight1, bias1, weight2):
-        hidden = np.maximum(descriptors @ weight1.T + bias1, 0)
-        return hidden @ weight2.T + output_bias
+    def logits(proj_q, proj_k):
+        q_hat = q @ proj_q + q[:, :dim]
+        k_hat = k @ proj_k + k[:, :dim]
+        return q_hat @ k_hat.T / math.sqrt(dim)
 
-    original = project(hidden_weight, hidden_bias, output_weight)
-    permuted = project(
-        hidden_weight[permutation],
-        hidden_bias[permutation],
-        output_weight[:, permutation],
-    )
-    original_bytes = b"".join(
-        array.tobytes() for array in (hidden_weight, hidden_bias, output_weight, output_bias)
-    )
-    permuted_bytes = b"".join(
-        array.tobytes()
-        for array in (
-            hidden_weight[permutation],
-            hidden_bias[permutation],
-            output_weight[:, permutation],
-            output_bias,
-        )
-    )
+    original = logits(original_q, original_k)
+    permuted = logits(cloned_q, cloned_k)
+    original_bytes = original_q.tobytes() + original_k.tobytes()
+    permuted_bytes = cloned_q.tobytes() + cloned_k.tobytes()
     score = 0.8
     clone_counts = (1, 5, 20)
     return {
@@ -807,7 +803,7 @@ def main() -> None:
                 "adaptive versus fixed allocation on equal block budgets",
                 "sample-size and ranking stability on synthetic candidates",
                 "repeated-submission selection bias",
-                "exact-hash clone bypass through hidden-unit permutation",
+                "exact-hash clone bypass through Veda residual-projection scaling",
                 "max-pooled teacher screening counterexample",
             ],
             "not_validated": [

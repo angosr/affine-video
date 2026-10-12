@@ -17,7 +17,7 @@ from validator.store import ChallengeStore, SubmissionRecord
 SCHEMA = {"selector.weight": TensorSpec((2, 2), "float32")}
 
 
-def submission_at(block: int, hotkey: str) -> SubmissionRecord:
+def submission_at(block: int, hotkey: str, repo_id: str = "owner/model") -> SubmissionRecord:
     position = ChainPosition(block, 0, 0)
     block_hash = "0x" + f"{block:064x}"
     return SubmissionRecord(
@@ -27,7 +27,7 @@ def submission_at(block: int, hotkey: str) -> SubmissionRecord:
         block_hash=block_hash,
         position=position,
         payload=b"VDA1payload",
-        repo_id="owner/model",
+        repo_id=repo_id,
         revision="12" * 20,
     )
 
@@ -75,7 +75,9 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
         assert first is not None and first.status is AdmissionStatus.ACCEPTED
         assert store.get_challenge(first_id).state is ChallengeState.SCREENING
 
-        second_id, _ = store.add_submission(submission_at(101, "hk2"), occurred_at_ms=2)
+        second_id, _ = store.add_submission(
+            submission_at(101, "hk2", "other/model"), occurred_at_ms=2
+        )
         second = process_next_admission(
             store,
             worker_id="admission",
@@ -91,6 +93,72 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
         duplicate = store.get_challenge(second_id)
         assert duplicate.state is ChallengeState.PARTICIPANT_FAILED
         assert duplicate.error_code == "EXACT_DUPLICATE"
+
+
+def test_same_repository_revision_is_rejected_before_redownload(tmp_path) -> None:
+    model = tmp_path / "selector.safetensors"
+    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, model)
+    downloads = 0
+
+    def counted_download(*args, **kwargs):
+        nonlocal downloads
+        downloads += 1
+        return model_downloader(model)(*args, **kwargs)
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        first_id, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        first = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=settings(tmp_path),
+            now_ms=100,
+            downloader=counted_download,
+        )
+        assert first is not None and first.status is AdmissionStatus.ACCEPTED
+
+        second_id, _ = store.add_submission(submission_at(101, "hk2"), occurred_at_ms=2)
+        second = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=settings(tmp_path),
+            now_ms=200,
+            downloader=counted_download,
+        )
+
+        assert downloads == 1
+        assert second is not None and second.code == "REFERENCE_DUPLICATE"
+        assert second.duplicate_of == first_id
+        assert store.get_challenge(second_id).state is ChallengeState.PARTICIPANT_FAILED
+
+
+def test_same_reference_can_retry_after_earlier_participant_failure(tmp_path) -> None:
+    model = tmp_path / "selector.safetensors"
+    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, model)
+
+    def missing(*_args, **_kwargs):
+        raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "repository is private")
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        failed = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=settings(tmp_path),
+            now_ms=100,
+            downloader=missing,
+        )
+        assert failed is not None and failed.status is AdmissionStatus.FAILED
+
+        store.add_submission(submission_at(101, "hk2"), occurred_at_ms=2)
+        retried = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=settings(tmp_path),
+            now_ms=200,
+            downloader=model_downloader(model),
+        )
+
+        assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
 
 
 def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:

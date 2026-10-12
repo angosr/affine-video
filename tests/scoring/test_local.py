@@ -7,21 +7,26 @@ from scoring.selector import FixedSelector, SelectorArchitecture
 from scoring.spec import BudgetSpec
 
 
-def zero_selector() -> FixedSelector:
-    architecture = SelectorArchitecture(("route0",), 6, 2, 2, "float32")
+def tied_selector() -> FixedSelector:
+    architecture = SelectorArchitecture(1, 1, 2, ("layer_0_head_0",), "float32")
     weights = {
-        name: np.zeros(tensor.shape, dtype=np.float32)
-        for name, tensor in architecture.tensor_schema.items()
+        f"layer_0_head_0.proj_{side}": np.zeros((6, 2), dtype=np.float32)
+        for side in ("q", "k")
     }
+    weights["layer_0_head_0.proj_q"][:2] = -np.eye(2, dtype=np.float32)
+    weights["layer_0_head_0.proj_k"][:2] = -np.eye(2, dtype=np.float32)
     return FixedSelector(architecture, weights)
 
 
-def zero_selector_for(routes: tuple[str, ...]) -> FixedSelector:
-    architecture = SelectorArchitecture(routes, 6, 2, 2, "float32")
+def tied_selector_for(routes: tuple[str, ...]) -> FixedSelector:
+    architecture = SelectorArchitecture(1, len(routes), 2, routes, "float32")
     weights = {
-        name: np.zeros(tensor.shape, dtype=np.float32)
-        for name, tensor in architecture.tensor_schema.items()
+        f"{route}.proj_{side}": np.zeros((6, 2), dtype=np.float32)
+        for route in routes
+        for side in ("q", "k")
     }
+    for projection in weights.values():
+        projection[:2] = -np.eye(2, dtype=np.float32)
     return FixedSelector(architecture, weights)
 
 
@@ -32,7 +37,7 @@ def exact_case(seed: int, *, stratum: str = "all") -> ExactCase:
     v = generator.normal(size=(3, 2, 2)).astype(np.float32)
     dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
     return ExactCase(
-        route="route0",
+        route="layer_0_head_0",
         stratum=stratum,
         q=q,
         k=k,
@@ -47,7 +52,7 @@ def test_exact_local_scoring_runs_fixed_selector_at_every_budget() -> None:
     budgets = (BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0))
 
     first = evaluate_selector_local(
-        zero_selector(),
+        tied_selector(),
         [exact_case(1), exact_case(2)],
         budgets,
         stratum_weights={"all": 1.0},
@@ -57,7 +62,7 @@ def test_exact_local_scoring_runs_fixed_selector_at_every_budget() -> None:
         bootstrap_seed=7,
     )
     second = evaluate_selector_local(
-        zero_selector(),
+        tied_selector(),
         [exact_case(1), exact_case(2)],
         budgets,
         stratum_weights={"all": 1.0},
@@ -76,7 +81,7 @@ def test_exact_local_scoring_runs_fixed_selector_at_every_budget() -> None:
 def test_exact_local_scoring_rejects_unknown_stratum_and_oversized_budget() -> None:
     with pytest.raises(ValueError, match="stratum"):
         evaluate_selector_local(
-            zero_selector(),
+            tied_selector(),
             [exact_case(1, stratum="missing")],
             (BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
             stratum_weights={"all": 1.0},
@@ -89,7 +94,7 @@ def test_exact_local_scoring_rejects_unknown_stratum_and_oversized_budget() -> N
     case = exact_case(1)
     with pytest.raises(ValueError, match="exceeds"):
         evaluate_selector_local(
-            zero_selector(),
+            tied_selector(),
             [case],
             (BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(4, 4.0)),
             stratum_weights={"all": 1.0},
@@ -111,8 +116,8 @@ def test_lightweight_screening_scores_retained_teacher_distribution() -> None:
     mass = np.array([[0.6, 0.3, 0.1], [0.2, 0.3, 0.5]], dtype=np.float32)
 
     result = evaluate_selector_screen(
-        zero_selector(),
-        [ScreenCase("route0", "all", q_desc, k_desc, mass, np.ones(3, dtype=np.bool_))],
+        tied_selector(),
+        [ScreenCase("layer_0_head_0", "all", q_desc, k_desc, mass, np.ones(3, dtype=np.bool_))],
         (BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
         stratum_weights={"all": 1.0},
         bootstrap_confidence=0.95,
@@ -129,7 +134,7 @@ def test_screening_macro_averages_routes_instead_of_cache_frequency() -> None:
     valid = np.ones(3, dtype=np.bool_)
     cases = [
         ScreenCase(
-            "route0",
+            "layer_0_head_0",
             "all",
             descriptors,
             np.ones((3, 6), dtype=np.float32),
@@ -139,7 +144,7 @@ def test_screening_macro_averages_routes_instead_of_cache_frequency() -> None:
     ]
     cases.extend(
         ScreenCase(
-            "route1",
+            "layer_0_head_1",
             "all",
             descriptors,
             np.ones((3, 6), dtype=np.float32),
@@ -150,7 +155,7 @@ def test_screening_macro_averages_routes_instead_of_cache_frequency() -> None:
     )
 
     result = evaluate_selector_screen(
-        zero_selector_for(("route0", "route1")),
+        tied_selector_for(("layer_0_head_0", "layer_0_head_1")),
         cases,
         (BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
         stratum_weights={"all": 1.0},

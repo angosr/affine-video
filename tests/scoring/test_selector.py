@@ -8,10 +8,10 @@ from scoring.selector import SelectorArchitecture, load_selector
 
 def architecture() -> SelectorArchitecture:
     return SelectorArchitecture(
-        routes=("block00_head00",),
-        descriptor_dim=3,
-        hidden_dim=2,
-        projection_dim=2,
+        num_layers=1,
+        num_heads=1,
+        head_dim=2,
+        routes=("layer_0_head_0",),
         storage_dtype="float32",
     )
 
@@ -21,21 +21,20 @@ def weights(spec: SelectorArchitecture) -> dict[str, np.ndarray]:
         name: np.zeros(tensor.shape, dtype=tensor.dtype)
         for name, tensor in spec.tensor_schema.items()
     }
-    prefix = "selector.block00_head00"
-    values[f"{prefix}.q_hidden.weight"][:] = [[1, 0, 0], [0, 1, 0]]
-    values[f"{prefix}.k_hidden.weight"][:] = [[1, 0, 0], [0, 1, 0]]
-    values[f"{prefix}.q_output.weight"][:] = np.eye(2)
-    values[f"{prefix}.k_output.weight"][:] = np.eye(2)
+    values["layers.0.proj_q"][0, :2] = np.eye(2)
+    values["layers.0.proj_k"][0, :2] = np.eye(2)
     return values
 
 
 def test_schema_contains_only_fixed_route_projection_weights() -> None:
     spec = architecture()
 
-    assert len(spec.tensor_schema) == 8
-    assert spec.tensor_schema["selector.block00_head00.q_hidden.weight"].shape == (2, 3)
+    assert len(spec.tensor_schema) == 2
+    assert spec.tensor_schema["layers.0.proj_q"].shape == (1, 6, 2)
     with pytest.raises(ValueError, match="route"):
-        SelectorArchitecture(("bad.route",), 3, 2, 2, "float32")
+        SelectorArchitecture(1, 1, 2, ("bad.route",), "float32")
+    with pytest.raises(ValueError, match="exceeds"):
+        SelectorArchitecture(1, 1, 2, ("layer_1_head_0",), "float32")
 
 
 def test_weight_only_selector_produces_deterministic_pair_logits(tmp_path) -> None:
@@ -43,14 +42,38 @@ def test_weight_only_selector_produces_deterministic_pair_logits(tmp_path) -> No
     path = tmp_path / "selector.safetensors"
     save_file(weights(spec), path)
     selector = load_selector(path, spec)
-    q = np.array([[1, 0, 9], [0, 2, 9]], dtype=np.float32)
-    k = np.array([[3, 0, 8], [0, 4, 8]], dtype=np.float32)
+    q = np.array([[1, 0, 9, 9, -9, -9], [0, 2, 9, 9, -9, -9]], dtype=np.float32)
+    k = np.array([[3, 0, 8, 8, -8, -8], [0, 4, 8, 8, -8, -8]], dtype=np.float32)
 
-    first = selector.logits("block00_head00", q, k)
-    second = selector.logits("block00_head00", q, k)
+    first = selector.logits("layer_0_head_0", q, k)
+    second = selector.logits("layer_0_head_0", q, k)
 
     assert first == pytest.approx(second)
-    assert first == pytest.approx(np.array([[3, 0], [0, 8]]) / np.sqrt(2))
+    assert first == pytest.approx(4 * np.array([[3, 0], [0, 8]]) / np.sqrt(2))
+    assert set(selector.weights) == {
+        "layer_0_head_0.proj_q",
+        "layer_0_head_0.proj_k",
+    }
+    assert sum(value.nbytes for value in selector.weights.values()) == 2 * 6 * 2 * 4
+
+
+def test_zero_veda_projection_equals_mean_pooled_qk(tmp_path) -> None:
+    spec = architecture()
+    path = tmp_path / "selector.safetensors"
+    save_file(
+        {
+            name: np.zeros(tensor.shape, dtype=tensor.dtype)
+            for name, tensor in spec.tensor_schema.items()
+        },
+        path,
+    )
+    selector = load_selector(path, spec)
+    q = np.array([[1, 2, 7, 8, -2, -3]], dtype=np.float32)
+    k = np.array([[3, 4, 9, 10, -4, -5]], dtype=np.float32)
+
+    result = selector.logits("layer_0_head_0", q, k)
+
+    assert result == pytest.approx(np.array([[11]], dtype=np.float32) / np.sqrt(2))
 
 
 def test_selector_rejects_extra_tensors_and_non_finite_runtime_input(tmp_path) -> None:
@@ -68,7 +91,7 @@ def test_selector_rejects_extra_tensors_and_non_finite_runtime_input(tmp_path) -
     selector = load_selector(path, spec)
     with pytest.raises(ModelValidationError, match="non-finite"):
         selector.logits(
-            "block00_head00",
-            np.array([[np.nan, 0, 0]], dtype=np.float32),
-            np.zeros((1, 3), dtype=np.float32),
+            "layer_0_head_0",
+            np.array([[np.nan, 0, 0, 0, 0, 0]], dtype=np.float32),
+            np.zeros((1, 6), dtype=np.float32),
         )

@@ -15,12 +15,11 @@ def valid_spec() -> dict:
             "filename": "selector.safetensors",
             "max_bytes": 1024,
             "selector": {
-                "routes": ["block00_head00"],
-                "descriptor_dim": 3,
-                "hidden_dim": 2,
-                "projection_dim": 2,
+                "routes": ["layer_0_head_0"],
+                "num_layers": 1,
+                "num_heads": 1,
+                "head_dim": 2,
                 "storage_dtype": "float32",
-                "activation": "relu",
             },
         },
         "base_model": {
@@ -32,6 +31,11 @@ def valid_spec() -> dict:
             "screen_max_bytes": 100_000,
             "exact_sha256": "56" * 32,
             "exact_max_bytes": 1_000_000,
+        },
+        "rollout": {
+            "runner_sha256": "78" * 32,
+            "panel_sha256": "9a" * 32,
+            "panel_max_bytes": 2_000_000,
         },
         "scoring": {
             "budgets": [
@@ -59,9 +63,10 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
 
     assert first.digest == second.digest
     assert len(first.digest) == 64
-    assert first.model.tensor_schema["selector.block00_head00.q_hidden.weight"].shape == (2, 3)
+    assert first.model.tensor_schema["layers.0.proj_q"].shape == (1, 6, 2)
     assert first.scoring.stratum_weight_map == {"layer-0": 0.5, "layer-1": 0.5}
     assert first.base_model.revision == "12" * 20
+    assert first.rollout.panel_sha256 == "9a" * 32
 
 
 def test_score_affecting_change_changes_digest() -> None:
@@ -74,13 +79,13 @@ def test_score_affecting_change_changes_digest() -> None:
 
 def test_selector_semantics_are_explicit_and_frozen() -> None:
     missing = valid_spec()
-    del missing["model"]["selector"]["activation"]
+    del missing["model"]["selector"]["head_dim"]
     with pytest.raises(TrackSpecError, match="exactly"):
         parse_track_spec(missing)
 
     unsupported = valid_spec()
-    unsupported["model"]["selector"]["activation"] = "gelu"
-    with pytest.raises(TrackSpecError, match="activation must be relu"):
+    unsupported["model"]["selector"]["routes"] = ["layer_1_head_0"]
+    with pytest.raises(TrackSpecError, match="exceeds"):
         parse_track_spec(unsupported)
 
 
@@ -112,7 +117,8 @@ def test_unknown_fields_and_invalid_budget_order_are_rejected() -> None:
         parse_track_spec(undersampled)
 
     uncovered_route = valid_spec()
-    uncovered_route["model"]["selector"]["routes"] = ["route-a", "route-b"]
+    uncovered_route["model"]["selector"]["num_heads"] = 2
+    uncovered_route["model"]["selector"]["routes"] = ["layer_0_head_0", "layer_0_head_1"]
     uncovered_route["scoring"]["local_sample_count"] = 3
     with pytest.raises(TrackSpecError, match="every route"):
         parse_track_spec(uncovered_route)

@@ -1,4 +1,4 @@
-"""Fixed, code-owned selector architecture loaded from weight-only submissions."""
+"""Veda predictor arithmetic loaded from weight-only submissions."""
 
 from __future__ import annotations
 
@@ -12,50 +12,68 @@ from safetensors import SafetensorError, safe_open
 
 from scoring.model import ModelValidationError, TensorSpec
 
-_ROUTE = re.compile(r"^[A-Za-z0-9_-]+$")
+_ROUTE = re.compile(r"^layer_(0|[1-9][0-9]*)_head_(0|[1-9][0-9]*)$")
 _DTYPES = frozenset({"float16", "float32"})
+_SAFETENSOR_DTYPES = {"float16": "F16", "float32": "F32"}
+
+
+def route_name(layer: int, head: int) -> str:
+    """Return the canonical cache route for one Veda layer and head."""
+
+    if type(layer) is not int or layer < 0 or type(head) is not int or head < 0:
+        raise ValueError("selector layer and head must be non-negative integers")
+    return f"layer_{layer}_head_{head}"
+
+
+def route_indices(route: str) -> tuple[int, int]:
+    """Parse a canonical cache route into its layer and head indices."""
+
+    if not isinstance(route, str) or (match := _ROUTE.fullmatch(route)) is None:
+        raise ValueError("selector route must use layer_<index>_head_<index>")
+    return int(match.group(1)), int(match.group(2))
 
 
 @dataclass(frozen=True, slots=True)
 class SelectorArchitecture:
+    """Code-owned subset of the Veda v1 predictor contract.
+
+    Submitted tensors cover every layer and head because a rollout needs the
+    complete predictor. ``routes`` selects the layer/head pairs represented in
+    the inexpensive frozen caches; it does not change the submitted schema.
+    """
+
+    num_layers: int
+    num_heads: int
+    head_dim: int
     routes: tuple[str, ...]
-    descriptor_dim: int
-    hidden_dim: int
-    projection_dim: int
     storage_dtype: str
-    activation: str = "relu"
 
     def __post_init__(self) -> None:
+        if min(self.num_layers, self.num_heads, self.head_dim) <= 0:
+            raise ValueError("selector layer, head, and channel counts must be positive")
         if not self.routes or len(set(self.routes)) != len(self.routes):
             raise ValueError("selector routes must be non-empty and unique")
-        if any(not _ROUTE.fullmatch(route) for route in self.routes):
-            raise ValueError("selector route names contain unsupported characters")
-        if min(self.descriptor_dim, self.hidden_dim, self.projection_dim) <= 0:
-            raise ValueError("selector dimensions must be positive")
+        for route in self.routes:
+            layer, head = route_indices(route)
+            if layer >= self.num_layers or head >= self.num_heads:
+                raise ValueError("selector route exceeds the declared layer or head count")
         if self.storage_dtype not in _DTYPES:
             raise ValueError("selector storage dtype must be float16 or float32")
-        if self.activation != "relu":
-            raise ValueError("selector activation must be relu")
+
+    @property
+    def descriptor_dim(self) -> int:
+        """TripPool width: mean, maximum, and minimum for each channel."""
+
+        return 3 * self.head_dim
 
     @property
     def tensor_schema(self) -> dict[str, TensorSpec]:
-        schema: dict[str, TensorSpec] = {}
-        for route in self.routes:
-            prefix = f"selector.{route}"
-            for side in ("q", "k"):
-                schema[f"{prefix}.{side}_hidden.weight"] = TensorSpec(
-                    (self.hidden_dim, self.descriptor_dim), self.storage_dtype
-                )
-                schema[f"{prefix}.{side}_hidden.bias"] = TensorSpec(
-                    (self.hidden_dim,), self.storage_dtype
-                )
-                schema[f"{prefix}.{side}_output.weight"] = TensorSpec(
-                    (self.projection_dim, self.hidden_dim), self.storage_dtype
-                )
-                schema[f"{prefix}.{side}_output.bias"] = TensorSpec(
-                    (self.projection_dim,), self.storage_dtype
-                )
-        return schema
+        shape = (self.num_heads, self.descriptor_dim, self.head_dim)
+        return {
+            f"layers.{layer}.proj_{side}": TensorSpec(shape, self.storage_dtype)
+            for layer in range(self.num_layers)
+            for side in ("q", "k")
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,39 +81,58 @@ class FixedSelector:
     architecture: SelectorArchitecture
     weights: dict[str, np.ndarray]
 
+    def __post_init__(self) -> None:
+        expected = {
+            f"{route}.proj_{side}"
+            for route in self.architecture.routes
+            for side in ("q", "k")
+        }
+        if set(self.weights) != expected:
+            raise ValueError("loaded selector projections do not cover the evaluation routes")
+        shape = (self.architecture.descriptor_dim, self.architecture.head_dim)
+        for projection in self.weights.values():
+            if projection.shape != shape or projection.dtype != np.float32:
+                raise ValueError("loaded selector projection has the wrong shape or dtype")
+            if not np.isfinite(projection).all():
+                raise ModelValidationError(
+                    "MODEL_NON_FINITE", "loaded selector projection is not finite"
+                )
+
     def logits(
         self, route: str, q_descriptors: np.ndarray, k_descriptors: np.ndarray
     ) -> np.ndarray:
-        """Return one finite score for every Query/Key tile pair."""
+        """Return Veda v1 logits for one layer/head cache route.
+
+        Veda TripPools each tile into ``[mean | max | min]``. Its learned
+        projection is residual: ``x_hat = pooled @ P + mean``. The submitted
+        file therefore needs only ``proj_q`` and ``proj_k`` tensors.
+        """
 
         if route not in self.architecture.routes:
             raise ValueError("unknown selector route")
         q = _descriptors(q_descriptors, self.architecture.descriptor_dim, "Q")
         k = _descriptors(k_descriptors, self.architecture.descriptor_dim, "K")
-        prefix = f"selector.{route}"
-        q_projected = self._project(prefix, "q", q)
-        k_projected = self._project(prefix, "k", k)
-        result = q_projected @ k_projected.T / np.float32(sqrt(self.architecture.projection_dim))
+        q_projected = self._project(q, self.weights[f"{route}.proj_q"])
+        k_projected = self._project(k, self.weights[f"{route}.proj_k"])
+        result = q_projected @ k_projected.T / np.float32(sqrt(self.architecture.head_dim))
         if not np.isfinite(result).all():
             raise ModelValidationError(
                 "MODEL_RUNTIME_INVALID", "selector produced non-finite logits"
             )
         return result.astype(np.float32, copy=False)
 
-    def _project(self, prefix: str, side: str, descriptors: np.ndarray) -> np.ndarray:
-        hidden = (
-            descriptors @ self.weights[f"{prefix}.{side}_hidden.weight"].T
-            + self.weights[f"{prefix}.{side}_hidden.bias"]
-        )
-        np.maximum(hidden, 0, out=hidden)
-        return (
-            hidden @ self.weights[f"{prefix}.{side}_output.weight"].T
-            + self.weights[f"{prefix}.{side}_output.bias"]
-        )
+    def _project(self, descriptors: np.ndarray, projection: np.ndarray) -> np.ndarray:
+        mean = descriptors[:, : self.architecture.head_dim]
+        return descriptors @ projection + mean
 
 
 def load_selector(path: str | Path, architecture: SelectorArchitecture) -> FixedSelector:
-    """Load exactly the tensors required by the fixed selector architecture."""
+    """Validate the file schema and materialize only locally evaluated heads.
+
+    Admission already streams every tensor to validate finite values. Scoring
+    rechecks the immutable file hash before this call, so loading only the
+    configured cache routes avoids expanding a full H3 predictor to float32.
+    """
 
     expected = architecture.tensor_schema
     weights: dict[str, np.ndarray] = {}
@@ -110,15 +147,25 @@ def load_selector(path: str | Path, architecture: SelectorArchitecture) -> Fixed
                     "MODEL_SCHEMA_INVALID", "tensor keys do not match the selector architecture"
                 )
             for name, tensor_spec in expected.items():
-                value = tensors.get_tensor(name)
-                if value.shape != tensor_spec.shape or value.dtype.name != tensor_spec.dtype:
+                view = tensors.get_slice(name)
+                if (
+                    tuple(view.get_shape()) != tensor_spec.shape
+                    or view.get_dtype() != _SAFETENSOR_DTYPES[tensor_spec.dtype]
+                ):
                     raise ModelValidationError(
                         "MODEL_SCHEMA_INVALID",
                         f"tensor {name} does not match the selector architecture",
                     )
-                if not np.isfinite(value).all():
-                    raise ModelValidationError("MODEL_NON_FINITE", f"tensor {name} is not finite")
-                weights[name] = np.asarray(value, dtype=np.float32)
+            for route in architecture.routes:
+                layer, head = route_indices(route)
+                for side in ("q", "k"):
+                    name = f"layers.{layer}.proj_{side}"
+                    value = tensors.get_slice(name)[head]
+                    if not np.isfinite(value).all():
+                        raise ModelValidationError(
+                            "MODEL_NON_FINITE", f"tensor {name} is not finite"
+                        )
+                    weights[f"{route}.proj_{side}"] = np.asarray(value, dtype=np.float32)
     except ModelValidationError:
         raise
     except (SafetensorError, OSError, ValueError) as exc:

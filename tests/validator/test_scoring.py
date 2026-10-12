@@ -14,6 +14,7 @@ from scoring.spec import (
     BudgetSpec,
     CacheSpec,
     ModelSpec,
+    RolloutSpec,
     ScoringSpec,
     TrackSpec,
 )
@@ -318,7 +319,7 @@ def test_repeated_infrastructure_failure_stops_without_zeroing_rank(tmp_path) ->
 
 
 def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> None:
-    architecture = SelectorArchitecture(("route0",), 6, 2, 2, "float32")
+    architecture = SelectorArchitecture(1, 1, 2, ("layer_0_head_0",), "float32")
     model_path = tmp_path / "selector.safetensors"
     save_file(
         {
@@ -335,6 +336,7 @@ def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> 
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
         cache=CacheSpec("34" * 32, 100_000, "56" * 32, 1_000_000),
+        rollout=RolloutSpec("78" * 32, "9a" * 32, 2_000_000),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
             local_sample_count=2,
@@ -360,7 +362,7 @@ def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> 
         dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
         screen_cases.append(
             ScreenCase(
-                "route0",
+                "layer_0_head_0",
                 "all",
                 trip_pool(q),
                 trip_pool(k),
@@ -368,7 +370,9 @@ def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> 
                 valid,
             )
         )
-        exact_cases.append(ExactCase("route0", "all", q, k, v, dense, valid, 1e-6))
+        exact_cases.append(
+            ExactCase("layer_0_head_0", "all", q, k, v, dense, valid, 1e-6)
+        )
 
     evaluator = TrackEvaluator(track, screen_cases, exact_cases)
     screening_task = replace(

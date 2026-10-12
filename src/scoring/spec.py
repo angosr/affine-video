@@ -53,6 +53,13 @@ class CacheSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class RolloutSpec:
+    runner_sha256: str
+    panel_sha256: str
+    panel_max_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class ScoringSpec:
     budgets: tuple[BudgetSpec, ...]
     local_sample_count: int
@@ -78,6 +85,7 @@ class TrackSpec:
     model: ModelSpec
     base_model: BaseModelSpec
     cache: CacheSpec
+    rollout: RolloutSpec
     scoring: ScoringSpec
     digest: str
 
@@ -108,6 +116,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "model",
             "base_model",
             "cache",
+            "rollout",
             "scoring",
         },
         "track specification",
@@ -124,11 +133,10 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         model_raw["selector"],
         {
             "routes",
-            "descriptor_dim",
-            "hidden_dim",
-            "projection_dim",
+            "num_layers",
+            "num_heads",
+            "head_dim",
             "storage_dtype",
-            "activation",
         },
         "selector",
     )
@@ -138,23 +146,18 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     routes = tuple(_nonempty_string(route, "selector route") for route in routes_raw)
     try:
         selector = SelectorArchitecture(
+            num_layers=_integer(selector_raw["num_layers"], "selector num_layers", minimum=1),
+            num_heads=_integer(selector_raw["num_heads"], "selector num_heads", minimum=1),
+            head_dim=_integer(selector_raw["head_dim"], "selector head_dim", minimum=1),
             routes=routes,
-            descriptor_dim=_integer(
-                selector_raw["descriptor_dim"], "selector descriptor_dim", minimum=1
-            ),
-            hidden_dim=_integer(selector_raw["hidden_dim"], "selector hidden_dim", minimum=1),
-            projection_dim=_integer(
-                selector_raw["projection_dim"], "selector projection_dim", minimum=1
-            ),
             storage_dtype=_nonempty_string(selector_raw["storage_dtype"], "selector storage_dtype"),
-            activation=_nonempty_string(selector_raw["activation"], "selector activation"),
         )
     except ValueError as exc:
         raise TrackSpecError(str(exc)) from exc
     max_model_bytes = _integer(model_raw["max_bytes"], "model max_bytes", minimum=1)
     item_size = 2 if selector.storage_dtype == "float16" else 4
     tensor_bytes = sum(prod(tensor.shape) * item_size for tensor in selector.tensor_schema.values())
-    if tensor_bytes >= max_model_bytes:
+    if tensor_bytes + 8 >= max_model_bytes:
         raise TrackSpecError("model max_bytes cannot hold the fixed selector tensors")
 
     base_raw = _object(root["base_model"], {"repo_id", "revision"}, "base_model")
@@ -169,6 +172,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         root["cache"],
         {"screen_sha256", "screen_max_bytes", "exact_sha256", "exact_max_bytes"},
         "cache",
+    )
+    rollout_raw = _object(
+        root["rollout"],
+        {"runner_sha256", "panel_sha256", "panel_max_bytes"},
+        "rollout",
     )
 
     scoring_raw = _object(
@@ -240,11 +248,10 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "max_bytes": max_model_bytes,
             "selector": {
                 "routes": list(selector.routes),
-                "descriptor_dim": selector.descriptor_dim,
-                "hidden_dim": selector.hidden_dim,
-                "projection_dim": selector.projection_dim,
+                "num_layers": selector.num_layers,
+                "num_heads": selector.num_heads,
+                "head_dim": selector.head_dim,
                 "storage_dtype": selector.storage_dtype,
-                "activation": selector.activation,
             },
         },
         "base_model": {"repo_id": repo_id, "revision": revision.lower()},
@@ -256,6 +263,13 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "exact_sha256": _digest(cache_raw["exact_sha256"], "exact cache sha256"),
             "exact_max_bytes": _integer(
                 cache_raw["exact_max_bytes"], "exact cache max bytes", minimum=1
+            ),
+        },
+        "rollout": {
+            "runner_sha256": _digest(rollout_raw["runner_sha256"], "rollout runner sha256"),
+            "panel_sha256": _digest(rollout_raw["panel_sha256"], "rollout panel sha256"),
+            "panel_max_bytes": _integer(
+                rollout_raw["panel_max_bytes"], "rollout panel max bytes", minimum=1
             ),
         },
         "scoring": {
@@ -284,6 +298,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     digest = hashlib.sha256(_canonical_json(spec_without_digest)).hexdigest()
     scoring = spec_without_digest["scoring"]
     cache = spec_without_digest["cache"]
+    rollout = spec_without_digest["rollout"]
     return TrackSpec(
         track_id=track_id,
         netuid=netuid,
@@ -300,6 +315,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             screen_max_bytes=cache["screen_max_bytes"],
             exact_sha256=cache["exact_sha256"],
             exact_max_bytes=cache["exact_max_bytes"],
+        ),
+        rollout=RolloutSpec(
+            runner_sha256=rollout["runner_sha256"],
+            panel_sha256=rollout["panel_sha256"],
+            panel_max_bytes=rollout["panel_max_bytes"],
         ),
         scoring=ScoringSpec(
             budgets=budgets,

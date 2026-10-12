@@ -80,6 +80,23 @@ def process_next_admission(
     if task is None:
         return None
 
+    reference_owner = store.earlier_reference_owner(task.challenge_id)
+    if reference_owner is not None:
+        store.complete_challenge(
+            task.challenge_id,
+            ChallengeState.PARTICIPANT_FAILED,
+            error_code="REFERENCE_DUPLICATE",
+            error_summary="repository revision duplicates an earlier active submission",
+            occurred_at_ms=now,
+            lease_token=task.lease_token,
+        )
+        return AdmissionOutcome(
+            task.challenge_id,
+            AdmissionStatus.FAILED,
+            "REFERENCE_DUPLICATE",
+            reference_owner,
+        )
+
     model_path = Path(task.model_path) if task.model_path is not None else None
     expected_file_sha256 = task.file_sha256
     if task.state is ChallengeState.FETCHING:
