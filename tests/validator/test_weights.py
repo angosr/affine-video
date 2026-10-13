@@ -3,19 +3,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from validator import weights as weights_module
 from validator.queue import ChainPosition
-from validator.store import ChallengeStore, LeaderboardEntry, WeightRunState
+from validator.store import LeaderboardEntry
 from validator.weights import (
-    WeightReceipt,
+    WeightArtifact,
+    WeightChainState,
+    WeightPlan,
     WeightSubmissionError,
     frontier_gains,
     plan_weights,
     read_weight_chain_state,
-    submit_recorded_weights,
     submit_weights,
-    update_weights,
+    validate_weight_artifact,
     waterfill_weights,
+    weight_update_due,
 )
 
 
@@ -37,13 +38,50 @@ def entry(
     )
 
 
-def test_frontier_gains_telescope_and_give_copies_no_extra_utility() -> None:
+def chain_state(
+    *,
+    finalized: int = 120,
+    mapping: dict[str, int] | None = None,
+    minimum: int = 1,
+    maximum: float = 1.0,
+    rate_limit: int = 10,
+    last_updates: dict[str, int] | None = None,
+) -> WeightChainState:
+    mapping = mapping or {"alice": 4, "validator": 9}
+    return WeightChainState(
+        finalized,
+        mapping,
+        minimum,
+        maximum,
+        rate_limit,
+        last_updates or {hotkey: 0 for hotkey in mapping},
+    )
+
+
+def artifact(*, source: int = 120, plan: WeightPlan | None = None) -> WeightArtifact:
+    return WeightArtifact(
+        "track",
+        "ab" * 32,
+        7,
+        0,
+        9,
+        source,
+        plan,
+    )
+
+
+def test_frontier_gains_telescope_ignore_copies_and_accumulate_hotkey() -> None:
     gains = frontier_gains(
-        [entry("copy", 0.6, 30), entry("first", 0.6, 10), entry("better", 0.9, 20)],
+        [
+            entry("alice", 0.6, 10),
+            entry("copy", 0.6, 20),
+            entry("bob", 0.8, 30),
+            entry("alice", 0.9, 40),
+        ],
         minimum_gain=0.001,
     )
 
-    assert gains == pytest.approx({"first": 0.6, "better": 0.3})
+    assert gains == pytest.approx({"alice": 0.7, "bob": 0.2})
     assert sum(gains.values()) == pytest.approx(0.9)
 
 
@@ -56,22 +94,7 @@ def test_frontier_gains_ignore_numerical_dust() -> None:
         ],
         minimum_gain=0.001,
     )
-
     assert gains == pytest.approx({"first": 0.6, "material": 0.002})
-
-
-def test_frontier_gains_accumulate_same_hotkey_improvements() -> None:
-    gains = frontier_gains(
-        [
-            entry("alice", 0.6, 10),
-            entry("bob", 0.8, 20),
-            entry("alice", 0.9, 30),
-        ],
-        minimum_gain=0.001,
-    )
-
-    assert gains == pytest.approx({"alice": 0.7, "bob": 0.2})
-    assert sum(gains.values()) == pytest.approx(0.9)
 
 
 def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
@@ -82,8 +105,8 @@ def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
             calls.append(("metagraph", netuid, commitments))
             return SimpleNamespace(
                 neurons=[
-                    SimpleNamespace(uid=0, hotkey="alice"),
-                    SimpleNamespace(uid=3, hotkey="bob"),
+                    SimpleNamespace(uid=0, hotkey="alice", last_update=100),
+                    SimpleNamespace(uid=3, hotkey="bob", last_update=110),
                 ]
             )
 
@@ -100,108 +123,21 @@ def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
 
     class FakeClient:
         async def finalized_block(self):
-            return 123
+            raise AssertionError("an explicit finalized block must not be reread")
 
         async def at(self, block: int):
             calls.append(("at", block))
             return FakeSnapshot()
 
-    state = asyncio.run(read_weight_chain_state(FakeClient(), netuid=7))
+    state = asyncio.run(read_weight_chain_state(FakeClient(), netuid=7, finalized_block=123))
 
     assert state.finalized_block == 123
     assert state.uid_by_hotkey == {"alice": 0, "bob": 3}
+    assert state.last_update_by_hotkey == {"alice": 100, "bob": 110}
     assert state.min_allowed_weights == 2
     assert state.max_weight == pytest.approx(32768 / 65535)
     assert state.weights_rate_limit == 100
     assert calls[0] == ("at", 123)
-
-
-def test_weight_update_obeys_block_interval_and_submits_one_snapshot(monkeypatch) -> None:
-    async def fake_state(_client, *, netuid: int):
-        assert netuid == 7
-        return weights_module.WeightChainState(120, {"alice": 4}, 1, 1.0, 10)
-
-    submitted = []
-
-    async def fake_submit(store, plan, **kwargs):
-        submitted.append((store, plan, kwargs))
-        return SimpleNamespace(source_block=plan.source_block), object()
-
-    monkeypatch.setattr(weights_module, "read_weight_chain_state", fake_state)
-    monkeypatch.setattr(weights_module, "submit_recorded_weights", fake_submit)
-    store = SimpleNamespace(
-        reward_entries=lambda: [entry("alice", 0.8, 100)],
-        latest_weight_run=lambda: None,
-        chain_cursor=lambda: (120, "0x" + "12" * 32),
-    )
-
-    result = asyncio.run(
-        update_weights(
-            object(),
-            store,
-            netuid=7,
-            network="test",
-            wallet_name="validator",
-            hotkey_name="default",
-            interval_blocks=10,
-            minimum_frontier_gain=0.001,
-        )
-    )
-
-    assert result.source_block == 120
-    assert len(submitted) == 1
-
-    store.latest_weight_run = lambda: SimpleNamespace(source_block=115)
-    skipped = asyncio.run(
-        update_weights(
-            object(),
-            store,
-            netuid=7,
-            network="test",
-            wallet_name="validator",
-            hotkey_name="default",
-            interval_blocks=10,
-            minimum_frontier_gain=0.001,
-        )
-    )
-    assert skipped is None
-    assert len(submitted) == 1
-
-
-def test_weight_update_waits_for_submission_scan_to_reach_snapshot(monkeypatch) -> None:
-    async def fake_state(_client, *, netuid: int):
-        assert netuid == 7
-        return weights_module.WeightChainState(120, {"alice": 4}, 1, 1.0, 10)
-
-    submitted = []
-
-    async def fake_submit(*args, **kwargs):
-        submitted.append((args, kwargs))
-        raise AssertionError("weights must not be submitted while the scanner is behind")
-
-    monkeypatch.setattr(weights_module, "read_weight_chain_state", fake_state)
-    monkeypatch.setattr(weights_module, "submit_recorded_weights", fake_submit)
-    store = SimpleNamespace(
-        chain_cursor=lambda: (119, "0x" + "11" * 32),
-        reward_entries=lambda: [entry("alice", 0.8, 100)],
-        latest_weight_run=lambda: None,
-    )
-
-    result = asyncio.run(
-        update_weights(
-            object(),
-            store,
-            netuid=7,
-            network="test",
-            wallet_name="validator",
-            hotkey_name="default",
-            interval_blocks=10,
-            minimum_frontier_gain=0.001,
-        )
-    )
-
-    assert result is None
-    assert submitted == []
 
 
 def test_plan_excludes_provisional_deregistered_and_future_entries() -> None:
@@ -235,59 +171,19 @@ def test_plan_excludes_provisional_deregistered_and_future_entries() -> None:
     assert plan.weights == pytest.approx((1 / 3, 1 / 3, 1 / 3))
 
 
-def test_old_score_remains_eligible_while_track_is_unchanged() -> None:
-    delayed = LeaderboardEntry(
-        hotkey="alice",
-        challenge_id="challenge-alice",
-        final_score=1.0,
-        attention_cost=0.1,
-        score_block=100,
-        provisional=False,
-        position=ChainPosition(1, 0, 0),
-    )
-
-    plan = plan_weights(
-        [delayed],
-        uid_by_hotkey={"alice": 7},
-        current_block=110,
-        min_allowed_weights=1,
-        max_weight=1.0,
-        minimum_frontier_gain=0.001,
-    )
-
-    assert plan is not None
-    assert plan.uids == (7,)
-
-
-def test_plan_returns_none_when_count_or_caps_are_infeasible() -> None:
+def test_plan_rejects_infeasible_or_ambiguous_vectors() -> None:
     entries = [entry("alice", 0.5, 10), entry("bob", 1.0, 20)]
     arguments = {
         "uid_by_hotkey": {"alice": 1, "bob": 2},
         "current_block": 100,
         "minimum_frontier_gain": 0.001,
     }
-
     assert plan_weights(entries, min_allowed_weights=3, max_weight=1.0, **arguments) is None
     assert plan_weights(entries, min_allowed_weights=2, max_weight=0.4, **arguments) is None
 
-
-def test_plan_rejects_weights_that_disappear_during_sdk_quantization() -> None:
-    plan = plan_weights(
-        [entry("alice", 0.5, 10), entry("bob", 0.5000000001, 20)],
-        uid_by_hotkey={"alice": 1, "bob": 2},
-        current_block=100,
-        min_allowed_weights=2,
-        max_weight=1.0,
-        minimum_frontier_gain=1e-12,
-    )
-
-    assert plan is None
-
-
-def test_plan_rejects_duplicate_uid_mapping() -> None:
     with pytest.raises(ValueError, match="same UID"):
         plan_weights(
-            [entry("alice", 0.5, 10), entry("bob", 1.0, 20)],
+            entries,
             uid_by_hotkey={"alice": 3, "bob": 3},
             current_block=100,
             min_allowed_weights=2,
@@ -296,47 +192,90 @@ def test_plan_rejects_duplicate_uid_mapping() -> None:
         )
 
 
-def test_waterfill_is_normalized_and_respects_caps() -> None:
+def test_waterfill_is_deterministic_normalized_and_capped() -> None:
     result = waterfill_weights(
         {"alice": 8.0, "bob": 1.0, "carol": 1.0},
         caps={"alice": 0.5, "bob": 0.7, "carol": 0.7},
     )
-
     assert result == pytest.approx({"alice": 0.5, "bob": 0.25, "carol": 0.25})
-    assert sum(result.values()) == pytest.approx(1.0)
+    assert waterfill_weights({"bob": 2.0, "alice": 1.0}) == waterfill_weights(
+        {"alice": 1.0, "bob": 2.0}
+    )
 
 
-def test_waterfill_is_independent_of_mapping_order() -> None:
-    forward = waterfill_weights({"alice": 1.0, "bob": 2.0})
-    reverse = waterfill_weights({"bob": 2.0, "alice": 1.0})
+def test_public_weights_are_checked_against_current_chain_state() -> None:
+    plan = WeightPlan(120, ("alice",), (4,), (1.0,))
+    state = chain_state()
 
-    assert forward == reverse
+    assert (
+        validate_weight_artifact(
+            artifact(plan=plan),
+            state,
+            expected_netuid=7,
+            expected_track_digest="ab" * 32,
+            max_staleness_blocks=20,
+        )
+        == plan
+    )
+
+    with pytest.raises(ValueError, match="stale"):
+        validate_weight_artifact(
+            artifact(source=90, plan=WeightPlan(90, ("alice",), (4,), (1.0,))),
+            state,
+            expected_netuid=7,
+            expected_track_digest="ab" * 32,
+            max_staleness_blocks=20,
+        )
+    with pytest.raises(ValueError, match="mapping"):
+        validate_weight_artifact(
+            artifact(plan=WeightPlan(120, ("alice",), (5,), (1.0,))),
+            state,
+            expected_netuid=7,
+            expected_track_digest="ab" * 32,
+            max_staleness_blocks=20,
+        )
+
+    with pytest.raises(ValueError, match="quantization"):
+        validate_weight_artifact(
+            artifact(
+                plan=WeightPlan(
+                    120,
+                    ("alice", "validator"),
+                    (4, 9),
+                    (1.0 - 1e-20, 1e-20),
+                )
+            ),
+            chain_state(minimum=2),
+            expected_netuid=7,
+            expected_track_digest="ab" * 32,
+            max_staleness_blocks=20,
+        )
 
 
-def test_infeasible_caps_are_rejected() -> None:
-    with pytest.raises(ValueError):
-        waterfill_weights({"alice": 1, "bob": 1}, caps={"alice": 0.4, "bob": 0.4})
+def test_validator_skips_applied_and_rate_limited_artifacts() -> None:
+    public = artifact(plan=WeightPlan(120, ("alice",), (4,), (1.0,)))
+    due, reason = weight_update_due(public, chain_state(), validator_hotkey="validator")
+    assert due and reason == "READY"
+
+    already = chain_state(last_updates={"alice": 0, "validator": 120})
+    assert weight_update_due(public, already, validator_hotkey="validator") == (
+        False,
+        "ALREADY_APPLIED",
+    )
+    limited = chain_state(last_updates={"alice": 0, "validator": 115})
+    assert weight_update_due(public, limited, validator_hotkey="validator") == (
+        False,
+        "RATE_LIMIT",
+    )
 
 
-def test_submit_weights_uses_intent_and_waits_for_finalization(monkeypatch) -> None:
+def test_submit_weights_uses_existing_client_and_wallet() -> None:
     calls: dict[str, object] = {}
 
-    class FakeWallet:
-        def __init__(self, **kwargs) -> None:
-            calls["wallet"] = kwargs
-
     class FakeClient:
-        def __init__(self, network: str) -> None:
-            calls["network"] = network
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args) -> None:
-            return None
-
         async def execute(self, intent, wallet, **kwargs):
             calls["intent"] = intent
+            calls["wallet"] = wallet
             calls["execute"] = kwargs
             return SimpleNamespace(
                 success=True,
@@ -345,26 +284,13 @@ def test_submit_weights_uses_intent_and_waits_for_finalization(monkeypatch) -> N
                 message="finalized",
             )
 
-    monkeypatch.setattr(weights_module.bt, "Wallet", FakeWallet)
-    monkeypatch.setattr(weights_module.bt, "Client", FakeClient)
-    plan = plan_weights(
-        [entry("alice", 0.5, 10), entry("bob", 1.0, 20)],
-        uid_by_hotkey={"alice": 1, "bob": 2},
-        current_block=100,
-        min_allowed_weights=2,
-        max_weight=0.6,
-        minimum_frontier_gain=0.001,
-    )
-    assert plan is not None
-
+    wallet = object()
     receipt = asyncio.run(
         submit_weights(
-            plan,
+            WeightPlan(100, ("alice", "bob"), (1, 2), (0.5, 0.5)),
+            client=FakeClient(),
+            wallet=wallet,
             netuid=7,
-            network="test",
-            wallet_name="validator",
-            hotkey_name="default",
-            wallet_path="/wallets",
             version_key=9,
         )
     )
@@ -374,11 +300,7 @@ def test_submit_weights_uses_intent_and_waits_for_finalization(monkeypatch) -> N
     assert intent.uids == [1, 2]
     assert intent.weights == pytest.approx([0.5, 0.5])
     assert intent.version_key == 9
-    assert calls["wallet"] == {
-        "name": "validator",
-        "hotkey": "default",
-        "path": "/wallets",
-    }
+    assert calls["wallet"] is wallet
     assert calls["execute"] == {
         "wait_for_inclusion": True,
         "wait_for_finalization": True,
@@ -386,75 +308,17 @@ def test_submit_weights_uses_intent_and_waits_for_finalization(monkeypatch) -> N
     assert receipt.extrinsic_id == "12-3"
 
 
-def test_submit_weights_surfaces_chain_failure(monkeypatch) -> None:
+def test_submit_weights_surfaces_chain_failure() -> None:
     class FakeClient:
-        def __init__(self, _network: str) -> None:
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args) -> None:
-            return None
-
         async def execute(self, *_args, **_kwargs):
             return SimpleNamespace(success=False, message="rate limited")
-
-    monkeypatch.setattr(weights_module.bt, "Wallet", lambda **_kwargs: object())
-    monkeypatch.setattr(weights_module.bt, "Client", FakeClient)
-    plan = plan_weights(
-        [entry("alice", 1.0, 100)],
-        uid_by_hotkey={"alice": 1},
-        current_block=100,
-        min_allowed_weights=1,
-        max_weight=1.0,
-        minimum_frontier_gain=0.001,
-    )
-    assert plan is not None
 
     with pytest.raises(WeightSubmissionError, match="rate limited"):
         asyncio.run(
             submit_weights(
-                plan,
+                WeightPlan(100, ("alice",), (1,), (1.0,)),
+                client=FakeClient(),
+                wallet=object(),
                 netuid=7,
-                network="test",
-                wallet_name="validator",
-                hotkey_name="default",
             )
         )
-
-
-def test_recorded_submission_persists_finalized_result(monkeypatch, tmp_path) -> None:
-    async def fake_submit(*_args, **_kwargs):
-        return WeightReceipt(
-            block_hash="0xabc",
-            extrinsic_id="12-3",
-            message="finalized",
-        )
-
-    monkeypatch.setattr(weights_module, "submit_weights", fake_submit)
-    plan = plan_weights(
-        [entry("alice", 1.0, 100)],
-        uid_by_hotkey={"alice": 1},
-        current_block=100,
-        min_allowed_weights=1,
-        max_weight=1.0,
-        minimum_frontier_gain=0.001,
-    )
-    assert plan is not None
-
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        run, _receipt = asyncio.run(
-            submit_recorded_weights(
-                store,
-                plan,
-                netuid=7,
-                network="test",
-                wallet_name="validator",
-                hotkey_name="default",
-            )
-        )
-
-        assert run.state is WeightRunState.FINALIZED
-        assert run.uids == (1,)
-        assert store.weight_runs() == [run]

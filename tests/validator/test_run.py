@@ -1,19 +1,29 @@
 import asyncio
 import hashlib
+from types import SimpleNamespace
 
+import httpx
 import numpy as np
 import pytest
 from safetensors.numpy import save_file
 
 from miner.submit import ModelSubmission
 from scoring.model import TensorSpec
+from validator import run as run_module
 from validator.admission import AdmissionSettings, AdmissionStatus
 from validator.download import DownloadedModel
+from validator.publication import encode_weight_artifact
 from validator.queue import ChallengeState
-from validator.run import process_cycle, run_validator
+from validator.run import process_cycle, process_weight_cycle
 from validator.scoring import ScoringSettings, StageOutcome
 from validator.store import ChallengeStore
-from validator.weights import plan_weights
+from validator.weights import (
+    WeightArtifact,
+    WeightChainState,
+    WeightPlan,
+    WeightReceipt,
+    plan_weights,
+)
 
 from .test_chain import HOTKEY, FakeClient, chain_block
 
@@ -22,14 +32,68 @@ def empty_chain_block(block_height: int) -> tuple[str, dict, list[dict]]:
     return "0x" + f"{block_height:064x}", {"extrinsics": []}, []
 
 
+def test_independent_validator_fetches_checks_and_submits_public_weights(monkeypatch) -> None:
+    artifact = WeightArtifact(
+        "track",
+        "ab" * 32,
+        7,
+        2,
+        9,
+        120,
+        WeightPlan(120, ("alice",), (4,), (1.0,)),
+    )
+    chain = WeightChainState(
+        120,
+        {"alice": 4, "validator": 8},
+        1,
+        1.0,
+        10,
+        {"alice": 0, "validator": 100},
+    )
+    submitted = {}
+
+    async def read_state(_client, *, netuid: int):
+        assert netuid == 7
+        return chain
+
+    async def submit(plan, **kwargs):
+        submitted["plan"] = plan
+        submitted.update(kwargs)
+        return WeightReceipt("0xabc", "120-1", "finalized")
+
+    monkeypatch.setattr(run_module, "read_weight_chain_state", read_state)
+    monkeypatch.setattr(run_module, "submit_weights", submit)
+
+    async def execute():
+        transport = httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=encode_weight_artifact(artifact))
+        )
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            return await process_weight_cycle(
+                object(),
+                http_client,
+                SimpleNamespace(name="wallet"),
+                validator_hotkey="validator",
+                public_weights_url="https://public.example/weights.json",
+                netuid=7,
+                track_spec_digest="ab" * 32,
+                max_staleness_blocks=20,
+            )
+
+    result = asyncio.run(execute())
+    assert result.status == "SUBMITTED"
+    assert result.receipt is not None and result.receipt.extrinsic_id == "120-1"
+    assert submitted["plan"] == artifact.plan
+    assert submitted["mechid"] == 2
+    assert submitted["version_key"] == 9
+
+
 def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
     model_path = tmp_path / "selector.safetensors"
     save_file({"selector.weight": np.ones((2, 3), dtype=np.float32)}, model_path)
     file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     payload = ModelSubmission("owner/model", "12" * 20).encode()
-    client = FakeClient(
-        {100: chain_block(payload, 100), 101: empty_chain_block(101)}
-    )
+    client = FakeClient({100: chain_block(payload, 100), 101: empty_chain_block(101)})
 
     def download(*_args, **_kwargs):
         return DownloadedModel(model_path, file_digest, model_path.stat().st_size, None, None)
@@ -76,9 +140,7 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
     save_file({"selector.weight": np.ones((2, 3), dtype=np.float32)}, model_path)
     file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     payload = ModelSubmission("owner/model", "12" * 20).encode()
-    client = FakeClient(
-        {100: chain_block(payload, 100), 101: empty_chain_block(101)}
-    )
+    client = FakeClient({100: chain_block(payload, 100), 101: empty_chain_block(101)})
     database = tmp_path / "validator.db"
     downloads = 0
 
@@ -162,23 +224,3 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
     assert plan.hotkeys == (HOTKEY,)
     assert plan.uids == (4,)
     assert plan.weights == (1.0,)
-
-
-def test_weight_submission_requires_authoritative_rollout_configuration(tmp_path) -> None:
-    arguments = {
-        "track_spec": tmp_path / "missing-track.json",
-        "database": tmp_path / "validator.db",
-        "model_cache": tmp_path / "models",
-        "screen_cache": tmp_path / "screen.npz",
-        "exact_cache": tmp_path / "exact.npz",
-        "rollout_runner": None,
-        "rollout_panel": None,
-        "network": "test",
-        "archive_endpoints": None,
-        "worker_id": "validator",
-        "submit_chain_weights": True,
-        "once": True,
-    }
-
-    with pytest.raises(ValueError, match="require an authoritative rollout"):
-        asyncio.run(run_validator(**arguments))

@@ -8,7 +8,6 @@ import sqlite3
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -125,29 +124,6 @@ class ModelRegistration:
     duplicate_of: str | None
 
 
-class WeightRunState(StrEnum):
-    PLANNED = "PLANNED"
-    FINALIZED = "FINALIZED"
-    FAILED = "FAILED"
-
-
-@dataclass(frozen=True, slots=True)
-class WeightRun:
-    run_id: str
-    netuid: int
-    mechid: int
-    source_block: int
-    hotkeys: tuple[str, ...]
-    uids: tuple[int, ...]
-    weights: tuple[float, ...]
-    state: WeightRunState
-    extrinsic_id: str | None
-    block_hash: str | None
-    message: str | None
-    created_at_ms: int
-    updated_at_ms: int
-
-
 class ChallengeStore:
     """Small SQLite boundary used only by the validator process."""
 
@@ -157,9 +133,7 @@ class ChallengeStore:
         *,
         track_spec_digest: str | None = None,
     ) -> None:
-        self._connection = sqlite3.connect(
-            Path(path), timeout=_SQLITE_BUSY_TIMEOUT_MS / 1_000
-        )
+        self._connection = sqlite3.connect(Path(path), timeout=_SQLITE_BUSY_TIMEOUT_MS / 1_000)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
         self._connection.execute("PRAGMA foreign_keys = ON")
@@ -290,29 +264,10 @@ class ChallengeStore:
                 challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id)
             );
 
-            CREATE TABLE IF NOT EXISTS weight_runs (
-                run_id TEXT PRIMARY KEY,
-                netuid INTEGER NOT NULL,
-                mechid INTEGER NOT NULL,
-                source_block INTEGER NOT NULL,
-                hotkeys_json TEXT NOT NULL,
-                uids_json TEXT NOT NULL,
-                weights_json TEXT NOT NULL,
-                state TEXT NOT NULL CHECK (state IN ('PLANNED', 'FINALIZED', 'FAILED')),
-                extrinsic_id TEXT,
-                block_hash TEXT,
-                message TEXT,
-                created_at_ms INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL,
-                UNIQUE (netuid, mechid, source_block)
-            );
-
             CREATE INDEX IF NOT EXISTS submissions_chain_order
                 ON submissions (block_height, extrinsic_index, event_index);
             CREATE INDEX IF NOT EXISTS challenges_state_order
                 ON challenges (state, created_at_ms);
-            CREATE INDEX IF NOT EXISTS weight_runs_created ON weight_runs (created_at_ms);
-
             COMMIT;
             """
         )
@@ -333,9 +288,7 @@ class ChallengeStore:
                 "SELECT value FROM store_metadata WHERE key = 'track_spec_digest'"
             ).fetchone()
             if row is not None and row["value"] != normalized:
-                raise RuntimeError(
-                    "database is already bound to a different track specification"
-                )
+                raise RuntimeError("database is already bound to a different track specification")
             if row is None:
                 self._connection.execute(
                     "INSERT INTO store_metadata (key, value) VALUES ('track_spec_digest', ?)",
@@ -1021,9 +974,7 @@ class ChallengeStore:
             raise
         return True
 
-    def stage_score(
-        self, identifier: str, stage: ChallengeState
-    ) -> RecordedStageScore | None:
+    def stage_score(self, identifier: str, stage: ChallengeState) -> RecordedStageScore | None:
         """Return a durable stage result left before its state transition."""
 
         row = self._connection.execute(
@@ -1376,158 +1327,24 @@ class ChallengeStore:
             for row in rows
         ]
 
-    def create_weight_run(
-        self,
-        *,
-        netuid: int,
-        mechid: int,
-        source_block: int,
-        hotkeys: tuple[str, ...],
-        uids: tuple[int, ...],
-        weights: tuple[float, ...],
-        occurred_at_ms: int | None = None,
-    ) -> WeightRun:
-        """Persist one exact vector before attempting its chain transaction."""
-
-        size = len(hotkeys)
-        if netuid < 0 or netuid > 0xFFFF or mechid < 0 or source_block < 0:
-            raise ValueError("weight run chain identifiers are invalid")
-        if size == 0 or len(uids) != size or len(weights) != size:
-            raise ValueError("weight run vector must be non-empty and aligned")
-        if len(set(hotkeys)) != size or len(set(uids)) != size:
-            raise ValueError("weight run hotkeys and UIDs must be unique")
-        if any(uid < 0 or uid > 0xFFFF for uid in uids):
-            raise ValueError("weight run UIDs are invalid")
-        if any(not isfinite(weight) or weight <= 0 for weight in weights):
-            raise ValueError("weight run values must be finite and positive")
-        if abs(sum(weights) - 1.0) > 1e-12:
-            raise ValueError("weight run values must sum to one")
-
-        timestamp = _timestamp(occurred_at_ms)
-        identifier = secrets.token_hex(16)
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            existing = self._connection.execute(
-                """
-                SELECT run_id FROM weight_runs
-                WHERE netuid = ? AND mechid = ? AND source_block = ?
-                """,
-                (netuid, mechid, source_block),
-            ).fetchone()
-            if existing is not None:
-                raise RuntimeError("weight snapshot already has a transaction attempt")
-            self._connection.execute(
-                """
-                INSERT INTO weight_runs (
-                    run_id, netuid, mechid, source_block, hotkeys_json, uids_json,
-                    weights_json, state, created_at_ms, updated_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    identifier,
-                    netuid,
-                    mechid,
-                    source_block,
-                    json.dumps(hotkeys, separators=(",", ":")),
-                    json.dumps(uids, separators=(",", ":")),
-                    json.dumps(weights, separators=(",", ":")),
-                    WeightRunState.PLANNED,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            self._connection.commit()
-        except Exception:
-            self._connection.rollback()
-            raise
-        return self.weight_run(identifier)
-
-    def finalize_weight_run(
-        self,
-        identifier: str,
-        *,
-        extrinsic_id: str,
-        block_hash: str,
-        message: str,
-        occurred_at_ms: int | None = None,
-    ) -> WeightRun:
-        """Record the successful finalization returned by the chain SDK."""
-
-        if not extrinsic_id or not block_hash:
-            raise ValueError("finalized weight run requires chain identifiers")
-        return self._finish_weight_run(
-            identifier,
-            state=WeightRunState.FINALIZED,
-            extrinsic_id=extrinsic_id,
-            block_hash=block_hash,
-            message=message,
-            occurred_at_ms=occurred_at_ms,
-        )
-
-    def fail_weight_run(
-        self,
-        identifier: str,
-        *,
-        message: str,
-        occurred_at_ms: int | None = None,
-    ) -> WeightRun:
-        """Record a rejected or interrupted transaction attempt."""
-
-        if not message:
-            raise ValueError("failed weight run requires a message")
-        return self._finish_weight_run(
-            identifier,
-            state=WeightRunState.FAILED,
-            extrinsic_id=None,
-            block_hash=None,
-            message=message,
-            occurred_at_ms=occurred_at_ms,
-        )
-
-    def weight_run(self, identifier: str) -> WeightRun:
-        row = self._connection.execute(
-            "SELECT * FROM weight_runs WHERE run_id = ?", (identifier,)
-        ).fetchone()
-        if row is None:
-            raise KeyError(identifier)
-        return _weight_run(row)
-
-    def weight_runs(self) -> list[WeightRun]:
-        rows = self._connection.execute(
-            "SELECT * FROM weight_runs ORDER BY created_at_ms, run_id"
-        ).fetchall()
-        return [_weight_run(row) for row in rows]
-
-    def latest_weight_run(self) -> WeightRun | None:
-        row = self._connection.execute(
-            """
-            SELECT * FROM weight_runs
-            ORDER BY source_block DESC, created_at_ms DESC, run_id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        return _weight_run(row) if row is not None else None
-
     def public_snapshot(self) -> dict[str, Any]:
         """Return the fixed public allowlist from one SQLite read transaction."""
 
+        snapshot, _ = self.public_snapshot_inputs()
+        return snapshot
+
+    def public_snapshot_inputs(self) -> tuple[dict[str, Any], list[LeaderboardEntry]]:
+        """Return one public snapshot and its exact weight-planning inputs."""
+
         self._connection.execute("BEGIN")
         try:
+            leaderboard_entries = self.leaderboard()
+            reward_entries = self.reward_entries()
             leaderboard = [
-                {
-                    "rank": rank,
-                    "hotkey": entry.hotkey,
-                    "challenge_id": entry.challenge_id,
-                    "final_score": entry.final_score,
-                    "attention_cost": entry.attention_cost,
-                    "score_block": entry.score_block,
-                    "provisional": entry.provisional,
-                    "block_height": entry.position.block,
-                    "extrinsic_index": entry.position.extrinsic_index,
-                    "event_index": entry.position.event_index,
-                }
-                for rank, entry in enumerate(self.leaderboard(), start=1)
+                {"rank": rank, **_public_entry(entry)}
+                for rank, entry in enumerate(leaderboard_entries, start=1)
             ]
+            rewards = [_public_entry(entry) for entry in reward_entries]
             challenge_rows = self._connection.execute(
                 """
                 SELECT c.challenge_id, c.submission_id, c.state,
@@ -1549,42 +1366,11 @@ class ChallengeStore:
         except Exception:
             self._connection.rollback()
             raise
-        return {"leaderboard": leaderboard, "challenges": challenges}
-
-    def _finish_weight_run(
-        self,
-        identifier: str,
-        *,
-        state: WeightRunState,
-        extrinsic_id: str | None,
-        block_hash: str | None,
-        message: str,
-        occurred_at_ms: int | None,
-    ) -> WeightRun:
-        timestamp = _timestamp(occurred_at_ms)
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._connection.execute(
-                "SELECT state FROM weight_runs WHERE run_id = ?", (identifier,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(identifier)
-            if WeightRunState(row["state"]) is not WeightRunState.PLANNED:
-                raise RuntimeError("weight run is already terminal")
-            self._connection.execute(
-                """
-                UPDATE weight_runs
-                SET state = ?, extrinsic_id = ?, block_hash = ?, message = ?,
-                    updated_at_ms = ?
-                WHERE run_id = ?
-                """,
-                (state, extrinsic_id, block_hash, message, timestamp, identifier),
-            )
-            self._connection.commit()
-        except Exception:
-            self._connection.rollback()
-            raise
-        return self.weight_run(identifier)
+        return {
+            "leaderboard": leaderboard,
+            "rewards": rewards,
+            "challenges": challenges,
+        }, reward_entries
 
     def public_challenge(self, identifier: str) -> dict[str, Any]:
         """Return one public challenge record and its state history."""
@@ -1979,22 +1765,18 @@ def _block_hash(value: str) -> str:
     return "0x" + raw.hex()
 
 
-def _weight_run(row: sqlite3.Row) -> WeightRun:
-    return WeightRun(
-        run_id=row["run_id"],
-        netuid=row["netuid"],
-        mechid=row["mechid"],
-        source_block=row["source_block"],
-        hotkeys=tuple(json.loads(row["hotkeys_json"])),
-        uids=tuple(json.loads(row["uids_json"])),
-        weights=tuple(json.loads(row["weights_json"])),
-        state=WeightRunState(row["state"]),
-        extrinsic_id=row["extrinsic_id"],
-        block_hash=row["block_hash"],
-        message=row["message"],
-        created_at_ms=row["created_at_ms"],
-        updated_at_ms=row["updated_at_ms"],
-    )
+def _public_entry(entry: LeaderboardEntry) -> dict[str, Any]:
+    return {
+        "hotkey": entry.hotkey,
+        "challenge_id": entry.challenge_id,
+        "final_score": entry.final_score,
+        "attention_cost": entry.attention_cost,
+        "score_block": entry.score_block,
+        "provisional": entry.provisional,
+        "block_height": entry.position.block,
+        "extrinsic_index": entry.position.extrinsic_index,
+        "event_index": entry.position.event_index,
+    }
 
 
 def _json(value: Mapping[str, Any]) -> str:

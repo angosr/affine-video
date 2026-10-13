@@ -157,17 +157,22 @@ def test_validator_query_does_not_create_a_missing_database(tmp_path, capsys) ->
     assert not database.exists()
 
 
-def test_validator_run_forwards_explicit_runtime_paths(monkeypatch, tmp_path) -> None:
+def test_evaluator_forwards_runtime_and_r2_configuration(monkeypatch, tmp_path) -> None:
     called = {}
 
     async def fake_run(**kwargs):
         called.update(kwargs)
 
-    monkeypatch.setattr(cli_module, "run_validator", fake_run)
+    monkeypatch.setattr(cli_module, "run_evaluator", fake_run)
+    monkeypatch.setattr(
+        cli_module.R2Publisher,
+        "from_environment",
+        lambda **kwargs: called.setdefault("r2", kwargs),
+    )
     main(
         [
             "validator",
-            "run",
+            "evaluate",
             "--track-spec",
             str(tmp_path / "track.json"),
             "--database",
@@ -186,6 +191,12 @@ def test_validator_run_forwards_explicit_runtime_paths(monkeypatch, tmp_path) ->
             "wss://archive-1.example",
             "--archive-endpoint",
             "wss://archive-2.example",
+            "--r2-account-id",
+            "account",
+            "--r2-bucket",
+            "public-data",
+            "--r2-prefix",
+            "veda/track",
             "--once",
         ]
     )
@@ -194,7 +205,45 @@ def test_validator_run_forwards_explicit_runtime_paths(monkeypatch, tmp_path) ->
     assert called["network"] == "finney"
     assert called["rollout_runner"] == str(tmp_path / "rollout")
     assert called["rollout_panel"] == str(tmp_path / "panel.json")
+    assert called["publisher"] == {
+        "account_id": "account",
+        "bucket": "public-data",
+        "prefix": "veda/track",
+    }
     assert called["archive_endpoints"] == [
         "wss://archive-1.example",
         "wss://archive-2.example",
     ]
+
+
+def test_validator_run_only_requires_public_weights_and_wallet(monkeypatch) -> None:
+    called = {}
+
+    async def fake_run(**kwargs):
+        called.update(kwargs)
+
+    monkeypatch.setattr(cli_module, "run_validator", fake_run)
+    main(
+        [
+            "validator",
+            "run",
+            "--public-weights-url",
+            "https://public.example/veda/weights.json",
+            "--netuid",
+            "7",
+            "--track-spec-digest",
+            "ab" * 32,
+            "--wallet-name",
+            "validator",
+            "--hotkey",
+            "default",
+            "--once",
+        ]
+    )
+
+    assert called["public_weights_url"] == "https://public.example/veda/weights.json"
+    assert called["netuid"] == 7
+    assert called["track_spec_digest"] == "ab" * 32
+    assert called["wallet_name"] == "validator"
+    assert called["hotkey_name"] == "default"
+    assert called["once"] is True

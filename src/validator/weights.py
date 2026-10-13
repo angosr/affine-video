@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from math import isfinite
@@ -11,7 +12,9 @@ from typing import Any
 import bittensor as bt
 from bittensor.intents import normalize as normalize_weights
 
-from validator.store import ChallengeStore, LeaderboardEntry, WeightRun
+from validator.store import LeaderboardEntry
+
+_HEX_32 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class WeightSubmissionError(RuntimeError):
@@ -46,6 +49,31 @@ class WeightPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class WeightArtifact:
+    """One public recommendation produced by the evaluation owner."""
+
+    track_id: str
+    track_spec_digest: str
+    netuid: int
+    mechid: int
+    version_key: int
+    source_block: int
+    plan: WeightPlan | None
+
+    def __post_init__(self) -> None:
+        if not self.track_id:
+            raise ValueError("track ID cannot be empty")
+        if not _HEX_32.fullmatch(self.track_spec_digest):
+            raise ValueError("track specification digest is invalid")
+        if not 0 <= self.netuid <= 0xFFFF:
+            raise ValueError("netuid must fit in an unsigned 16-bit integer")
+        if min(self.mechid, self.version_key, self.source_block) < 0:
+            raise ValueError("weight artifact chain values must be non-negative")
+        if self.plan is not None and self.plan.source_block != self.source_block:
+            raise ValueError("weight plan source block does not match its artifact")
+
+
+@dataclass(frozen=True, slots=True)
 class WeightReceipt:
     block_hash: str
     extrinsic_id: str
@@ -59,14 +87,22 @@ class WeightChainState:
     min_allowed_weights: int
     max_weight: float
     weights_rate_limit: int
+    last_update_by_hotkey: Mapping[str, int]
 
 
-async def read_weight_chain_state(client: Any, *, netuid: int) -> WeightChainState:
+async def read_weight_chain_state(
+    client: Any,
+    *,
+    netuid: int,
+    finalized_block: int | None = None,
+) -> WeightChainState:
     """Read all planning inputs from one finalized chain snapshot."""
 
     if netuid < 0 or netuid > 0xFFFF:
         raise ValueError("netuid must fit in an unsigned 16-bit integer")
-    finalized = await client.finalized_block()
+    finalized = await client.finalized_block() if finalized_block is None else finalized_block
+    if finalized < 0:
+        raise ValueError("finalized block must be non-negative")
     snapshot = await client.at(finalized)
     graph, minimum, maximum_raw, rate_limit = await asyncio.gather(
         snapshot.subnets.metagraph(netuid, commitments=False),
@@ -84,17 +120,22 @@ async def read_weight_chain_state(client: Any, *, netuid: int) -> WeightChainSta
         raise RuntimeError("chain returned an invalid weights_rate_limit value")
 
     uid_by_hotkey: dict[str, int] = {}
+    last_update_by_hotkey: dict[str, int] = {}
     seen_uids: set[int] = set()
     for neuron in graph.neurons:
         hotkey = neuron.hotkey
         uid = neuron.uid
+        last_update = neuron.last_update
         if not isinstance(hotkey, str) or not hotkey:
             raise RuntimeError("metagraph contains an invalid hotkey")
         if type(uid) is not int or not 0 <= uid <= 0xFFFF:
             raise RuntimeError("metagraph contains an invalid UID")
         if hotkey in uid_by_hotkey or uid in seen_uids:
             raise RuntimeError("metagraph hotkey and UID mapping is not unique")
+        if type(last_update) is not int or last_update < 0 or last_update > finalized:
+            raise RuntimeError("metagraph contains an invalid last-update block")
         uid_by_hotkey[hotkey] = uid
+        last_update_by_hotkey[hotkey] = last_update
         seen_uids.add(uid)
     return WeightChainState(
         finalized_block=finalized,
@@ -102,12 +143,11 @@ async def read_weight_chain_state(client: Any, *, netuid: int) -> WeightChainSta
         min_allowed_weights=minimum,
         max_weight=maximum_raw / 0xFFFF,
         weights_rate_limit=rate_limit,
+        last_update_by_hotkey=last_update_by_hotkey,
     )
 
 
-def frontier_gains(
-    entries: Iterable[LeaderboardEntry], *, minimum_gain: float
-) -> dict[str, float]:
+def frontier_gains(entries: Iterable[LeaderboardEntry], *, minimum_gain: float) -> dict[str, float]:
     """Credit only score improvements over earlier on-chain submissions.
 
     Gains telescope to the best score, so copied or Sybil-split models cannot
@@ -191,11 +231,9 @@ def plan_weights(
 async def submit_weights(
     plan: WeightPlan,
     *,
+    client: Any,
+    wallet: Any,
     netuid: int,
-    network: str,
-    wallet_name: str,
-    hotkey_name: str,
-    wallet_path: str | None = None,
     mechid: int = 0,
     version_key: int = 0,
 ) -> WeightReceipt:
@@ -203,15 +241,9 @@ async def submit_weights(
 
     if netuid < 0 or netuid > 0xFFFF:
         raise ValueError("netuid must fit in an unsigned 16-bit integer")
-    if not network:
-        raise ValueError("network cannot be empty")
     if mechid < 0 or version_key < 0:
         raise ValueError("mechanism and version identifiers must be non-negative")
 
-    wallet_arguments = {"name": wallet_name, "hotkey": hotkey_name}
-    if wallet_path is not None:
-        wallet_arguments["path"] = wallet_path
-    wallet = bt.Wallet(**wallet_arguments)
     intent = bt.SetWeights(
         netuid=netuid,
         uids=list(plan.uids),
@@ -219,13 +251,12 @@ async def submit_weights(
         mechid=mechid,
         version_key=version_key,
     )
-    async with bt.Client(network) as client:
-        result = await client.execute(
-            intent,
-            wallet,
-            wait_for_inclusion=True,
-            wait_for_finalization=True,
-        )
+    result = await client.execute(
+        intent,
+        wallet,
+        wait_for_inclusion=True,
+        wait_for_finalization=True,
+    )
 
     if not result.success:
         raise WeightSubmissionError(result.message or "weight transaction failed")
@@ -238,102 +269,64 @@ async def submit_weights(
     )
 
 
-async def submit_recorded_weights(
-    store: ChallengeStore,
-    plan: WeightPlan,
+def validate_weight_artifact(
+    artifact: WeightArtifact,
+    chain: WeightChainState,
     *,
-    netuid: int,
-    network: str,
-    wallet_name: str,
-    hotkey_name: str,
-    wallet_path: str | None = None,
-    mechid: int = 0,
-    version_key: int = 0,
-) -> tuple[WeightRun, WeightReceipt]:
-    """Record one attempt, submit it, and persist the final chain outcome."""
+    expected_netuid: int,
+    expected_track_digest: str,
+    max_staleness_blocks: int,
+) -> WeightPlan | None:
+    """Validate an untrusted public recommendation against current finalized chain state."""
 
-    run = store.create_weight_run(
-        netuid=netuid,
-        mechid=mechid,
-        source_block=plan.source_block,
-        hotkeys=plan.hotkeys,
-        uids=plan.uids,
-        weights=plan.weights,
-    )
-    try:
-        receipt = await submit_weights(
-            plan,
-            netuid=netuid,
-            network=network,
-            wallet_name=wallet_name,
-            hotkey_name=hotkey_name,
-            wallet_path=wallet_path,
-            mechid=mechid,
-            version_key=version_key,
-        )
-    except Exception as exc:
-        store.fail_weight_run(
-            run.run_id,
-            message=str(exc) or type(exc).__name__,
-        )
-        raise
-    finalized = store.finalize_weight_run(
-        run.run_id,
-        extrinsic_id=receipt.extrinsic_id,
-        block_hash=receipt.block_hash,
-        message=receipt.message,
-    )
-    return finalized, receipt
-
-
-async def update_weights(
-    client: Any,
-    store: ChallengeStore,
-    *,
-    netuid: int,
-    network: str,
-    wallet_name: str,
-    hotkey_name: str,
-    interval_blocks: int,
-    minimum_frontier_gain: float,
-    wallet_path: str | None = None,
-    mechid: int = 0,
-    version_key: int = 0,
-) -> WeightRun | None:
-    """Submit at most one due vector built from a finalized chain snapshot."""
-
-    if interval_blocks <= 0:
-        raise ValueError("weight interval must be positive")
-    chain = await read_weight_chain_state(client, netuid=netuid)
-    cursor = store.chain_cursor()
-    if cursor is None or cursor[0] != chain.finalized_block:
-        return None
-    latest = store.latest_weight_run()
-    effective_interval = max(interval_blocks, chain.weights_rate_limit)
-    if latest is not None and chain.finalized_block < latest.source_block + effective_interval:
-        return None
-    plan = plan_weights(
-        store.reward_entries(),
-        uid_by_hotkey=chain.uid_by_hotkey,
-        current_block=chain.finalized_block,
-        min_allowed_weights=chain.min_allowed_weights,
-        max_weight=chain.max_weight,
-        minimum_frontier_gain=minimum_frontier_gain,
-    )
+    if expected_netuid < 0 or expected_netuid > 0xFFFF:
+        raise ValueError("netuid must fit in an unsigned 16-bit integer")
+    normalized_digest = expected_track_digest.lower()
+    if not _HEX_32.fullmatch(normalized_digest):
+        raise ValueError("expected track specification digest is invalid")
+    if max_staleness_blocks <= 0:
+        raise ValueError("maximum staleness must be positive")
+    if artifact.netuid != expected_netuid:
+        raise ValueError("public weights target a different subnet")
+    if artifact.track_spec_digest != normalized_digest:
+        raise ValueError("public weights target a different track specification")
+    if artifact.source_block > chain.finalized_block:
+        raise ValueError("public weights come from a future block")
+    if chain.finalized_block - artifact.source_block > max_staleness_blocks:
+        raise ValueError("public weights are stale")
+    plan = artifact.plan
     if plan is None:
         return None
-    run, _receipt = await submit_recorded_weights(
-        store,
-        plan,
-        netuid=netuid,
-        network=network,
-        wallet_name=wallet_name,
-        hotkey_name=hotkey_name,
-        wallet_path=wallet_path,
-        mechid=mechid,
-        version_key=version_key,
-    )
-    return run
+    required = max(1, chain.min_allowed_weights)
+    if len(plan.hotkeys) < required:
+        raise ValueError("public weights do not meet the chain minimum")
+    quantized_uids, _ = normalize_weights(plan.uids, plan.weights)
+    if len(quantized_uids) < required:
+        raise ValueError("public weights fall below the chain minimum after quantization")
+    if any(weight > chain.max_weight + 1e-12 for weight in plan.weights):
+        raise ValueError("public weights exceed the current chain cap")
+    for hotkey, uid in zip(plan.hotkeys, plan.uids, strict=True):
+        if chain.uid_by_hotkey.get(hotkey) != uid:
+            raise ValueError("public hotkey and UID mapping is no longer current")
+    return plan
+
+
+def weight_update_due(
+    artifact: WeightArtifact,
+    chain: WeightChainState,
+    *,
+    validator_hotkey: str,
+) -> tuple[bool, str]:
+    """Decide whether this Validator can submit the fetched artifact now."""
+
+    if validator_hotkey not in chain.uid_by_hotkey:
+        raise ValueError("validator hotkey is not registered on the subnet")
+    last_update = chain.last_update_by_hotkey[validator_hotkey]
+    if artifact.source_block <= last_update:
+        return False, "ALREADY_APPLIED"
+    if chain.finalized_block < last_update + chain.weights_rate_limit:
+        return False, "RATE_LIMIT"
+    return True, "READY"
 
 
 def waterfill_weights(

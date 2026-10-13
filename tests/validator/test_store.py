@@ -4,7 +4,7 @@ from threading import Barrier
 import pytest
 
 from validator.queue import ChainPosition, ChallengeState, submission_id
-from validator.store import ChallengeStore, SubmissionRecord, WeightRunState
+from validator.store import ChallengeStore, SubmissionRecord
 
 
 def make_submission(*, hotkey: str = "hk1") -> SubmissionRecord:
@@ -368,12 +368,8 @@ def test_provisional_and_system_failure_preserve_previous_success(tmp_path) -> N
 
 def test_reward_entries_keep_improvement_history_for_current_successes(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
-        alice_first, _ = store.add_submission(
-            submission_at(100, hotkey="alice"), occurred_at_ms=10
-        )
-        bob, _ = store.add_submission(
-            submission_at(110, hotkey="bob"), occurred_at_ms=11
-        )
+        alice_first, _ = store.add_submission(submission_at(100, hotkey="alice"), occurred_at_ms=10)
+        bob, _ = store.add_submission(submission_at(110, hotkey="bob"), occurred_at_ms=11)
         alice_upgrade, _ = store.add_submission(
             submission_at(120, hotkey="alice"), occurred_at_ms=12
         )
@@ -492,78 +488,6 @@ def test_stale_worker_cannot_write_stage_score(tmp_path) -> None:
             metrics={},
             occurred_at_ms=32,
         )
-
-
-def test_weight_run_records_exact_plan_and_terminal_outcome(tmp_path) -> None:
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        run = store.create_weight_run(
-            netuid=7,
-            mechid=0,
-            source_block=123,
-            hotkeys=("alice", "bob"),
-            uids=(1, 2),
-            weights=(0.6, 0.4),
-            occurred_at_ms=10,
-        )
-        assert run.state is WeightRunState.PLANNED
-        assert run.weights == (0.6, 0.4)
-
-        finalized = store.finalize_weight_run(
-            run.run_id,
-            extrinsic_id="123-4",
-            block_hash="0xabc",
-            message="finalized",
-            occurred_at_ms=20,
-        )
-        assert finalized.state is WeightRunState.FINALIZED
-        assert finalized.extrinsic_id == "123-4"
-        assert store.weight_runs() == [finalized]
-
-        with pytest.raises(RuntimeError, match="terminal"):
-            store.fail_weight_run(run.run_id, message="late failure", occurred_at_ms=30)
-
-
-def test_failed_weight_run_keeps_attempt_for_audit(tmp_path) -> None:
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        run = store.create_weight_run(
-            netuid=7,
-            mechid=0,
-            source_block=123,
-            hotkeys=("alice",),
-            uids=(1,),
-            weights=(1.0,),
-            occurred_at_ms=10,
-        )
-        failed = store.fail_weight_run(
-            run.run_id,
-            message="rate limited",
-            occurred_at_ms=20,
-        )
-
-        assert failed.state is WeightRunState.FAILED
-        assert failed.message == "rate limited"
-        assert failed.block_hash is None
-
-
-def test_weight_snapshot_can_only_be_reserved_once_across_connections(tmp_path) -> None:
-    path = tmp_path / "validator.db"
-    arguments = {
-        "netuid": 7,
-        "mechid": 0,
-        "source_block": 100,
-        "hotkeys": ("alice",),
-        "uids": (1,),
-        "weights": (1.0,),
-        "occurred_at_ms": 1,
-    }
-
-    with ChallengeStore(path) as first, ChallengeStore(path) as second:
-        reserved = first.create_weight_run(**arguments)
-
-        with pytest.raises(RuntimeError, match="already has a transaction attempt"):
-            second.create_weight_run(**arguments)
-
-        assert first.weight_runs() == [reserved]
 
 
 def test_expired_admission_lease_is_recovered(tmp_path) -> None:
