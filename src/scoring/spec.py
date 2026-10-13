@@ -82,6 +82,7 @@ class TrackSpec:
     track_id: str
     netuid: int
     track_start_block: int
+    publication_grace_blocks: int
     submission_cooldown_blocks: int
     model: ModelSpec
     base_model: BaseModelSpec
@@ -113,6 +114,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "track_id",
             "netuid",
             "track_start_block",
+            "publication_grace_blocks",
             "submission_cooldown_blocks",
             "model",
             "base_model",
@@ -238,6 +240,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         "track_id": track_id,
         "netuid": netuid,
         "track_start_block": _integer(root["track_start_block"], "track_start_block", minimum=0),
+        "publication_grace_blocks": _integer(
+            root["publication_grace_blocks"],
+            "publication_grace_blocks",
+            minimum=1,
+        ),
         "submission_cooldown_blocks": _integer(
             root["submission_cooldown_blocks"],
             "submission_cooldown_blocks",
@@ -308,6 +315,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         track_id=track_id,
         netuid=netuid,
         track_start_block=spec_without_digest["track_start_block"],
+        publication_grace_blocks=spec_without_digest["publication_grace_blocks"],
         submission_cooldown_blocks=spec_without_digest["submission_cooldown_blocks"],
         model=ModelSpec(
             filename="selector.safetensors",

@@ -30,6 +30,7 @@ class AdmissionSettings:
     cache_dir: Path
     max_model_bytes: int
     tensor_schema: Mapping[str, TensorSpec]
+    publication_grace_blocks: int
     lease_ms: int = 5 * 60 * 1000
     retry_base_ms: int = 30 * 1000
     retry_max_ms: int = 30 * 60 * 1000
@@ -50,6 +51,8 @@ class AdmissionSettings:
             raise ValueError("retry base cannot exceed retry maximum")
         if self.max_attempts <= 0:
             raise ValueError("maximum attempts must be positive")
+        if self.publication_grace_blocks <= 0:
+            raise ValueError("publication grace blocks must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,16 +68,20 @@ def process_next_admission(
     *,
     worker_id: str,
     settings: AdmissionSettings,
+    current_finalized_block: int,
     now_ms: int | None = None,
     downloader: Callable[..., DownloadedModel] = download_public_model,
     model_validator: Callable[..., ValidatedModel] = validate_model,
 ) -> AdmissionOutcome | None:
     """Process at most one FIFO admission task."""
 
+    if current_finalized_block < 0:
+        raise ValueError("current finalized block must be non-negative")
     now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
     task = store.claim_next_admission(
         worker_id,
         lease_ms=settings.lease_ms,
+        ready_through_block=current_finalized_block - settings.publication_grace_blocks,
         now_ms=now,
     )
     if task is None:

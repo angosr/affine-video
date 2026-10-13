@@ -569,17 +569,23 @@ def test_weight_snapshot_can_only_be_reserved_once_across_connections(tmp_path) 
 def test_expired_admission_lease_is_recovered(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
-        first = store.claim_next_admission("worker-a", lease_ms=50, now_ms=100)
+        first = store.claim_next_admission(
+            "worker-a", lease_ms=50, ready_through_block=10_000, now_ms=100
+        )
         assert first is not None
         assert first.challenge_id == identifier
         assert first.state is ChallengeState.FETCHING
         assert first.attempts == 1
 
         assert (
-            store.claim_next_admission("worker-b", lease_ms=50, now_ms=149)
+            store.claim_next_admission(
+                "worker-b", lease_ms=50, ready_through_block=10_000, now_ms=149
+            )
             is None
         )
-        reclaimed = store.claim_next_admission("worker-b", lease_ms=50, now_ms=150)
+        reclaimed = store.claim_next_admission(
+            "worker-b", lease_ms=50, ready_through_block=10_000, now_ms=150
+        )
         assert reclaimed is not None
         assert reclaimed.challenge_id == identifier
         assert reclaimed.lease_token != first.lease_token
@@ -606,7 +612,9 @@ def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> No
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         second_id, _ = store.add_submission(submission_at(101, hotkey="hk2"), occurred_at_ms=20)
-        first = store.claim_next_admission("worker", lease_ms=100, now_ms=100)
+        first = store.claim_next_admission(
+            "worker", lease_ms=100, ready_through_block=10_000, now_ms=100
+        )
         assert first is not None
         store.defer_leased(
             first_id,
@@ -617,7 +625,9 @@ def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> No
             occurred_at_ms=110,
         )
 
-        second = store.claim_next_admission("worker", lease_ms=100, now_ms=150)
+        second = store.claim_next_admission(
+            "worker", lease_ms=100, ready_through_block=10_000, now_ms=150
+        )
         assert second is not None
         assert second.challenge_id == second_id
         store.advance_leased(
@@ -635,7 +645,9 @@ def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> No
             occurred_at_ms=152,
         )
 
-        retry = store.claim_next_admission("worker", lease_ms=100, now_ms=200)
+        retry = store.claim_next_admission(
+            "worker", lease_ms=100, ready_through_block=10_000, now_ms=200
+        )
         assert retry is not None
         assert retry.challenge_id == first_id
         assert retry.state is ChallengeState.FETCHING
@@ -675,7 +687,9 @@ def test_scoring_claims_can_run_in_parallel_and_reject_stale_completion(tmp_path
 def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
-        lease = store.claim_next_admission("secret-worker", lease_ms=1_000, now_ms=20)
+        lease = store.claim_next_admission(
+            "secret-worker", lease_ms=1_000, ready_through_block=10_000, now_ms=20
+        )
         assert lease is not None
         store.record_downloaded_model(
             identifier,

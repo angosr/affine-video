@@ -19,6 +19,15 @@ The submitted `selector.safetensors` contains only Veda v1 projection tensors na
 Veda: `x_hat = [mean|max|min] @ projection + mean`, followed by scaled Q/K dot products. Model
 metadata, biases, adapters, executable code, and additional tensors are rejected.
 
+A Miner may keep that pinned revision private while submitting its `repo_id + revision`. The
+frozen track's positive `publication_grace_blocks` delays admission by the same number of finalized
+blocks for every submission. The Miner must make `selector.safetensors` anonymously readable before
+that deadline. Validator then attempts the download in finalized chain order; a repository or
+revision that is still unavailable when its turn starts receives a recorded participant failure,
+and evaluation continues with the next submission. No ownership proof or commit-reveal phase is
+used. Later copies lose to the earlier chain position through reference and canonical-weight
+deduplication.
+
 All submissions on one track are compared on the same exact hidden panel. The sample covers every
 selector route and scoring stratum. Screening runs over the complete lightweight cache and only
 controls evaluation cost; it is not a ranking signal. Local scores remain provisional and receive
@@ -42,9 +51,8 @@ does not reserve its content digest permanently.
 Before live rewards are enabled, the rollout score must be validated against real paired videos.
 The rollout panel must rotate and successful incumbents must be re-audited before each reward epoch;
 otherwise public scores turn a fixed hidden set into a black-box training oracle. The submission
-flow also needs an ownership proof or commit-reveal step to prevent repository front-running.
-Neither condition can be established by the current CPU-only tests or implemented by the current
-single-phase submission payload.
+and publication flow is intentionally single phase. The real-video validation and rotating panel
+cannot be established by the current CPU-only tests.
 
 Run the current test suite with `uv run pytest`.
 

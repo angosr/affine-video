@@ -53,10 +53,50 @@ def settings(tmp_path) -> AdmissionSettings:
         cache_dir=tmp_path / "cache",
         max_model_bytes=10_000,
         tensor_schema=SCHEMA,
+        publication_grace_blocks=1,
         lease_ms=1_000,
         retry_base_ms=30_000,
         retry_max_ms=120_000,
     )
+
+
+def test_model_can_be_published_during_frozen_block_grace(tmp_path) -> None:
+    model = tmp_path / "selector.safetensors"
+    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, model)
+    downloads = 0
+
+    def download_after_publication(*args, **kwargs):
+        nonlocal downloads
+        downloads += 1
+        return model_downloader(model)(*args, **kwargs)
+
+    configured = replace(settings(tmp_path), publication_grace_blocks=2)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+
+        waiting = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=101,
+            now_ms=100,
+            downloader=download_after_publication,
+        )
+        assert waiting is None
+        assert downloads == 0
+        assert store.get_challenge(identifier).state is ChallengeState.QUEUED
+
+        admitted = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=102,
+            now_ms=200,
+            downloader=download_after_publication,
+        )
+        assert admitted is not None and admitted.status is AdmissionStatus.ACCEPTED
+        assert downloads == 1
+        assert store.get_challenge(identifier).state is ChallengeState.SCREENING
 
 
 def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) -> None:
@@ -69,6 +109,7 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=100,
             downloader=model_downloader(model),
         )
@@ -82,6 +123,7 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=200,
             downloader=model_downloader(model),
         )
@@ -111,6 +153,7 @@ def test_same_repository_revision_is_rejected_before_redownload(tmp_path) -> Non
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=100,
             downloader=counted_download,
         )
@@ -121,6 +164,7 @@ def test_same_repository_revision_is_rejected_before_redownload(tmp_path) -> Non
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=200,
             downloader=counted_download,
         )
@@ -144,6 +188,7 @@ def test_same_reference_can_retry_after_earlier_participant_failure(tmp_path) ->
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=100,
             downloader=missing,
         )
@@ -154,6 +199,7 @@ def test_same_reference_can_retry_after_earlier_participant_failure(tmp_path) ->
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=200,
             downloader=model_downloader(model),
         )
@@ -171,6 +217,7 @@ def test_same_model_can_retry_after_earlier_system_failure(tmp_path) -> None:
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=100,
             downloader=model_downloader(model),
         )
@@ -191,6 +238,7 @@ def test_same_model_can_retry_after_earlier_system_failure(tmp_path) -> None:
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=200,
             downloader=model_downloader(model),
         )
@@ -209,6 +257,7 @@ def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=100,
             downloader=unavailable,
         )
@@ -216,10 +265,14 @@ def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:
         assert outcome is not None and outcome.status is AdmissionStatus.DEFERRED
         assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_DEFERRED
         assert (
-            store.claim_next_admission("other", lease_ms=1_000, now_ms=30_099)
+            store.claim_next_admission(
+                "other", lease_ms=1_000, ready_through_block=10_000, now_ms=30_099
+            )
             is None
         )
-        retry = store.claim_next_admission("other", lease_ms=1_000, now_ms=30_100)
+        retry = store.claim_next_admission(
+            "other", lease_ms=1_000, ready_through_block=10_000, now_ms=30_100
+        )
         assert retry is not None and retry.state is ChallengeState.FETCHING
 
 
@@ -234,6 +287,7 @@ def test_repeated_download_infrastructure_failure_becomes_system_failed(tmp_path
             store,
             worker_id="admission",
             settings=configured,
+            current_finalized_block=10_000,
             now_ms=100,
             downloader=unavailable,
         )
@@ -253,6 +307,7 @@ def test_permanent_download_failure_records_zero_score(tmp_path) -> None:
             store,
             worker_id="admission",
             settings=settings(tmp_path),
+            current_finalized_block=10_000,
             now_ms=100,
             downloader=missing,
         )

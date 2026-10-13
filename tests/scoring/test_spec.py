@@ -10,6 +10,7 @@ def valid_spec() -> dict:
         "track_id": "veda-test-v1",
         "netuid": 7,
         "track_start_block": 100,
+        "publication_grace_blocks": 20,
         "submission_cooldown_blocks": 50,
         "model": {
             "filename": "selector.safetensors",
@@ -67,6 +68,7 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.model.tensor_schema["layers.0.proj_q"].shape == (1, 6, 2)
     assert first.scoring.stratum_weight_map == {"layer-0": 0.5, "layer-1": 0.5}
     assert first.base_model.revision == "12" * 20
+    assert first.publication_grace_blocks == 20
     assert first.rollout.panel_sha256 == "9a" * 32
     assert first.scoring.minimum_frontier_gain == 0.001
 
@@ -77,6 +79,17 @@ def test_score_affecting_change_changes_digest() -> None:
     second["scoring"]["rollout_threshold"] = 0.8
 
     assert parse_track_spec(first).digest != parse_track_spec(second).digest
+
+
+def test_publication_grace_is_positive_and_changes_digest() -> None:
+    invalid = valid_spec()
+    invalid["publication_grace_blocks"] = 0
+    with pytest.raises(TrackSpecError, match="greater than or equal to 1"):
+        parse_track_spec(invalid)
+
+    changed = valid_spec()
+    changed["publication_grace_blocks"] += 1
+    assert parse_track_spec(changed).digest != parse_track_spec(valid_spec()).digest
 
 
 def test_minimum_frontier_gain_must_be_positive_and_changes_digest() -> None:

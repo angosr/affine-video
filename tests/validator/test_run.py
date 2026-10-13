@@ -18,12 +18,18 @@ from validator.weights import plan_weights
 from .test_chain import HOTKEY, FakeClient, chain_block
 
 
+def empty_chain_block(block_height: int) -> tuple[str, dict, list[dict]]:
+    return "0x" + f"{block_height:064x}", {"extrinsics": []}, []
+
+
 def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
     model_path = tmp_path / "selector.safetensors"
     save_file({"selector.weight": np.ones((2, 3), dtype=np.float32)}, model_path)
     file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     payload = ModelSubmission("owner/model", "12" * 20).encode()
-    client = FakeClient({100: chain_block(payload, 100)})
+    client = FakeClient(
+        {100: chain_block(payload, 100), 101: empty_chain_block(101)}
+    )
 
     def download(*_args, **_kwargs):
         return DownloadedModel(model_path, file_digest, model_path.stat().st_size, None, None)
@@ -42,6 +48,7 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
                 cache_dir=tmp_path / "cache",
                 max_model_bytes=10_000,
                 tensor_schema={"selector.weight": TensorSpec((2, 3), "float32")},
+                publication_grace_blocks=1,
             ),
             "scoring_settings": ScoringSettings(),
             "evaluator": evaluate,
@@ -69,7 +76,9 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
     save_file({"selector.weight": np.ones((2, 3), dtype=np.float32)}, model_path)
     file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     payload = ModelSubmission("owner/model", "12" * 20).encode()
-    client = FakeClient({100: chain_block(payload, 100)})
+    client = FakeClient(
+        {100: chain_block(payload, 100), 101: empty_chain_block(101)}
+    )
     database = tmp_path / "validator.db"
     downloads = 0
 
@@ -100,6 +109,7 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
             cache_dir=tmp_path / "cache",
             max_model_bytes=10_000,
             tensor_schema={"selector.weight": TensorSpec((2, 3), "float32")},
+            publication_grace_blocks=1,
         ),
         "scoring_settings": ScoringSettings(),
         "evaluator": evaluate,
@@ -119,7 +129,7 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         plan = plan_weights(
             store.reward_entries(),
             uid_by_hotkey={HOTKEY: 4},
-            current_block=100,
+            current_block=101,
             min_allowed_weights=1,
             max_weight=1.0,
             minimum_frontier_gain=0.001,

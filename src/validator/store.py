@@ -546,9 +546,10 @@ class ChallengeStore:
         worker_id: str,
         *,
         lease_ms: int,
+        ready_through_block: int,
         now_ms: int | None = None,
     ) -> LeasedChallenge | None:
-        """Claim the oldest ready download/validation task without bypassing FIFO."""
+        """Claim the oldest mature download/validation task without bypassing FIFO."""
 
         return self._claim_next(
             worker_id,
@@ -557,6 +558,7 @@ class ChallengeStore:
             strict_fifo=True,
             lease_ms=lease_ms,
             now_ms=now_ms,
+            ready_through_block=ready_through_block,
         )
 
     def claim_next_scoring(
@@ -579,6 +581,7 @@ class ChallengeStore:
             strict_fifo=False,
             lease_ms=lease_ms,
             now_ms=now_ms,
+            ready_through_block=None,
         )
 
     def earlier_reference_owner(self, identifier: str) -> str | None:
@@ -1743,6 +1746,7 @@ class ChallengeStore:
         strict_fifo: bool,
         lease_ms: int,
         now_ms: int | None,
+        ready_through_block: int | None,
     ) -> LeasedChallenge | None:
         if not worker_id:
             raise ValueError("worker id cannot be empty")
@@ -1761,6 +1765,10 @@ class ChallengeStore:
             *stages,
             now,
         ]
+        block_filter = ""
+        if ready_through_block is not None:
+            block_filter = "AND s.block_height <= ?"
+            parameters.append(ready_through_block)
         if not strict_fifo:
             parameters.append(now)
 
@@ -1782,6 +1790,7 @@ class ChallengeStore:
                         AND c.retry_after_ms <= ?
                     )
                 )
+                {block_filter}
                 {lease_filter}
                 ORDER BY s.block_height, s.extrinsic_index, s.event_index
                 LIMIT 1

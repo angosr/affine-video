@@ -18,9 +18,9 @@ from validator.store import ChallengeStore
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="veda")
     modules = parser.add_subparsers(dest="module", required=True)
-    miner = modules.add_parser("miner", help="submit a public model reference")
+    miner = modules.add_parser("miner", help="submit a pinned model reference")
     miner_commands = miner.add_subparsers(dest="command", required=True)
-    submit = miner_commands.add_parser("submit", help="publish a model reference on-chain")
+    submit = miner_commands.add_parser("submit", help="commit a model reference on-chain")
     submit.add_argument("--repo-id", required=True)
     submit.add_argument("--revision", required=True)
     submit.add_argument("--netuid", required=True, type=int)

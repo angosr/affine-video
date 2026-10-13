@@ -118,6 +118,7 @@ async def run_validator(
         cache_dir=Path(model_cache),
         max_model_bytes=track.model.max_bytes,
         tensor_schema=track.model.tensor_schema,
+        publication_grace_blocks=track.publication_grace_blocks,
     )
     evaluator = IsolatedEvaluator(
         FileTrackEvaluator(track, str(screen_cache), str(exact_cache), rollout=rollout),
@@ -213,6 +214,7 @@ async def process_cycle(
         store,
         worker_id=f"{worker_id}:admission",
         settings=admission_settings,
+        current_finalized_block=finalized_block,
         downloader=downloader,
         model_validator=model_validator,
     )

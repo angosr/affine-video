@@ -372,6 +372,7 @@ def test_track_evaluator_runs_seeded_screen_and_exact_local_stages(tmp_path) -> 
         track_id="test",
         netuid=7,
         track_start_block=1,
+        publication_grace_blocks=1,
         submission_cooldown_blocks=1,
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
