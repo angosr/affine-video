@@ -10,7 +10,7 @@ from pathlib import Path
 
 from miner.chain import ChainSubmissionError, submit_model
 from miner.submit import ModelSubmission, SubmissionFormatError
-from validator.publication import R2Publisher
+from validator.publication import R2Repository
 from validator.run import (
     EvaluationCycleResult,
     WeightCycleResult,
@@ -51,7 +51,7 @@ def _parser() -> argparse.ArgumentParser:
     challenge.add_argument("--database", required=True)
 
     evaluate = validator_commands.add_parser(
-        "evaluate", help="run owner evaluation and publish public R2 artifacts"
+        "evaluate", help="evaluate submissions and publish public R2 artifacts"
     )
     evaluate.add_argument("--track-spec", required=True)
     evaluate.add_argument("--database", required=True)
@@ -148,7 +148,7 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
 def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
     if arguments.command == "evaluate":
         try:
-            publisher = R2Publisher.from_environment(
+            publisher = R2Repository.from_environment(
                 account_id=arguments.r2_account_id,
                 bucket=arguments.r2_bucket,
                 prefix=arguments.r2_prefix,
@@ -251,6 +251,7 @@ def _print_evaluation_cycle(result: EvaluationCycleResult) -> None:
             if result.scoring is not None
             else None
         ),
+        "restored_matches": result.restored_matches,
         "published_block": result.published_block,
         "publication_error": result.publication_error,
     }

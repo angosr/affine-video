@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from scoring.spec import TrackSpecError, load_track_spec, parse_track_spec
+from scoring.spec import TrackSpecError, load_track_spec, parse_track_spec, track_spec_dict
 
 
 def valid_spec() -> dict:
@@ -71,6 +71,7 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.publication_grace_blocks == 20
     assert first.rollout.panel_sha256 == "9a" * 32
     assert first.scoring.minimum_frontier_gain == 0.001
+    assert parse_track_spec(track_spec_dict(first)) == first
 
 
 def test_score_affecting_change_changes_digest() -> None:

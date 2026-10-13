@@ -1,23 +1,45 @@
 import asyncio
+import io
 import json
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from scoring.spec import parse_track_spec
+from tests.scoring.test_spec import valid_spec
+from validator import publication as publication_module
 from validator.publication import (
     PublicArtifactError,
     PublicArtifacts,
-    R2Publisher,
+    R2Repository,
     build_public_artifacts,
     decode_weight_artifact,
     encode_weight_artifact,
     fetch_weight_artifact,
     validate_public_weights_url,
 )
-from validator.queue import ChainPosition
-from validator.store import LeaderboardEntry
 from validator.weights import WeightArtifact, WeightChainState, WeightPlan
+
+
+class MissingObject(Exception):
+    response = {"Error": {"Code": "NoSuchKey"}}
+
+
+class MemoryS3:
+    def __init__(self) -> None:
+        self.objects = {}
+        self.calls = []
+
+    def get_object(self, *, Bucket, Key):
+        del Bucket
+        if Key not in self.objects:
+            raise MissingObject
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def put_object(self, **kwargs) -> None:
+        self.calls.append(kwargs)
+        self.objects[kwargs["Key"]] = kwargs["Body"]
 
 
 def weight_artifact() -> WeightArtifact:
@@ -72,46 +94,198 @@ def test_fetch_weight_artifact_is_https_only_and_size_bounded() -> None:
 @pytest.mark.parametrize("prefix", ["../track", "track//main", "track name", "track\nmain"])
 def test_r2_rejects_unsafe_object_prefix(prefix: str) -> None:
     with pytest.raises(ValueError, match="prefix"):
-        R2Publisher(object(), bucket="public-data", prefix=prefix)
+        R2Repository(object(), bucket="public-data", prefix=prefix)
 
 
-def test_r2_publishes_results_before_consumable_weights() -> None:
-    calls = []
-
-    class FakeS3:
-        def put_object(self, **kwargs) -> None:
-            calls.append(kwargs)
-
-    publisher = R2Publisher(FakeS3(), bucket="public-data", prefix="veda/track")
-    artifacts = PublicArtifacts(120, b"weights", b"results")
+def test_r2_publishes_immutable_facts_before_summary_and_weights() -> None:
+    client = MemoryS3()
+    publisher = R2Repository(client, bucket="public-data", prefix="veda/track")
+    artifacts = PublicArtifacts(
+        120,
+        b"track",
+        b"summary",
+        b"weights",
+        (("matches/000000000001.json", b"match"),),
+    )
     asyncio.run(publisher.publish(artifacts))
 
-    assert [call["Key"] for call in calls] == [
-        "veda/track/results.json",
+    writes = [call for call in client.calls if "Key" in call and "Body" in call]
+    assert [call["Key"] for call in writes] == [
+        "veda/track/track.json",
+        "veda/track/matches/000000000001.json",
+        "veda/track/summary.json",
         "veda/track/weights.json",
     ]
-    assert [call["Body"] for call in calls] == [b"results", b"weights"]
-    assert all(call["CacheControl"] == "no-store, max-age=0" for call in calls)
+    assert writes[0]["CacheControl"].endswith("immutable")
+    assert writes[1]["CacheControl"].endswith("immutable")
+    assert writes[2]["CacheControl"] == writes[3]["CacheControl"] == "no-store, max-age=0"
 
+    client.calls.clear()
+    asyncio.run(publisher.publish(artifacts))
+    assert [call["Key"] for call in client.calls if "Body" in call] == [
+        "veda/track/summary.json",
+        "veda/track/weights.json",
+    ]
 
-def test_public_artifacts_bind_results_and_weights_to_one_chain_snapshot() -> None:
-    reward = LeaderboardEntry(
-        hotkey="alice",
-        challenge_id="challenge",
-        final_score=0.8,
-        attention_cost=0.2,
-        score_block=110,
-        provisional=False,
-        position=ChainPosition(100, 0, 0),
+    conflicting = PublicArtifacts(
+        120,
+        b"track",
+        b"summary",
+        b"weights",
+        (("matches/000000000001.json", b"different"),),
     )
+    with pytest.raises(PublicArtifactError, match="conflicts"):
+        asyncio.run(publisher.publish(conflicting))
+
+
+def test_r2_ledger_rebuilds_and_verifies_every_committed_match() -> None:
+    track = parse_track_spec(valid_spec())
     snapshot = {
-        "leaderboard": [{"hotkey": "alice"}],
-        "rewards": [{"hotkey": "alice", "challenge_id": "challenge"}],
-        "challenges": [{"challenge_id": "challenge"}],
+        "challenges": [
+            {
+                "challenge_id": "challenge",
+                "submission_id": "submission",
+                "hotkey": "alice",
+                "repo_id": "owner/model",
+                "revision": "12" * 20,
+                "block_height": 100,
+                "extrinsic_index": 0,
+                "event_index": 0,
+                "state": "SUCCEEDED",
+                "error_code": None,
+                "file_sha256": "ab" * 32,
+                "model_digest": "cd" * 32,
+                "model_size_bytes": 123,
+                "final_score": 0.8,
+                "attention_cost": 0.2,
+                "score_block": 110,
+                "stages": [],
+            }
+        ]
     }
     store = SimpleNamespace(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
-        public_snapshot_inputs=lambda: (snapshot, [reward]),
+        public_snapshot=lambda: snapshot,
+    )
+    chain = WeightChainState(120, {"alice": 4}, 1, 1.0, 10, {"alice": 0})
+    artifacts = build_public_artifacts(store, track, chain, mechid=0, version_key=0)
+    assert artifacts is not None
+
+    client = MemoryS3()
+    repository = R2Repository(client, bucket="public-data", prefix="veda/track")
+    asyncio.run(repository.publish(artifacts))
+    ledger = asyncio.run(repository.load(track))
+
+    assert ledger.source_block == 120
+    assert ledger.required_finalized_block == 120
+    assert len(ledger.matches) == 1
+    assert ledger.matches[0].challenge_id == "challenge"
+
+    original_match = client.objects.pop("veda/track/matches/000000000001.json")
+    with pytest.raises(PublicArtifactError, match="committed match is missing"):
+        asyncio.run(R2Repository(client, bucket="public-data", prefix="veda/track").load(track))
+    client.objects["veda/track/matches/000000000001.json"] = original_match
+
+    client.objects["veda/track/matches/000000000001.json"] = b"{}"
+    with pytest.raises(PublicArtifactError, match="match is invalid"):
+        asyncio.run(R2Repository(client, bucket="public-data", prefix="veda/track").load(track))
+
+
+def test_r2_loader_recovers_match_uploaded_before_mutable_summary() -> None:
+    track = parse_track_spec(valid_spec())
+    first = {
+        "challenge_id": "challenge-1",
+        "submission_id": "submission-1",
+        "hotkey": "alice",
+        "repo_id": "owner/model-1",
+        "revision": "12" * 20,
+        "block_height": 100,
+        "extrinsic_index": 0,
+        "event_index": 0,
+        "state": "SUCCEEDED",
+        "error_code": None,
+        "file_sha256": "ab" * 32,
+        "model_digest": "cd" * 32,
+        "model_size_bytes": 123,
+        "final_score": 0.8,
+        "attention_cost": 0.2,
+        "score_block": 110,
+        "stages": [],
+    }
+    snapshot = {"challenges": [first]}
+    store = SimpleNamespace(
+        chain_cursor=lambda: (120, "0x" + "12" * 32),
+        public_snapshot=lambda: snapshot,
+    )
+    chain = WeightChainState(120, {"alice": 4, "bob": 5}, 1, 1.0, 10, {})
+    committed = build_public_artifacts(store, track, chain, mechid=0, version_key=0)
+    assert committed is not None
+    client = MemoryS3()
+    asyncio.run(R2Repository(client, bucket="public-data", prefix="veda/track").publish(committed))
+
+    second = {
+        **first,
+        "challenge_id": "challenge-2",
+        "submission_id": "submission-2",
+        "hotkey": "bob",
+        "repo_id": "owner/model-2",
+        "revision": "34" * 20,
+        "block_height": 121,
+        "model_digest": "ef" * 32,
+        "final_score": 0.9,
+        "score_block": 125,
+    }
+    snapshot["challenges"] = [first, second]
+    store.chain_cursor = lambda: (130, "0x" + "13" * 32)
+    newer = build_public_artifacts(
+        store,
+        track,
+        WeightChainState(130, {"alice": 4, "bob": 5}, 1, 1.0, 10, {}),
+        mechid=0,
+        version_key=0,
+    )
+    assert newer is not None
+    orphan_name, orphan_payload = newer.matches[1]
+    client.objects[f"veda/track/{orphan_name}"] = orphan_payload
+
+    recovered = asyncio.run(
+        R2Repository(client, bucket="public-data", prefix="veda/track").load(track)
+    )
+    assert recovered.source_block == 120
+    assert recovered.required_finalized_block == 125
+    assert [match.challenge_id for match in recovered.matches] == [
+        "challenge-1",
+        "challenge-2",
+    ]
+
+
+def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monkeypatch) -> None:
+    snapshot = {
+        "challenges": [
+            {
+                "challenge_id": "challenge",
+                "submission_id": "submission",
+                "hotkey": "alice",
+                "repo_id": "owner/model",
+                "revision": "12" * 20,
+                "block_height": 100,
+                "extrinsic_index": 0,
+                "event_index": 0,
+                "state": "SUCCEEDED",
+                "error_code": None,
+                "file_sha256": "ab" * 32,
+                "model_digest": "cd" * 32,
+                "model_size_bytes": 123,
+                "final_score": 0.8,
+                "attention_cost": 0.2,
+                "score_block": 110,
+                "stages": [],
+            }
+        ],
+    }
+    store = SimpleNamespace(
+        chain_cursor=lambda: (120, "0x" + "12" * 32),
+        public_snapshot=lambda: snapshot,
     )
     track = SimpleNamespace(
         track_id="track",
@@ -127,15 +301,25 @@ def test_public_artifacts_bind_results_and_weights_to_one_chain_snapshot() -> No
         10,
         {"alice": 0},
     )
+    monkeypatch.setattr(publication_module, "track_spec_dict", lambda _track: {"track_id": "track"})
 
     artifacts = build_public_artifacts(store, track, chain, mechid=2, version_key=9)
     assert artifacts is not None
     public_weights = decode_weight_artifact(artifacts.weights)
-    public_results = json.loads(artifacts.results)
-    assert public_weights.source_block == public_results["source_block"] == 120
+    public_summary = json.loads(artifacts.summary)
+    public_match = json.loads(artifacts.matches[0][1])
+    assert public_weights.source_block == public_summary["source_block"] == 120
     assert public_weights.plan is not None
     assert public_weights.plan.hotkeys == ("alice",)
-    assert public_results["challenges"] == snapshot["challenges"]
+    assert public_summary["champion"]["hotkey"] == "alice"
+    assert public_summary["match_count"] == 1
+    assert public_summary["leaderboard_total"] == public_summary["rewards_total"] == 1
+    assert public_match["outcome"] == "INITIAL_CHAMPION"
 
     store.chain_cursor = lambda: (119, "0x" + "11" * 32)
     assert build_public_artifacts(store, track, chain, mechid=2, version_key=9) is None
+
+    store.chain_cursor = lambda: (120, "0x" + "12" * 32)
+    snapshot["challenges"][0]["score_block"] = 121
+    with pytest.raises(PublicArtifactError, match="newer"):
+        build_public_artifacts(store, track, chain, mechid=2, version_key=9)

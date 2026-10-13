@@ -1,81 +1,99 @@
 # Veda Subnet
 
-Veda Subnet is a sparse-attention selector training competition on Bittensor. The repository has
-three business boundaries:
+Veda Subnet is a Bittensor competition for training sparse-attention selectors. It has three code
+boundaries:
 
-- `miner`: one-shot model-reference submission;
-- `validator`: owner evaluation, public R2 artifacts, and independent chain weight setting;
-- `scoring`: deterministic model validation and evaluation.
+- `miner`: validates and submits a pinned Hugging Face model reference;
+- `validator`: evaluates submissions, publishes the public tournament ledger, or independently
+  applies public weights on-chain;
+- `scoring`: validates selector weights and runs deterministic staged evaluation.
 
-The owner runs the only expensive evaluation loop. It scans finalized submissions, downloads and
-scores models, then publishes public results and recommended weights to Cloudflare R2. Every
-Validator, including the owner's Validator, runs the same lightweight loop: fetch weights from the
-public R2 URL, validate them against current finalized chain state, and sign its own `set_weights`
-transaction. The evaluation process never opens a Validator wallet.
+There is one expensive evaluator process. It has R2 write credentials but no Validator wallet.
+Every Validator, including the one operated alongside the evaluator, runs the same separate
+lightweight process: fetch `weights.json`, validate it against finalized chain state, and sign its
+own `SetWeights` transaction. No service or direct Miner-to-Validator protocol exists.
 
-The CPU evaluator, finalized-chain queue, challenge history, R2 artifact path, and independent
-weight loop are implemented. A real Video DiT rollout backend and frozen production track/cache
-bundle are still required before live rewards can be enabled.
+## Competition flow
 
-## Submission and scoring
+1. A Miner commits a Hugging Face `repo_id` and a complete 40-character commit SHA on-chain.
+2. After the fixed publication grace period, the evaluator processes submissions by finalized
+   `(block, extrinsic, event)` order. The pinned revision must then be anonymously downloadable.
+3. The evaluator accepts exactly one `selector.safetensors` file. It rejects executable code,
+   metadata, unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.
+4. Cheap screening and exact local scoring decide whether a model reaches the hidden full-video
+   rollout. Only a successful rollout produces an authoritative score.
+5. Terminal submissions are adjudicated in chain order. The first successful model becomes the
+   initial champion. A later model replaces it only when
+   `challenger_score - champion_score >= minimum_frontier_gain`.
+6. An immutable match record is published for every terminal item in the contiguous chain-order
+   prefix. A failed or unfinished earlier submission can never be skipped to publish a later win.
 
-Each on-chain submission contains a Hugging Face `repo_id` and a complete commit SHA. The pinned
-repository contains one `selector.safetensors` file with only Veda v1 tensors named
-`layers.<layer>.proj_q` and `layers.<layer>.proj_k`. Shapes are frozen by the track as
-`[num_heads, 3 * head_dim, head_dim]`. Metadata, biases, adapters, executable code, and extra
-tensors are rejected.
+Scoring covers several frozen block budgets. The authoritative score combines quality and
+calibrated attention cost, so a selector must preserve quality while selecting fewer blocks. The
+track specification pins every score-affecting rule and asset hash.
 
-A Miner may keep the revision private while submitting it. The track's positive
-`publication_grace_blocks` delays admission by a fixed number of finalized blocks. The Miner must
-make the file anonymously readable before that deadline. Evaluation then proceeds in finalized
-chain order; an unavailable repository or revision receives a recorded participant failure and the
-next submission proceeds. There is no ownership proof or commit-reveal phase. Reference and
-canonical-weight deduplication give priority to the earlier chain position.
+Rewards use chronological frontier gains rather than raw leaderboard rank. Exact duplicates earn
+nothing, sub-threshold changes earn nothing, and splitting the same sequence of improvements among
+several hotkeys cannot increase total utility. Deregistered historical winners remain part of the
+frontier calculation, so their removal cannot retroactively turn an earlier loser into a winner.
+The resulting utilities are filtered to currently registered hotkeys and normalized under current
+Bittensor count and weight-cap constraints. When no valid vector exists, `weights` is `null` and
+Validators keep their last finalized weights.
 
-All submissions on a track use the same hidden panel. Screening covers every route and stratum and
-only limits evaluation cost. Local scores are provisional; only a successful full rollout is
-eligible for chain weight. Utility is the final-score improvement over earlier successful
-submissions. Improvements from the same hotkey accumulate, exact copies receive no marginal
-utility, and gains below the frozen `minimum_frontier_gain` receive no utility.
+The hidden rollout panel must be rotated between reward epochs. Before live rewards, the production
+track must also pass real-GPU repeatability, ranking stability, cost calibration, baseline headroom,
+and adversarial-submission experiments. CPU tests validate mechanics; they do not establish video
+quality or target-GPU utilization.
 
-A provisional update cannot remove the same hotkey's previous confirmed result. It replaces that
-result only after rollout success or deterministic participant failure. Infrastructure failure does
-not permanently reserve a repository reference or model digest.
+## Public R2 state
 
-Before production, rollout scoring must be validated on real paired videos. The hidden rollout
-panel must rotate and successful incumbents must be re-audited for each reward epoch; otherwise a
-fixed public score becomes a black-box training oracle.
+Each frozen track uses one prefix:
 
-## Public R2 artifacts
+```text
+tracks/<track>/
+  track.json
+  summary.json
+  weights.json
+  matches/
+    000000000001.json
+    000000000002.json
+    ...
+```
 
-The owner publishes two canonical JSON objects under one R2 prefix:
+- `track.json` is immutable and contains the canonical public track specification and digest.
+- `matches/*.json` are immutable terminal match facts in chain order: public model reference,
+  content hashes, aggregate result, incumbent, decision, and decision block.
+- `summary.json` is a bounded current view containing the champion, top leaderboard and reward
+  entries with their totals, and the committed match count.
+- `weights.json` is the small mutable artifact consumed by Validators.
 
-- `results.json`: leaderboard, weight-source history, and complete public challenge records;
-- `weights.json`: the small hotkey/UID/weight vector consumed by Validators.
+Publication writes the immutable track and matches first, then `summary.json`, then `weights.json`.
+A crash can therefore leave an extra immutable match but cannot expose weights for an uncommitted
+summary. On restart the evaluator validates every committed match, follows any contiguous orphaned
+matches, and restores them instead of evaluating them again. Conflicting immutable bytes stop
+publication. A chain node behind the recovered R2 watermark may keep scanning, but evaluation and
+publication wait until its finalized height catches up, so public state cannot move backward.
 
-Both bind to `track_id`, `track_spec_digest`, `netuid`, and one finalized `source_block`.
-`results.json` is uploaded first and `weights.json` last. Publication is skipped while the chain
-scanner is behind, so an incomplete submission history cannot become a public weight vector. If
-the current chain constraints cannot hold a valid vector, `weights` is `null`.
+R2 is the durable source for public tournament facts. The local SQLite database and downloaded
+model cache are disposable execution state: after loss, finalized chain submissions plus verified
+R2 matches reconstruct completed work, and remaining submissions can be evaluated again.
 
-Validators reject a weight artifact when it targets another track or subnet, is stale or from the
-future, violates current count/cap constraints, or contains a hotkey-to-UID mapping that no longer
-matches the finalized metagraph. They also use the Validator hotkey's chain `last_update` and the
-subnet rate limit to avoid duplicate or premature transactions.
-
-Use an R2 custom domain for production. The publisher sets `Cache-Control: no-store`; do not add a
-cache rule that overrides it for these mutable JSON objects. Cloudflare's `r2.dev` endpoint is
-rate-limited and intended only for development.
+Public artifacts deliberately exclude hidden samples, per-sample or per-layer metrics, local paths,
+worker and lease data, retry timing, error text, stack traces, and credentials. Only stable error
+codes are public. Use a public HTTPS custom domain for reads; mutable objects are published with
+`Cache-Control: no-store`, while immutable objects receive long-lived immutable caching.
 
 ## Commands
 
-Run tests:
+Install and test:
 
 ```bash
+uv sync
+uv run ruff check src tests
 uv run pytest
 ```
 
-Preview a Miner submission without opening a wallet or network connection:
+Preview a Miner payload locally:
 
 ```bash
 uv run veda miner submit \
@@ -84,11 +102,11 @@ uv run veda miner submit \
   --netuid 1
 ```
 
-Add `--execute`, `--wallet-name`, `--hotkey`, and optionally `--network` or `--wallet-path` to
-submit, wait for finalization, and exit.
+Add `--execute`, wallet options, and the target network to sign, submit, wait for finalization, and
+exit. The model revision may be private at submission time, but it must be public when its grace
+period expires.
 
-The owner installs the R2 publishing extra and supplies S3 credentials only through environment
-variables:
+Run the evaluator:
 
 ```bash
 uv sync --extra r2
@@ -109,8 +127,11 @@ uv run --extra r2 veda validator evaluate \
   --r2-prefix tracks/main
 ```
 
-An independent Validator needs no evaluation database, model cache, hidden data, GPU, or R2 write
-credentials:
+The rollout runner is a local executable started by the evaluator, not a network service. Omitting
+both rollout arguments keeps qualifying submissions provisional and prevents them from receiving
+weights.
+
+Run any Validator, including the evaluator operator's independent Validator:
 
 ```bash
 uv run veda validator run \
@@ -121,25 +142,6 @@ uv run veda validator run \
   --hotkey default
 ```
 
-The local rollout runner is an executable, not a network service. Evaluation starts it directly,
-sends one JSON request on stdin, and reads one JSON result from stdout. The track digest pins the
-runner and hidden panel by SHA-256. Omitting both keeps qualifying results provisional; adding both
-later automatically queues saved provisional results that meet the rollout threshold.
-
-A successful runner returns exactly one object whose binding fields echo the request:
-
-```json
-{
-  "status": "ok",
-  "challenge_id": "...",
-  "file_sha256": "...",
-  "track_digest": "...",
-  "final_score": 0.73,
-  "attention_cost": 0.18,
-  "metrics": {"video_samples": 4}
-}
-```
-
-Deterministic model failures use `status: "participant_error"`; retryable GPU or environment
-failures use `status: "temporary_error"`. Non-zero exits, malformed JSON, unknown fields, changed
-hashes, or binding mismatches are treated as infrastructure failures rather than participant scores.
+This process needs no evaluator database, model cache, hidden data, GPU, or R2 write credentials. It
+rejects artifacts for another track or subnet, future or stale snapshots, invalid normalization or
+caps, insufficient UID count, and hotkey-to-UID mappings that differ from the finalized metagraph.

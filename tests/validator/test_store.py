@@ -5,6 +5,7 @@ import pytest
 
 from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
+from validator.tournament import resolve_tournament
 
 
 def make_submission(*, hotkey: str = "hk1") -> SubmissionRecord:
@@ -270,7 +271,7 @@ def advance_to_rollout(store: ChallengeStore, identifier: str, timestamp: int) -
     store.transition(identifier, ChallengeState.ROLLOUT, occurred_at_ms=timestamp + 4)
 
 
-def test_later_chain_position_wins_even_when_scoring_finishes_first(tmp_path) -> None:
+def test_leaderboard_keeps_hotkeys_best_authoritative_score(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
@@ -294,11 +295,11 @@ def test_later_chain_position_wins_even_when_scoring_finishes_first(tmp_path) ->
 
         entries = store.leaderboard()
         assert len(entries) == 1
-        assert entries[0].challenge_id == newer
-        assert entries[0].final_score == 0.5
+        assert entries[0].challenge_id == older
+        assert entries[0].final_score == 0.9
 
 
-def test_later_participant_failure_replaces_previous_score_with_zero(tmp_path) -> None:
+def test_later_participant_failure_preserves_previous_authoritative_score(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
@@ -318,8 +319,8 @@ def test_later_participant_failure_replaces_previous_score_with_zero(tmp_path) -
             occurred_at_ms=51,
         )
 
-        assert store.leaderboard()[0].challenge_id == newer
-        assert store.leaderboard()[0].final_score == 0
+        assert store.leaderboard()[0].challenge_id == older
+        assert store.leaderboard()[0].final_score == 0.9
 
 
 def test_provisional_and_system_failure_preserve_previous_success(tmp_path) -> None:
@@ -357,6 +358,7 @@ def test_provisional_and_system_failure_preserve_previous_success(tmp_path) -> N
         store.fail_leased_system(
             newer,
             rollout.lease_token,
+            score_block=121,
             error_code="ROLLOUT_RUNNER_FAILURE",
             error_summary="GPU worker unavailable",
             occurred_at_ms=63,
@@ -366,49 +368,39 @@ def test_provisional_and_system_failure_preserve_previous_success(tmp_path) -> N
         assert store.leaderboard()[0].challenge_id == older
 
 
-def test_reward_entries_keep_improvement_history_for_current_successes(tmp_path) -> None:
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        alice_first, _ = store.add_submission(submission_at(100, hotkey="alice"), occurred_at_ms=10)
-        bob, _ = store.add_submission(submission_at(110, hotkey="bob"), occurred_at_ms=11)
-        alice_upgrade, _ = store.add_submission(
-            submission_at(120, hotkey="alice"), occurred_at_ms=12
+def test_verified_r2_match_restores_disposable_local_state(tmp_path) -> None:
+    digest = "ab" * 32
+    with ChallengeStore(tmp_path / "validator.db", track_spec_digest=digest) as store:
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        public = store.public_challenge(identifier)
+        public.update(
+            {
+                "state": ChallengeState.SUCCEEDED,
+                "error_code": None,
+                "file_sha256": "cd" * 32,
+                "model_digest": "ef" * 32,
+                "model_size_bytes": 123,
+                "final_score": 0.8,
+                "attention_cost": 0.2,
+                "score_block": 110,
+                "stages": [],
+            }
         )
-        for index, (identifier, score) in enumerate(
-            ((alice_first, 0.6), (bob, 0.8), (alice_upgrade, 0.9)),
-            start=1,
-        ):
-            advance_to_rollout(store, identifier, 20 + index * 10)
-            store.complete_challenge(
-                identifier,
-                ChallengeState.SUCCEEDED,
-                final_score=score,
-                attention_cost=0.2,
-                score_block=120,
-                occurred_at_ms=29 + index * 10,
-            )
-
-        history = store.reward_entries()
-        assert [(item.hotkey, item.final_score) for item in history] == [
-            ("alice", 0.6),
-            ("bob", 0.8),
-            ("alice", 0.9),
-        ]
-
-        alice_failure, _ = store.add_submission(
-            submission_at(130, hotkey="alice"), occurred_at_ms=70
-        )
-        store.transition(alice_failure, ChallengeState.FETCHING, occurred_at_ms=71)
-        store.complete_challenge(
-            alice_failure,
-            ChallengeState.PARTICIPANT_FAILED,
-            error_code="MODEL_SCHEMA_INVALID",
-            score_block=130,
-            occurred_at_ms=72,
+        tournament = resolve_tournament(
+            [public],
+            track_id="track",
+            track_spec_digest=digest,
+            netuid=7,
+            minimum_gain=0.001,
         )
 
-        assert [(item.hotkey, item.final_score) for item in store.reward_entries()] == [
-            ("bob", 0.8)
-        ]
+        assert store.restore_public_matches(tournament.matches) == 1
+        assert store.restore_public_matches(tournament.matches) == 1
+        restored = store.get_challenge(identifier)
+        assert restored.state is ChallengeState.SUCCEEDED
+        assert restored.final_score == 0.8
+        assert store.leaderboard()[0].challenge_id == identifier
+        assert store.public_challenge(identifier)["stages"] == []
 
 
 def test_stage_score_replay_must_be_identical(tmp_path) -> None:
@@ -597,12 +589,14 @@ def test_scoring_claims_can_run_in_parallel_and_reject_stale_completion(tmp_path
             store.complete_challenge(
                 first_id,
                 ChallengeState.SCREENED_OUT,
+                error_code="SCREENING_THRESHOLD",
                 occurred_at_ms=151,
                 lease_token=first.lease_token,
             )
         store.complete_challenge(
             first_id,
             ChallengeState.SCREENED_OUT,
+            error_code="SCREENING_THRESHOLD",
             occurred_at_ms=151,
             lease_token=reclaimed.lease_token,
         )

@@ -1,0 +1,394 @@
+"""Deterministic FIFO tournament resolution over terminal challenge records."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from decimal import Decimal
+from enum import StrEnum
+from math import isfinite
+from typing import Any
+
+from validator.queue import TERMINAL_STATES, ChainPosition, ChallengeState
+from validator.store import LeaderboardEntry
+
+
+class MatchOutcome(StrEnum):
+    INITIAL_CHAMPION = "INITIAL_CHAMPION"
+    CHALLENGER_WON = "CHALLENGER_WON"
+    CHAMPION_RETAINED = "CHAMPION_RETAINED"
+    CHALLENGE_FAILED = "CHALLENGE_FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class Champion:
+    challenge_id: str
+    hotkey: str
+    repo_id: str
+    revision: str
+    score: float
+    attention_cost: float
+    position: ChainPosition
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "challenge_id": self.challenge_id,
+            "hotkey": self.hotkey,
+            "repo_id": self.repo_id,
+            "revision": self.revision,
+            "score": self.score,
+            "attention_cost": self.attention_cost,
+            "block_height": self.position.block,
+            "extrinsic_index": self.position.extrinsic_index,
+            "event_index": self.position.event_index,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MatchRecord:
+    sequence: int
+    challenge_id: str
+    hotkey: str
+    state: ChallengeState
+    final_score: float | None
+    score_gain: float | None
+    outcome: MatchOutcome
+    champion_after: Champion | None
+    document: Mapping[str, Any]
+
+    @property
+    def object_name(self) -> str:
+        return f"matches/{self.sequence:012d}.json"
+
+
+@dataclass(frozen=True, slots=True)
+class Tournament:
+    matches: tuple[MatchRecord, ...]
+    champion: Champion | None
+    leaderboard: tuple[dict[str, Any], ...]
+    reward_entries: tuple[LeaderboardEntry, ...]
+
+
+def canonical_score_gain(score: float, frontier: float) -> float:
+    """Subtract canonical JSON-style decimals without binary boundary drift."""
+
+    if not isfinite(score) or not isfinite(frontier):
+        raise ValueError("scores must be finite")
+    return float(Decimal(str(score)) - Decimal(str(frontier)))
+
+
+def challenge_from_match(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Recover the public terminal challenge facts carried by one match object."""
+
+    submission = document.get("submission")
+    evaluation = document.get("evaluation")
+    if not isinstance(submission, Mapping) or not isinstance(evaluation, Mapping):
+        raise ValueError("match submission and evaluation must be objects")
+    return {
+        "challenge_id": document.get("challenge_id"),
+        "submission_id": document.get("submission_id"),
+        "hotkey": submission.get("hotkey"),
+        "repo_id": submission.get("repo_id"),
+        "revision": submission.get("revision"),
+        "block_height": submission.get("block_height"),
+        "extrinsic_index": submission.get("extrinsic_index"),
+        "event_index": submission.get("event_index"),
+        "state": evaluation.get("state"),
+        "error_code": evaluation.get("error_code"),
+        "file_sha256": evaluation.get("file_sha256"),
+        "model_digest": evaluation.get("model_digest"),
+        "model_size_bytes": evaluation.get("model_size_bytes"),
+        "final_score": evaluation.get("final_score"),
+        "attention_cost": evaluation.get("attention_cost"),
+        "score_block": evaluation.get("score_block"),
+        "stages": [],
+    }
+
+
+def validate_match_document(
+    document: Mapping[str, Any],
+    *,
+    sequence: int,
+    track_id: str,
+    track_spec_digest: str,
+    netuid: int,
+    minimum_gain: float,
+    incumbent: Champion | None,
+) -> MatchRecord:
+    """Strictly validate one stored match and its link to the previous champion."""
+
+    challenge = challenge_from_match(document)
+    record, _ = _resolve_match(
+        challenge,
+        sequence=sequence,
+        track_id=track_id,
+        track_spec_digest=track_spec_digest,
+        netuid=netuid,
+        minimum_gain=minimum_gain,
+        incumbent=incumbent,
+    )
+    if dict(record.document) != dict(document):
+        raise ValueError("stored match is not the canonical tournament decision")
+    return record
+
+
+def resolve_tournament(
+    challenges: Iterable[Mapping[str, Any]],
+    *,
+    track_id: str,
+    track_spec_digest: str,
+    netuid: int,
+    minimum_gain: float,
+) -> Tournament:
+    """Resolve the contiguous terminal prefix in finalized submission order."""
+
+    if not track_id:
+        raise ValueError("track ID cannot be empty")
+    if len(track_spec_digest) != 64:
+        raise ValueError("track specification digest must contain 32 bytes")
+    try:
+        bytes.fromhex(track_spec_digest)
+    except ValueError as exc:
+        raise ValueError("track specification digest must be hexadecimal") from exc
+    if not 0 <= netuid <= 0xFFFF:
+        raise ValueError("netuid must fit in an unsigned 16-bit integer")
+    if not isfinite(minimum_gain) or not 0 < minimum_gain <= 1:
+        raise ValueError("minimum gain must be within (0, 1]")
+
+    champion: Champion | None = None
+    matches: list[MatchRecord] = []
+    successful: list[LeaderboardEntry] = []
+    best_by_hotkey: dict[str, Champion] = {}
+
+    for sequence, challenge in enumerate(challenges, start=1):
+        state = ChallengeState(_required_string(challenge, "state"))
+        if state not in TERMINAL_STATES:
+            break
+        record, champion = _resolve_match(
+            challenge,
+            sequence=sequence,
+            track_id=track_id,
+            track_spec_digest=track_spec_digest.lower(),
+            netuid=netuid,
+            minimum_gain=minimum_gain,
+            incumbent=champion,
+        )
+        matches.append(record)
+        if state is ChallengeState.SUCCEEDED:
+            position = _position(challenge)
+            score = _score(challenge["final_score"], "final_score")
+            attention_cost = _nonnegative(challenge["attention_cost"], "attention_cost")
+            score_block = _integer(challenge["score_block"], "score_block")
+            entry = LeaderboardEntry(
+                hotkey=record.hotkey,
+                challenge_id=record.challenge_id,
+                final_score=score,
+                attention_cost=attention_cost,
+                provisional=False,
+                score_block=score_block,
+                position=position,
+            )
+            successful.append(entry)
+            repo_id = _required_string(challenge, "repo_id")
+            revision = _required_string(challenge, "revision")
+            candidate = Champion(
+                record.challenge_id,
+                record.hotkey,
+                repo_id,
+                revision,
+                score,
+                attention_cost,
+                position,
+            )
+            current = best_by_hotkey.get(candidate.hotkey)
+            if current is None or _champion_order(candidate) < _champion_order(current):
+                best_by_hotkey[candidate.hotkey] = candidate
+
+    ranked = sorted(best_by_hotkey.values(), key=_champion_order)
+    leaderboard = tuple(
+        {"rank": rank, **candidate.public()} for rank, candidate in enumerate(ranked, start=1)
+    )
+    return Tournament(tuple(matches), champion, leaderboard, tuple(successful))
+
+
+def _resolve_match(
+    challenge: Mapping[str, Any],
+    *,
+    sequence: int,
+    track_id: str,
+    track_spec_digest: str,
+    netuid: int,
+    minimum_gain: float,
+    incumbent: Champion | None,
+) -> tuple[MatchRecord, Champion | None]:
+    identifier = _required_string(challenge, "challenge_id")
+    submission_id = _required_string(challenge, "submission_id")
+    hotkey = _required_string(challenge, "hotkey")
+    position = _position(challenge)
+    state = ChallengeState(_required_string(challenge, "state"))
+    if state not in TERMINAL_STATES:
+        raise ValueError("a match must contain a terminal challenge")
+    repo_id = _optional_string(challenge.get("repo_id"), "repo_id")
+    revision = _optional_string(challenge.get("revision"), "revision")
+    error_code = _optional_string(challenge.get("error_code"), "error_code")
+    file_sha256 = _optional_digest(challenge.get("file_sha256"), "file_sha256")
+    model_digest = _optional_digest(challenge.get("model_digest"), "model_digest")
+    model_size_bytes = _optional_integer(challenge.get("model_size_bytes"), "model_size_bytes")
+    before = incumbent
+    score_gain: float | None = None
+
+    if state is ChallengeState.SUCCEEDED:
+        if repo_id is None or revision is None:
+            raise ValueError("successful challenge is missing its model reference")
+        if error_code is not None:
+            raise ValueError("successful challenge cannot contain an error code")
+        if challenge.get("score_block") is None:
+            raise ValueError("successful challenge is missing its score block")
+        if file_sha256 is None or model_digest is None or model_size_bytes is None:
+            raise ValueError("successful challenge is missing its model facts")
+        score = _score(challenge.get("final_score"), "final_score")
+        attention_cost = _nonnegative(challenge.get("attention_cost"), "attention_cost")
+        candidate = Champion(identifier, hotkey, repo_id, revision, score, attention_cost, position)
+        score_gain = score if before is None else canonical_score_gain(score, before.score)
+        if before is None:
+            outcome = MatchOutcome.INITIAL_CHAMPION
+            incumbent = candidate
+        elif score_gain >= minimum_gain:
+            outcome = MatchOutcome.CHALLENGER_WON
+            incumbent = candidate
+        else:
+            outcome = MatchOutcome.CHAMPION_RETAINED
+    else:
+        if error_code is None:
+            raise ValueError("failed challenge is missing its error code")
+        score = None
+        attention_cost = None
+        outcome = MatchOutcome.CHALLENGE_FAILED
+
+    decided_block = (
+        _integer(challenge["score_block"], "score_block")
+        if challenge.get("score_block") is not None
+        else position.block
+    )
+    if decided_block < position.block:
+        raise ValueError("decision block cannot precede submission")
+    evaluation = {
+        "state": state,
+        "error_code": error_code,
+        "file_sha256": file_sha256,
+        "model_digest": model_digest,
+        "model_size_bytes": model_size_bytes,
+        "final_score": score,
+        "attention_cost": attention_cost,
+        "score_block": (
+            _integer(challenge["score_block"], "score_block")
+            if challenge.get("score_block") is not None
+            else None
+        ),
+    }
+    document = {
+        "track_id": track_id,
+        "track_spec_digest": track_spec_digest,
+        "netuid": netuid,
+        "sequence": sequence,
+        "challenge_id": identifier,
+        "submission_id": submission_id,
+        "submission": {
+            "hotkey": hotkey,
+            "repo_id": repo_id,
+            "revision": revision,
+            "block_height": position.block,
+            "extrinsic_index": position.extrinsic_index,
+            "event_index": position.event_index,
+        },
+        "evaluation": evaluation,
+        "incumbent_before": None if before is None else before.public(),
+        "minimum_gain": minimum_gain,
+        "score_gain": score_gain,
+        "outcome": outcome,
+        "champion_after": None if incumbent is None else incumbent.public(),
+        "decided_block": decided_block,
+    }
+    return (
+        MatchRecord(
+            sequence,
+            identifier,
+            hotkey,
+            state,
+            score,
+            score_gain,
+            outcome,
+            incumbent,
+            document,
+        ),
+        incumbent,
+    )
+
+
+def _position(value: Mapping[str, Any]) -> ChainPosition:
+    return ChainPosition(
+        _integer(value.get("block_height"), "block_height"),
+        _integer(value.get("extrinsic_index"), "extrinsic_index"),
+        _integer(value.get("event_index"), "event_index"),
+    )
+
+
+def _champion_order(value: Champion) -> tuple[float, float, ChainPosition]:
+    return (-value.score, value.attention_cost, value.position)
+
+
+def _required_string(value: Mapping[str, Any], key: str) -> str:
+    result = value.get(key)
+    if not isinstance(result, str) or not result:
+        raise ValueError(f"{key} must be a non-empty string")
+    return result
+
+
+def _optional_string(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be null or a non-empty string")
+    return value
+
+
+def _integer(value: Any, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _optional_integer(value: Any, name: str) -> int | None:
+    return None if value is None else _integer(value, name)
+
+
+def _score(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    result = float(value)
+    if not isfinite(result) or not 0 <= result <= 1:
+        raise ValueError(f"{name} must be within [0, 1]")
+    return result
+
+
+def _nonnegative(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    result = float(value)
+    if not isfinite(result) or result < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return result
+
+
+def _optional_digest(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    result = _optional_string(value, name)
+    assert result is not None
+    if len(result) != 64:
+        raise ValueError(f"{name} must contain 32 bytes")
+    try:
+        bytes.fromhex(result)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be hexadecimal") from exc
+    return result.lower()

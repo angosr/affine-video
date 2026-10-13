@@ -13,6 +13,7 @@ import bittensor as bt
 from bittensor.intents import normalize as normalize_weights
 
 from validator.store import LeaderboardEntry
+from validator.tournament import canonical_score_gain
 
 _HEX_32 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -50,7 +51,7 @@ class WeightPlan:
 
 @dataclass(frozen=True, slots=True)
 class WeightArtifact:
-    """One public recommendation produced by the evaluation owner."""
+    """One public recommendation produced by the evaluator."""
 
     track_id: str
     track_spec_digest: str
@@ -150,19 +151,26 @@ async def read_weight_chain_state(
 def frontier_gains(entries: Iterable[LeaderboardEntry], *, minimum_gain: float) -> dict[str, float]:
     """Credit only score improvements over earlier on-chain submissions.
 
-    Gains telescope to the best score, so copied or Sybil-split models cannot
-    multiply their total utility merely by occupying more hotkeys.
+    Credited gains are disjoint frontier increments bounded by the best score,
+    so copied or Sybil-split models cannot multiply total utility merely by
+    occupying more hotkeys.
     """
 
     if not isfinite(minimum_gain) or not 0 < minimum_gain <= 1:
         raise ValueError("minimum frontier gain must be within (0, 1]")
     ordered = sorted(entries, key=lambda entry: entry.position)
-    frontier = 0.0
+    frontier: float | None = None
     gains: dict[str, float] = {}
     for entry in ordered:
         if not isfinite(entry.final_score) or not 0 <= entry.final_score <= 1:
             raise ValueError("leaderboard scores must be finite and within [0, 1]")
-        gain = entry.final_score - frontier
+        gain = (
+            entry.final_score
+            if frontier is None
+            else canonical_score_gain(entry.final_score, frontier)
+        )
+        if frontier is None:
+            frontier = entry.final_score
         if gain >= minimum_gain:
             gains[entry.hotkey] = gains.get(entry.hotkey, 0.0) + gain
             frontier = entry.final_score
@@ -186,28 +194,28 @@ def plan_weights(
         raise ValueError("minimum allowed weights must be non-negative")
     if not isfinite(max_weight) or not 0 < max_weight <= 1:
         raise ValueError("maximum weight must be within (0, 1]")
-    eligible_entries = [
-        entry
-        for entry in entries
-        if entry.hotkey in uid_by_hotkey
-        and not entry.provisional
-        and entry.score_block <= current_block
+    settled_entries = [
+        entry for entry in entries if not entry.provisional and entry.score_block <= current_block
     ]
-    utilities = frontier_gains(eligible_entries, minimum_gain=minimum_frontier_gain)
+    historical_utilities = frontier_gains(
+        settled_entries,
+        minimum_gain=minimum_frontier_gain,
+    )
+    utilities = {
+        hotkey: utility
+        for hotkey, utility in historical_utilities.items()
+        if hotkey in uid_by_hotkey
+    }
     caps: dict[str, float] = {}
     seen_uids: dict[int, str] = {}
-    for entry in eligible_entries:
-        uid = uid_by_hotkey.get(entry.hotkey)
-        if uid is None:
-            raise AssertionError("eligible entry lost its UID")
+    for hotkey in utilities:
+        uid = uid_by_hotkey[hotkey]
         if uid < 0 or uid > 0xFFFF:
             raise ValueError("UIDs must fit in an unsigned 16-bit integer")
-        other = seen_uids.setdefault(uid, entry.hotkey)
-        if other != entry.hotkey:
+        other = seen_uids.setdefault(uid, hotkey)
+        if other != hotkey:
             raise ValueError("multiple hotkeys map to the same UID")
-        if entry.hotkey not in utilities:
-            continue
-        caps[entry.hotkey] = max_weight
+        caps[hotkey] = max_weight
 
     required = max(1, min_allowed_weights)
     if len(utilities) < required or sum(caps.values()) < 1 - 1e-12:

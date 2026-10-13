@@ -96,6 +96,7 @@ def process_next_admission(
             error_summary="repository revision duplicates an earlier active submission",
             occurred_at_ms=now,
             lease_token=task.lease_token,
+            score_block=current_finalized_block,
         )
         return AdmissionOutcome(
             task.challenge_id,
@@ -124,6 +125,7 @@ def process_next_admission(
                     settings,
                     now,
                     exc,
+                    current_finalized_block,
                 )
                 return AdmissionOutcome(task.challenge_id, status, exc.code)
             store.complete_challenge(
@@ -133,6 +135,7 @@ def process_next_admission(
                 error_summary=str(exc),
                 occurred_at_ms=now,
                 lease_token=task.lease_token,
+                score_block=current_finalized_block,
             )
             return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, exc.code)
 
@@ -160,6 +163,7 @@ def process_next_admission(
             settings,
             now,
             error,
+            current_finalized_block,
             resume_state=ChallengeState.FETCHING,
         )
         return AdmissionOutcome(task.challenge_id, status, error.code)
@@ -182,6 +186,7 @@ def process_next_admission(
             settings,
             now,
             error,
+            current_finalized_block,
             resume_state=ChallengeState.FETCHING,
         )
         return AdmissionOutcome(task.challenge_id, status, error.code)
@@ -193,6 +198,7 @@ def process_next_admission(
             error_summary=str(exc),
             occurred_at_ms=now,
             lease_token=task.lease_token,
+            score_block=current_finalized_block,
         )
         return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, exc.code)
 
@@ -208,6 +214,7 @@ def process_next_admission(
             settings,
             now,
             error,
+            current_finalized_block,
             resume_state=ChallengeState.FETCHING,
         )
         return AdmissionOutcome(task.challenge_id, status, error.code)
@@ -226,6 +233,7 @@ def process_next_admission(
             error_summary="model weights duplicate an earlier submission",
             occurred_at_ms=now,
             lease_token=task.lease_token,
+            score_block=current_finalized_block,
         )
         return AdmissionOutcome(
             task.challenge_id,
@@ -244,6 +252,7 @@ def _defer_or_fail(
     settings: AdmissionSettings,
     now_ms: int,
     error: ModelDownloadError,
+    current_finalized_block: int,
     *,
     resume_state: ChallengeState | None = None,
 ) -> AdmissionStatus:
@@ -251,6 +260,7 @@ def _defer_or_fail(
         store.fail_leased_system(
             challenge_id,
             lease_token,
+            score_block=current_finalized_block,
             error_code=error.code,
             error_summary=str(error),
             occurred_at_ms=now_ms,

@@ -147,7 +147,7 @@ def test_scoring_stages_advance_and_finish_with_one_leaderboard_result(tmp_path)
             now_ms=30,
         )
         assert local is not None and local.state is ChallengeState.ROLLOUT
-        assert store.leaderboard()[0].provisional is True
+        assert store.leaderboard() == []
         assert store.get_challenge(identifier).state is ChallengeState.ROLLOUT
 
         final = process_next_scoring(
@@ -246,11 +246,8 @@ def test_local_result_can_wait_provisionally_before_rollout(tmp_path) -> None:
         )
 
         assert result is not None and result.state is ChallengeState.PROVISIONAL
-        assert store.leaderboard()[0].provisional is True
-        assert (
-            store.claim_next_scoring("other", lease_ms=100, now_ms=31)
-            is None
-        )
+        assert store.leaderboard() == []
+        assert store.claim_next_scoring("other", lease_ms=100, now_ms=31) is None
 
         assert store.schedule_qualified_rollouts(0.8, occurred_at_ms=39) == 0
         assert store.get_challenge(identifier).state is ChallengeState.PROVISIONAL
@@ -261,7 +258,7 @@ def test_local_result_can_wait_provisionally_before_rollout(tmp_path) -> None:
         assert rollout.state is ChallengeState.ROLLOUT
 
 
-def test_screening_out_records_zero_terminal_score(tmp_path) -> None:
+def test_screening_out_records_no_authoritative_score(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier = ready_for_screening(store)
         outcome = process_next_scoring(
@@ -280,7 +277,7 @@ def test_screening_out_records_zero_terminal_score(tmp_path) -> None:
 
         assert outcome is not None and outcome.state is ChallengeState.SCREENED_OUT
         challenge = store.get_challenge(identifier)
-        assert challenge.final_score == 0
+        assert challenge.final_score is None
         assert challenge.error_code == "SCREENING_THRESHOLD"
 
 
@@ -354,7 +351,9 @@ def test_repeated_infrastructure_failure_stops_without_zeroing_rank(tmp_path) ->
         )
 
         assert outcome is not None and outcome.state is ChallengeState.SYSTEM_FAILED
-        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_FAILED
+        challenge = store.get_challenge(identifier)
+        assert challenge.state is ChallengeState.SYSTEM_FAILED
+        assert challenge.score_block == 100
         assert store.leaderboard() == []
 
 

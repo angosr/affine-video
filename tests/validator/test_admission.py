@@ -228,6 +228,7 @@ def test_same_model_can_retry_after_earlier_system_failure(tmp_path) -> None:
         store.fail_leased_system(
             first_id,
             scoring.lease_token,
+            score_block=10_000,
             error_code="SCORING_WORKER_FAILURE",
             error_summary="worker unavailable",
             occurred_at_ms=102,
@@ -293,11 +294,13 @@ def test_repeated_download_infrastructure_failure_becomes_system_failed(tmp_path
         )
 
         assert outcome is not None and outcome.status is AdmissionStatus.SYSTEM_FAILED
-        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_FAILED
+        challenge = store.get_challenge(identifier)
+        assert challenge.state is ChallengeState.SYSTEM_FAILED
+        assert challenge.score_block == 10_000
         assert store.leaderboard() == []
 
 
-def test_permanent_download_failure_records_zero_score(tmp_path) -> None:
+def test_permanent_download_failure_records_no_authoritative_score(tmp_path) -> None:
     def missing(*_args, **_kwargs):
         raise ModelDownloadError("MODEL_FILE_MISSING", "selector is missing")
 
@@ -316,4 +319,6 @@ def test_permanent_download_failure_records_zero_score(tmp_path) -> None:
         challenge = store.get_challenge(identifier)
         assert challenge.state is ChallengeState.PARTICIPANT_FAILED
         assert challenge.error_code == "MODEL_FILE_MISSING"
-        assert store.leaderboard()[0].final_score == 0
+        assert challenge.final_score is None
+        assert challenge.score_block == 10_000
+        assert store.leaderboard() == []

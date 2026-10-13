@@ -97,6 +97,24 @@ def test_frontier_gains_ignore_numerical_dust() -> None:
     assert gains == pytest.approx({"first": 0.6, "material": 0.002})
 
 
+def test_frontier_gain_accepts_an_exact_decimal_threshold() -> None:
+    gains = frontier_gains(
+        [entry("first", 0.2, 10), entry("second", 0.21, 20)],
+        minimum_gain=0.01,
+    )
+
+    assert gains == pytest.approx({"first": 0.2, "second": 0.01})
+
+
+def test_subthreshold_initial_champion_still_defines_the_frontier() -> None:
+    gains = frontier_gains(
+        [entry("first", 0.0005, 10), entry("second", 0.0014, 20)],
+        minimum_gain=0.001,
+    )
+
+    assert gains == {}
+
+
 def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
     calls: list[object] = []
 
@@ -169,6 +187,25 @@ def test_plan_excludes_provisional_deregistered_and_future_entries() -> None:
     assert plan.hotkeys == ("bob", "carol", "alice")
     assert plan.uids == (2, 5, 8)
     assert plan.weights == pytest.approx((1 / 3, 1 / 3, 1 / 3))
+
+
+def test_deregistered_champion_does_not_turn_a_historical_loser_into_a_winner() -> None:
+    plan = plan_weights(
+        [
+            entry("former", 0.8, 10),
+            entry("loser", 0.7, 20),
+            entry("winner", 0.9, 30),
+        ],
+        uid_by_hotkey={"loser": 1, "winner": 2},
+        current_block=100,
+        min_allowed_weights=1,
+        max_weight=1.0,
+        minimum_frontier_gain=0.001,
+    )
+
+    assert plan is not None
+    assert plan.hotkeys == ("winner",)
+    assert plan.weights == (1.0,)
 
 
 def test_plan_rejects_infeasible_or_ambiguous_vectors() -> None:

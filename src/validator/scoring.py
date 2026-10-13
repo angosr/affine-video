@@ -420,7 +420,15 @@ def process_next_scoring(
                 exc.code,
             )
         except TemporaryScoringError as exc:
-            state = _defer_or_fail(store, task, settings, now, code=exc.code, summary=str(exc))
+            state = _defer_or_fail(
+                store,
+                task,
+                settings,
+                now,
+                current_finalized_block,
+                code=exc.code,
+                summary=str(exc),
+            )
             return ScoringOutcome(task.challenge_id, state, exc.code)
         except Exception as exc:
             state = _defer_or_fail(
@@ -428,6 +436,7 @@ def process_next_scoring(
                 task,
                 settings,
                 now,
+                current_finalized_block,
                 code="SCORING_WORKER_FAILURE",
                 summary=str(exc) or type(exc).__name__,
             )
@@ -506,6 +515,7 @@ def _defer_or_fail(
     task: LeasedChallenge,
     settings: ScoringSettings,
     now_ms: int,
+    current_finalized_block: int,
     *,
     code: str,
     summary: str,
@@ -514,6 +524,7 @@ def _defer_or_fail(
         store.fail_leased_system(
             task.challenge_id,
             task.lease_token,
+            score_block=current_finalized_block,
             error_code=code,
             error_summary=summary,
             occurred_at_ms=now_ms,

@@ -92,6 +92,59 @@ class TrackSpec:
     digest: str
 
 
+def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
+    """Return the canonical public document whose SHA-256 is ``spec.digest``."""
+
+    return {
+        "track_id": spec.track_id,
+        "netuid": spec.netuid,
+        "track_start_block": spec.track_start_block,
+        "publication_grace_blocks": spec.publication_grace_blocks,
+        "submission_cooldown_blocks": spec.submission_cooldown_blocks,
+        "model": {
+            "filename": spec.model.filename,
+            "max_bytes": spec.model.max_bytes,
+            "selector": {
+                "routes": list(spec.model.selector.routes),
+                "num_layers": spec.model.selector.num_layers,
+                "num_heads": spec.model.selector.num_heads,
+                "head_dim": spec.model.selector.head_dim,
+                "storage_dtype": spec.model.selector.storage_dtype,
+            },
+        },
+        "base_model": {
+            "repo_id": spec.base_model.repo_id,
+            "revision": spec.base_model.revision,
+        },
+        "cache": {
+            "screen_sha256": spec.cache.screen_sha256,
+            "screen_max_bytes": spec.cache.screen_max_bytes,
+            "exact_sha256": spec.cache.exact_sha256,
+            "exact_max_bytes": spec.cache.exact_max_bytes,
+        },
+        "rollout": {
+            "runner_sha256": spec.rollout.runner_sha256,
+            "panel_sha256": spec.rollout.panel_sha256,
+            "panel_max_bytes": spec.rollout.panel_max_bytes,
+        },
+        "scoring": {
+            "budgets": [
+                {"blocks": budget.blocks, "calibrated_cost": budget.calibrated_cost}
+                for budget in spec.scoring.budgets
+            ],
+            "local_sample_count": spec.scoring.local_sample_count,
+            "tail_mean_weight": spec.scoring.tail_mean_weight,
+            "stratum_weights": dict(spec.scoring.stratum_weights),
+            "screening_threshold": spec.scoring.screening_threshold,
+            "rollout_threshold": spec.scoring.rollout_threshold,
+            "minimum_frontier_gain": spec.scoring.minimum_frontier_gain,
+            "bootstrap_confidence": spec.scoring.bootstrap_confidence,
+            "bootstrap_resamples": spec.scoring.bootstrap_resamples,
+            "bootstrap_seed": spec.scoring.bootstrap_seed,
+        },
+    }
+
+
 def load_track_spec(path: str | Path) -> TrackSpec:
     """Load one JSON spec, rejecting duplicate keys before validation."""
 

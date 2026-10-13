@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
@@ -16,7 +16,7 @@ import httpx
 from scoring.cache import validate_exact_cache, validate_screen_cache
 from scoring.model import ValidatedModel, validate_model
 from scoring.rollout import ProcessRollout
-from scoring.spec import load_track_spec
+from scoring.spec import TrackSpec, load_track_spec
 from validator.admission import (
     AdmissionOutcome,
     AdmissionSettings,
@@ -26,6 +26,7 @@ from validator.chain import ScanResult, scan_finalized_blocks
 from validator.download import DownloadedModel, download_public_model
 from validator.publication import (
     PublicArtifacts,
+    PublicLedger,
     build_public_artifacts,
     fetch_weight_artifact,
     validate_public_weights_url,
@@ -39,6 +40,7 @@ from validator.scoring import (
     process_next_scoring,
 )
 from validator.store import ChallengeStore, LeasedChallenge
+from validator.tournament import MatchRecord
 from validator.weights import (
     WeightReceipt,
     read_weight_chain_state,
@@ -48,8 +50,10 @@ from validator.weights import (
 )
 
 
-class ArtifactPublisher(Protocol):
+class ArtifactRepository(Protocol):
     async def publish(self, artifacts: PublicArtifacts) -> None: ...
+
+    async def load(self, track: TrackSpec) -> PublicLedger: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +62,7 @@ class EvaluationCycleResult:
     scan: ScanResult
     admission: AdmissionOutcome | None
     scoring: ScoringOutcome | None
+    restored_matches: int = 0
     published_block: int | None = None
     publication_error: str | None = None
 
@@ -83,7 +88,7 @@ async def run_evaluator(
     network: str,
     archive_endpoints: list[str] | None,
     worker_id: str,
-    publisher: ArtifactPublisher,
+    publisher: ArtifactRepository,
     mechid: int = 0,
     version_key: int = 0,
     poll_seconds: float = 12.0,
@@ -106,6 +111,7 @@ async def run_evaluator(
     if rollout_runner is not None and rollout_timeout_seconds >= scoring_timeout_seconds:
         raise ValueError("rollout timeout must be shorter than the scoring process timeout")
     track = load_track_spec(track_spec)
+    ledger = await publisher.load(track)
     rollout = (
         ProcessRollout(
             runner=str(rollout_runner),
@@ -155,6 +161,7 @@ async def run_evaluator(
         if rollout is not None:
             store.schedule_qualified_rollouts(track.scoring.rollout_threshold)
         async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
+            recovery_index = 0
             while True:
                 result = await process_cycle(
                     client,
@@ -167,9 +174,16 @@ async def run_evaluator(
                     evaluator=evaluator,
                     worker_id=worker_id,
                     max_scan_blocks=max_scan_blocks,
+                    recovery_matches=ledger.matches[recovery_index:],
+                    minimum_finalized_block=ledger.required_finalized_block,
                 )
+                recovery_index += result.restored_matches
                 cursor = store.chain_cursor()
-                if cursor is not None and cursor[0] == result.finalized_block:
+                if (
+                    cursor is not None
+                    and cursor[0] == result.finalized_block
+                    and result.finalized_block >= ledger.required_finalized_block
+                ):
                     try:
                         chain = await read_weight_chain_state(
                             client,
@@ -190,6 +204,7 @@ async def run_evaluator(
                                 result.scan,
                                 result.admission,
                                 result.scoring,
+                                restored_matches=result.restored_matches,
                                 published_block=artifacts.source_block,
                             )
                     except Exception as exc:
@@ -198,6 +213,7 @@ async def run_evaluator(
                             result.scan,
                             result.admission,
                             result.scoring,
+                            restored_matches=result.restored_matches,
                             publication_error=str(exc) or type(exc).__name__,
                         )
                 if report is not None:
@@ -221,7 +237,7 @@ async def run_validator(
     once: bool = False,
     report: Callable[[WeightCycleResult], None] | None = None,
 ) -> None:
-    """Fetch owner-produced weights, validate them, and submit with one Validator wallet."""
+    """Fetch evaluator-produced weights, validate them, and submit with one Validator wallet."""
 
     if not network:
         raise ValueError("network cannot be empty")
@@ -334,11 +350,15 @@ async def process_cycle(
     max_scan_blocks: int = 100,
     downloader: Callable[..., DownloadedModel] = download_public_model,
     model_validator: Callable[..., ValidatedModel] = validate_model,
+    recovery_matches: Sequence[MatchRecord] = (),
+    minimum_finalized_block: int = 0,
 ) -> EvaluationCycleResult:
     """Synchronize the chain, admit one model, and score one ready stage."""
 
     if not worker_id:
         raise ValueError("worker id cannot be empty")
+    if minimum_finalized_block < 0:
+        raise ValueError("minimum finalized block cannot be negative")
     scan = await scan_finalized_blocks(
         client,
         store,
@@ -348,6 +368,15 @@ async def process_cycle(
         max_blocks=max_scan_blocks,
     )
     finalized_block = await client.finalized_block()
+    restored_matches = store.restore_public_matches(recovery_matches)
+    if finalized_block < minimum_finalized_block:
+        return EvaluationCycleResult(
+            finalized_block,
+            scan,
+            None,
+            None,
+            restored_matches=restored_matches,
+        )
     admission = process_next_admission(
         store,
         worker_id=f"{worker_id}:admission",
@@ -363,4 +392,10 @@ async def process_cycle(
         settings=scoring_settings,
         evaluator=evaluator,
     )
-    return EvaluationCycleResult(finalized_block, scan, admission, scoring)
+    return EvaluationCycleResult(
+        finalized_block,
+        scan,
+        admission,
+        scoring,
+        restored_matches=restored_matches,
+    )

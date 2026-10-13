@@ -17,6 +17,7 @@ from validator.queue import ChallengeState
 from validator.run import process_cycle, process_weight_cycle
 from validator.scoring import ScoringSettings, StageOutcome
 from validator.store import ChallengeStore
+from validator.tournament import resolve_tournament
 from validator.weights import (
     WeightArtifact,
     WeightChainState,
@@ -119,10 +120,15 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
             "worker_id": "validator-a",
             "downloader": download,
         }
+        paused = asyncio.run(
+            process_cycle(client, store, minimum_finalized_block=102, **arguments)
+        )
         first = asyncio.run(process_cycle(client, store, **arguments))
         second = asyncio.run(process_cycle(client, store, **arguments))
 
-        assert first.scan.submissions_found == 1
+        assert paused.scan.submissions_found == 1
+        assert paused.admission is paused.scoring is None
+        assert first.scan.blocks_scanned == 0
         assert first.admission is not None
         assert first.admission.status is AdmissionStatus.ACCEPTED
         assert first.scoring is not None
@@ -131,8 +137,7 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
         assert second.admission is None
         assert second.scoring is not None
         assert second.scoring.state is ChallengeState.PROVISIONAL
-        assert store.leaderboard()[0].final_score == 0.7
-        assert store.leaderboard()[0].provisional is True
+        assert store.leaderboard() == []
 
 
 def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_path) -> None:
@@ -188,8 +193,15 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
     with ChallengeStore(database, track_spec_digest="ab" * 32) as store:
         snapshot = store.public_snapshot()
         challenge = snapshot["challenges"][0]
+        tournament = resolve_tournament(
+            snapshot["challenges"],
+            track_id="track",
+            track_spec_digest="ab" * 32,
+            netuid=7,
+            minimum_gain=0.001,
+        )
         plan = plan_weights(
-            store.reward_entries(),
+            tournament.reward_entries,
             uid_by_hotkey={HOTKEY: 4},
             current_block=101,
             min_allowed_weights=1,

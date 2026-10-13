@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -12,15 +13,32 @@ from urllib.parse import urlparse
 
 import httpx
 
-from scoring.spec import TrackSpec
+from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
 from validator.store import ChallengeStore
-from validator.weights import WeightArtifact, WeightChainState, WeightPlan, plan_weights
+from validator.tournament import (
+    Champion,
+    MatchRecord,
+    Tournament,
+    challenge_from_match,
+    resolve_tournament,
+    validate_match_document,
+)
+from validator.weights import (
+    WeightArtifact,
+    WeightChainState,
+    WeightPlan,
+    frontier_gains,
+    plan_weights,
+)
 
 _HEX_32 = re.compile(r"^[0-9a-f]{64}$")
 _R2_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _R2_ACCOUNT_ID = re.compile(r"^[0-9a-fA-F]{32}$")
 _R2_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MAX_WEIGHT_ARTIFACT_BYTES = 1024 * 1024
+_MAX_PUBLIC_OBJECT_BYTES = 1024 * 1024
+_SUMMARY_LEADERBOARD_LIMIT = 100
+_SUMMARY_REWARD_LIMIT = 100
 
 
 class PublicArtifactError(RuntimeError):
@@ -30,8 +48,25 @@ class PublicArtifactError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class PublicArtifacts:
     source_block: int
+    track: bytes
+    summary: bytes
     weights: bytes
-    results: bytes
+    matches: tuple[tuple[str, bytes], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PublicLedger:
+    source_block: int | None
+    matches: tuple[MatchRecord, ...]
+
+    @property
+    def required_finalized_block(self) -> int:
+        committed = 0 if self.source_block is None else self.source_block
+        decided = max(
+            (int(match.document["decided_block"]) for match in self.matches),
+            default=0,
+        )
+        return max(committed, decided)
 
 
 def build_public_artifacts(
@@ -47,9 +82,18 @@ def build_public_artifacts(
     cursor = store.chain_cursor()
     if cursor is None or cursor[0] != chain.finalized_block:
         return None
-    snapshot, reward_entries = store.public_snapshot_inputs()
+    snapshot = store.public_snapshot()
+    tournament = resolve_tournament(
+        snapshot["challenges"],
+        track_id=track.track_id,
+        track_spec_digest=track.digest,
+        netuid=track.netuid,
+        minimum_gain=track.scoring.minimum_frontier_gain,
+    )
+    if any(match.document["decided_block"] > chain.finalized_block for match in tournament.matches):
+        raise PublicArtifactError("a terminal decision is newer than the finalized chain snapshot")
     plan = plan_weights(
-        reward_entries,
+        tournament.reward_entries,
         uid_by_hotkey=chain.uid_by_hotkey,
         current_block=chain.finalized_block,
         min_allowed_weights=chain.min_allowed_weights,
@@ -65,22 +109,20 @@ def build_public_artifacts(
         source_block=chain.finalized_block,
         plan=plan,
     )
-    common = {
-        "track_id": track.track_id,
-        "track_spec_digest": track.digest,
-        "netuid": track.netuid,
-        "source_block": chain.finalized_block,
-    }
-    results = {
-        **common,
-        "leaderboard": snapshot["leaderboard"],
-        "rewards": snapshot["rewards"],
-        "challenges": snapshot["challenges"],
-    }
+    summary = _summary_document(track, chain.finalized_block, tournament)
     return PublicArtifacts(
         source_block=chain.finalized_block,
+        track=_json_bytes(
+            {
+                "track_spec_digest": track.digest,
+                "spec": track_spec_dict(track),
+            }
+        ),
+        summary=_json_bytes(summary),
         weights=encode_weight_artifact(artifact),
-        results=_json_bytes(results),
+        matches=tuple(
+            (match.object_name, _json_bytes(match.document)) for match in tournament.matches
+        ),
     )
 
 
@@ -208,7 +250,7 @@ async def fetch_weight_artifact(
 
 
 def validate_public_weights_url(url: str) -> str:
-    """Validate the immutable Validator-side location configured by an operator."""
+    """Validate the public Validator-side weight URL configured by an operator."""
 
     parsed = urlparse(url)
     if (
@@ -222,8 +264,8 @@ def validate_public_weights_url(url: str) -> str:
     return url
 
 
-class R2Publisher:
-    """Publish results first and the consumable weight artifact last."""
+class R2Repository:
+    """Persist immutable public facts and publish bounded current-state pointers."""
 
     def __init__(self, client: Any, *, bucket: str, prefix: str) -> None:
         if not _R2_NAME.fullmatch(bucket) or len(bucket) > 64:
@@ -238,9 +280,10 @@ class R2Publisher:
         self._client = client
         self._bucket = bucket
         self._prefix = normalized
+        self._confirmed_immutable: dict[str, str] = {}
 
     @classmethod
-    def from_environment(cls, *, account_id: str, bucket: str, prefix: str) -> R2Publisher:
+    def from_environment(cls, *, account_id: str, bucket: str, prefix: str) -> R2Repository:
         if not _R2_ACCOUNT_ID.fullmatch(account_id):
             raise ValueError("R2 account ID is invalid")
         access_key = os.environ.get("VEDA_R2_ACCESS_KEY_ID")
@@ -263,17 +306,186 @@ class R2Publisher:
         return cls(client, bucket=bucket, prefix=prefix)
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
-        await asyncio.to_thread(self._put, "results.json", artifacts.results)
-        await asyncio.to_thread(self._put, "weights.json", artifacts.weights)
+        await asyncio.to_thread(self._put_immutable, "track.json", artifacts.track)
+        for name, payload in artifacts.matches:
+            await asyncio.to_thread(self._put_immutable, name, payload)
+        await asyncio.to_thread(self._put, "summary.json", artifacts.summary, False)
+        await asyncio.to_thread(self._put, "weights.json", artifacts.weights, False)
 
-    def _put(self, name: str, payload: bytes) -> None:
+    async def load(self, track: TrackSpec) -> PublicLedger:
+        """Load and verify the committed public tournament ledger from R2."""
+
+        return await asyncio.to_thread(self._load, track)
+
+    def _load(self, track: TrackSpec) -> PublicLedger:
+        track_payload = self._get_optional("track.json")
+        summary_payload = self._get_optional("summary.json")
+        if track_payload is None:
+            if summary_payload is not None:
+                raise PublicArtifactError("R2 summary exists without its immutable track")
+            return PublicLedger(None, ())
+
+        track_document = _decode_canonical_object(track_payload, "track")
+        if set(track_document) != {"track_spec_digest", "spec"}:
+            raise PublicArtifactError("R2 track fields are invalid")
+        try:
+            stored_track = parse_track_spec(track_document["spec"])
+        except ValueError as exc:
+            raise PublicArtifactError("R2 track specification is invalid") from exc
+        if track_document["track_spec_digest"] != stored_track.digest or stored_track != track:
+            raise PublicArtifactError("R2 track does not match the configured track")
+        self._confirmed_immutable["track.json"] = hashlib.sha256(track_payload).hexdigest()
+
+        if summary_payload is None:
+            return PublicLedger(None, tuple(self._load_following_matches(track, 1, None)))
+        summary = _decode_canonical_object(summary_payload, "summary")
+        expected_fields = {
+            "track_id",
+            "track_spec_digest",
+            "netuid",
+            "source_block",
+            "match_count",
+            "latest_match",
+            "champion",
+            "leaderboard",
+            "leaderboard_total",
+            "rewards",
+            "rewards_total",
+        }
+        if set(summary) != expected_fields:
+            raise PublicArtifactError("R2 summary fields are invalid")
+        source_block = _integer(summary["source_block"], "source_block")
+        if source_block < track.track_start_block:
+            raise PublicArtifactError("R2 summary predates the configured track")
+        match_count = _integer(summary["match_count"], "match_count")
+        matches: list[MatchRecord] = []
+        committed_challenges: list[dict[str, Any]] = []
+        incumbent = None
+        for sequence in range(1, match_count + 1):
+            name = f"matches/{sequence:012d}.json"
+            payload = self._get_optional(name)
+            if payload is None:
+                raise PublicArtifactError(f"R2 committed match is missing: {name}")
+            document = _decode_canonical_object(payload, name)
+            try:
+                record = validate_match_document(
+                    document,
+                    sequence=sequence,
+                    track_id=track.track_id,
+                    track_spec_digest=track.digest,
+                    netuid=track.netuid,
+                    minimum_gain=track.scoring.minimum_frontier_gain,
+                    incumbent=incumbent,
+                )
+            except ValueError as exc:
+                raise PublicArtifactError(f"R2 match is invalid: {name}") from exc
+            matches.append(record)
+            committed_challenges.append(challenge_from_match(document))
+            if document["decided_block"] > source_block:
+                raise PublicArtifactError(f"R2 match is newer than its summary: {name}")
+            incumbent = record.champion_after
+            self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
+
+        tournament = resolve_tournament(
+            committed_challenges,
+            track_id=track.track_id,
+            track_spec_digest=track.digest,
+            netuid=track.netuid,
+            minimum_gain=track.scoring.minimum_frontier_gain,
+        )
+        if summary != _summary_document(track, source_block, tournament):
+            raise PublicArtifactError("R2 summary does not match its immutable matches")
+
+        matches.extend(self._load_following_matches(track, match_count + 1, incumbent))
+        return PublicLedger(source_block, tuple(matches))
+
+    def _load_following_matches(
+        self,
+        track: TrackSpec,
+        sequence: int,
+        incumbent: Champion | None,
+    ) -> list[MatchRecord]:
+        matches: list[MatchRecord] = []
+        while True:
+            name = f"matches/{sequence:012d}.json"
+            payload = self._get_optional(name)
+            if payload is None:
+                break
+            document = _decode_canonical_object(payload, name)
+            try:
+                record = validate_match_document(
+                    document,
+                    sequence=sequence,
+                    track_id=track.track_id,
+                    track_spec_digest=track.digest,
+                    netuid=track.netuid,
+                    minimum_gain=track.scoring.minimum_frontier_gain,
+                    incumbent=incumbent,
+                )
+            except ValueError as exc:
+                raise PublicArtifactError(f"R2 match is invalid: {name}") from exc
+            matches.append(record)
+            incumbent = record.champion_after
+            self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
+            sequence += 1
+        return matches
+
+    def _put_immutable(self, name: str, payload: bytes) -> None:
+        digest = hashlib.sha256(payload).hexdigest()
+        if self._confirmed_immutable.get(name) == digest:
+            return
+        existing = self._get_optional(name)
+        if existing is not None:
+            if existing != payload:
+                raise PublicArtifactError(f"immutable R2 object conflicts with local data: {name}")
+            self._confirmed_immutable[name] = digest
+            return
+        self._put(name, payload, True)
+        self._confirmed_immutable[name] = digest
+
+    def _put(self, name: str, payload: bytes, immutable: bool) -> None:
+        if not payload or len(payload) > _MAX_PUBLIC_OBJECT_BYTES:
+            raise PublicArtifactError(f"public object size is invalid: {name}")
         self._client.put_object(
             Bucket=self._bucket,
             Key=f"{self._prefix}/{name}",
             Body=payload,
             ContentType="application/json; charset=utf-8",
-            CacheControl="no-store, max-age=0",
+            CacheControl=(
+                "public, max-age=31536000, immutable" if immutable else "no-store, max-age=0"
+            ),
         )
+
+    def _get_optional(self, name: str) -> bytes | None:
+        try:
+            response = self._client.get_object(
+                Bucket=self._bucket,
+                Key=f"{self._prefix}/{name}",
+            )
+        except Exception as exc:
+            response_data = getattr(exc, "response", None)
+            code = (
+                response_data.get("Error", {}).get("Code")
+                if isinstance(response_data, dict)
+                else None
+            )
+            status = (
+                response_data.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if isinstance(response_data, dict)
+                else None
+            )
+            if status == 404 or code in {"NoSuchKey", "404", "NotFound"}:
+                return None
+            raise
+        body = response.get("Body")
+        if body is None or not hasattr(body, "read"):
+            raise PublicArtifactError(f"R2 returned an invalid object body: {name}")
+        payload = body.read(_MAX_PUBLIC_OBJECT_BYTES + 1)
+        if not isinstance(payload, bytes):
+            raise PublicArtifactError(f"R2 returned a non-byte object body: {name}")
+        if not payload or len(payload) > _MAX_PUBLIC_OBJECT_BYTES:
+            raise PublicArtifactError(f"R2 object size is invalid: {name}")
+        return payload
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -284,6 +496,46 @@ def _json_bytes(value: Any) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _summary_document(
+    track: TrackSpec,
+    source_block: int,
+    tournament: Tournament,
+) -> dict[str, Any]:
+    rewards = frontier_gains(
+        tournament.reward_entries,
+        minimum_gain=track.scoring.minimum_frontier_gain,
+    )
+    ranked_rewards = sorted(rewards.items(), key=lambda item: (-item[1], item[0]))
+    return {
+        "track_id": track.track_id,
+        "track_spec_digest": track.digest,
+        "netuid": track.netuid,
+        "source_block": source_block,
+        "match_count": len(tournament.matches),
+        "latest_match": tournament.matches[-1].object_name if tournament.matches else None,
+        "champion": None if tournament.champion is None else tournament.champion.public(),
+        "leaderboard": list(tournament.leaderboard[:_SUMMARY_LEADERBOARD_LIMIT]),
+        "leaderboard_total": len(tournament.leaderboard),
+        "rewards": [
+            {"hotkey": hotkey, "utility": utility}
+            for hotkey, utility in ranked_rewards[:_SUMMARY_REWARD_LIMIT]
+        ],
+        "rewards_total": len(ranked_rewards),
+    }
+
+
+def _decode_canonical_object(payload: bytes, name: str) -> dict[str, Any]:
+    if not payload or len(payload) > _MAX_PUBLIC_OBJECT_BYTES:
+        raise PublicArtifactError(f"R2 {name} size is invalid")
+    try:
+        raw = json.loads(payload, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PublicArtifactError(f"R2 {name} is not valid JSON") from exc
+    if not isinstance(raw, dict) or _json_bytes(raw) != payload:
+        raise PublicArtifactError(f"R2 {name} is not a canonical JSON object")
+    return raw
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

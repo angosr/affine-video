@@ -165,7 +165,7 @@ def test_evaluator_forwards_runtime_and_r2_configuration(monkeypatch, tmp_path) 
 
     monkeypatch.setattr(cli_module, "run_evaluator", fake_run)
     monkeypatch.setattr(
-        cli_module.R2Publisher,
+        cli_module.R2Repository,
         "from_environment",
         lambda **kwargs: called.setdefault("r2", kwargs),
     )
