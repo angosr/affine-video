@@ -134,14 +134,12 @@ weights.
 Run any Validator, including the evaluator operator's independent Validator:
 
 ```bash
-uv run veda validator run \
-  --public-weights-url https://public.example/tracks/main/weights.json \
-  --track-spec-digest <64-hex-track-digest> \
-  --netuid 1 \
-  --wallet-name default \
-  --hotkey default
+uv run veda validator run
 ```
 
 This process needs no evaluator database, model cache, hidden data, GPU, or R2 write credentials. It
-rejects artifacts for another track or subnet, future or stale snapshots, invalid normalization or
-caps, insufficient UID count, and hotkey-to-UID mappings that differ from the finalized metagraph.
+also needs no object-storage or track arguments: the public URL, subnet, and pinned track digest are
+release defaults. Wallet name, hotkey, network, and public track fields remain optional overrides.
+It rejects artifacts for another track or subnet, future or stale snapshots, invalid normalization
+or caps, insufficient UID count, and hotkey-to-UID mappings that differ from the finalized
+metagraph.

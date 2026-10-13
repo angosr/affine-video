@@ -49,6 +49,13 @@ from validator.weights import (
     weight_update_due,
 )
 
+DEFAULT_PUBLIC_WEIGHTS_URL = (
+    "https://iblosevwkuiootbbgnsy.supabase.co/storage/v1/object/public/"
+    "affine_video/tracks/main/weights.json"
+)
+DEFAULT_NETUID = 7
+DEFAULT_TRACK_SPEC_DIGEST = "a1862eeb3f7a0bf7c32a7dd15075dacfcab94a70aa1d0a74747c1a0ab8e103a7"
+
 
 class ArtifactRepository(Protocol):
     async def publish(self, artifacts: PublicArtifacts) -> None: ...

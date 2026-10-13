@@ -216,7 +216,7 @@ def test_evaluator_forwards_runtime_and_r2_configuration(monkeypatch, tmp_path) 
     ]
 
 
-def test_validator_run_only_requires_public_weights_and_wallet(monkeypatch) -> None:
+def test_validator_run_needs_no_track_or_storage_configuration(monkeypatch) -> None:
     called = {}
 
     async def fake_run(**kwargs):
@@ -227,23 +227,13 @@ def test_validator_run_only_requires_public_weights_and_wallet(monkeypatch) -> N
         [
             "validator",
             "run",
-            "--public-weights-url",
-            "https://public.example/veda/weights.json",
-            "--netuid",
-            "7",
-            "--track-spec-digest",
-            "ab" * 32,
-            "--wallet-name",
-            "validator",
-            "--hotkey",
-            "default",
             "--once",
         ]
     )
 
-    assert called["public_weights_url"] == "https://public.example/veda/weights.json"
-    assert called["netuid"] == 7
-    assert called["track_spec_digest"] == "ab" * 32
-    assert called["wallet_name"] == "validator"
+    assert called["public_weights_url"] == cli_module.DEFAULT_PUBLIC_WEIGHTS_URL
+    assert called["netuid"] == cli_module.DEFAULT_NETUID
+    assert called["track_spec_digest"] == cli_module.DEFAULT_TRACK_SPEC_DIGEST
+    assert called["wallet_name"] == "default"
     assert called["hotkey_name"] == "default"
     assert called["once"] is True

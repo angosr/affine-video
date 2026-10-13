@@ -12,6 +12,9 @@ from miner.chain import ChainSubmissionError, submit_model
 from miner.submit import ModelSubmission, SubmissionFormatError
 from validator.publication import R2Repository
 from validator.run import (
+    DEFAULT_NETUID,
+    DEFAULT_PUBLIC_WEIGHTS_URL,
+    DEFAULT_TRACK_SPEC_DIGEST,
     EvaluationCycleResult,
     WeightCycleResult,
     run_evaluator,
@@ -79,9 +82,9 @@ def _parser() -> argparse.ArgumentParser:
     run = validator_commands.add_parser(
         "run", help="fetch public R2 weights and submit them on-chain"
     )
-    run.add_argument("--public-weights-url", required=True)
-    run.add_argument("--netuid", required=True, type=int)
-    run.add_argument("--track-spec-digest", required=True)
+    run.add_argument("--public-weights-url", default=DEFAULT_PUBLIC_WEIGHTS_URL)
+    run.add_argument("--netuid", default=DEFAULT_NETUID, type=int)
+    run.add_argument("--track-spec-digest", default=DEFAULT_TRACK_SPEC_DIGEST)
     run.add_argument("--network", default="finney")
     run.add_argument("--wallet-name", default="default")
     run.add_argument("--hotkey", default="default")
