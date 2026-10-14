@@ -100,7 +100,7 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
         return DownloadedModel(model_path, file_digest, model_path.stat().st_size, None, None)
 
     def evaluate(_task):
-        return StageOutcome(ChallengeState.SUCCEEDED, 0.7, {"stage": "scoring"})
+        return StageOutcome(0.7, {"stage": "scoring"})
 
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest="ab" * 32) as store:
         arguments = {
@@ -148,7 +148,7 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         return DownloadedModel(model_path, file_digest, model_path.stat().st_size, None, None)
 
     def evaluate(_task):
-        return StageOutcome(ChallengeState.SUCCEEDED, 0.9, {"stage": "scoring"})
+        return StageOutcome(0.9, {"stage": "scoring"})
 
     arguments = {
         "netuid": 7,

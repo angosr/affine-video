@@ -44,7 +44,6 @@ class TemporaryScoringError(RuntimeError):
 class StageOutcome:
     """Aggregate result returned by the trusted scoring implementation."""
 
-    next_state: ChallengeState
     score: float
     metrics: Mapping[str, Any]
 
@@ -136,7 +135,6 @@ class TrackEvaluator:
                     bootstrap_seed=scoring.bootstrap_seed,
                 )
                 return StageOutcome(
-                    ChallengeState.SUCCEEDED,
                     result.lower_bound,
                     {
                         "exact_score": result.aggregate.score,
@@ -320,7 +318,7 @@ def process_next_scoring(
     if recorded is None:
         try:
             result = evaluator(task)
-            require_transition(task.state, result.next_state)
+            require_transition(task.state, ChallengeState.SUCCEEDED)
         except ParticipantScoringError as exc:
             store.complete_challenge(
                 task.challenge_id,
@@ -366,7 +364,6 @@ def process_next_scoring(
             task.challenge_id,
             task.lease_token,
             task.state,
-            next_state=result.next_state,
             score=result.score,
             score_block=current_finalized_block,
             metrics=result.metrics,
@@ -375,26 +372,19 @@ def process_next_scoring(
         result_score_block = current_finalized_block
     else:
         result = StageOutcome(
-            recorded.next_state,
             recorded.score,
             recorded.metrics,
         )
         result_score_block = recorded.score_block
-    if result.next_state is ChallengeState.SUCCEEDED:
-        store.complete_challenge(
-            task.challenge_id,
-            ChallengeState.SUCCEEDED,
-            final_score=result.score,
-            occurred_at_ms=now,
-            lease_token=task.lease_token,
-            score_block=result_score_block,
-        )
-    else:
-        raise TemporaryScoringError(
-            "SCORING_RESULT_INVALID",
-            "authoritative scoring did not produce a terminal result",
-        )
-    return ScoringOutcome(task.challenge_id, result.next_state)
+    store.complete_challenge(
+        task.challenge_id,
+        ChallengeState.SUCCEEDED,
+        final_score=result.score,
+        occurred_at_ms=now,
+        lease_token=task.lease_token,
+        score_block=result_score_block,
+    )
+    return ScoringOutcome(task.challenge_id, ChallengeState.SUCCEEDED)
 
 
 def _defer_or_fail(

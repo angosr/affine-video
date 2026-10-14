@@ -88,7 +88,6 @@ class ChallengeEvent:
 @dataclass(frozen=True, slots=True)
 class RecordedStageScore:
     stage: ChallengeState
-    next_state: ChallengeState
     score: float
     score_block: int
     metrics: Mapping[str, Any]
@@ -233,7 +232,6 @@ class ChallengeStore:
             CREATE TABLE IF NOT EXISTS stage_scores (
                 challenge_id TEXT NOT NULL REFERENCES challenges(challenge_id),
                 stage TEXT NOT NULL,
-                next_state TEXT NOT NULL,
                 score REAL NOT NULL,
                 score_block INTEGER NOT NULL,
                 metrics_json TEXT NOT NULL,
@@ -879,7 +877,6 @@ class ChallengeStore:
         lease_token: str,
         stage: ChallengeState,
         *,
-        next_state: ChallengeState,
         score: float,
         score_block: int,
         metrics: Mapping[str, Any],
@@ -889,7 +886,6 @@ class ChallengeStore:
 
         if stage is not ChallengeState.SCORING:
             raise ValueError("stage does not produce a score")
-        require_transition(stage, next_state)
         if not isfinite(score) or not 0 <= score <= 1:
             raise ValueError("stage score is out of range")
         if type(score_block) is not int or score_block < 0:
@@ -899,7 +895,6 @@ class ChallengeStore:
         values = (
             identifier,
             stage,
-            next_state,
             score,
             score_block,
             metrics_json,
@@ -925,7 +920,7 @@ class ChallengeStore:
                 raise ValueError("score block cannot precede the submission block")
             existing = self._connection.execute(
                 """
-                SELECT challenge_id, stage, next_state, score, score_block, metrics_json
+                SELECT challenge_id, stage, score, score_block, metrics_json
                 FROM stage_scores WHERE challenge_id = ? AND stage = ?
                 """,
                 (identifier, stage),
@@ -938,9 +933,9 @@ class ChallengeStore:
             self._connection.execute(
                 """
                 INSERT INTO stage_scores (
-                    challenge_id, stage, next_state, score,
+                    challenge_id, stage, score,
                     score_block, metrics_json, created_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (*values, timestamp),
             )
@@ -955,7 +950,7 @@ class ChallengeStore:
 
         row = self._connection.execute(
             """
-            SELECT stage, next_state, score, score_block, metrics_json
+            SELECT stage, score, score_block, metrics_json
             FROM stage_scores WHERE challenge_id = ? AND stage = ?
             """,
             (identifier, stage),
@@ -963,11 +958,10 @@ class ChallengeStore:
         if row is None:
             return None
         recorded_stage = ChallengeState(row["stage"])
-        next_state = ChallengeState(row["next_state"])
-        require_transition(recorded_stage, next_state)
+        if recorded_stage is not ChallengeState.SCORING:
+            raise RuntimeError("stored score has an invalid stage")
         return RecordedStageScore(
             stage=recorded_stage,
-            next_state=next_state,
             score=row["score"],
             score_block=row["score_block"],
             metrics=json.loads(row["metrics_json"]),
@@ -1316,7 +1310,7 @@ class ChallengeStore:
         ).fetchall()
         stage_rows = self._connection.execute(
             """
-            SELECT stage, next_state, score, score_block, created_at_ms
+            SELECT stage, score, score_block, created_at_ms
             FROM stage_scores WHERE challenge_id = ?
             ORDER BY created_at_ms
             """,
@@ -1346,7 +1340,6 @@ class ChallengeStore:
             "stages": [
                 {
                     "stage": stage["stage"],
-                    "next_state": stage["next_state"],
                     "score": stage["score"],
                     "score_block": stage["score_block"],
                     "created_at_ms": stage["created_at_ms"],

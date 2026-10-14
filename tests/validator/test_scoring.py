@@ -28,7 +28,6 @@ from .test_store import submission_at
 
 def isolated_success(_task: LeasedChallenge) -> StageOutcome:
     return StageOutcome(
-        ChallengeState.SUCCEEDED,
         score=0.75,
         metrics={"worker": "child"},
     )
@@ -102,7 +101,6 @@ def test_authoritative_score_finishes_one_challenge(tmp_path) -> None:
             current_finalized_block=250,
             settings=ScoringSettings(),
             evaluator=lambda _task: StageOutcome(
-                ChallengeState.SUCCEEDED,
                 score=0.6,
                 metrics={"budget_scores": [0.4, 0.6, 0.8]},
             ),
@@ -128,7 +126,6 @@ def test_recorded_score_resumes_without_repeating_evaluation(tmp_path) -> None:
             identifier,
             interrupted.lease_token,
             ChallengeState.SCORING,
-            next_state=ChallengeState.SUCCEEDED,
             score=0.8,
             score_block=100,
             metrics={"lower_bound": 0.8},
@@ -281,6 +278,5 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
 
     assert changed.value.code == "SCORING_MODEL_CHANGED"
     assert first == second == other_submission
-    assert first.next_state is ChallengeState.SUCCEEDED
     assert 0 <= first.score <= 1
     assert first.metrics["sample_count"] == 2
