@@ -69,9 +69,7 @@ class ChallengeRecord:
     error_code: str | None
     error_summary: str | None
     final_score: float | None
-    attention_cost: float | None
     score_block: int | None
-    provisional: bool
     created_at_ms: int
     updated_at_ms: int
 
@@ -92,7 +90,6 @@ class RecordedStageScore:
     stage: ChallengeState
     next_state: ChallengeState
     score: float
-    attention_cost: float
     score_block: int
     metrics: Mapping[str, Any]
 
@@ -102,8 +99,6 @@ class LeaderboardEntry:
     hotkey: str
     challenge_id: str
     final_score: float
-    attention_cost: float | None
-    provisional: bool
     score_block: int
     position: ChainPosition
 
@@ -208,10 +203,7 @@ class ChallengeStore:
                 error_code TEXT,
                 error_summary TEXT,
                 final_score REAL,
-                attention_cost REAL,
                 score_block INTEGER,
-                provisional INTEGER NOT NULL DEFAULT 0
-                    CHECK (provisional IN (0, 1)),
                 lease_token TEXT,
                 lease_expires_at_ms INTEGER,
                 resume_state TEXT,
@@ -243,7 +235,6 @@ class ChallengeStore:
                 stage TEXT NOT NULL,
                 next_state TEXT NOT NULL,
                 score REAL NOT NULL,
-                attention_cost REAL NOT NULL,
                 score_block INTEGER NOT NULL,
                 metrics_json TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
@@ -512,17 +503,13 @@ class ChallengeStore:
         lease_ms: int,
         now_ms: int | None = None,
     ) -> LeasedChallenge | None:
-        """Claim one ready scoring task while allowing other tasks to run in parallel."""
+        """Claim the oldest authoritative scoring task without bypassing FIFO."""
 
         return self._claim_next(
             worker_id,
-            stages=(
-                ChallengeState.SCREENING,
-                ChallengeState.SCORING,
-                ChallengeState.ROLLOUT,
-            ),
+            stages=(ChallengeState.SCORING,),
             include_queued=False,
-            strict_fifo=False,
+            strict_fifo=True,
             lease_ms=lease_ms,
             now_ms=now_ms,
             ready_through_block=None,
@@ -698,7 +685,7 @@ class ChallengeStore:
                 )
             self._transition_locked(
                 identifier,
-                ChallengeState.SCREENING,
+                ChallengeState.SCORING,
                 timestamp=timestamp,
                 error_code=None,
                 error_summary=None,
@@ -733,9 +720,7 @@ class ChallengeStore:
             retryable = {
                 ChallengeState.FETCHING,
                 ChallengeState.VALIDATING,
-                ChallengeState.SCREENING,
                 ChallengeState.SCORING,
-                ChallengeState.ROLLOUT,
             }
             if current not in retryable:
                 raise ValueError("challenge is not in a retryable stage")
@@ -783,9 +768,7 @@ class ChallengeStore:
             if current not in {
                 ChallengeState.FETCHING,
                 ChallengeState.VALIDATING,
-                ChallengeState.SCREENING,
                 ChallengeState.SCORING,
-                ChallengeState.ROLLOUT,
             }:
                 raise ValueError("challenge is not in an active stage")
             submission = self._connection.execute(
@@ -808,7 +791,7 @@ class ChallengeStore:
                 details={},
             )
             self._connection.execute(
-                "UPDATE challenges SET score_block = ?, provisional = 0 WHERE challenge_id = ?",
+                "UPDATE challenges SET score_block = ? WHERE challenge_id = ?",
                 (score_block, identifier),
             )
             self._clear_lease_locked(identifier)
@@ -859,9 +842,7 @@ class ChallengeStore:
             error_code=row["error_code"],
             error_summary=row["error_summary"],
             final_score=row["final_score"],
-            attention_cost=row["attention_cost"],
             score_block=row["score_block"],
-            provisional=bool(row["provisional"]),
             created_at_ms=row["created_at_ms"],
             updated_at_ms=row["updated_at_ms"],
         )
@@ -900,27 +881,17 @@ class ChallengeStore:
         *,
         next_state: ChallengeState,
         score: float,
-        attention_cost: float,
         score_block: int,
         metrics: Mapping[str, Any],
         occurred_at_ms: int | None = None,
     ) -> bool:
         """Persist one aggregate stage result; exact replay is idempotent."""
 
-        if stage not in {
-            ChallengeState.SCREENING,
-            ChallengeState.SCORING,
-            ChallengeState.ROLLOUT,
-        }:
+        if stage is not ChallengeState.SCORING:
             raise ValueError("stage does not produce a score")
         require_transition(stage, next_state)
-        if (
-            not isfinite(score)
-            or not isfinite(attention_cost)
-            or not 0 <= score <= 1
-            or attention_cost < 0
-        ):
-            raise ValueError("stage score or attention cost is out of range")
+        if not isfinite(score) or not 0 <= score <= 1:
+            raise ValueError("stage score is out of range")
         if type(score_block) is not int or score_block < 0:
             raise ValueError("score block must be a non-negative integer")
         timestamp = _timestamp(occurred_at_ms)
@@ -930,7 +901,6 @@ class ChallengeStore:
             stage,
             next_state,
             score,
-            attention_cost,
             score_block,
             metrics_json,
         )
@@ -955,8 +925,7 @@ class ChallengeStore:
                 raise ValueError("score block cannot precede the submission block")
             existing = self._connection.execute(
                 """
-                SELECT challenge_id, stage, next_state, score, attention_cost,
-                       score_block, metrics_json
+                SELECT challenge_id, stage, next_state, score, score_block, metrics_json
                 FROM stage_scores WHERE challenge_id = ? AND stage = ?
                 """,
                 (identifier, stage),
@@ -969,9 +938,9 @@ class ChallengeStore:
             self._connection.execute(
                 """
                 INSERT INTO stage_scores (
-                    challenge_id, stage, next_state, score, attention_cost,
+                    challenge_id, stage, next_state, score,
                     score_block, metrics_json, created_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (*values, timestamp),
             )
@@ -986,7 +955,7 @@ class ChallengeStore:
 
         row = self._connection.execute(
             """
-            SELECT stage, next_state, score, attention_cost, score_block, metrics_json
+            SELECT stage, next_state, score, score_block, metrics_json
             FROM stage_scores WHERE challenge_id = ? AND stage = ?
             """,
             (identifier, stage),
@@ -1000,7 +969,6 @@ class ChallengeStore:
             stage=recorded_stage,
             next_state=next_state,
             score=row["score"],
-            attention_cost=row["attention_cost"],
             score_block=row["score_block"],
             metrics=json.loads(row["metrics_json"]),
         )
@@ -1011,7 +979,6 @@ class ChallengeStore:
         target: ChallengeState,
         *,
         final_score: float | None = None,
-        attention_cost: float | None = None,
         occurred_at_ms: int | None = None,
         error_code: str | None = None,
         error_summary: str | None = None,
@@ -1022,27 +989,20 @@ class ChallengeStore:
 
         if target not in {
             ChallengeState.SUCCEEDED,
-            ChallengeState.SCREENED_OUT,
             ChallengeState.PARTICIPANT_FAILED,
         }:
             raise ValueError("target is not a scored terminal state")
         if target is ChallengeState.SUCCEEDED:
-            if final_score is None or attention_cost is None:
-                raise ValueError("successful challenge requires score and attention cost")
+            if final_score is None:
+                raise ValueError("successful challenge requires a score")
             if error_code is not None or error_summary is not None:
                 raise ValueError("successful challenge cannot contain an error")
-            if (
-                not isfinite(final_score)
-                or not isfinite(attention_cost)
-                or not 0 <= final_score <= 1
-                or attention_cost < 0
-            ):
-                raise ValueError("final score or attention cost is out of range")
+            if not isfinite(final_score) or not 0 <= final_score <= 1:
+                raise ValueError("final score is out of range")
         else:
             if not error_code:
                 raise ValueError("failed challenge requires an error code")
             final_score = None
-            attention_cost = None
 
         timestamp = _timestamp(occurred_at_ms)
         self._connection.execute("BEGIN IMMEDIATE")
@@ -1072,15 +1032,15 @@ class ChallengeStore:
                 timestamp=timestamp,
                 error_code=error_code,
                 error_summary=error_summary,
-                details={"final_score": final_score, "attention_cost": attention_cost},
+                details={"final_score": final_score},
             )
             self._connection.execute(
                 """
                 UPDATE challenges
-                SET final_score = ?, attention_cost = ?, score_block = ?, provisional = ?
+                SET final_score = ?, score_block = ?
                 WHERE challenge_id = ?
                 """,
-                (final_score, attention_cost, effective_score_block, 0, identifier),
+                (final_score, effective_score_block, identifier),
             )
 
             self._clear_lease_locked(identifier)
@@ -1088,132 +1048,18 @@ class ChallengeStore:
         except Exception:
             self._connection.rollback()
             raise
-
-    def publish_provisional(
-        self,
-        identifier: str,
-        lease_token: str,
-        *,
-        final_score: float,
-        attention_cost: float,
-        score_block: int,
-        schedule_rollout: bool = False,
-        occurred_at_ms: int | None = None,
-    ) -> None:
-        """Publish a local score that remains capped until a rollout completes."""
-
-        if (
-            not isfinite(final_score)
-            or not isfinite(attention_cost)
-            or not 0 <= final_score <= 1
-            or attention_cost < 0
-        ):
-            raise ValueError("provisional score or attention cost is out of range")
-        if type(score_block) is not int or score_block < 0:
-            raise ValueError("score block must be a non-negative integer")
-        timestamp = _timestamp(occurred_at_ms)
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            current = self._require_lease_locked(identifier, lease_token)
-            if current is not ChallengeState.SCORING:
-                raise ValueError("only a local scoring task can publish a provisional result")
-            row = self._connection.execute(
-                """
-                SELECT s.hotkey, s.block_height, s.extrinsic_index, s.event_index
-                FROM challenges c
-                JOIN submissions s ON s.submission_id = c.submission_id
-                WHERE c.challenge_id = ?
-                """,
-                (identifier,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(identifier)
-            if score_block < row["block_height"]:
-                raise ValueError("score block cannot precede the submission block")
-            target = ChallengeState.ROLLOUT if schedule_rollout else ChallengeState.PROVISIONAL
-            self._transition_locked(
-                identifier,
-                target,
-                timestamp=timestamp,
-                error_code=None,
-                error_summary=None,
-                details={"final_score": final_score, "attention_cost": attention_cost},
-            )
-            self._connection.execute(
-                """
-                UPDATE challenges
-                SET final_score = ?, attention_cost = ?, score_block = ?, provisional = 1
-                WHERE challenge_id = ?
-                """,
-                (final_score, attention_cost, score_block, identifier),
-            )
-            self._clear_lease_locked(identifier)
-            self._connection.commit()
-        except Exception:
-            self._connection.rollback()
-            raise
-
-    def schedule_qualified_rollouts(
-        self,
-        minimum_score: float,
-        *,
-        occurred_at_ms: int | None = None,
-    ) -> int:
-        """Queue every qualifying provisional result for an available rollout."""
-
-        if not isfinite(minimum_score) or not 0 <= minimum_score <= 1:
-            raise ValueError("rollout threshold must be finite and within [0, 1]")
-        timestamp = _timestamp(occurred_at_ms)
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            rows = self._connection.execute(
-                """
-                SELECT c.challenge_id
-                FROM challenges c
-                JOIN stage_scores score
-                  ON score.challenge_id = c.challenge_id
-                 AND score.stage = ?
-                JOIN submissions submission
-                  ON submission.submission_id = c.submission_id
-                WHERE c.state = ? AND score.score >= ?
-                ORDER BY submission.block_height,
-                         submission.extrinsic_index,
-                         submission.event_index
-                """,
-                (
-                    ChallengeState.SCORING,
-                    ChallengeState.PROVISIONAL,
-                    minimum_score,
-                ),
-            ).fetchall()
-            for row in rows:
-                self._transition_locked(
-                    row["challenge_id"],
-                    ChallengeState.ROLLOUT,
-                    timestamp=timestamp,
-                    error_code=None,
-                    error_summary=None,
-                    details={"scheduled": True},
-                )
-            self._connection.commit()
-        except Exception:
-            self._connection.rollback()
-            raise
-        return len(rows)
 
     def leaderboard(self) -> list[LeaderboardEntry]:
         rows = self._connection.execute(
             """
             WITH ranked AS (
                 SELECT submission.hotkey, challenge.challenge_id,
-                       challenge.final_score, challenge.attention_cost,
-                       challenge.score_block,
+                       challenge.final_score, challenge.score_block,
                        submission.block_height, submission.extrinsic_index,
                        submission.event_index,
                        ROW_NUMBER() OVER (
                            PARTITION BY submission.hotkey
                            ORDER BY challenge.final_score DESC,
-                                    challenge.attention_cost ASC,
                                     submission.block_height ASC,
                                     submission.extrinsic_index ASC,
                                     submission.event_index ASC
@@ -1223,12 +1069,11 @@ class ChallengeStore:
                   ON submission.submission_id = challenge.submission_id
                 WHERE challenge.state = ?
             )
-            SELECT hotkey, challenge_id, final_score, attention_cost,
-                   score_block, block_height, extrinsic_index, event_index
+            SELECT hotkey, challenge_id, final_score, score_block,
+                   block_height, extrinsic_index, event_index
             FROM ranked
             WHERE hotkey_rank = 1
             ORDER BY final_score DESC,
-                     attention_cost ASC,
                      block_height ASC, extrinsic_index ASC, event_index ASC
             """,
             (ChallengeState.SUCCEEDED,),
@@ -1238,9 +1083,7 @@ class ChallengeStore:
                 hotkey=row["hotkey"],
                 challenge_id=row["challenge_id"],
                 final_score=row["final_score"],
-                attention_cost=row["attention_cost"],
                 score_block=row["score_block"],
-                provisional=False,
                 position=ChainPosition(
                     row["block_height"], row["extrinsic_index"], row["event_index"]
                 ),
@@ -1249,7 +1092,7 @@ class ChallengeStore:
         ]
 
     def restore_public_matches(self, matches: Sequence[MatchRecord]) -> int:
-        """Restore the locally available prefix of a verified R2 ledger."""
+        """Restore the locally available prefix of the verified public ledger."""
 
         restored = 0
         self._connection.execute("BEGIN IMMEDIATE")
@@ -1260,8 +1103,8 @@ class ChallengeStore:
                 evaluation = document["evaluation"]
                 row = self._connection.execute(
                     """
-                    SELECT c.state, c.error_code, c.final_score, c.attention_cost,
-                           c.score_block, c.file_sha256, c.model_digest,
+                    SELECT c.state, c.error_code, c.final_score, c.score_block,
+                           c.file_sha256, c.model_digest,
                            c.model_size_bytes, c.created_at_ms,
                            s.submission_id, s.hotkey, s.repo_id, s.revision,
                            s.block_height, s.extrinsic_index, s.event_index
@@ -1292,36 +1135,37 @@ class ChallengeStore:
                     row["event_index"],
                 )
                 if actual_submission != expected_submission:
-                    raise RuntimeError("R2 match conflicts with its on-chain submission")
+                    raise RuntimeError("public match conflicts with its on-chain submission")
 
                 target = ChallengeState(evaluation["state"])
                 current = ChallengeState(row["state"])
                 if current in TERMINAL_STATES:
                     if current is not target or row["error_code"] != evaluation["error_code"]:
-                        raise RuntimeError("R2 match conflicts with a local terminal challenge")
+                        raise RuntimeError(
+                            "public match conflicts with a local terminal challenge"
+                        )
                     if row["score_block"] != evaluation["score_block"]:
-                        raise RuntimeError("R2 decision block conflicts with local state")
+                        raise RuntimeError("public decision block conflicts with local state")
                     if (
                         row["file_sha256"] != evaluation["file_sha256"]
                         or row["model_digest"] != evaluation["model_digest"]
                         or row["model_size_bytes"] != evaluation["model_size_bytes"]
                     ):
                         raise RuntimeError(
-                            "R2 model facts conflict with a local terminal challenge"
+                            "public model facts conflict with a local terminal challenge"
                         )
-                    if target is ChallengeState.SUCCEEDED and (
-                        row["final_score"] != evaluation["final_score"]
-                        or row["attention_cost"] != evaluation["attention_cost"]
+                    if (
+                        target is ChallengeState.SUCCEEDED
+                        and row["final_score"] != evaluation["final_score"]
                     ):
-                        raise RuntimeError("R2 score conflicts with a local terminal challenge")
+                        raise RuntimeError("public score conflicts with a local terminal challenge")
                 else:
                     self._connection.execute(
                         """
                         UPDATE challenges
                         SET state = ?, error_code = ?, error_summary = NULL,
-                            final_score = ?, attention_cost = ?, score_block = ?,
-                            provisional = 0, lease_token = NULL,
-                            lease_expires_at_ms = NULL, resume_state = NULL,
+                            final_score = ?, score_block = ?,
+                            lease_token = NULL, lease_expires_at_ms = NULL, resume_state = NULL,
                             retry_after_ms = NULL, attempts = 0,
                             file_sha256 = ?, model_digest = ?, model_size_bytes = ?,
                             updated_at_ms = ?
@@ -1331,7 +1175,6 @@ class ChallengeStore:
                             target,
                             evaluation["error_code"],
                             evaluation["final_score"],
-                            evaluation["attention_cost"],
                             evaluation["score_block"],
                             evaluation["file_sha256"],
                             evaluation["model_digest"],
@@ -1383,7 +1226,7 @@ class ChallengeStore:
                             or ChallengeState(owner_state["state"])
                             is not ChallengeState.SYSTEM_FAILED
                         ):
-                            raise RuntimeError("R2 model ownership conflicts with local state")
+                            raise RuntimeError("public model ownership conflicts with local state")
                         self._connection.execute(
                             "UPDATE model_owners SET challenge_id = ? WHERE model_digest = ?",
                             (match.challenge_id, model_digest),
@@ -1409,10 +1252,10 @@ class ChallengeStore:
                 """
                 SELECT c.challenge_id, c.submission_id, c.state,
                        c.total_attempts AS attempts,
-                       c.error_code, c.error_summary, c.final_score, c.attention_cost,
+                       c.error_code, c.error_summary, c.final_score,
                        c.score_block,
                        c.file_sha256, c.model_digest, c.model_size_bytes,
-                       c.track_spec_digest, c.provisional,
+                       c.track_spec_digest,
                        c.created_at_ms, c.updated_at_ms,
                        s.hotkey, s.repo_id, s.revision, s.block_height,
                        s.extrinsic_index, s.event_index
@@ -1440,10 +1283,10 @@ class ChallengeStore:
                 """
                 SELECT c.challenge_id, c.submission_id, c.state,
                        c.total_attempts AS attempts,
-                       c.error_code, c.error_summary, c.final_score, c.attention_cost,
+                       c.error_code, c.error_summary, c.final_score,
                        c.score_block,
                        c.file_sha256, c.model_digest, c.model_size_bytes,
-                       c.track_spec_digest, c.provisional,
+                       c.track_spec_digest,
                        c.created_at_ms, c.updated_at_ms,
                        s.hotkey, s.repo_id, s.revision, s.block_height,
                        s.extrinsic_index, s.event_index
@@ -1473,14 +1316,9 @@ class ChallengeStore:
         ).fetchall()
         stage_rows = self._connection.execute(
             """
-            SELECT stage, next_state, score, attention_cost, score_block, created_at_ms
+            SELECT stage, next_state, score, score_block, created_at_ms
             FROM stage_scores WHERE challenge_id = ?
-            ORDER BY CASE stage
-                         WHEN 'SCREENING' THEN 0
-                         WHEN 'SCORING' THEN 1
-                         WHEN 'ROLLOUT' THEN 2
-                         ELSE 3
-                     END
+            ORDER BY created_at_ms
             """,
             (row["challenge_id"],),
         ).fetchall()
@@ -1501,9 +1339,7 @@ class ChallengeStore:
             "model_digest": row["model_digest"],
             "model_size_bytes": row["model_size_bytes"],
             "track_spec_digest": row["track_spec_digest"],
-            "provisional": bool(row["provisional"]),
             "final_score": row["final_score"],
-            "attention_cost": row["attention_cost"],
             "score_block": row["score_block"],
             "created_at_ms": row["created_at_ms"],
             "updated_at_ms": row["updated_at_ms"],
@@ -1512,7 +1348,6 @@ class ChallengeStore:
                     "stage": stage["stage"],
                     "next_state": stage["next_state"],
                     "score": stage["score"],
-                    "attention_cost": stage["attention_cost"],
                     "score_block": stage["score_block"],
                     "created_at_ms": stage["created_at_ms"],
                 }
@@ -1645,6 +1480,32 @@ class ChallengeStore:
             if row is None:
                 self._connection.commit()
                 return None
+            if strict_fifo and not include_queued:
+                terminal_placeholders = ",".join("?" for _ in TERMINAL_STATES)
+                earlier = self._connection.execute(
+                    f"""
+                    SELECT 1
+                    FROM challenges earlier_challenge
+                    JOIN submissions earlier_submission
+                      ON earlier_submission.submission_id = earlier_challenge.submission_id
+                    WHERE earlier_challenge.state NOT IN ({terminal_placeholders})
+                      AND (
+                        earlier_submission.block_height,
+                        earlier_submission.extrinsic_index,
+                        earlier_submission.event_index
+                      ) < (?, ?, ?)
+                    LIMIT 1
+                    """,
+                    (
+                        *TERMINAL_STATES,
+                        row["block_height"],
+                        row["extrinsic_index"],
+                        row["event_index"],
+                    ),
+                ).fetchone()
+                if earlier is not None:
+                    self._connection.commit()
+                    return None
             if strict_fifo and row["lease_token"] is not None and row["lease_expires_at_ms"] > now:
                 self._connection.commit()
                 return None
@@ -1773,9 +1634,7 @@ def _public_entry(entry: LeaderboardEntry) -> dict[str, Any]:
         "hotkey": entry.hotkey,
         "challenge_id": entry.challenge_id,
         "final_score": entry.final_score,
-        "attention_cost": entry.attention_cost,
         "score_block": entry.score_block,
-        "provisional": entry.provisional,
         "block_height": entry.position.block,
         "extrinsic_index": entry.position.extrinsic_index,
         "event_index": entry.position.event_index,

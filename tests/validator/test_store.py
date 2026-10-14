@@ -262,34 +262,26 @@ def test_malformed_submission_is_recorded_and_does_not_consume_cooldown(tmp_path
 def advance_to_scoring(store: ChallengeStore, identifier: str, timestamp: int) -> None:
     store.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=timestamp)
     store.transition(identifier, ChallengeState.VALIDATING, occurred_at_ms=timestamp + 1)
-    store.transition(identifier, ChallengeState.SCREENING, occurred_at_ms=timestamp + 2)
-    store.transition(identifier, ChallengeState.SCORING, occurred_at_ms=timestamp + 3)
-
-
-def advance_to_rollout(store: ChallengeStore, identifier: str, timestamp: int) -> None:
-    advance_to_scoring(store, identifier, timestamp)
-    store.transition(identifier, ChallengeState.ROLLOUT, occurred_at_ms=timestamp + 4)
+    store.transition(identifier, ChallengeState.SCORING, occurred_at_ms=timestamp + 2)
 
 
 def test_leaderboard_keeps_hotkeys_best_authoritative_score(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
-        advance_to_rollout(store, older, 30)
-        advance_to_rollout(store, newer, 40)
+        advance_to_scoring(store, older, 30)
+        advance_to_scoring(store, newer, 40)
 
         store.complete_challenge(
             newer,
             ChallengeState.SUCCEEDED,
             final_score=0.5,
-            attention_cost=0.2,
             occurred_at_ms=50,
         )
         store.complete_challenge(
             older,
             ChallengeState.SUCCEEDED,
             final_score=0.9,
-            attention_cost=0.1,
             occurred_at_ms=60,
         )
 
@@ -303,12 +295,11 @@ def test_later_participant_failure_preserves_previous_authoritative_score(tmp_pa
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
-        advance_to_rollout(store, older, 30)
+        advance_to_scoring(store, older, 30)
         store.complete_challenge(
             older,
             ChallengeState.SUCCEEDED,
             final_score=0.9,
-            attention_cost=0.1,
             occurred_at_ms=40,
         )
         store.transition(newer, ChallengeState.FETCHING, occurred_at_ms=50)
@@ -323,44 +314,26 @@ def test_later_participant_failure_preserves_previous_authoritative_score(tmp_pa
         assert store.leaderboard()[0].final_score == 0.9
 
 
-def test_provisional_and_system_failure_preserve_previous_success(tmp_path) -> None:
+def test_system_failure_preserves_previous_success(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
-        advance_to_rollout(store, older, 30)
+        advance_to_scoring(store, older, 30)
         store.complete_challenge(
             older,
             ChallengeState.SUCCEEDED,
             final_score=0.8,
-            attention_cost=0.2,
             occurred_at_ms=40,
         )
         advance_to_scoring(store, newer, 50)
-        local = store.claim_next_scoring("local", lease_ms=100, now_ms=60)
-        assert local is not None and local.challenge_id == newer
-        store.publish_provisional(
-            newer,
-            local.lease_token,
-            final_score=0.9,
-            attention_cost=0.1,
-            score_block=120,
-            schedule_rollout=True,
-            occurred_at_ms=61,
-        )
-
-        current = store.leaderboard()[0]
-        assert current.challenge_id == older
-        assert current.final_score == 0.8
-        assert current.provisional is False
-
-        rollout = store.claim_next_scoring("rollout", lease_ms=100, now_ms=62)
-        assert rollout is not None and rollout.challenge_id == newer
+        scoring = store.claim_next_scoring("scoring", lease_ms=100, now_ms=60)
+        assert scoring is not None and scoring.challenge_id == newer
         store.fail_leased_system(
             newer,
-            rollout.lease_token,
+            scoring.lease_token,
             score_block=121,
-            error_code="ROLLOUT_RUNNER_FAILURE",
-            error_summary="GPU worker unavailable",
+            error_code="SCORING_WORKER_FAILURE",
+            error_summary="scoring worker unavailable",
             occurred_at_ms=63,
         )
 
@@ -368,7 +341,7 @@ def test_provisional_and_system_failure_preserve_previous_success(tmp_path) -> N
         assert store.leaderboard()[0].challenge_id == older
 
 
-def test_verified_r2_match_restores_disposable_local_state(tmp_path) -> None:
+def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None:
     digest = "ab" * 32
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest=digest) as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
@@ -381,7 +354,6 @@ def test_verified_r2_match_restores_disposable_local_state(tmp_path) -> None:
                 "model_digest": "ef" * 32,
                 "model_size_bytes": 123,
                 "final_score": 0.8,
-                "attention_cost": 0.2,
                 "score_block": 110,
                 "stages": [],
             }
@@ -408,16 +380,15 @@ def test_stage_score_replay_must_be_identical(tmp_path) -> None:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         store.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=11)
         store.transition(identifier, ChallengeState.VALIDATING, occurred_at_ms=12)
-        store.transition(identifier, ChallengeState.SCREENING, occurred_at_ms=13)
+        store.transition(identifier, ChallengeState.SCORING, occurred_at_ms=13)
         task = store.claim_next_scoring("worker", lease_ms=100, now_ms=14)
         assert task is not None
         assert store.record_stage_score(
             identifier,
             task.lease_token,
-            ChallengeState.SCREENING,
-            next_state=ChallengeState.SCORING,
+            ChallengeState.SCORING,
+            next_state=ChallengeState.SUCCEEDED,
             score=0.7,
-            attention_cost=0.2,
             score_block=100,
             metrics={"samples": 4},
             occurred_at_ms=20,
@@ -425,10 +396,9 @@ def test_stage_score_replay_must_be_identical(tmp_path) -> None:
         assert not store.record_stage_score(
             identifier,
             task.lease_token,
-            ChallengeState.SCREENING,
-            next_state=ChallengeState.SCORING,
+            ChallengeState.SCORING,
+            next_state=ChallengeState.SUCCEEDED,
             score=0.7,
-            attention_cost=0.2,
             score_block=100,
             metrics={"samples": 4},
             occurred_at_ms=30,
@@ -437,10 +407,9 @@ def test_stage_score_replay_must_be_identical(tmp_path) -> None:
             store.record_stage_score(
                 identifier,
                 task.lease_token,
-                ChallengeState.SCREENING,
-                next_state=ChallengeState.SCORING,
+                ChallengeState.SCORING,
+                next_state=ChallengeState.SUCCEEDED,
                 score=0.8,
-                attention_cost=0.2,
                 score_block=100,
                 metrics={"samples": 4},
                 occurred_at_ms=40,
@@ -452,7 +421,7 @@ def test_stale_worker_cannot_write_stage_score(tmp_path) -> None:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         store.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=11)
         store.transition(identifier, ChallengeState.VALIDATING, occurred_at_ms=12)
-        store.transition(identifier, ChallengeState.SCREENING, occurred_at_ms=13)
+        store.transition(identifier, ChallengeState.SCORING, occurred_at_ms=13)
         stale = store.claim_next_scoring("worker-a", lease_ms=10, now_ms=20)
         current = store.claim_next_scoring("worker-b", lease_ms=10, now_ms=30)
         assert stale is not None and current is not None
@@ -461,10 +430,9 @@ def test_stale_worker_cannot_write_stage_score(tmp_path) -> None:
             store.record_stage_score(
                 identifier,
                 stale.lease_token,
-                ChallengeState.SCREENING,
-                next_state=ChallengeState.SCORING,
+                ChallengeState.SCORING,
+                next_state=ChallengeState.SUCCEEDED,
                 score=0.7,
-                attention_cost=0.2,
                 score_block=100,
                 metrics={},
                 occurred_at_ms=31,
@@ -472,10 +440,9 @@ def test_stale_worker_cannot_write_stage_score(tmp_path) -> None:
         assert store.record_stage_score(
             identifier,
             current.lease_token,
-            ChallengeState.SCREENING,
-            next_state=ChallengeState.SCORING,
+            ChallengeState.SCORING,
+            next_state=ChallengeState.SUCCEEDED,
             score=0.7,
-            attention_cost=0.2,
             score_block=100,
             metrics={},
             occurred_at_ms=32,
@@ -556,7 +523,7 @@ def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> No
         store.advance_leased(
             second_id,
             second.lease_token,
-            ChallengeState.SCREENING,
+            ChallengeState.SCORING,
             release=True,
             occurred_at_ms=152,
         )
@@ -569,37 +536,77 @@ def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> No
         assert retry.state is ChallengeState.FETCHING
 
 
-def test_scoring_claims_can_run_in_parallel_and_reject_stale_completion(tmp_path) -> None:
+def test_scoring_claims_are_fifo_and_reject_stale_completion(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         second_id, _ = store.add_submission(submission_at(101, hotkey="hk2"), occurred_at_ms=20)
         for identifier in (first_id, second_id):
             store.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=30)
             store.transition(identifier, ChallengeState.VALIDATING, occurred_at_ms=31)
-            store.transition(identifier, ChallengeState.SCREENING, occurred_at_ms=32)
+            store.transition(identifier, ChallengeState.SCORING, occurred_at_ms=32)
 
         first = store.claim_next_scoring("score-a", lease_ms=50, now_ms=100)
         second = store.claim_next_scoring("score-b", lease_ms=50, now_ms=100)
         assert first is not None and first.challenge_id == first_id
-        assert second is not None and second.challenge_id == second_id
+        assert second is None
 
         reclaimed = store.claim_next_scoring("score-c", lease_ms=50, now_ms=150)
         assert reclaimed is not None and reclaimed.challenge_id == first_id
         with pytest.raises(RuntimeError, match="lease"):
             store.complete_challenge(
                 first_id,
-                ChallengeState.SCREENED_OUT,
-                error_code="SCREENING_THRESHOLD",
+                ChallengeState.PARTICIPANT_FAILED,
+                error_code="MODEL_RUNTIME_INVALID",
                 occurred_at_ms=151,
                 lease_token=first.lease_token,
             )
         store.complete_challenge(
             first_id,
-            ChallengeState.SCREENED_OUT,
-            error_code="SCREENING_THRESHOLD",
+            ChallengeState.PARTICIPANT_FAILED,
+            error_code="MODEL_RUNTIME_INVALID",
             occurred_at_ms=151,
             lease_token=reclaimed.lease_token,
         )
+        second = store.claim_next_scoring("score-b", lease_ms=50, now_ms=152)
+        assert second is not None and second.challenge_id == second_id
+
+
+def test_scoring_waits_for_an_earlier_deferred_challenge(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        first_id, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        second_id, _ = store.add_submission(submission_at(101, hotkey="hk2"), occurred_at_ms=20)
+
+        first = store.claim_next_admission(
+            "admit-a", lease_ms=100, ready_through_block=10_000, now_ms=100
+        )
+        assert first is not None and first.challenge_id == first_id
+        store.defer_leased(
+            first_id,
+            first.lease_token,
+            retry_after_ms=200,
+            error_code="DOWNLOAD_TEMPORARY_FAILURE",
+            error_summary="temporary outage",
+            occurred_at_ms=110,
+        )
+        advance_to_scoring(store, second_id, 120)
+
+        assert store.claim_next_scoring("score", lease_ms=50, now_ms=150) is None
+
+        retry = store.claim_next_admission(
+            "admit-b", lease_ms=100, ready_through_block=10_000, now_ms=200
+        )
+        assert retry is not None and retry.challenge_id == first_id
+        store.fail_leased_system(
+            first_id,
+            retry.lease_token,
+            score_block=101,
+            error_code="DOWNLOAD_TEMPORARY_FAILURE",
+            error_summary="retry limit reached",
+            occurred_at_ms=201,
+        )
+
+        second = store.claim_next_scoring("score", lease_ms=50, now_ms=202)
+        assert second is not None and second.challenge_id == second_id
 
 
 def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
@@ -629,10 +636,9 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
         store.record_stage_score(
             identifier,
             scoring.lease_token,
-            ChallengeState.SCREENING,
-            next_state=ChallengeState.SCORING,
+            ChallengeState.SCORING,
+            next_state=ChallengeState.SUCCEEDED,
             score=0.7,
-            attention_cost=3.0,
             score_block=100,
             metrics={
                 "upper_bound": 0.8,
@@ -661,10 +667,9 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
         assert challenge["error_summary"] == "frozen cache is unavailable"
         assert challenge["stages"] == [
             {
-                "stage": ChallengeState.SCREENING,
-                "next_state": ChallengeState.SCORING,
+                "stage": ChallengeState.SCORING,
+                "next_state": ChallengeState.SUCCEEDED,
                 "score": 0.7,
-                "attention_cost": 3.0,
                 "score_block": 100,
                 "created_at_ms": 24,
             }

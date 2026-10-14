@@ -12,7 +12,7 @@ from validator import publication as publication_module
 from validator.publication import (
     PublicArtifactError,
     PublicArtifacts,
-    R2Repository,
+    S3Repository,
     build_public_artifacts,
     decode_weight_artifact,
     encode_weight_artifact,
@@ -92,14 +92,27 @@ def test_fetch_weight_artifact_is_https_only_and_size_bounded() -> None:
 
 
 @pytest.mark.parametrize("prefix", ["../track", "track//main", "track name", "track\nmain"])
-def test_r2_rejects_unsafe_object_prefix(prefix: str) -> None:
+def test_storage_rejects_unsafe_object_prefix(prefix: str) -> None:
     with pytest.raises(ValueError, match="prefix"):
-        R2Repository(object(), bucket="public-data", prefix=prefix)
+        S3Repository(object(), bucket="public-data", prefix=prefix)
 
 
-def test_r2_publishes_immutable_facts_before_summary_and_weights() -> None:
+def test_storage_factory_requires_complete_safe_environment(monkeypatch) -> None:
+    for name in ("STORAGE_URL", "ACCESS_KEY", "SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValueError, match="required"):
+        S3Repository.from_environment(bucket="public-data", prefix="veda/track")
+
+    monkeypatch.setenv("STORAGE_URL", "http://storage.example/s3")
+    monkeypatch.setenv("ACCESS_KEY", "access")
+    monkeypatch.setenv("SECRET_ACCESS_KEY", "secret")
+    with pytest.raises(ValueError, match="HTTPS"):
+        S3Repository.from_environment(bucket="public-data", prefix="veda/track")
+
+
+def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
     client = MemoryS3()
-    publisher = R2Repository(client, bucket="public-data", prefix="veda/track")
+    publisher = S3Repository(client, bucket="public-data", prefix="veda/track")
     artifacts = PublicArtifacts(
         120,
         b"track",
@@ -138,7 +151,7 @@ def test_r2_publishes_immutable_facts_before_summary_and_weights() -> None:
         asyncio.run(publisher.publish(conflicting))
 
 
-def test_r2_ledger_rebuilds_and_verifies_every_committed_match() -> None:
+def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
     track = parse_track_spec(valid_spec())
     snapshot = {
         "challenges": [
@@ -157,7 +170,6 @@ def test_r2_ledger_rebuilds_and_verifies_every_committed_match() -> None:
                 "model_digest": "cd" * 32,
                 "model_size_bytes": 123,
                 "final_score": 0.8,
-                "attention_cost": 0.2,
                 "score_block": 110,
                 "stages": [],
             }
@@ -172,7 +184,7 @@ def test_r2_ledger_rebuilds_and_verifies_every_committed_match() -> None:
     assert artifacts is not None
 
     client = MemoryS3()
-    repository = R2Repository(client, bucket="public-data", prefix="veda/track")
+    repository = S3Repository(client, bucket="public-data", prefix="veda/track")
     asyncio.run(repository.publish(artifacts))
     ledger = asyncio.run(repository.load(track))
 
@@ -183,15 +195,15 @@ def test_r2_ledger_rebuilds_and_verifies_every_committed_match() -> None:
 
     original_match = client.objects.pop("veda/track/matches/000000000001.json")
     with pytest.raises(PublicArtifactError, match="committed match is missing"):
-        asyncio.run(R2Repository(client, bucket="public-data", prefix="veda/track").load(track))
+        asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
     client.objects["veda/track/matches/000000000001.json"] = original_match
 
     client.objects["veda/track/matches/000000000001.json"] = b"{}"
     with pytest.raises(PublicArtifactError, match="match is invalid"):
-        asyncio.run(R2Repository(client, bucket="public-data", prefix="veda/track").load(track))
+        asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
 
 
-def test_r2_loader_recovers_match_uploaded_before_mutable_summary() -> None:
+def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None:
     track = parse_track_spec(valid_spec())
     first = {
         "challenge_id": "challenge-1",
@@ -208,7 +220,6 @@ def test_r2_loader_recovers_match_uploaded_before_mutable_summary() -> None:
         "model_digest": "cd" * 32,
         "model_size_bytes": 123,
         "final_score": 0.8,
-        "attention_cost": 0.2,
         "score_block": 110,
         "stages": [],
     }
@@ -221,7 +232,7 @@ def test_r2_loader_recovers_match_uploaded_before_mutable_summary() -> None:
     committed = build_public_artifacts(store, track, chain, mechid=0, version_key=0)
     assert committed is not None
     client = MemoryS3()
-    asyncio.run(R2Repository(client, bucket="public-data", prefix="veda/track").publish(committed))
+    asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").publish(committed))
 
     second = {
         **first,
@@ -249,7 +260,7 @@ def test_r2_loader_recovers_match_uploaded_before_mutable_summary() -> None:
     client.objects[f"veda/track/{orphan_name}"] = orphan_payload
 
     recovered = asyncio.run(
-        R2Repository(client, bucket="public-data", prefix="veda/track").load(track)
+        S3Repository(client, bucket="public-data", prefix="veda/track").load(track)
     )
     assert recovered.source_block == 120
     assert recovered.required_finalized_block == 125
@@ -277,7 +288,6 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
                 "model_digest": "cd" * 32,
                 "model_size_bytes": 123,
                 "final_score": 0.8,
-                "attention_cost": 0.2,
                 "score_block": 110,
                 "stages": [],
             }

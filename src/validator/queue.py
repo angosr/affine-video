@@ -78,14 +78,10 @@ class ChallengeState(StrEnum):
     QUEUED = "QUEUED"
     FETCHING = "FETCHING"
     VALIDATING = "VALIDATING"
-    SCREENING = "SCREENING"
     SCORING = "SCORING"
-    PROVISIONAL = "PROVISIONAL"
-    ROLLOUT = "ROLLOUT"
     SYSTEM_DEFERRED = "SYSTEM_DEFERRED"
     SYSTEM_FAILED = "SYSTEM_FAILED"
     SUCCEEDED = "SUCCEEDED"
-    SCREENED_OUT = "SCREENED_OUT"
     PARTICIPANT_FAILED = "PARTICIPANT_FAILED"
     MALFORMED_SUBMISSION = "MALFORMED_SUBMISSION"
     REJECTED_RATE_LIMIT = "REJECTED_RATE_LIMIT"
@@ -94,7 +90,6 @@ class ChallengeState(StrEnum):
 TERMINAL_STATES = frozenset(
     {
         ChallengeState.SUCCEEDED,
-        ChallengeState.SCREENED_OUT,
         ChallengeState.PARTICIPANT_FAILED,
         ChallengeState.SYSTEM_FAILED,
         ChallengeState.MALFORMED_SUBMISSION,
@@ -106,9 +101,7 @@ _ACTIVE_STAGES = frozenset(
     {
         ChallengeState.FETCHING,
         ChallengeState.VALIDATING,
-        ChallengeState.SCREENING,
         ChallengeState.SCORING,
-        ChallengeState.ROLLOUT,
     }
 )
 
@@ -130,16 +123,7 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
     ),
     ChallengeState.VALIDATING: frozenset(
         {
-            ChallengeState.SCREENING,
-            ChallengeState.PARTICIPANT_FAILED,
-            ChallengeState.SYSTEM_DEFERRED,
-            ChallengeState.SYSTEM_FAILED,
-        }
-    ),
-    ChallengeState.SCREENING: frozenset(
-        {
             ChallengeState.SCORING,
-            ChallengeState.SCREENED_OUT,
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
             ChallengeState.SYSTEM_FAILED,
@@ -147,22 +131,12 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
     ),
     ChallengeState.SCORING: frozenset(
         {
-            ChallengeState.ROLLOUT,
-            ChallengeState.PROVISIONAL,
-            ChallengeState.PARTICIPANT_FAILED,
-            ChallengeState.SYSTEM_DEFERRED,
-            ChallengeState.SYSTEM_FAILED,
-        }
-    ),
-    ChallengeState.ROLLOUT: frozenset(
-        {
             ChallengeState.SUCCEEDED,
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
             ChallengeState.SYSTEM_FAILED,
         }
     ),
-    ChallengeState.PROVISIONAL: frozenset({ChallengeState.ROLLOUT}),
     ChallengeState.SYSTEM_DEFERRED: _ACTIVE_STAGES,
 }
 

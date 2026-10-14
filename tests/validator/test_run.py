@@ -99,10 +99,8 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
     def download(*_args, **_kwargs):
         return DownloadedModel(model_path, file_digest, model_path.stat().st_size, None, None)
 
-    def evaluate(task):
-        if task.state is ChallengeState.SCREENING:
-            return StageOutcome(ChallengeState.SCORING, 0.8, 0.2, {"stage": "screen"})
-        return StageOutcome(ChallengeState.PROVISIONAL, 0.7, 0.3, {"stage": "local"})
+    def evaluate(_task):
+        return StageOutcome(ChallengeState.SUCCEEDED, 0.7, {"stage": "scoring"})
 
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest="ab" * 32) as store:
         arguments = {
@@ -124,7 +122,6 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
             process_cycle(client, store, minimum_finalized_block=102, **arguments)
         )
         first = asyncio.run(process_cycle(client, store, **arguments))
-        second = asyncio.run(process_cycle(client, store, **arguments))
 
         assert paused.scan.submissions_found == 1
         assert paused.admission is paused.scoring is None
@@ -132,12 +129,8 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
         assert first.admission is not None
         assert first.admission.status is AdmissionStatus.ACCEPTED
         assert first.scoring is not None
-        assert first.scoring.state is ChallengeState.SCORING
-        assert second.scan.blocks_scanned == 0
-        assert second.admission is None
-        assert second.scoring is not None
-        assert second.scoring.state is ChallengeState.PROVISIONAL
-        assert store.leaderboard() == []
+        assert first.scoring.state is ChallengeState.SUCCEEDED
+        assert store.leaderboard()[0].final_score == pytest.approx(0.7)
 
 
 def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_path) -> None:
@@ -154,19 +147,8 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         downloads += 1
         return DownloadedModel(model_path, file_digest, model_path.stat().st_size, None, None)
 
-    def evaluate(task):
-        outcomes = {
-            ChallengeState.SCREENING: StageOutcome(
-                ChallengeState.SCORING, 0.8, 0.2, {"stage": "screen"}
-            ),
-            ChallengeState.SCORING: StageOutcome(
-                ChallengeState.ROLLOUT, 0.7, 0.3, {"stage": "local"}
-            ),
-            ChallengeState.ROLLOUT: StageOutcome(
-                ChallengeState.SUCCEEDED, 0.9, 0.25, {"stage": "rollout"}
-            ),
-        }
-        return outcomes[task.state]
+    def evaluate(_task):
+        return StageOutcome(ChallengeState.SUCCEEDED, 0.9, {"stage": "scoring"})
 
     arguments = {
         "netuid": 7,
@@ -183,12 +165,9 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         "worker_id": "validator-a",
         "downloader": download,
     }
-    outcomes = []
-    for _stage in range(3):
-        with ChallengeStore(database, track_spec_digest="ab" * 32) as store:
-            cycle = asyncio.run(process_cycle(client, store, **arguments))
-            assert cycle.scoring is not None
-            outcomes.append(cycle.scoring.state)
+    with ChallengeStore(database, track_spec_digest="ab" * 32) as store:
+        cycle = asyncio.run(process_cycle(client, store, **arguments))
+        assert cycle.scoring is not None
 
     with ChallengeStore(database, track_spec_digest="ab" * 32) as store:
         snapshot = store.public_snapshot()
@@ -210,26 +189,15 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         )
 
     assert downloads == 1
-    assert outcomes == [
-        ChallengeState.SCORING,
-        ChallengeState.ROLLOUT,
-        ChallengeState.SUCCEEDED,
-    ]
+    assert cycle.scoring.state is ChallengeState.SUCCEEDED
     assert challenge["state"] == ChallengeState.SUCCEEDED
     assert challenge["final_score"] == pytest.approx(0.9)
-    assert challenge["provisional"] is False
-    assert [stage["stage"] for stage in challenge["stages"]] == [
-        ChallengeState.SCREENING,
-        ChallengeState.SCORING,
-        ChallengeState.ROLLOUT,
-    ]
+    assert [stage["stage"] for stage in challenge["stages"]] == [ChallengeState.SCORING]
     assert [event["state"] for event in challenge["events"]] == [
         ChallengeState.QUEUED,
         ChallengeState.FETCHING,
         ChallengeState.VALIDATING,
-        ChallengeState.SCREENING,
         ChallengeState.SCORING,
-        ChallengeState.ROLLOUT,
         ChallengeState.SUCCEEDED,
     ]
     assert plan is not None

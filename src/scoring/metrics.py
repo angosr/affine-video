@@ -1,4 +1,4 @@
-"""Core metric formulas shared by local evaluation and validators."""
+"""Core metric formulas used by authoritative selector scoring."""
 
 from __future__ import annotations
 

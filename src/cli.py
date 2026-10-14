@@ -10,7 +10,7 @@ from pathlib import Path
 
 from miner.chain import ChainSubmissionError, submit_model
 from miner.submit import ModelSubmission, SubmissionFormatError
-from validator.publication import R2Repository
+from validator.publication import S3Repository
 from validator.run import (
     DEFAULT_NETUID,
     DEFAULT_PUBLIC_WEIGHTS_URL,
@@ -54,33 +54,28 @@ def _parser() -> argparse.ArgumentParser:
     challenge.add_argument("--database", required=True)
 
     evaluate = validator_commands.add_parser(
-        "evaluate", help="evaluate submissions and publish public R2 artifacts"
+        "evaluate", help="evaluate submissions and publish public artifacts"
     )
     evaluate.add_argument("--track-spec", required=True)
     evaluate.add_argument("--database", required=True)
     evaluate.add_argument("--model-cache", required=True)
-    evaluate.add_argument("--screen-cache", required=True)
     evaluate.add_argument("--exact-cache", required=True)
-    evaluate.add_argument("--rollout-runner")
-    evaluate.add_argument("--rollout-panel")
     evaluate.add_argument("--network", default="finney")
     evaluate.add_argument("--archive-endpoint", dest="archive_endpoints", action="append")
     evaluate.add_argument("--worker-id", default="evaluator")
     evaluate.add_argument("--poll-seconds", default=12.0, type=float)
     evaluate.add_argument("--max-scan-blocks", default=100, type=int)
     evaluate.add_argument("--scoring-timeout-seconds", default=1800.0, type=float)
-    evaluate.add_argument("--rollout-timeout-seconds", default=1500.0, type=float)
     evaluate.add_argument("--scoring-max-memory-bytes", type=int)
     evaluate.add_argument("--scoring-max-cpu-seconds", type=int)
-    evaluate.add_argument("--r2-account-id", required=True)
-    evaluate.add_argument("--r2-bucket", required=True)
-    evaluate.add_argument("--r2-prefix", required=True)
+    evaluate.add_argument("--storage-bucket", required=True)
+    evaluate.add_argument("--storage-prefix", required=True)
     evaluate.add_argument("--mechid", default=0, type=int)
     evaluate.add_argument("--version-key", default=0, type=int)
     evaluate.add_argument("--once", action="store_true")
 
     run = validator_commands.add_parser(
-        "run", help="fetch public R2 weights and submit them on-chain"
+        "run", help="fetch public weights and submit them on-chain"
     )
     run.add_argument("--public-weights-url", default=DEFAULT_PUBLIC_WEIGHTS_URL)
     run.add_argument("--netuid", default=DEFAULT_NETUID, type=int)
@@ -151,20 +146,16 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
 def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
     if arguments.command == "evaluate":
         try:
-            publisher = R2Repository.from_environment(
-                account_id=arguments.r2_account_id,
-                bucket=arguments.r2_bucket,
-                prefix=arguments.r2_prefix,
+            publisher = S3Repository.from_environment(
+                bucket=arguments.storage_bucket,
+                prefix=arguments.storage_prefix,
             )
             asyncio.run(
                 run_evaluator(
                     track_spec=arguments.track_spec,
                     database=arguments.database,
                     model_cache=arguments.model_cache,
-                    screen_cache=arguments.screen_cache,
                     exact_cache=arguments.exact_cache,
-                    rollout_runner=arguments.rollout_runner,
-                    rollout_panel=arguments.rollout_panel,
                     network=arguments.network,
                     archive_endpoints=arguments.archive_endpoints,
                     worker_id=arguments.worker_id,
@@ -174,7 +165,6 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
                     poll_seconds=arguments.poll_seconds,
                     max_scan_blocks=arguments.max_scan_blocks,
                     scoring_timeout_seconds=arguments.scoring_timeout_seconds,
-                    rollout_timeout_seconds=arguments.rollout_timeout_seconds,
                     scoring_max_memory_bytes=arguments.scoring_max_memory_bytes,
                     scoring_max_cpu_seconds=arguments.scoring_max_cpu_seconds,
                     once=arguments.once,

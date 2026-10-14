@@ -827,7 +827,7 @@ def main() -> None:
                 "repeated-submission selection bias",
                 "exact-hash clone bypass through Veda residual-projection scaling",
                 "frontier dust amplification under chain weight caps",
-                "max-pooled teacher screening counterexample",
+                "max-pooled teacher-proxy counterexample",
             ],
             "not_validated": [
                 "GPU block count versus latency",
@@ -835,7 +835,7 @@ def main() -> None:
                 "proxy score versus real video quality",
                 "selector-only quality without adapters in a real Video DiT",
                 "public Veda checkpoint compatibility",
-                "minimum frontier gain calibration from real rollout repeatability",
+                "minimum frontier gain calibration from repeated full-video evaluation",
             ],
         },
         "dimensions": {

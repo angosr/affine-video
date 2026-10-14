@@ -14,21 +14,11 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
-from scoring.cache import CacheLoadError, load_screen_cache, sample_exact_cache
+from scoring.cache import CacheLoadError, sample_exact_cache
 from scoring.evaluate import panel_seed, route_stratified_sample_indices
-from scoring.local import (
-    ExactCase,
-    ScreenCase,
-    evaluate_selector_local,
-    evaluate_selector_screen,
-)
+from scoring.exact import ExactCase, score_selector
 from scoring.model import ModelValidationError
-from scoring.rollout import (
-    RolloutParticipantError,
-    RolloutResult,
-    RolloutTemporaryError,
-)
-from scoring.selector import FixedSelector, load_selector
+from scoring.selector import load_selector
 from scoring.spec import TrackSpec
 from validator.queue import ChallengeState, require_transition
 from validator.store import ChallengeStore, LeasedChallenge
@@ -56,14 +46,11 @@ class StageOutcome:
 
     next_state: ChallengeState
     score: float
-    attention_cost: float
     metrics: Mapping[str, Any]
 
     def __post_init__(self) -> None:
         if not isfinite(self.score) or not 0 <= self.score <= 1:
             raise ValueError("stage score must be finite and within [0, 1]")
-        if not isfinite(self.attention_cost) or self.attention_cost < 0:
-            raise ValueError("attention cost must be finite and non-negative")
         try:
             json.dumps(
                 self.metrics,
@@ -101,12 +88,10 @@ class ScoringOutcome:
 
 @dataclass(frozen=True, slots=True)
 class TrackEvaluator:
-    """Trusted staged evaluator over frozen lightweight and exact caches."""
+    """Trusted authoritative evaluator over the frozen exact cache."""
 
     track: TrackSpec
-    screen_cases: Sequence[ScreenCase]
     exact_cases: Sequence[ExactCase]
-    rollout: Callable[[LeasedChallenge, FixedSelector, TrackSpec], RolloutResult] | None = None
     presampled: bool = False
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
@@ -131,44 +116,16 @@ class TrackEvaluator:
 
         scoring = self.track.scoring
         try:
-            if task.state is ChallengeState.SCREENING:
-                cases = tuple(self.screen_cases)
-                if not cases:
-                    raise ValueError("screen cache is empty")
-                result = evaluate_selector_screen(
-                    selector,
-                    cases,
-                    scoring.budgets,
-                    stratum_weights=scoring.stratum_weight_map,
-                    bootstrap_confidence=scoring.bootstrap_confidence,
-                    bootstrap_resamples=scoring.bootstrap_resamples,
-                    bootstrap_seed=scoring.bootstrap_seed,
-                )
-                target = (
-                    ChallengeState.SCREENED_OUT
-                    if result.upper_bound < scoring.screening_threshold
-                    else ChallengeState.SCORING
-                )
-                return StageOutcome(
-                    target,
-                    result.score,
-                    scoring.budgets[-1].calibrated_cost,
-                    {
-                        "upper_bound": result.upper_bound,
-                        "budget_scores": list(result.budget_scores),
-                        "sample_count": len(cases),
-                    },
-                )
             if task.state is ChallengeState.SCORING:
                 cases = _exact_cases_for_stage(
                     self.exact_cases,
-                    count=scoring.local_sample_count,
+                    count=scoring.sample_count,
                     seed=panel_seed(self.track.digest, stage="exact"),
                     routes=self.track.model.selector.routes,
                     strata=scoring.stratum_weight_map,
                     presampled=self.presampled,
                 )
-                result = evaluate_selector_local(
+                result = score_selector(
                     selector,
                     cases,
                     scoring.budgets,
@@ -178,42 +135,15 @@ class TrackEvaluator:
                     bootstrap_resamples=scoring.bootstrap_resamples,
                     bootstrap_seed=scoring.bootstrap_seed,
                 )
-                target = (
-                    ChallengeState.ROLLOUT
-                    if self.rollout is not None and result.lower_bound >= scoring.rollout_threshold
-                    else ChallengeState.PROVISIONAL
-                )
                 return StageOutcome(
-                    target,
+                    ChallengeState.SUCCEEDED,
                     result.lower_bound,
-                    scoring.budgets[-1].calibrated_cost,
                     {
-                        "local_score": result.aggregate.score,
+                        "exact_score": result.aggregate.score,
                         "lower_bound": result.lower_bound,
                         "budget_scores": [item.quality for item in result.aggregate.budgets],
                         "sample_count": len(cases),
                     },
-                )
-            if task.state is ChallengeState.ROLLOUT:
-                if self.rollout is None:
-                    raise TemporaryScoringError(
-                        "ROLLOUT_UNAVAILABLE", "rollout evaluator is not configured"
-                    )
-                try:
-                    rollout = self.rollout(task, selector, self.track)
-                except RolloutParticipantError as exc:
-                    raise ParticipantScoringError(exc.code, str(exc)) from exc
-                except RolloutTemporaryError as exc:
-                    raise TemporaryScoringError(exc.code, str(exc)) from exc
-                if not isinstance(rollout, RolloutResult):
-                    raise TemporaryScoringError(
-                        "ROLLOUT_RESULT_INVALID", "rollout returned an invalid result"
-                    )
-                return StageOutcome(
-                    ChallengeState.SUCCEEDED,
-                    rollout.final_score,
-                    rollout.attention_cost,
-                    rollout.metrics,
                 )
         except (ParticipantScoringError, TemporaryScoringError):
             raise
@@ -230,44 +160,31 @@ class TrackEvaluator:
 
 @dataclass(frozen=True, slots=True)
 class FileTrackEvaluator:
-    """Load only the cache needed by the current stage inside the worker."""
+    """Load the deterministic exact sample inside the isolated worker."""
 
     track: TrackSpec
-    screen_cache: str
     exact_cache: str
-    rollout: Callable[[LeasedChallenge, FixedSelector, TrackSpec], RolloutResult] | None = None
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         try:
             scoring = self.track.scoring
-            if task.state is ChallengeState.SCREENING:
-                screen_cases = load_screen_cache(
-                    self.screen_cache,
-                    expected_sha256=self.track.cache.screen_sha256,
-                    max_bytes=self.track.cache.screen_max_bytes,
-                )
-                exact_cases: Sequence[ExactCase] = ()
-            elif task.state is ChallengeState.SCORING:
-                screen_cases = ()
+            if task.state is ChallengeState.SCORING:
                 exact_cases = sample_exact_cache(
                     self.exact_cache,
                     expected_sha256=self.track.cache.exact_sha256,
                     max_bytes=self.track.cache.exact_max_bytes,
-                    count=scoring.local_sample_count,
+                    count=scoring.sample_count,
                     seed=panel_seed(self.track.digest, stage="exact"),
                     routes=self.track.model.selector.routes,
                     strata=scoring.stratum_weight_map,
                 )
             else:
-                screen_cases = ()
                 exact_cases = ()
         except CacheLoadError as exc:
             raise TemporaryScoringError("SCORING_CACHE_INVALID", str(exc)) from exc
         return TrackEvaluator(
             self.track,
-            screen_cases,
             exact_cases,
-            rollout=self.rollout,
             presampled=True,
         )(task)
 
@@ -451,7 +368,6 @@ def process_next_scoring(
             task.state,
             next_state=result.next_state,
             score=result.score,
-            attention_cost=result.attention_cost,
             score_block=current_finalized_block,
             metrics=result.metrics,
             occurred_at_ms=now,
@@ -461,51 +377,22 @@ def process_next_scoring(
         result = StageOutcome(
             recorded.next_state,
             recorded.score,
-            recorded.attention_cost,
             recorded.metrics,
         )
         result_score_block = recorded.score_block
-    if (
-        result.next_state in {ChallengeState.PROVISIONAL, ChallengeState.ROLLOUT}
-        and task.state is ChallengeState.SCORING
-    ):
-        store.publish_provisional(
-            task.challenge_id,
-            task.lease_token,
-            final_score=result.score,
-            attention_cost=result.attention_cost,
-            score_block=result_score_block,
-            schedule_rollout=result.next_state is ChallengeState.ROLLOUT,
-            occurred_at_ms=now,
-        )
-    elif result.next_state is ChallengeState.SUCCEEDED:
+    if result.next_state is ChallengeState.SUCCEEDED:
         store.complete_challenge(
             task.challenge_id,
             ChallengeState.SUCCEEDED,
             final_score=result.score,
-            attention_cost=result.attention_cost,
-            occurred_at_ms=now,
-            lease_token=task.lease_token,
-            score_block=result_score_block,
-        )
-    elif result.next_state is ChallengeState.SCREENED_OUT:
-        store.complete_challenge(
-            task.challenge_id,
-            ChallengeState.SCREENED_OUT,
-            error_code="SCREENING_THRESHOLD",
-            error_summary="screening upper bound is below the fixed threshold",
             occurred_at_ms=now,
             lease_token=task.lease_token,
             score_block=result_score_block,
         )
     else:
-        store.advance_leased(
-            task.challenge_id,
-            task.lease_token,
-            result.next_state,
-            release=True,
-            occurred_at_ms=now,
-            details={"stage_score": result.score},
+        raise TemporaryScoringError(
+            "SCORING_RESULT_INVALID",
+            "authoritative scoring did not produce a terminal result",
         )
     return ScoringOutcome(task.challenge_id, result.next_state)
 

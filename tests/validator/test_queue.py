@@ -45,9 +45,7 @@ def test_state_machine_accepts_scored_success() -> None:
         ChallengeState.QUEUED,
         ChallengeState.FETCHING,
         ChallengeState.VALIDATING,
-        ChallengeState.SCREENING,
         ChallengeState.SCORING,
-        ChallengeState.ROLLOUT,
         ChallengeState.SUCCEEDED,
     ]
 

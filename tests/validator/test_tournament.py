@@ -27,7 +27,6 @@ def challenge(
         "model_digest": "cd" * 32 if score is not None else None,
         "model_size_bytes": 123 if score is not None else None,
         "final_score": score,
-        "attention_cost": 0.2 if score is not None else None,
         "score_block": 200 + sequence if score is not None else None,
         "stages": [],
     }
@@ -99,7 +98,7 @@ def test_unfinished_submission_stops_the_public_match_prefix() -> None:
     tournament = resolve(
         [
             challenge(1, "alice", score=0.6),
-            challenge(2, "bob", state=ChallengeState.ROLLOUT),
+            challenge(2, "bob", state=ChallengeState.SCORING),
             challenge(3, "carol", score=0.9),
         ]
     )
@@ -114,10 +113,9 @@ def test_public_match_validation_rejects_nonterminal_records() -> None:
         **public,
         "evaluation": {
             **public["evaluation"],
-            "state": ChallengeState.ROLLOUT,
+            "state": ChallengeState.SCORING,
             "error_code": "TEMPORARY",
             "final_score": None,
-            "attention_cost": None,
         },
         "score_gain": None,
         "outcome": MatchOutcome.CHALLENGE_FAILED,

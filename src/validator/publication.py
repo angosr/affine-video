@@ -1,4 +1,4 @@
-"""Canonical public artifacts and Cloudflare R2 transport."""
+"""Canonical public artifacts and S3-compatible object-storage transport."""
 
 from __future__ import annotations
 
@@ -32,9 +32,8 @@ from validator.weights import (
 )
 
 _HEX_32 = re.compile(r"^[0-9a-f]{64}$")
-_R2_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_R2_ACCOUNT_ID = re.compile(r"^[0-9a-fA-F]{32}$")
-_R2_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_STORAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MAX_WEIGHT_ARTIFACT_BYTES = 1024 * 1024
 _MAX_PUBLIC_OBJECT_BYTES = 1024 * 1024
 _SUMMARY_LEADERBOARD_LIMIT = 100
@@ -221,7 +220,7 @@ async def fetch_weight_artifact(
     client: httpx.AsyncClient,
     max_bytes: int = _MAX_WEIGHT_ARTIFACT_BYTES,
 ) -> WeightArtifact:
-    """Fetch one public R2 weight artifact with a hard response-size bound."""
+    """Fetch one public weight artifact with a hard response-size bound."""
 
     validate_public_weights_url(url)
     if max_bytes <= 0 or max_bytes > _MAX_WEIGHT_ARTIFACT_BYTES:
@@ -264,40 +263,49 @@ def validate_public_weights_url(url: str) -> str:
     return url
 
 
-class R2Repository:
+class S3Repository:
     """Persist immutable public facts and publish bounded current-state pointers."""
 
     def __init__(self, client: Any, *, bucket: str, prefix: str) -> None:
-        if not _R2_NAME.fullmatch(bucket) or len(bucket) > 64:
-            raise ValueError("R2 bucket name is invalid")
+        if not _STORAGE_NAME.fullmatch(bucket) or len(bucket) > 64:
+            raise ValueError("storage bucket name is invalid")
         normalized = prefix.strip("/")
         if (
-            not _R2_PREFIX.fullmatch(normalized)
+            not _STORAGE_PREFIX.fullmatch(normalized)
             or len(normalized) > 512
             or any(part in {"", ".", ".."} for part in normalized.split("/"))
         ):
-            raise ValueError("R2 object prefix is invalid")
+            raise ValueError("storage object prefix is invalid")
         self._client = client
         self._bucket = bucket
         self._prefix = normalized
         self._confirmed_immutable: dict[str, str] = {}
 
     @classmethod
-    def from_environment(cls, *, account_id: str, bucket: str, prefix: str) -> R2Repository:
-        if not _R2_ACCOUNT_ID.fullmatch(account_id):
-            raise ValueError("R2 account ID is invalid")
-        access_key = os.environ.get("VEDA_R2_ACCESS_KEY_ID")
-        secret_key = os.environ.get("VEDA_R2_SECRET_ACCESS_KEY")
-        if not access_key or not secret_key:
-            raise ValueError("VEDA_R2_ACCESS_KEY_ID and VEDA_R2_SECRET_ACCESS_KEY are required")
+    def from_environment(cls, *, bucket: str, prefix: str) -> S3Repository:
+        endpoint = os.environ.get("STORAGE_URL")
+        access_key = os.environ.get("ACCESS_KEY")
+        secret_key = os.environ.get("SECRET_ACCESS_KEY")
+        if not endpoint or not access_key or not secret_key:
+            raise ValueError("STORAGE_URL, ACCESS_KEY, and SECRET_ACCESS_KEY are required")
+        parsed = urlparse(endpoint)
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("STORAGE_URL must be an HTTPS endpoint without credentials or query")
         try:
             import boto3
             from botocore.config import Config
         except ImportError as exc:
-            raise RuntimeError("R2 publishing requires the 'r2' package extra") from exc
+            raise RuntimeError("publishing requires the 'storage' package extra") from exc
         client = boto3.client(
             "s3",
-            endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+            endpoint_url=endpoint,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name="auto",
@@ -313,7 +321,7 @@ class R2Repository:
         await asyncio.to_thread(self._put, "weights.json", artifacts.weights, False)
 
     async def load(self, track: TrackSpec) -> PublicLedger:
-        """Load and verify the committed public tournament ledger from R2."""
+        """Load and verify the committed public tournament ledger from object storage."""
 
         return await asyncio.to_thread(self._load, track)
 
@@ -322,18 +330,18 @@ class R2Repository:
         summary_payload = self._get_optional("summary.json")
         if track_payload is None:
             if summary_payload is not None:
-                raise PublicArtifactError("R2 summary exists without its immutable track")
+                raise PublicArtifactError("public summary exists without its immutable track")
             return PublicLedger(None, ())
 
         track_document = _decode_canonical_object(track_payload, "track")
         if set(track_document) != {"track_spec_digest", "spec"}:
-            raise PublicArtifactError("R2 track fields are invalid")
+            raise PublicArtifactError("public track fields are invalid")
         try:
             stored_track = parse_track_spec(track_document["spec"])
         except ValueError as exc:
-            raise PublicArtifactError("R2 track specification is invalid") from exc
+            raise PublicArtifactError("public track specification is invalid") from exc
         if track_document["track_spec_digest"] != stored_track.digest or stored_track != track:
-            raise PublicArtifactError("R2 track does not match the configured track")
+            raise PublicArtifactError("public track does not match the configured track")
         self._confirmed_immutable["track.json"] = hashlib.sha256(track_payload).hexdigest()
 
         if summary_payload is None:
@@ -353,10 +361,10 @@ class R2Repository:
             "rewards_total",
         }
         if set(summary) != expected_fields:
-            raise PublicArtifactError("R2 summary fields are invalid")
+            raise PublicArtifactError("public summary fields are invalid")
         source_block = _integer(summary["source_block"], "source_block")
         if source_block < track.track_start_block:
-            raise PublicArtifactError("R2 summary predates the configured track")
+            raise PublicArtifactError("public summary predates the configured track")
         match_count = _integer(summary["match_count"], "match_count")
         matches: list[MatchRecord] = []
         committed_challenges: list[dict[str, Any]] = []
@@ -365,7 +373,7 @@ class R2Repository:
             name = f"matches/{sequence:012d}.json"
             payload = self._get_optional(name)
             if payload is None:
-                raise PublicArtifactError(f"R2 committed match is missing: {name}")
+                raise PublicArtifactError(f"committed match is missing: {name}")
             document = _decode_canonical_object(payload, name)
             try:
                 record = validate_match_document(
@@ -378,11 +386,11 @@ class R2Repository:
                     incumbent=incumbent,
                 )
             except ValueError as exc:
-                raise PublicArtifactError(f"R2 match is invalid: {name}") from exc
+                raise PublicArtifactError(f"public match is invalid: {name}") from exc
             matches.append(record)
             committed_challenges.append(challenge_from_match(document))
             if document["decided_block"] > source_block:
-                raise PublicArtifactError(f"R2 match is newer than its summary: {name}")
+                raise PublicArtifactError(f"public match is newer than its summary: {name}")
             incumbent = record.champion_after
             self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
 
@@ -394,7 +402,7 @@ class R2Repository:
             minimum_gain=track.scoring.minimum_frontier_gain,
         )
         if summary != _summary_document(track, source_block, tournament):
-            raise PublicArtifactError("R2 summary does not match its immutable matches")
+            raise PublicArtifactError("public summary does not match its immutable matches")
 
         matches.extend(self._load_following_matches(track, match_count + 1, incumbent))
         return PublicLedger(source_block, tuple(matches))
@@ -423,7 +431,7 @@ class R2Repository:
                     incumbent=incumbent,
                 )
             except ValueError as exc:
-                raise PublicArtifactError(f"R2 match is invalid: {name}") from exc
+                raise PublicArtifactError(f"public match is invalid: {name}") from exc
             matches.append(record)
             incumbent = record.champion_after
             self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
@@ -437,7 +445,9 @@ class R2Repository:
         existing = self._get_optional(name)
         if existing is not None:
             if existing != payload:
-                raise PublicArtifactError(f"immutable R2 object conflicts with local data: {name}")
+                raise PublicArtifactError(
+                    f"immutable public object conflicts with local data: {name}"
+                )
             self._confirmed_immutable[name] = digest
             return
         self._put(name, payload, True)
@@ -479,12 +489,12 @@ class R2Repository:
             raise
         body = response.get("Body")
         if body is None or not hasattr(body, "read"):
-            raise PublicArtifactError(f"R2 returned an invalid object body: {name}")
+            raise PublicArtifactError(f"storage returned an invalid object body: {name}")
         payload = body.read(_MAX_PUBLIC_OBJECT_BYTES + 1)
         if not isinstance(payload, bytes):
-            raise PublicArtifactError(f"R2 returned a non-byte object body: {name}")
+            raise PublicArtifactError(f"storage returned a non-byte object body: {name}")
         if not payload or len(payload) > _MAX_PUBLIC_OBJECT_BYTES:
-            raise PublicArtifactError(f"R2 object size is invalid: {name}")
+            raise PublicArtifactError(f"public object size is invalid: {name}")
         return payload
 
 
@@ -528,13 +538,13 @@ def _summary_document(
 
 def _decode_canonical_object(payload: bytes, name: str) -> dict[str, Any]:
     if not payload or len(payload) > _MAX_PUBLIC_OBJECT_BYTES:
-        raise PublicArtifactError(f"R2 {name} size is invalid")
+        raise PublicArtifactError(f"public {name} size is invalid")
     try:
         raw = json.loads(payload, object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PublicArtifactError(f"R2 {name} is not valid JSON") from exc
+        raise PublicArtifactError(f"public {name} is not valid JSON") from exc
     if not isinstance(raw, dict) or _json_bytes(raw) != payload:
-        raise PublicArtifactError(f"R2 {name} is not a canonical JSON object")
+        raise PublicArtifactError(f"public {name} is not a canonical JSON object")
     return raw
 
 

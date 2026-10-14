@@ -967,7 +967,7 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-r2 = [
+storage = [
     { name = "boto3" },
 ]
 
@@ -984,13 +984,13 @@ experiments = [
 [package.metadata]
 requires-dist = [
     { name = "bittensor", specifier = "==11.3.0" },
-    { name = "boto3", marker = "extra == 'r2'", specifier = ">=1.40,<2" },
+    { name = "boto3", marker = "extra == 'storage'", specifier = ">=1.40,<2" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "huggingface-hub", specifier = "==2.2.0" },
     { name = "numpy", specifier = "==2.5.1" },
     { name = "safetensors", specifier = "==0.8.0" },
 ]
-provides-extras = ["r2"]
+provides-extras = ["storage"]
 
 [package.metadata.requires-dev]
 dev = [

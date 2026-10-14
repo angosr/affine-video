@@ -6,9 +6,9 @@ boundaries:
 - `miner`: validates and submits a pinned Hugging Face model reference;
 - `validator`: evaluates submissions, publishes the public tournament ledger, or independently
   applies public weights on-chain;
-- `scoring`: validates selector weights and runs deterministic staged evaluation.
+- `scoring`: validates selector weights and computes one deterministic authoritative score.
 
-There is one expensive evaluator process. It has R2 write credentials but no Validator wallet.
+There is one evaluator process. It has object-storage write credentials but no Validator wallet.
 Every Validator, including the one operated alongside the evaluator, runs the same separate
 lightweight process: fetch `weights.json`, validate it against finalized chain state, and sign its
 own `SetWeights` transaction. No service or direct Miner-to-Validator protocol exists.
@@ -20,9 +20,9 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
    `(block, extrinsic, event)` order. The pinned revision must then be anonymously downloadable.
 3. The evaluator accepts exactly one `selector.safetensors` file. It rejects executable code,
    metadata, unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.
-4. Cheap screening and exact local scoring decide whether a model reaches the hidden full-video
-   rollout. Only a successful rollout produces an authoritative score.
-5. Terminal submissions are adjudicated in chain order. The first successful model becomes the
+4. Every valid model is scored once on the same hash-pinned hidden exact-attention cache. The score
+   is the conservative lower bound of its multi-budget quality-cost curve.
+5. Completed submissions are adjudicated in chain order. The first successful model becomes the
    initial champion. A later model replaces it only when
    `challenger_score - champion_score >= minimum_frontier_gain`.
 6. An immutable match record is published for every terminal item in the contiguous chain-order
@@ -30,7 +30,9 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
 
 Scoring covers several frozen block budgets. The authoritative score combines quality and
 calibrated attention cost, so a selector must preserve quality while selecting fewer blocks. The
-track specification pins every score-affecting rule and asset hash.
+track specification pins every score-affecting rule and asset hash. The evaluator covers every
+layer and head derived from the fixed architecture. Kernel-required tiles are stored in the hidden
+cache, always retained, and counted inside each block budget before predictor Top-k fills the rest.
 
 Rewards use chronological frontier gains rather than raw leaderboard rank. Exact duplicates earn
 nothing, sub-threshold changes earn nothing, and splitting the same sequence of improvements among
@@ -40,12 +42,12 @@ The resulting utilities are filtered to currently registered hotkeys and normali
 Bittensor count and weight-cap constraints. When no valid vector exists, `weights` is `null` and
 Validators keep their last finalized weights.
 
-The hidden rollout panel must be rotated between reward epochs. Before live rewards, the production
-track must also pass real-GPU repeatability, ranking stability, cost calibration, baseline headroom,
-and adversarial-submission experiments. CPU tests validate mechanics; they do not establish video
-quality or target-GPU utilization.
+Before live rewards, the frozen exact-cache score must be validated against full-video quality on
+the target GPU. The production track must also pass ranking stability, cost calibration, baseline
+headroom, and adversarial-submission experiments. Those are track-acceptance experiments rather
+than a second runtime scoring system.
 
-## Public R2 state
+## Public object-storage state
 
 Each frozen track uses one prefix:
 
@@ -71,12 +73,13 @@ Publication writes the immutable track and matches first, then `summary.json`, t
 A crash can therefore leave an extra immutable match but cannot expose weights for an uncommitted
 summary. On restart the evaluator validates every committed match, follows any contiguous orphaned
 matches, and restores them instead of evaluating them again. Conflicting immutable bytes stop
-publication. A chain node behind the recovered R2 watermark may keep scanning, but evaluation and
-publication wait until its finalized height catches up, so public state cannot move backward.
+publication. A chain node behind the recovered public watermark may keep scanning, but evaluation
+and publication wait until its finalized height catches up, so public state cannot move backward.
 
-R2 is the durable source for public tournament facts. The local SQLite database and downloaded
-model cache are disposable execution state: after loss, finalized chain submissions plus verified
-R2 matches reconstruct completed work, and remaining submissions can be evaluated again.
+Object storage is the durable source for public tournament facts. The local SQLite database and
+downloaded model cache are disposable execution state: after loss, finalized chain submissions plus
+verified published matches reconstruct completed work, and remaining submissions can be evaluated
+again.
 
 Public artifacts deliberately exclude hidden samples, per-sample or per-layer metrics, local paths,
 worker and lease data, retry timing, error text, stack traces, and credentials. Only stable error
@@ -109,27 +112,20 @@ period expires.
 Run the evaluator:
 
 ```bash
-uv sync --extra r2
-export VEDA_R2_ACCESS_KEY_ID=...
-export VEDA_R2_SECRET_ACCESS_KEY=...
+uv sync --extra storage
+export STORAGE_URL=https://project.storage.supabase.co/storage/v1/s3
+export ACCESS_KEY=...
+export SECRET_ACCESS_KEY=...
 
-uv run --extra r2 veda validator evaluate \
+uv run --extra storage veda validator evaluate \
   --track-spec /data/track.json \
   --database /data/validator.db \
   --model-cache /data/models \
-  --screen-cache /data/screen.npz \
   --exact-cache /data/exact.npz \
-  --rollout-runner /opt/veda/rollout \
-  --rollout-panel /data/rollout-panel \
   --archive-endpoint wss://archive.example \
-  --r2-account-id 0123456789abcdef0123456789abcdef \
-  --r2-bucket veda-public \
-  --r2-prefix tracks/main
+  --storage-bucket affine_video \
+  --storage-prefix tracks/main
 ```
-
-The rollout runner is a local executable started by the evaluator, not a network service. Omitting
-both rollout arguments keeps qualifying submissions provisional and prevents them from receiving
-weights.
 
 Run any Validator, including the evaluator operator's independent Validator:
 
@@ -137,7 +133,7 @@ Run any Validator, including the evaluator operator's independent Validator:
 uv run veda validator run
 ```
 
-This process needs no evaluator database, model cache, hidden data, GPU, or R2 write credentials. It
+This process needs no evaluator database, model cache, hidden data, GPU, or storage write credentials. It
 also needs no object-storage or track arguments: the public URL, subnet, and pinned track digest are
 release defaults. Wallet name, hotkey, network, and public track fields remain optional overrides.
 It rejects artifacts for another track or subnet, future or stale snapshots, invalid normalization

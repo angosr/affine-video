@@ -3,7 +3,7 @@ import pytest
 
 from scoring.evaluate import (
     BudgetEvidence,
-    evaluate_local,
+    aggregate_exact_score,
     panel_seed,
     percentile,
     reference_attention,
@@ -22,7 +22,7 @@ def test_panel_seed_is_common_to_the_track_and_stage() -> None:
     first = panel_seed(track, stage="exact")
 
     assert first == panel_seed(track.upper(), stage="exact")
-    assert first != panel_seed(track, stage="rollout")
+    assert first != panel_seed(track, stage="other")
     with pytest.raises(ValueError, match="32 bytes"):
         panel_seed("11", stage="exact")
 
@@ -83,6 +83,21 @@ def test_stable_top_k_has_exact_budget_and_index_tie_break() -> None:
     assert np.all(mask.sum(axis=1) == 2)
 
 
+def test_stable_top_k_counts_required_keys_inside_the_budget() -> None:
+    logits = np.array([[10.0, 9.0, 1.0], [10.0, 9.0, 1.0]], dtype=np.float32)
+    required = np.array([[False, False, True], [False, True, False]], dtype=np.bool_)
+
+    mask = stable_top_k(
+        logits,
+        np.ones(3, dtype=np.bool_),
+        required_keys=required,
+        blocks=2,
+    )
+
+    assert mask.tolist() == [[True, False, True], [True, True, False]]
+    assert np.all(mask.sum(axis=1) == 2)
+
+
 def test_reference_attention_full_mask_matches_flat_dense_attention() -> None:
     q = np.array([[[1.0, 0.0], [0.0, 1.0]]], dtype=np.float32)
     k = np.array([[[1.0, 0.0]], [[0.0, 1.0]]], dtype=np.float32)
@@ -116,8 +131,8 @@ def test_linear_percentile_and_tail_mixture_are_explicit() -> None:
     assert tail_error(values, mean_weight=0.8) == pytest.approx(33.08)
 
 
-def test_local_score_macro_averages_strata_then_integrates_cost() -> None:
-    result = evaluate_local(
+def test_exact_score_macro_averages_strata_then_integrates_cost() -> None:
+    result = aggregate_exact_score(
         [
             BudgetEvidence(1, 1.0, {"a": [1.0, 1.0], "b": [3.0, 3.0]}),
             BudgetEvidence(2, 2.0, {"a": [0.5, 0.5], "b": [1.5, 1.5]}),
@@ -132,9 +147,9 @@ def test_local_score_macro_averages_strata_then_integrates_cost() -> None:
     assert result.score == pytest.approx((0.4 + 2 / 1.75 + 0.8) / 4)
 
 
-def test_local_score_rejects_missing_stratum_and_two_budget_shortcut() -> None:
+def test_exact_score_rejects_missing_stratum_and_two_budget_shortcut() -> None:
     with pytest.raises(ValueError, match="at least three"):
-        evaluate_local(
+        aggregate_exact_score(
             [
                 BudgetEvidence(1, 1.0, {"a": [1.0]}),
                 BudgetEvidence(2, 2.0, {"a": [0.5]}),
@@ -144,7 +159,7 @@ def test_local_score_rejects_missing_stratum_and_two_budget_shortcut() -> None:
         )
 
     with pytest.raises(ValueError, match="exact evaluation groups"):
-        evaluate_local(
+        aggregate_exact_score(
             [
                 BudgetEvidence(1, 1.0, {"a": [1.0]}),
                 BudgetEvidence(2, 2.0, {"a": [0.5], "b": [0.5]}),

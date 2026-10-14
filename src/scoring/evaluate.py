@@ -1,4 +1,4 @@
-"""Deterministic aggregation for the exact local scoring stage."""
+"""Deterministic aggregation for authoritative exact-cache scoring."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class BudgetScore:
 
 
 @dataclass(frozen=True, slots=True)
-class LocalScore:
+class ExactScore:
     score: float
     budgets: tuple[BudgetScore, ...]
 
@@ -144,8 +144,14 @@ def trip_pool(tiles: np.ndarray) -> np.ndarray:
     return descriptor.astype(np.float32, copy=False)
 
 
-def stable_top_k(logits: np.ndarray, valid_keys: np.ndarray, *, blocks: int) -> np.ndarray:
-    """Select exactly ``blocks`` keys per query with key index as the tie-breaker."""
+def stable_top_k(
+    logits: np.ndarray,
+    valid_keys: np.ndarray,
+    *,
+    blocks: int,
+    required_keys: np.ndarray | None = None,
+) -> np.ndarray:
+    """Keep required keys, then fill an exact per-query budget by stable Top-k."""
 
     scores = np.asarray(logits)
     validity = np.asarray(valid_keys)
@@ -164,10 +170,29 @@ def stable_top_k(logits: np.ndarray, valid_keys: np.ndarray, *, blocks: int) -> 
     if not np.isfinite(valid_scores).all():
         raise ValueError("valid logits must be finite")
 
-    mask = np.zeros(scores.shape, dtype=np.bool_)
+    if required_keys is None:
+        required = np.zeros(scores.shape, dtype=np.bool_)
+    else:
+        required = np.asarray(required_keys)
+        if required.shape != scores.shape or required.dtype != np.bool_:
+            raise ValueError("required_keys must be boolean and aligned with logits")
+        if np.any(required & ~validity[None, :]):
+            raise ValueError("required_keys cannot include an invalid key")
+        if np.any(required.sum(axis=1) > blocks):
+            raise ValueError("required key count exceeds the block budget")
+
+    mask = required.copy()
     for query_index, row in enumerate(valid_scores):
         order = np.lexsort((valid_indices, -row))
-        mask[query_index, valid_indices[order[:blocks]]] = True
+        needed = blocks - int(mask[query_index].sum())
+        if needed == 0:
+            continue
+        for candidate in valid_indices[order]:
+            if not mask[query_index, candidate]:
+                mask[query_index, candidate] = True
+                needed -= 1
+                if needed == 0:
+                    break
     return mask
 
 
@@ -239,16 +264,16 @@ def tail_error(errors: Sequence[float], *, mean_weight: float) -> float:
     return mean_weight * mean + (1 - mean_weight) * percentile(checked, 0.95)
 
 
-def evaluate_local(
+def aggregate_exact_score(
     evidence: Sequence[BudgetEvidence],
     *,
     group_weights: Mapping[str, float],
     tail_mean_weight: float,
-) -> LocalScore:
-    """Aggregate fixed-budget exact-cache evidence into the local score."""
+) -> ExactScore:
+    """Aggregate fixed-budget exact-cache evidence into the authoritative score."""
 
     if len(evidence) < 3:
-        raise ValueError("local evaluation requires at least three budgets")
+        raise ValueError("exact evaluation requires at least three budgets")
     expected_groups = set(group_weights)
     if not expected_groups:
         raise ValueError("at least one evaluation group is required")
@@ -295,7 +320,7 @@ def evaluate_local(
         [item.calibrated_cost for item in budgets],
         [item.quality for item in budgets],
     )
-    return LocalScore(score=score, budgets=tuple(budgets))
+    return ExactScore(score=score, budgets=tuple(budgets))
 
 
 def stratified_bootstrap_bound(

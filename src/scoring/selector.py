@@ -35,30 +35,28 @@ def route_indices(route: str) -> tuple[int, int]:
 
 @dataclass(frozen=True, slots=True)
 class SelectorArchitecture:
-    """Code-owned subset of the Veda v1 predictor contract.
-
-    Submitted tensors cover every layer and head because a rollout needs the
-    complete predictor. ``routes`` selects the layer/head pairs represented in
-    the inexpensive frozen caches; it does not change the submitted schema.
-    """
+    """Code-owned Veda v1 predictor contract covering every layer and head."""
 
     num_layers: int
     num_heads: int
     head_dim: int
-    routes: tuple[str, ...]
     storage_dtype: str
 
     def __post_init__(self) -> None:
         if min(self.num_layers, self.num_heads, self.head_dim) <= 0:
             raise ValueError("selector layer, head, and channel counts must be positive")
-        if not self.routes or len(set(self.routes)) != len(self.routes):
-            raise ValueError("selector routes must be non-empty and unique")
-        for route in self.routes:
-            layer, head = route_indices(route)
-            if layer >= self.num_layers or head >= self.num_heads:
-                raise ValueError("selector route exceeds the declared layer or head count")
         if self.storage_dtype not in _DTYPES:
             raise ValueError("selector storage dtype must be float16 or float32")
+
+    @property
+    def routes(self) -> tuple[str, ...]:
+        """Return every layer/head pair in one canonical order."""
+
+        return tuple(
+            route_name(layer, head)
+            for layer in range(self.num_layers)
+            for head in range(self.num_heads)
+        )
 
     @property
     def descriptor_dim(self) -> int:
@@ -127,11 +125,10 @@ class FixedSelector:
 
 
 def load_selector(path: str | Path, architecture: SelectorArchitecture) -> FixedSelector:
-    """Validate the file schema and materialize only locally evaluated heads.
+    """Validate the file schema and materialize every submitted head.
 
     Admission already streams every tensor to validate finite values. Scoring
-    rechecks the immutable file hash before this call, so loading only the
-    configured cache routes avoids expanding a full H3 predictor to float32.
+    rechecks the immutable file hash before this call.
     """
 
     expected = architecture.tensor_schema

@@ -157,7 +157,7 @@ def test_validator_query_does_not_create_a_missing_database(tmp_path, capsys) ->
     assert not database.exists()
 
 
-def test_evaluator_forwards_runtime_and_r2_configuration(monkeypatch, tmp_path) -> None:
+def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_path) -> None:
     called = {}
 
     async def fake_run(**kwargs):
@@ -165,9 +165,9 @@ def test_evaluator_forwards_runtime_and_r2_configuration(monkeypatch, tmp_path) 
 
     monkeypatch.setattr(cli_module, "run_evaluator", fake_run)
     monkeypatch.setattr(
-        cli_module.R2Repository,
+        cli_module.S3Repository,
         "from_environment",
-        lambda **kwargs: called.setdefault("r2", kwargs),
+        lambda **kwargs: called.setdefault("storage", kwargs),
     )
     main(
         [
@@ -179,23 +179,15 @@ def test_evaluator_forwards_runtime_and_r2_configuration(monkeypatch, tmp_path) 
             str(tmp_path / "validator.db"),
             "--model-cache",
             str(tmp_path / "models"),
-            "--screen-cache",
-            str(tmp_path / "screen.npz"),
             "--exact-cache",
             str(tmp_path / "exact.npz"),
-            "--rollout-runner",
-            str(tmp_path / "rollout"),
-            "--rollout-panel",
-            str(tmp_path / "panel.json"),
             "--archive-endpoint",
             "wss://archive-1.example",
             "--archive-endpoint",
             "wss://archive-2.example",
-            "--r2-account-id",
-            "account",
-            "--r2-bucket",
+            "--storage-bucket",
             "public-data",
-            "--r2-prefix",
+            "--storage-prefix",
             "veda/track",
             "--once",
         ]
@@ -203,10 +195,8 @@ def test_evaluator_forwards_runtime_and_r2_configuration(monkeypatch, tmp_path) 
 
     assert called["once"] is True
     assert called["network"] == "finney"
-    assert called["rollout_runner"] == str(tmp_path / "rollout")
-    assert called["rollout_panel"] == str(tmp_path / "panel.json")
+    assert called["exact_cache"] == str(tmp_path / "exact.npz")
     assert called["publisher"] == {
-        "account_id": "account",
         "bucket": "public-data",
         "prefix": "veda/track",
     }

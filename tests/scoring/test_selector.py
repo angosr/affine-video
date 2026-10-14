@@ -11,7 +11,6 @@ def architecture() -> SelectorArchitecture:
         num_layers=1,
         num_heads=1,
         head_dim=2,
-        routes=("layer_0_head_0",),
         storage_dtype="float32",
     )
 
@@ -26,15 +25,24 @@ def weights(spec: SelectorArchitecture) -> dict[str, np.ndarray]:
     return values
 
 
-def test_schema_contains_only_fixed_route_projection_weights() -> None:
+def test_schema_and_routes_cover_every_layer_and_head() -> None:
     spec = architecture()
 
     assert len(spec.tensor_schema) == 2
     assert spec.tensor_schema["layers.0.proj_q"].shape == (1, 6, 2)
-    with pytest.raises(ValueError, match="route"):
-        SelectorArchitecture(1, 1, 2, ("bad.route",), "float32")
-    with pytest.raises(ValueError, match="exceeds"):
-        SelectorArchitecture(1, 1, 2, ("layer_1_head_0",), "float32")
+    full = SelectorArchitecture(2, 2, 2, "float32")
+    assert full.routes == (
+        "layer_0_head_0",
+        "layer_0_head_1",
+        "layer_1_head_0",
+        "layer_1_head_1",
+    )
+    assert set(full.tensor_schema) == {
+        "layers.0.proj_q",
+        "layers.0.proj_k",
+        "layers.1.proj_q",
+        "layers.1.proj_k",
+    }
 
 
 def test_weight_only_selector_produces_deterministic_pair_logits(tmp_path) -> None:

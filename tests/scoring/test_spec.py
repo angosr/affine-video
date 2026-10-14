@@ -16,7 +16,6 @@ def valid_spec() -> dict:
             "filename": "selector.safetensors",
             "max_bytes": 1024,
             "selector": {
-                "routes": ["layer_0_head_0"],
                 "num_layers": 1,
                 "num_heads": 1,
                 "head_dim": 2,
@@ -28,15 +27,8 @@ def valid_spec() -> dict:
             "revision": "12" * 20,
         },
         "cache": {
-            "screen_sha256": "34" * 32,
-            "screen_max_bytes": 100_000,
             "exact_sha256": "56" * 32,
             "exact_max_bytes": 1_000_000,
-        },
-        "rollout": {
-            "runner_sha256": "78" * 32,
-            "panel_sha256": "9a" * 32,
-            "panel_max_bytes": 2_000_000,
         },
         "scoring": {
             "budgets": [
@@ -44,11 +36,9 @@ def valid_spec() -> dict:
                 {"blocks": 4, "calibrated_cost": 2.0},
                 {"blocks": 8, "calibrated_cost": 4.0},
             ],
-            "local_sample_count": 20,
+            "sample_count": 20,
             "tail_mean_weight": 0.8,
             "stratum_weights": {"layer-0": 0.5, "layer-1": 0.5},
-            "screening_threshold": 0.5,
-            "rollout_threshold": 0.7,
             "minimum_frontier_gain": 0.001,
             "bootstrap_confidence": 0.95,
             "bootstrap_resamples": 1000,
@@ -69,7 +59,7 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.scoring.stratum_weight_map == {"layer-0": 0.5, "layer-1": 0.5}
     assert first.base_model.revision == "12" * 20
     assert first.publication_grace_blocks == 20
-    assert first.rollout.panel_sha256 == "9a" * 32
+    assert first.cache.exact_sha256 == "56" * 32
     assert first.scoring.minimum_frontier_gain == 0.001
     assert parse_track_spec(track_spec_dict(first)) == first
 
@@ -77,7 +67,7 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
 def test_score_affecting_change_changes_digest() -> None:
     first = valid_spec()
     second = valid_spec()
-    second["scoring"]["rollout_threshold"] = 0.8
+    second["scoring"]["budgets"][1]["calibrated_cost"] = 2.5
 
     assert parse_track_spec(first).digest != parse_track_spec(second).digest
 
@@ -110,12 +100,6 @@ def test_selector_semantics_are_explicit_and_frozen() -> None:
     with pytest.raises(TrackSpecError, match="exactly"):
         parse_track_spec(missing)
 
-    unsupported = valid_spec()
-    unsupported["model"]["selector"]["routes"] = ["layer_1_head_0"]
-    with pytest.raises(TrackSpecError, match="exceeds"):
-        parse_track_spec(unsupported)
-
-
 def test_unknown_fields_and_invalid_budget_order_are_rejected() -> None:
     unknown = valid_spec()
     unknown["ignored"] = True
@@ -127,10 +111,10 @@ def test_unknown_fields_and_invalid_budget_order_are_rejected() -> None:
     with pytest.raises(TrackSpecError, match="strictly increasing"):
         parse_track_spec(unordered)
 
-    duplicate_route = valid_spec()
-    duplicate_route["model"]["selector"]["routes"] *= 2
-    with pytest.raises(TrackSpecError, match="unique"):
-        parse_track_spec(duplicate_route)
+    redundant_routes = valid_spec()
+    redundant_routes["model"]["selector"]["routes"] = ["layer_0_head_0"]
+    with pytest.raises(TrackSpecError, match="exactly"):
+        parse_track_spec(redundant_routes)
 
     impossible_size = valid_spec()
     impossible_size["model"]["max_bytes"] = 100
@@ -148,14 +132,13 @@ def test_unknown_fields_and_invalid_budget_order_are_rejected() -> None:
 
     undersampled = valid_spec()
     undersampled["scoring"]["stratum_weights"] = {f"layer-{index}": 0.2 for index in range(5)}
-    undersampled["scoring"]["local_sample_count"] = 3
+    undersampled["scoring"]["sample_count"] = 3
     with pytest.raises(TrackSpecError, match="cover every"):
         parse_track_spec(undersampled)
 
     uncovered_route = valid_spec()
     uncovered_route["model"]["selector"]["num_heads"] = 2
-    uncovered_route["model"]["selector"]["routes"] = ["layer_0_head_0", "layer_0_head_1"]
-    uncovered_route["scoring"]["local_sample_count"] = 3
+    uncovered_route["scoring"]["sample_count"] = 3
     with pytest.raises(TrackSpecError, match="every route"):
         parse_track_spec(uncovered_route)
 

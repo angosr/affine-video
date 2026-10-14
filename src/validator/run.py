@@ -13,9 +13,8 @@ from typing import Any, Protocol
 import bittensor as bt
 import httpx
 
-from scoring.cache import validate_exact_cache, validate_screen_cache
+from scoring.cache import validate_exact_cache
 from scoring.model import ValidatedModel, validate_model
-from scoring.rollout import ProcessRollout
 from scoring.spec import TrackSpec, load_track_spec
 from validator.admission import (
     AdmissionOutcome,
@@ -54,7 +53,7 @@ DEFAULT_PUBLIC_WEIGHTS_URL = (
     "affine_video/tracks/main/weights.json"
 )
 DEFAULT_NETUID = 7
-DEFAULT_TRACK_SPEC_DIGEST = "a1862eeb3f7a0bf7c32a7dd15075dacfcab94a70aa1d0a74747c1a0ab8e103a7"
+DEFAULT_TRACK_SPEC_DIGEST = "bbbba0ba4b416a2cd889958e4d6cab61abe51babd70e623eb06b1d9dcbbfc6ee"
 
 
 class ArtifactRepository(Protocol):
@@ -88,10 +87,7 @@ async def run_evaluator(
     track_spec: str | Path,
     database: str | Path,
     model_cache: str | Path,
-    screen_cache: str | Path,
     exact_cache: str | Path,
-    rollout_runner: str | Path | None,
-    rollout_panel: str | Path | None,
     network: str,
     archive_endpoints: list[str] | None,
     worker_id: str,
@@ -101,7 +97,6 @@ async def run_evaluator(
     poll_seconds: float = 12.0,
     max_scan_blocks: int = 100,
     scoring_timeout_seconds: float = 30 * 60,
-    rollout_timeout_seconds: float = 25 * 60,
     scoring_max_memory_bytes: int | None = None,
     scoring_max_cpu_seconds: int | None = None,
     once: bool = False,
@@ -113,42 +108,18 @@ async def run_evaluator(
         raise ValueError("poll interval must be positive")
     if min(mechid, version_key) < 0:
         raise ValueError("mechanism and version identifiers must be non-negative")
-    if (rollout_runner is None) != (rollout_panel is None):
-        raise ValueError("rollout runner and panel must be configured together")
-    if rollout_runner is not None and rollout_timeout_seconds >= scoring_timeout_seconds:
-        raise ValueError("rollout timeout must be shorter than the scoring process timeout")
     track = load_track_spec(track_spec)
     ledger = await publisher.load(track)
-    rollout = (
-        ProcessRollout(
-            runner=str(rollout_runner),
-            panel=str(rollout_panel),
-            runner_sha256=track.rollout.runner_sha256,
-            panel_sha256=track.rollout.panel_sha256,
-            panel_max_bytes=track.rollout.panel_max_bytes,
-            timeout_seconds=rollout_timeout_seconds,
-        )
-        if rollout_runner is not None and rollout_panel is not None
-        else None
-    )
-    validate_screen_cache(
-        screen_cache,
-        expected_sha256=track.cache.screen_sha256,
-        max_bytes=track.cache.screen_max_bytes,
-        max_blocks=track.scoring.budgets[-1].blocks,
-        head_dim=track.model.selector.head_dim,
-        routes=track.model.selector.routes,
-        strata=track.scoring.stratum_weight_map,
-    )
     validate_exact_cache(
         exact_cache,
         expected_sha256=track.cache.exact_sha256,
         max_bytes=track.cache.exact_max_bytes,
+        min_blocks=track.scoring.budgets[0].blocks,
         max_blocks=track.scoring.budgets[-1].blocks,
         head_dim=track.model.selector.head_dim,
         routes=track.model.selector.routes,
         strata=track.scoring.stratum_weight_map,
-        sample_count=track.scoring.local_sample_count,
+        sample_count=track.scoring.sample_count,
     )
     admission_settings = AdmissionSettings(
         cache_dir=Path(model_cache),
@@ -157,7 +128,7 @@ async def run_evaluator(
         publication_grace_blocks=track.publication_grace_blocks,
     )
     evaluator = IsolatedEvaluator(
-        FileTrackEvaluator(track, str(screen_cache), str(exact_cache), rollout=rollout),
+        FileTrackEvaluator(track, str(exact_cache)),
         timeout_seconds=scoring_timeout_seconds,
         max_memory_bytes=scoring_max_memory_bytes,
         max_cpu_seconds=scoring_max_cpu_seconds,
@@ -165,8 +136,6 @@ async def run_evaluator(
     scoring_settings = ScoringSettings(lease_ms=ceil(evaluator.timeout_seconds * 1000) + 60_000)
 
     with ChallengeStore(database, track_spec_digest=track.digest) as store:
-        if rollout is not None:
-            store.schedule_qualified_rollouts(track.scoring.rollout_threshold)
         async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
             recovery_index = 0
             while True:

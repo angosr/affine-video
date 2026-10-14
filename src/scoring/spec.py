@@ -46,27 +46,16 @@ class BaseModelSpec:
 
 @dataclass(frozen=True, slots=True)
 class CacheSpec:
-    screen_sha256: str
-    screen_max_bytes: int
     exact_sha256: str
     exact_max_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
-class RolloutSpec:
-    runner_sha256: str
-    panel_sha256: str
-    panel_max_bytes: int
-
-
-@dataclass(frozen=True, slots=True)
 class ScoringSpec:
     budgets: tuple[BudgetSpec, ...]
-    local_sample_count: int
+    sample_count: int
     tail_mean_weight: float
     stratum_weights: tuple[tuple[str, float], ...]
-    screening_threshold: float
-    rollout_threshold: float
     minimum_frontier_gain: float
     bootstrap_confidence: float
     bootstrap_resamples: int
@@ -87,7 +76,6 @@ class TrackSpec:
     model: ModelSpec
     base_model: BaseModelSpec
     cache: CacheSpec
-    rollout: RolloutSpec
     scoring: ScoringSpec
     digest: str
 
@@ -105,7 +93,6 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
             "filename": spec.model.filename,
             "max_bytes": spec.model.max_bytes,
             "selector": {
-                "routes": list(spec.model.selector.routes),
                 "num_layers": spec.model.selector.num_layers,
                 "num_heads": spec.model.selector.num_heads,
                 "head_dim": spec.model.selector.head_dim,
@@ -117,26 +104,17 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
             "revision": spec.base_model.revision,
         },
         "cache": {
-            "screen_sha256": spec.cache.screen_sha256,
-            "screen_max_bytes": spec.cache.screen_max_bytes,
             "exact_sha256": spec.cache.exact_sha256,
             "exact_max_bytes": spec.cache.exact_max_bytes,
-        },
-        "rollout": {
-            "runner_sha256": spec.rollout.runner_sha256,
-            "panel_sha256": spec.rollout.panel_sha256,
-            "panel_max_bytes": spec.rollout.panel_max_bytes,
         },
         "scoring": {
             "budgets": [
                 {"blocks": budget.blocks, "calibrated_cost": budget.calibrated_cost}
                 for budget in spec.scoring.budgets
             ],
-            "local_sample_count": spec.scoring.local_sample_count,
+            "sample_count": spec.scoring.sample_count,
             "tail_mean_weight": spec.scoring.tail_mean_weight,
             "stratum_weights": dict(spec.scoring.stratum_weights),
-            "screening_threshold": spec.scoring.screening_threshold,
-            "rollout_threshold": spec.scoring.rollout_threshold,
             "minimum_frontier_gain": spec.scoring.minimum_frontier_gain,
             "bootstrap_confidence": spec.scoring.bootstrap_confidence,
             "bootstrap_resamples": spec.scoring.bootstrap_resamples,
@@ -172,7 +150,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "model",
             "base_model",
             "cache",
-            "rollout",
             "scoring",
         },
         "track specification",
@@ -188,7 +165,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     selector_raw = _object(
         model_raw["selector"],
         {
-            "routes",
             "num_layers",
             "num_heads",
             "head_dim",
@@ -196,16 +172,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         },
         "selector",
     )
-    routes_raw = selector_raw["routes"]
-    if not isinstance(routes_raw, list) or not routes_raw:
-        raise TrackSpecError("selector routes must be a non-empty list")
-    routes = tuple(_nonempty_string(route, "selector route") for route in routes_raw)
     try:
         selector = SelectorArchitecture(
             num_layers=_integer(selector_raw["num_layers"], "selector num_layers", minimum=1),
             num_heads=_integer(selector_raw["num_heads"], "selector num_heads", minimum=1),
             head_dim=_integer(selector_raw["head_dim"], "selector head_dim", minimum=1),
-            routes=routes,
             storage_dtype=_nonempty_string(selector_raw["storage_dtype"], "selector storage_dtype"),
         )
     except ValueError as exc:
@@ -224,24 +195,17 @@ def parse_track_spec(raw: Any) -> TrackSpec:
 
     cache_raw = _object(
         root["cache"],
-        {"screen_sha256", "screen_max_bytes", "exact_sha256", "exact_max_bytes"},
+        {"exact_sha256", "exact_max_bytes"},
         "cache",
-    )
-    rollout_raw = _object(
-        root["rollout"],
-        {"runner_sha256", "panel_sha256", "panel_max_bytes"},
-        "rollout",
     )
 
     scoring_raw = _object(
         root["scoring"],
         {
             "budgets",
-            "local_sample_count",
+            "sample_count",
             "tail_mean_weight",
             "stratum_weights",
-            "screening_threshold",
-            "rollout_threshold",
             "minimum_frontier_gain",
             "bootstrap_confidence",
             "bootstrap_resamples",
@@ -283,11 +247,9 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     )
     if abs(fsum(weight for _, weight in strata) - 1.0) > 1e-12:
         raise TrackSpecError("stratum weights must sum to one")
-    local_sample_count = _integer(
-        scoring_raw["local_sample_count"], "local_sample_count", minimum=1
-    )
-    if local_sample_count < len(routes) * len(strata):
-        raise TrackSpecError("local sample count must cover every route and scoring stratum")
+    sample_count = _integer(scoring_raw["sample_count"], "sample_count", minimum=1)
+    if sample_count < len(selector.routes) * len(strata):
+        raise TrackSpecError("sample count must cover every route and scoring stratum")
 
     spec_without_digest = {
         "track_id": track_id,
@@ -307,7 +269,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "filename": "selector.safetensors",
             "max_bytes": max_model_bytes,
             "selector": {
-                "routes": list(selector.routes),
                 "num_layers": selector.num_layers,
                 "num_heads": selector.num_heads,
                 "head_dim": selector.head_dim,
@@ -316,31 +277,18 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         },
         "base_model": {"repo_id": repo_id, "revision": revision.lower()},
         "cache": {
-            "screen_sha256": _digest(cache_raw["screen_sha256"], "screen cache sha256"),
-            "screen_max_bytes": _integer(
-                cache_raw["screen_max_bytes"], "screen cache max bytes", minimum=1
-            ),
             "exact_sha256": _digest(cache_raw["exact_sha256"], "exact cache sha256"),
             "exact_max_bytes": _integer(
                 cache_raw["exact_max_bytes"], "exact cache max bytes", minimum=1
-            ),
-        },
-        "rollout": {
-            "runner_sha256": _digest(rollout_raw["runner_sha256"], "rollout runner sha256"),
-            "panel_sha256": _digest(rollout_raw["panel_sha256"], "rollout panel sha256"),
-            "panel_max_bytes": _integer(
-                rollout_raw["panel_max_bytes"], "rollout panel max bytes", minimum=1
             ),
         },
         "scoring": {
             "budgets": [
                 {"blocks": item.blocks, "calibrated_cost": item.calibrated_cost} for item in budgets
             ],
-            "local_sample_count": local_sample_count,
+            "sample_count": sample_count,
             "tail_mean_weight": _unit(scoring_raw["tail_mean_weight"], "tail_mean_weight"),
             "stratum_weights": dict(strata),
-            "screening_threshold": _unit(scoring_raw["screening_threshold"], "screening_threshold"),
-            "rollout_threshold": _unit(scoring_raw["rollout_threshold"], "rollout_threshold"),
             "minimum_frontier_gain": _unit(
                 scoring_raw["minimum_frontier_gain"],
                 "minimum_frontier_gain",
@@ -363,7 +311,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     digest = hashlib.sha256(_canonical_json(spec_without_digest)).hexdigest()
     scoring = spec_without_digest["scoring"]
     cache = spec_without_digest["cache"]
-    rollout = spec_without_digest["rollout"]
     return TrackSpec(
         track_id=track_id,
         netuid=netuid,
@@ -377,23 +324,14 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         ),
         base_model=BaseModelSpec(repo_id, revision.lower()),
         cache=CacheSpec(
-            screen_sha256=cache["screen_sha256"],
-            screen_max_bytes=cache["screen_max_bytes"],
             exact_sha256=cache["exact_sha256"],
             exact_max_bytes=cache["exact_max_bytes"],
         ),
-        rollout=RolloutSpec(
-            runner_sha256=rollout["runner_sha256"],
-            panel_sha256=rollout["panel_sha256"],
-            panel_max_bytes=rollout["panel_max_bytes"],
-        ),
         scoring=ScoringSpec(
             budgets=budgets,
-            local_sample_count=scoring["local_sample_count"],
+            sample_count=scoring["sample_count"],
             tail_mean_weight=scoring["tail_mean_weight"],
             stratum_weights=strata,
-            screening_threshold=scoring["screening_threshold"],
-            rollout_threshold=scoring["rollout_threshold"],
             minimum_frontier_gain=scoring["minimum_frontier_gain"],
             bootstrap_confidence=scoring["bootstrap_confidence"],
             bootstrap_resamples=scoring["bootstrap_resamples"],

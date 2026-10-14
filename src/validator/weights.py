@@ -194,9 +194,7 @@ def plan_weights(
         raise ValueError("minimum allowed weights must be non-negative")
     if not isfinite(max_weight) or not 0 < max_weight <= 1:
         raise ValueError("maximum weight must be within (0, 1]")
-    settled_entries = [
-        entry for entry in entries if not entry.provisional and entry.score_block <= current_block
-    ]
+    settled_entries = [entry for entry in entries if entry.score_block <= current_block]
     historical_utilities = frontier_gains(
         settled_entries,
         minimum_gain=minimum_frontier_gain,

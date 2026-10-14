@@ -1,4 +1,4 @@
-"""Verified loading of frozen lightweight and exact scoring caches."""
+"""Verified loading of the frozen exact scoring cache."""
 
 from __future__ import annotations
 
@@ -14,38 +14,11 @@ import numpy as np
 from numpy.lib.format import read_array_header_1_0, read_array_header_2_0, read_magic
 
 from scoring.evaluate import route_stratified_sample_indices
-from scoring.local import ExactCase, ScreenCase
+from scoring.exact import ExactCase
 
 
 class CacheLoadError(ValueError):
     """Raised when a frozen scoring cache is missing, changed, or malformed."""
-
-
-def validate_screen_cache(
-    path: str | Path,
-    *,
-    expected_sha256: str,
-    max_bytes: int,
-    max_blocks: int,
-    head_dim: int,
-    routes: tuple[str, ...],
-    strata: Mapping[str, float],
-) -> None:
-    """Validate the lightweight cache index without materializing case arrays."""
-
-    _validate_cache_index(
-        path,
-        expected_sha256=expected_sha256,
-        max_bytes=max_bytes,
-        expected_format="veda-screen-cache",
-        case_fields={"route", "stratum"},
-        array_fields=("q_descriptors", "k_descriptors", "teacher_distribution", "valid_keys"),
-        routes=routes,
-        strata=strata,
-        sample_count=None,
-        max_blocks=max_blocks,
-        head_dim=head_dim,
-    )
 
 
 def validate_exact_cache(
@@ -53,6 +26,7 @@ def validate_exact_cache(
     *,
     expected_sha256: str,
     max_bytes: int,
+    min_blocks: int,
     max_blocks: int,
     head_dim: int,
     routes: tuple[str, ...],
@@ -67,57 +41,14 @@ def validate_exact_cache(
         max_bytes=max_bytes,
         expected_format="veda-exact-cache",
         case_fields={"route", "stratum", "epsilon"},
-        array_fields=("q", "k", "v", "dense", "valid_keys"),
+        array_fields=("q", "k", "v", "dense", "valid_keys", "required_keys"),
         routes=routes,
         strata=strata,
         sample_count=sample_count,
+        min_blocks=min_blocks,
         max_blocks=max_blocks,
         head_dim=head_dim,
     )
-
-
-def load_screen_cache(
-    path: str | Path,
-    *,
-    expected_sha256: str,
-    max_bytes: int,
-) -> tuple[ScreenCase, ...]:
-    """Load a hash-pinned lightweight cache without pickle support."""
-    cache_path = _verify_archive(path, expected_sha256, max_bytes)
-    try:
-        with np.load(cache_path, allow_pickle=False) as archive:
-            metadata = _metadata(archive, expected_format="veda-screen-cache")
-            cases = [
-                _object(raw_case, {"route", "stratum"}, "screen case")
-                for raw_case in metadata["cases"]
-            ]
-            expected = {"metadata"}
-            loaded: list[ScreenCase] = []
-            for index, case in enumerate(cases):
-                prefix = f"case_{index:06d}"
-                names = {
-                    "q": f"{prefix}_q_descriptors",
-                    "k": f"{prefix}_k_descriptors",
-                    "teacher": f"{prefix}_teacher_distribution",
-                    "valid": f"{prefix}_valid_keys",
-                }
-                expected.update(names.values())
-                loaded.append(
-                    ScreenCase(
-                        route=_string(case["route"], "screen route"),
-                        stratum=_string(case["stratum"], "screen stratum"),
-                        q_descriptors=_array(archive, names["q"]),
-                        k_descriptors=_array(archive, names["k"]),
-                        teacher_distribution=_array(archive, names["teacher"]),
-                        valid_keys=_array(archive, names["valid"]),
-                    )
-                )
-            _exact_keys(archive, expected)
-    except CacheLoadError:
-        raise
-    except (OSError, ValueError, KeyError) as exc:
-        raise CacheLoadError("screen cache arrays cannot be read") from exc
-    return tuple(loaded)
 
 
 def load_exact_cache(
@@ -185,7 +116,8 @@ def _load_exact_cache(
             for index, case in enumerate(cases):
                 prefix = f"case_{index:06d}"
                 names = {
-                    field: f"{prefix}_{field}" for field in ("q", "k", "v", "dense", "valid_keys")
+                    field: f"{prefix}_{field}"
+                    for field in ("q", "k", "v", "dense", "valid_keys", "required_keys")
                 }
                 expected.update(names.values())
                 epsilon = case["epsilon"]
@@ -200,6 +132,7 @@ def _load_exact_cache(
                         v=_array(archive, names["v"]),
                         dense=_array(archive, names["dense"]),
                         valid_keys=_array(archive, names["valid_keys"]),
+                        required_keys=_array(archive, names["required_keys"]),
                         epsilon=float(epsilon),
                     )
             _exact_keys(archive, expected)
@@ -245,11 +178,17 @@ def _validate_cache_index(
     routes: tuple[str, ...],
     strata: Mapping[str, float],
     sample_count: int | None,
+    min_blocks: int,
     max_blocks: int,
     head_dim: int,
 ) -> None:
-    if type(max_blocks) is not int or max_blocks <= 0:
-        raise ValueError("maximum block budget must be a positive integer")
+    if (
+        type(min_blocks) is not int
+        or type(max_blocks) is not int
+        or min_blocks <= 0
+        or max_blocks < min_blocks
+    ):
+        raise ValueError("block budget range is invalid")
     if type(head_dim) is not int or head_dim <= 0:
         raise ValueError("attention head dimension must be a positive integer")
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
@@ -293,6 +232,7 @@ def _validate_cache_index(
                     head_dim=head_dim,
                 )
                 valid_keys = _array(archive, f"{prefix}_valid_keys")
+                required_keys = _array(archive, f"{prefix}_required_keys")
                 if (
                     valid_keys.ndim != 1
                     or valid_keys.dtype != np.bool_
@@ -301,6 +241,12 @@ def _validate_cache_index(
                     raise CacheLoadError(
                         "cache case cannot satisfy the maximum block budget"
                     )
+                if (
+                    required_keys.dtype != np.bool_
+                    or np.any(required_keys & ~valid_keys[None, :])
+                    or np.any(required_keys.sum(axis=1) > min_blocks)
+                ):
+                    raise CacheLoadError("cache required-key mask is invalid")
             coverage_count = len(routes) * len(strata) if sample_count is None else sample_count
             try:
                 route_stratified_sample_indices(
@@ -389,34 +335,13 @@ def _validate_case_headers(
     expected_format: str,
     head_dim: int,
 ) -> None:
-    if expected_format == "veda-screen-cache":
-        q_shape, q_dtype = _array_header(archive, f"{prefix}_q_descriptors")
-        k_shape, k_dtype = _array_header(archive, f"{prefix}_k_descriptors")
-        teacher_shape, teacher_dtype = _array_header(
-            archive, f"{prefix}_teacher_distribution"
-        )
-        valid_shape, valid_dtype = _array_header(archive, f"{prefix}_valid_keys")
-        descriptor_dim = 3 * head_dim
-        valid = (
-            len(q_shape) == 2
-            and len(k_shape) == 2
-            and q_shape[0] > 0
-            and k_shape[0] > 0
-            and q_shape[1] == descriptor_dim
-            and k_shape[1] == descriptor_dim
-            and teacher_shape == (q_shape[0], k_shape[0])
-            and valid_shape == (k_shape[0],)
-            and _floating(q_dtype)
-            and _floating(k_dtype)
-            and _floating(teacher_dtype)
-            and valid_dtype == np.dtype(np.bool_)
-        )
-    elif expected_format == "veda-exact-cache":
+    if expected_format == "veda-exact-cache":
         q_shape, q_dtype = _array_header(archive, f"{prefix}_q")
         k_shape, k_dtype = _array_header(archive, f"{prefix}_k")
         v_shape, v_dtype = _array_header(archive, f"{prefix}_v")
         dense_shape, dense_dtype = _array_header(archive, f"{prefix}_dense")
         valid_shape, valid_dtype = _array_header(archive, f"{prefix}_valid_keys")
+        required_shape, required_dtype = _array_header(archive, f"{prefix}_required_keys")
         valid = (
             len(q_shape) == 3
             and len(k_shape) == 3
@@ -426,11 +351,13 @@ def _validate_case_headers(
             and v_shape == k_shape
             and dense_shape == q_shape
             and valid_shape == (k_shape[0],)
+            and required_shape == (q_shape[0], k_shape[0])
             and _floating(q_dtype)
             and _floating(k_dtype)
             and _floating(v_dtype)
             and _floating(dense_dtype)
             and valid_dtype == np.dtype(np.bool_)
+            and required_dtype == np.dtype(np.bool_)
         )
     else:
         raise AssertionError("unsupported cache format")

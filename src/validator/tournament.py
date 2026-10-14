@@ -27,7 +27,6 @@ class Champion:
     repo_id: str
     revision: str
     score: float
-    attention_cost: float
     position: ChainPosition
 
     def public(self) -> dict[str, Any]:
@@ -37,7 +36,6 @@ class Champion:
             "repo_id": self.repo_id,
             "revision": self.revision,
             "score": self.score,
-            "attention_cost": self.attention_cost,
             "block_height": self.position.block,
             "extrinsic_index": self.position.extrinsic_index,
             "event_index": self.position.event_index,
@@ -99,7 +97,6 @@ def challenge_from_match(document: Mapping[str, Any]) -> dict[str, Any]:
         "model_digest": evaluation.get("model_digest"),
         "model_size_bytes": evaluation.get("model_size_bytes"),
         "final_score": evaluation.get("final_score"),
-        "attention_cost": evaluation.get("attention_cost"),
         "score_block": evaluation.get("score_block"),
         "stages": [],
     }
@@ -177,14 +174,11 @@ def resolve_tournament(
         if state is ChallengeState.SUCCEEDED:
             position = _position(challenge)
             score = _score(challenge["final_score"], "final_score")
-            attention_cost = _nonnegative(challenge["attention_cost"], "attention_cost")
             score_block = _integer(challenge["score_block"], "score_block")
             entry = LeaderboardEntry(
                 hotkey=record.hotkey,
                 challenge_id=record.challenge_id,
                 final_score=score,
-                attention_cost=attention_cost,
-                provisional=False,
                 score_block=score_block,
                 position=position,
             )
@@ -197,7 +191,6 @@ def resolve_tournament(
                 repo_id,
                 revision,
                 score,
-                attention_cost,
                 position,
             )
             current = best_by_hotkey.get(candidate.hotkey)
@@ -247,8 +240,7 @@ def _resolve_match(
         if file_sha256 is None or model_digest is None or model_size_bytes is None:
             raise ValueError("successful challenge is missing its model facts")
         score = _score(challenge.get("final_score"), "final_score")
-        attention_cost = _nonnegative(challenge.get("attention_cost"), "attention_cost")
-        candidate = Champion(identifier, hotkey, repo_id, revision, score, attention_cost, position)
+        candidate = Champion(identifier, hotkey, repo_id, revision, score, position)
         score_gain = score if before is None else canonical_score_gain(score, before.score)
         if before is None:
             outcome = MatchOutcome.INITIAL_CHAMPION
@@ -262,7 +254,6 @@ def _resolve_match(
         if error_code is None:
             raise ValueError("failed challenge is missing its error code")
         score = None
-        attention_cost = None
         outcome = MatchOutcome.CHALLENGE_FAILED
 
     decided_block = (
@@ -279,7 +270,6 @@ def _resolve_match(
         "model_digest": model_digest,
         "model_size_bytes": model_size_bytes,
         "final_score": score,
-        "attention_cost": attention_cost,
         "score_block": (
             _integer(challenge["score_block"], "score_block")
             if challenge.get("score_block") is not None
@@ -333,8 +323,8 @@ def _position(value: Mapping[str, Any]) -> ChainPosition:
     )
 
 
-def _champion_order(value: Champion) -> tuple[float, float, ChainPosition]:
-    return (-value.score, value.attention_cost, value.position)
+def _champion_order(value: Champion) -> tuple[float, ChainPosition]:
+    return (-value.score, value.position)
 
 
 def _required_string(value: Mapping[str, Any], key: str) -> str:
@@ -368,15 +358,6 @@ def _score(value: Any, name: str) -> float:
     result = float(value)
     if not isfinite(result) or not 0 <= result <= 1:
         raise ValueError(f"{name} must be within [0, 1]")
-    return result
-
-
-def _nonnegative(value: Any, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be numeric")
-    result = float(value)
-    if not isfinite(result) or result < 0:
-        raise ValueError(f"{name} must be non-negative")
     return result
 
 

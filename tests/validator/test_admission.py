@@ -96,7 +96,7 @@ def test_model_can_be_published_during_frozen_block_grace(tmp_path) -> None:
         )
         assert admitted is not None and admitted.status is AdmissionStatus.ACCEPTED
         assert downloads == 1
-        assert store.get_challenge(identifier).state is ChallengeState.SCREENING
+        assert store.get_challenge(identifier).state is ChallengeState.SCORING
 
 
 def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) -> None:
@@ -114,7 +114,7 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
             downloader=model_downloader(model),
         )
         assert first is not None and first.status is AdmissionStatus.ACCEPTED
-        assert store.get_challenge(first_id).state is ChallengeState.SCREENING
+        assert store.get_challenge(first_id).state is ChallengeState.SCORING
 
         second_id, _ = store.add_submission(
             submission_at(101, "hk2", "other/model"), occurred_at_ms=2
@@ -245,7 +245,7 @@ def test_same_model_can_retry_after_earlier_system_failure(tmp_path) -> None:
         )
 
         assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
-        assert store.get_challenge(second_id).state is ChallengeState.SCREENING
+        assert store.get_challenge(second_id).state is ChallengeState.SCORING
 
 
 def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:

@@ -24,16 +24,12 @@ def entry(
     hotkey: str,
     score: float,
     block: int,
-    *,
-    provisional: bool = False,
 ) -> LeaderboardEntry:
     return LeaderboardEntry(
         hotkey=hotkey,
         challenge_id=f"challenge-{hotkey}",
         final_score=score,
-        attention_cost=0.1,
         score_block=block,
-        provisional=provisional,
         position=ChainPosition(block, 0, 0),
     )
 
@@ -158,10 +154,9 @@ def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
     assert calls[0] == ("at", 123)
 
 
-def test_plan_excludes_provisional_deregistered_and_future_entries() -> None:
+def test_plan_excludes_deregistered_and_future_entries() -> None:
     plan = plan_weights(
         [
-            entry("provisional", 0.95, 5, provisional=True),
             entry("alice", 0.3, 10),
             entry("bob", 0.6, 20),
             entry("carol", 0.9, 30),
@@ -170,9 +165,7 @@ def test_plan_excludes_provisional_deregistered_and_future_entries() -> None:
                 hotkey="future",
                 challenge_id="challenge-future",
                 final_score=1.0,
-                attention_cost=0.1,
                 score_block=101,
-                provisional=False,
                 position=ChainPosition(50, 0, 0),
             ),
         ],
