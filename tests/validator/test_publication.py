@@ -1001,7 +1001,7 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
             "internal-cleared-v1",
             hashlib.sha256(f"nonce-{index}".encode()).hexdigest(),
         )
-        for index in range(4)
+        for index in range(20)
     )
     audit = SourceLeaf(
         "audit",

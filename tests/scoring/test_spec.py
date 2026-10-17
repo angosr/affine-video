@@ -18,11 +18,9 @@ from scoring.spec import (
 
 
 def valid_spec() -> dict:
-    production = "aa" * 32
-    audit = "bb" * 32
-    source_root = hashlib.sha256(
-        b"\x01" + bytes.fromhex(production) + bytes.fromhex(audit)
-    ).hexdigest()
+    production = [f"{index:064x}" for index in range(1, 21)]
+    audit = [f"{index:064x}" for index in range(100, 102)]
+    source_root = source_merkle_root(production + audit)
     return {
         "track_id": "veda-test-v1",
         "netuid": 7,
@@ -34,8 +32,8 @@ def valid_spec() -> dict:
         "track_close_grace_blocks": 50,
         "source_pool_merkle_root": source_root,
         "source_commitments": {
-            "production": {"all": [production]},
-            "audit": {"all": [audit]},
+            "production": {"all": production},
+            "audit": {"all": audit},
         },
         "artifact_manifest_sha256": "cd" * 32,
         "initial_champion": {
@@ -114,6 +112,16 @@ def valid_spec() -> dict:
     }
 
 
+def source_merkle_root(digests: list[str]) -> str:
+    level = [bytes.fromhex(value) for value in digests]
+    while len(level) > 1:
+        level = [
+            hashlib.sha256(b"\x01" + level[index] + level[min(index + 1, len(level) - 1)]).digest()
+            for index in range(0, len(level), 2)
+        ]
+    return level[0].hex()
+
+
 def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     raw = valid_spec()
     first = parse_track_spec(raw)
@@ -136,6 +144,8 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.scoring.minimum_frontier_gain == 0.001
     assert first.scoring.case_count == 24
     assert first.match_confidence == 0.95
+    assert first.maximum_nonempty_production_batches == 4
+    assert first.required_production_sources_per_stratum == 20
     assert parse_track_spec(track_spec_dict(first)) == first
 
 
@@ -160,6 +170,19 @@ def test_track_reserves_enough_boundaries_to_drain_the_fifo_queue() -> None:
     raw["maximum_generation_batches"] = raw["maximum_effective_challenges"]
 
     with pytest.raises(TrackSpecError, match="leave one exact boundary"):
+        parse_track_spec(raw)
+
+
+def test_track_rejects_insufficient_production_sources_per_stratum() -> None:
+    raw = valid_spec()
+    raw["source_commitments"]["production"]["all"].pop()
+    digests = (
+        raw["source_commitments"]["production"]["all"]
+        + raw["source_commitments"]["audit"]["all"]
+    )
+    raw["source_pool_merkle_root"] = source_merkle_root(digests)
+
+    with pytest.raises(TrackSpecError, match="plus one reserve"):
         parse_track_spec(raw)
 
 

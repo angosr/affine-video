@@ -27,7 +27,7 @@ from scoring.cache import (
     validate_exact_cache_references,
     write_exact_cache_batch,
 )
-from scoring.spec import TrackSpec, load_track_spec
+from scoring.spec import TrackSpec, load_track_spec, required_production_sources_per_stratum
 from validator.alerts import webhook_alerter
 from validator.production.commitment import (
     ArtifactManifest,
@@ -1098,14 +1098,11 @@ def _prune_local_work(root: Path, retained: frozenset[str]) -> None:
 
 
 def _validate_source_capacity(pool: SourcePool, track: TrackSpec) -> None:
-    per_batch = track.scoring.rollouts_per_stratum
-    # A season slot appears in exactly one exact plan and at most one
-    # confirmation plan. Empty generation boundaries consume no sources.
-    nonempty_plan_limit = min(
-        track.maximum_generation_batches,
-        2 * track.maximum_effective_challenges,
+    required = required_production_sources_per_stratum(
+        maximum_generation_batches=track.maximum_generation_batches,
+        maximum_effective_challenges=track.maximum_effective_challenges,
+        rollouts_per_stratum=track.scoring.rollouts_per_stratum,
     )
-    required = (nonempty_plan_limit + 1) * per_batch
     for stratum in track.scoring.stratum_weight_map:
         families = {
             leaf.source_family_id

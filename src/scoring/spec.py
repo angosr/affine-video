@@ -208,6 +208,62 @@ class TrackSpec:
     def source_commitment_documents(self) -> tuple[dict[str, str], ...]:
         return tuple(asdict(item) for item in self.source_commitments)
 
+    @property
+    def maximum_nonempty_production_batches(self) -> int:
+        """Bound exact plus next-batch confirmations for a fully used season."""
+
+        return maximum_nonempty_production_batches(
+            maximum_generation_batches=self.maximum_generation_batches,
+            maximum_effective_challenges=self.maximum_effective_challenges,
+        )
+
+    @property
+    def required_production_sources_per_stratum(self) -> int:
+        return required_production_sources_per_stratum(
+            maximum_generation_batches=self.maximum_generation_batches,
+            maximum_effective_challenges=self.maximum_effective_challenges,
+            rollouts_per_stratum=self.scoring.rollouts_per_stratum,
+        )
+
+
+def maximum_nonempty_production_batches(
+    *,
+    maximum_generation_batches: int,
+    maximum_effective_challenges: int,
+) -> int:
+    """Return the worst exact/confirmation plan count that can contain work."""
+
+    if (
+        type(maximum_generation_batches) is not int
+        or type(maximum_effective_challenges) is not int
+        or maximum_effective_challenges <= 0
+        or maximum_generation_batches <= maximum_effective_challenges
+    ):
+        raise ValueError("generation capacity must exceed the effective challenge limit")
+    return maximum_effective_challenges + min(
+        maximum_effective_challenges,
+        maximum_generation_batches - maximum_effective_challenges,
+    )
+
+
+def required_production_sources_per_stratum(
+    *,
+    maximum_generation_batches: int,
+    maximum_effective_challenges: int,
+    rollouts_per_stratum: int,
+) -> int:
+    """Include one full independent batch beyond worst-case season demand."""
+
+    if type(rollouts_per_stratum) is not int or rollouts_per_stratum <= 0:
+        raise ValueError("rollouts per stratum must be positive")
+    return (
+        maximum_nonempty_production_batches(
+            maximum_generation_batches=maximum_generation_batches,
+            maximum_effective_challenges=maximum_effective_challenges,
+        )
+        + 1
+    ) * rollouts_per_stratum
+
 
 def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
     """Return the canonical public document whose SHA-256 is ``spec.digest``."""
@@ -332,6 +388,21 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         expected_root=values["source_pool_merkle_root"],
         strata=frozenset(values["scoring"].stratum_weight_map),
     )
+    required_sources = required_production_sources_per_stratum(
+        maximum_generation_batches=values["maximum_generation_batches"],
+        maximum_effective_challenges=maximum_effective,
+        rollouts_per_stratum=values["scoring"].rollouts_per_stratum,
+    )
+    for stratum in values["scoring"].stratum_weight_map:
+        available = sum(
+            item.partition == "production" and item.generation_geometry == stratum
+            for item in values["source_commitments"]
+        )
+        if available < required_sources:
+            raise TrackSpecError(
+                "production source commitments cannot cover maximum non-empty batches "
+                f"plus one reserve for stratum {stratum}"
+            )
     if values["full_video"].minimum_gain < values["scoring"].minimum_frontier_gain:
         raise TrackSpecError("full-video minimum gain cannot be lower than the exact-stage gate")
     canonical = _spec_document(values)
