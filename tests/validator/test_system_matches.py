@@ -60,6 +60,22 @@ def test_production_system_matches_are_complete_and_separate_from_rewards() -> N
     )
 
 
+def test_candidate_track_keeps_the_exact_runtime_schedule() -> None:
+    track = load_track_spec(Path(__file__).parents[2] / "track.json")
+
+    assert track.scoring.trajectory_schedule.sigmas == (
+        1.0,
+        0.9882352941176471,
+        0.972972972972973,
+        0.9523809523809523,
+        0.9230769230769231,
+        0.8780487804878049,
+        0.8,
+        0.631578947368421,
+        0.0,
+    )
+
+
 def test_system_matches_are_not_attached_to_another_track() -> None:
     assert system_match_artifacts("another-track", "ab" * 32, 7) == ()
     assert system_match_artifacts(PRODUCTION_TRACK_ID, "ab" * 32, PRODUCTION_NETUID) == ()
