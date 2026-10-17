@@ -245,16 +245,20 @@ class WorkerPool:
         self._result = context.Queue()
         self._queues = []
         self._processes = []
-        for gpu_id in config.gpu_ids:
-            tasks = context.Queue()
-            process = context.Process(
-                target=_worker_loop,
-                args=(gpu_id, config, track, tasks, self._result),
-                name=f"veda-producer-gpu-{gpu_id}",
-            )
-            process.start()
-            self._queues.append(tasks)
-            self._processes.append(process)
+        try:
+            for gpu_id in config.gpu_ids:
+                tasks = context.Queue()
+                process = context.Process(
+                    target=_worker_loop,
+                    args=(gpu_id, config, track, tasks, self._result),
+                    name=f"veda-producer-gpu-{gpu_id}",
+                )
+                process.start()
+                self._queues.append(tasks)
+                self._processes.append(process)
+        except Exception:
+            self.close()
+            raise
 
     def run(
         self,
@@ -377,15 +381,16 @@ class ProducerService:
                             f"{plan.generation_block}"
                         )
                     attempt = _reserve_plan_attempt(self.objects, plan)
-                    if workers is None:
-                        workers = WorkerPool(self.config, self.track)
+                    deadline = time.monotonic() + self.attempt_timeout_seconds
                     try:
-                        deadline = time.monotonic() + self.attempt_timeout_seconds
+                        if workers is None:
+                            workers = WorkerPool(self.config, self.track)
                         ready = self._execute(
                             pending[0], pending[1], plan, workers, deadline=deadline
                         )
                     except Exception as exc:
-                        workers.close()
+                        if workers is not None:
+                            workers.close()
                         workers = None
                         if self.alert is not None and attempt in {1, _MAX_PLAN_ATTEMPTS}:
                             self.alert(

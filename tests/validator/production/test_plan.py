@@ -391,6 +391,65 @@ def test_producer_retry_ceiling_survives_process_and_host_loss(monkeypatch) -> N
         service._run_locked(once=True)
 
 
+def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch) -> None:
+    plan = build_plan(
+        track_spec_digest="ab" * 32,
+        generation_block=120,
+        block_hash="0x" + "cd" * 32,
+        track_start_block=100,
+        minimum_generation_delay_blocks=1,
+        generation_interval_blocks=20,
+        exact_challenge_ids=("challenge",),
+        confirmation_challenge_ids=(),
+        source_proofs=(proof(0), proof(1)),
+        scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+
+    class Store:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class Coordinator:
+        def __init__(self, **_kwargs):
+            pass
+
+        def create_next(self):
+            return None
+
+        def plans(self):
+            return (("plans/120.json", StoredObject(plan.encode(), "etag"), plan),)
+
+    def failed_pool(*_args, **_kwargs):
+        raise RuntimeError("gpu worker could not start")
+
+    objects = AttemptObjects()
+    alerts = []
+    service = object.__new__(ProducerService)
+    service.config = SimpleNamespace(validator_database="unused.db", poll_seconds=0.01)
+    service.track = SimpleNamespace(digest=plan.track_spec_digest)
+    service.objects = objects
+    service.pool = None
+    service.alert = lambda event, details: alerts.append((event, details))
+    service.attempt_timeout_seconds = 10
+    monkeypatch.setattr(
+        production_service, "ChallengeStore", lambda *_args, **_kwargs: Store()
+    )
+    monkeypatch.setattr(production_service, "PlanCoordinator", Coordinator)
+    monkeypatch.setattr(production_service, "WorkerPool", failed_pool)
+
+    with pytest.raises(RuntimeError, match="retry ceiling"):
+        service._run_locked(once=True)
+
+    assert _plan_attempt_count(objects, plan) == 1
+    assert alerts[0][0] == "PRODUCER_PLAN_FAILURE"
+    assert alerts[0][1]["attempt"] == 1
+    assert "could not start" in alerts[0][1]["error"]
+
+
 @pytest.mark.parametrize("slow_step", ["upload", "assembly"])
 def test_producer_attempt_deadline_covers_post_generation_work(
     tmp_path, monkeypatch, slow_step
