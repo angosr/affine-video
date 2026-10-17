@@ -336,27 +336,7 @@ class ReadyBatchSource:
                 sha256=selected.condition.sha256,
                 size_bytes=selected.condition.size_bytes,
             )
-        try:
-            document = json.loads((destination / "index.json").read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("READY selected source index is invalid") from exc
-        rows = document.get("samples") if isinstance(document, dict) else None
-        identifiers = (
-            [row.get("id") for row in rows if isinstance(row, dict)]
-            if isinstance(rows, list)
-            else []
-        )
-        expected = {proof.leaf.source_id for proof in plan.source_proofs}
-        if (
-            not isinstance(document, dict)
-            or set(document) != {"samples"}
-            or not isinstance(rows, list)
-            or any(not isinstance(row, dict) for row in rows)
-            or any(not isinstance(identifier, str) for identifier in identifiers)
-            or len(identifiers) != len(set(identifiers))
-            or set(identifiers) != expected
-        ):
-            raise RuntimeError("READY selected source index conflicts with its plan")
+        validate_selected_sample_cache(destination, plan)
         return destination
 
     def is_ready(self, challenge_id: str, *, confirmation: bool) -> bool:
@@ -561,6 +541,32 @@ class ReadyBatchSource:
         )
         if rebuilt.planned_document() != plan.planned_document():
             raise RuntimeError("private plan conflicts with the deterministic track schedule")
+
+
+def validate_selected_sample_cache(path: Path, plan: BatchPlan) -> None:
+    """Require the selected evaluator inputs to cover exactly the proved sources."""
+
+    try:
+        document = json.loads((path / "index.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("READY selected source index is invalid") from exc
+    rows = document.get("samples") if isinstance(document, dict) else None
+    identifiers = (
+        [row.get("id") for row in rows if isinstance(row, dict)]
+        if isinstance(rows, list)
+        else []
+    )
+    expected = {proof.leaf.source_id for proof in plan.source_proofs}
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"samples"}
+        or not isinstance(rows, list)
+        or any(not isinstance(row, dict) for row in rows)
+        or any(not isinstance(identifier, str) for identifier in identifiers)
+        or len(identifiers) != len(set(identifiers))
+        or set(identifiers) != expected
+    ):
+        raise RuntimeError("READY selected source index conflicts with its plan")
 
 
 def _json(value: object) -> bytes:
