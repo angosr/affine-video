@@ -216,7 +216,7 @@ def _distribution_record(distribution: importlib.metadata.Distribution) -> Path 
         return None
     path = root / "RECORD"
     if not path.is_file():
-        raise ValueError("installed distribution RECORD is unavailable")
+        return None
     return path
 
 

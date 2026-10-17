@@ -145,6 +145,14 @@ def test_dependency_tree_hashes_metadata_when_no_file_list_exists(tmp_path) -> N
     assert environment._distribution_content_sha256(distribution) != first
 
 
+def test_dist_info_without_record_uses_metadata_tree(tmp_path) -> None:
+    metadata = tmp_path / "example-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text("Version: 1.0\n", encoding="utf-8")
+
+    assert environment._distribution_record(SimpleNamespace(_path=metadata)) is None
+
+
 def test_dependency_lock_must_be_canonical(tmp_path, monkeypatch) -> None:
     source = tmp_path / "example.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
