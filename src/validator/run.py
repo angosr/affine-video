@@ -295,6 +295,7 @@ async def run_evaluator(
                             max_scan_blocks=max_scan_blocks,
                             recovery_matches=ledger.matches[recovery_index:],
                             minimum_finalized_block=ledger.required_finalized_block,
+                            track_close_block=track.track_close_block,
                             track_aborted=track_aborted,
                         )
                         recovery_index += result.restored_matches
@@ -553,6 +554,7 @@ async def process_cycle(
     model_validator: Callable[..., ValidatedModel] = validate_model,
     recovery_matches: Sequence[MatchRecord] = (),
     minimum_finalized_block: int = 0,
+    track_close_block: int | None = None,
     track_aborted: bool = False,
 ) -> EvaluationCycleResult:
     """Synchronize the chain, admit one model, and score one ready stage."""
@@ -561,6 +563,8 @@ async def process_cycle(
         raise ValueError("worker id cannot be empty")
     if minimum_finalized_block < 0:
         raise ValueError("minimum finalized block cannot be negative")
+    if track_close_block is not None and track_close_block < 0:
+        raise ValueError("track close block cannot be negative")
     scan = await scan_finalized_blocks(
         client,
         store,
@@ -581,7 +585,9 @@ async def process_cycle(
             None,
             restored_matches=restored_matches,
         )
-    if track_aborted:
+    if track_aborted or (
+        track_close_block is not None and finalized_block > track_close_block
+    ):
         return EvaluationCycleResult(
             finalized_block,
             scan,

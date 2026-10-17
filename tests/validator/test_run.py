@@ -85,6 +85,7 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
         ),
         initial_champion=SimpleNamespace(hotkey="uid0-hotkey"),
         last_submission_block=1_000,
+        track_close_block=2_000,
     )
     attempts = 0
     clients = 0
@@ -259,11 +260,13 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
             "downloader": download,
         }
         paused = asyncio.run(process_cycle(client, store, minimum_finalized_block=102, **arguments))
+        closed = asyncio.run(process_cycle(client, store, track_close_block=100, **arguments))
         aborted = asyncio.run(process_cycle(client, store, track_aborted=True, **arguments))
         first = asyncio.run(process_cycle(client, store, **arguments))
 
         assert paused.scan.submissions_found == 1
         assert paused.admission is paused.scoring is None
+        assert closed.admission is closed.scoring is None
         assert aborted.admission is aborted.scoring is None
         assert first.scan.blocks_scanned == 0
         assert first.admission is not None
