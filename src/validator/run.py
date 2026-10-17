@@ -563,7 +563,10 @@ async def process_cycle(
         max_blocks=max_scan_blocks,
     )
     finalized_block = await client.finalized_block()
-    restored_matches = store.restore_public_matches(recovery_matches)
+    restored_matches = store.restore_public_matches(
+        recovery_matches,
+        maximum_effective_challenges=admission_settings.maximum_effective_challenges,
+    )
     if finalized_block < minimum_finalized_block:
         return EvaluationCycleResult(
             finalized_block,

@@ -191,6 +191,12 @@ def test_frozen_effective_challenge_limit_is_enforced(tmp_path) -> None:
         metadata={"hotkey": "hk2"},
     )
     configured = replace(settings(tmp_path), maximum_effective_challenges=1)
+    second_downloads = 0
+
+    def count_second_download(*args, **kwargs):
+        nonlocal second_downloads
+        second_downloads += 1
+        return model_downloader(second_model)(*args, **kwargs)
 
     with ChallengeStore(tmp_path / "validator.db") as store:
         store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
@@ -211,15 +217,16 @@ def test_frozen_effective_challenge_limit_is_enforced(tmp_path) -> None:
             settings=configured,
             current_finalized_block=10_000,
             now_ms=200,
-            downloader=model_downloader(second_model),
+            downloader=count_second_download,
         )
 
         assert first is not None and first.status is AdmissionStatus.ACCEPTED
         assert second is not None and second.code == "TRACK_CAPACITY_REACHED"
         assert store.get_challenge(second_id).state is ChallengeState.REJECTED_TRACK_CAPACITY
+        assert second_downloads == 0
 
 
-def test_deferred_earlier_submission_keeps_its_non_refundable_season_slot(tmp_path) -> None:
+def test_deferred_earlier_submission_blocks_fifo_without_consuming_a_slot(tmp_path) -> None:
     configured = replace(settings(tmp_path), maximum_effective_challenges=1)
     model = tmp_path / "selector.safetensors"
     write_model(model, "hk1")
@@ -257,7 +264,7 @@ def test_deferred_earlier_submission_keeps_its_non_refundable_season_slot(tmp_pa
         )
 
         assert first is not None and first.status is AdmissionStatus.DEFERRED
-        assert store.has_season_slot(first_id)
+        assert not store.has_season_slot(first_id)
         assert blocked_by_fifo is None
 
         retried = process_next_admission(
@@ -269,6 +276,7 @@ def test_deferred_earlier_submission_keeps_its_non_refundable_season_slot(tmp_pa
             downloader=initially_unavailable,
         )
         assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
+        assert store.has_season_slot(first_id)
 
         second = process_next_admission(
             store,
@@ -328,29 +336,78 @@ def test_same_reference_can_retry_after_earlier_participant_failure(tmp_path) ->
     def missing(*_args, **_kwargs):
         raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "repository is private")
 
+    configured = replace(settings(tmp_path), maximum_effective_challenges=1)
     with ChallengeStore(tmp_path / "validator.db") as store:
         store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
         failed = process_next_admission(
             store,
             worker_id="admission",
-            settings=settings(tmp_path),
+            settings=configured,
             current_finalized_block=10_000,
             now_ms=100,
             downloader=missing,
         )
         assert failed is not None and failed.status is AdmissionStatus.FAILED
+        assert store.effective_challenge_count() == 0
 
-        store.add_submission(submission_at(101, "hk2"), occurred_at_ms=2)
+        retried_id, _ = store.add_submission(submission_at(101, "hk2"), occurred_at_ms=2)
         retried = process_next_admission(
             store,
             worker_id="admission",
-            settings=settings(tmp_path),
+            settings=configured,
             current_finalized_block=10_000,
             now_ms=200,
             downloader=model_downloader(model),
         )
 
         assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
+        assert store.effective_challenge_count() == 1
+        assert store.has_season_slot(retried_id)
+
+
+def test_invalid_model_cannot_consume_the_only_effective_challenge_slot(tmp_path) -> None:
+    invalid_model = tmp_path / "invalid.safetensors"
+    valid_model = tmp_path / "valid.safetensors"
+    save_file(
+        {"unexpected.weight": np.ones((2, 2), dtype=np.float32)},
+        invalid_model,
+        metadata={"hotkey": "invalid"},
+    )
+    write_model(valid_model, "valid")
+    configured = replace(settings(tmp_path), maximum_effective_challenges=1)
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        invalid_id, _ = store.add_submission(
+            submission_at(100, "invalid", "invalid/model"), occurred_at_ms=1
+        )
+        invalid = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=model_downloader(invalid_model),
+        )
+
+        assert invalid is not None and invalid.status is AdmissionStatus.FAILED
+        assert store.get_challenge(invalid_id).error_code == "MODEL_SCHEMA_INVALID"
+        assert store.effective_challenge_count() == 0
+
+        valid_id, _ = store.add_submission(
+            submission_at(101, "valid", "valid/model"), occurred_at_ms=2
+        )
+        valid = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=200,
+            downloader=model_downloader(valid_model),
+        )
+
+        assert valid is not None and valid.status is AdmissionStatus.ACCEPTED
+        assert store.effective_challenge_count() == 1
+        assert store.has_season_slot(valid_id)
 
 
 def test_copied_reference_cannot_front_run_model_owner(tmp_path) -> None:

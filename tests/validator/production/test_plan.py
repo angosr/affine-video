@@ -731,9 +731,6 @@ def test_plan_coordinator_skips_empty_intervals_without_losing_later_work() -> N
     )
 
     class Store:
-        def reserve_season_slots(self, maximum):
-            assert maximum == 2
-
         def chain_cursor(self):
             return (140, "0x" + "ef" * 32)
 
@@ -790,9 +787,6 @@ def test_plan_coordinator_maps_confirmation_from_its_exact_decision_block() -> N
     )
 
     class Store:
-        def reserve_season_slots(self, maximum):
-            assert maximum == 2
-
         def chain_cursor(self):
             return (140, "0x" + "ef" * 32)
 
@@ -866,9 +860,6 @@ def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
     class Store:
         score_recovered = False
         transition_applied = False
-
-        def reserve_season_slots(self, maximum):
-            assert maximum == 2
 
         def stage_score(self, identifier, stage):
             assert identifier == challenge_id

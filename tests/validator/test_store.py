@@ -260,6 +260,49 @@ def test_model_owner_lookup_validates_and_returns_the_registered_challenge(tmp_p
             store.model_owner("bad")
 
 
+def test_model_registration_enforces_capacity_in_the_ownership_transaction(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        first_id, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        second_id, _ = store.add_submission(
+            submission_at(101, hotkey="hk2"), occurred_at_ms=11
+        )
+        store.transition(first_id, ChallengeState.FETCHING, occurred_at_ms=12)
+        store.transition(first_id, ChallengeState.VALIDATING, occurred_at_ms=13)
+        first = store.claim_next_admission(
+            "worker", lease_ms=1_000, ready_through_block=1_000, now_ms=14
+        )
+        assert first is not None
+        assert store.register_validated_model(
+            first_id,
+            first.lease_token,
+            model_digest="ab" * 32,
+            maximum_effective_challenges=1,
+            occurred_at_ms=15,
+        ).accepted
+
+        store.transition(second_id, ChallengeState.FETCHING, occurred_at_ms=16)
+        store.transition(second_id, ChallengeState.VALIDATING, occurred_at_ms=17)
+        second = store.claim_next_admission(
+            "worker", lease_ms=1_000, ready_through_block=1_000, now_ms=18
+        )
+        assert second is not None
+        registration = store.register_validated_model(
+            second_id,
+            second.lease_token,
+            model_digest="cd" * 32,
+            maximum_effective_challenges=1,
+            occurred_at_ms=19,
+        )
+
+        assert not registration.accepted
+        assert registration.capacity_reached
+        assert registration.duplicate_of is None
+        assert store.effective_challenge_count() == 1
+        assert not store.has_season_slot(second_id)
+        assert store.model_owner("cd" * 32) is None
+        assert store.get_challenge(second_id).state is ChallengeState.VALIDATING
+
+
 def test_uid_zero_baseline_hotkey_is_cleanly_rejected_as_duplicate(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         store.reserve_uid_zero("uid0-hotkey", track_start_block=100)
@@ -515,11 +558,25 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
             ),
         )
 
-        assert store.restore_public_matches(tournament.matches) == 1
-        assert store.restore_public_matches(tournament.matches) == 1
+        assert (
+            store.restore_public_matches(
+                tournament.matches,
+                maximum_effective_challenges=1,
+            )
+            == 1
+        )
+        assert (
+            store.restore_public_matches(
+                tournament.matches,
+                maximum_effective_challenges=1,
+            )
+            == 1
+        )
         restored = store.get_challenge(identifier)
         assert restored.state is ChallengeState.SUCCEEDED
         assert restored.final_score == 0.8
+        assert store.effective_challenge_count() == 1
+        assert store.has_season_slot(identifier)
         assert store.leaderboard()[0].challenge_id == identifier
         assert [stage["stage"] for stage in store.public_challenge(identifier)["stages"]] == [
             ChallengeState.SCORING

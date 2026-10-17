@@ -94,7 +94,6 @@ class PlanCoordinator:
         return tuple(rows)
 
     def create_next(self) -> BatchPlan | None:
-        self.store.reserve_season_slots(self.track.maximum_effective_challenges)
         if not self._stage_recovery_complete():
             return None
         existing = self.plans()

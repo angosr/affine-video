@@ -116,16 +116,18 @@ def process_next_admission(
         )
         return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, "TRACK_CLOSED")
 
-    if settings.maximum_effective_challenges is not None:
-        store.reserve_season_slots(settings.maximum_effective_challenges)
-        if not store.has_season_slot(task.challenge_id):
-            return _reject_track_capacity(
-                store,
-                task.challenge_id,
-                task.lease_token,
-                current_finalized_block=current_finalized_block,
-                now_ms=now,
-            )
+    if (
+        settings.maximum_effective_challenges is not None
+        and not store.has_season_slot(task.challenge_id)
+        and store.effective_challenge_count() >= settings.maximum_effective_challenges
+    ):
+        return _reject_track_capacity(
+            store,
+            task.challenge_id,
+            task.lease_token,
+            current_finalized_block=current_finalized_block,
+            now_ms=now,
+        )
 
     reference_owner = store.earlier_reference_owner(task.challenge_id)
     if reference_owner is not None:
@@ -330,8 +332,17 @@ def process_next_admission(
         task.challenge_id,
         task.lease_token,
         model_digest=validated.model_digest,
+        maximum_effective_challenges=settings.maximum_effective_challenges,
         occurred_at_ms=now,
     )
+    if registration.capacity_reached:
+        return _reject_track_capacity(
+            store,
+            task.challenge_id,
+            task.lease_token,
+            current_finalized_block=current_finalized_block,
+            now_ms=now,
+        )
     if not registration.accepted:
         return _reject_exact_duplicate(
             store,
