@@ -784,7 +784,13 @@ def _prune_local_work(root: Path, retained: frozenset[str]) -> None:
 
 def _validate_source_capacity(pool: SourcePool, track: TrackSpec) -> None:
     per_batch = track.scoring.rollouts_per_stratum
-    required = (track.maximum_generation_batches + 1) * per_batch
+    # A season slot appears in exactly one exact plan and at most one
+    # confirmation plan. Empty generation boundaries consume no sources.
+    nonempty_plan_limit = min(
+        track.maximum_generation_batches,
+        2 * track.maximum_effective_challenges,
+    )
+    required = (nonempty_plan_limit + 1) * per_batch
     for stratum in track.scoring.stratum_weight_map:
         families = {
             leaf.source_family_id

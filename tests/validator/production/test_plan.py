@@ -936,6 +936,7 @@ def test_source_pool_capacity_is_proved_before_production_starts() -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(6)))
     track = SimpleNamespace(
         maximum_generation_batches=2,
+        maximum_effective_challenges=1,
         scoring=SimpleNamespace(
             rollouts_per_stratum=2,
             stratum_weight_map={"16:9@37": 1.0},
@@ -947,3 +948,23 @@ def test_source_pool_capacity_is_proved_before_production_starts() -> None:
     track.scoring.rollouts_per_stratum = 3
     with pytest.raises(ValueError, match="reserve batch"):
         _validate_source_capacity(pool, track)
+
+
+def test_source_capacity_counts_only_possible_nonempty_plans() -> None:
+    track = SimpleNamespace(
+        maximum_generation_batches=80,
+        maximum_effective_challenges=20,
+        scoring=SimpleNamespace(
+            rollouts_per_stratum=4,
+            stratum_weight_map={"16:9@37": 1.0},
+        ),
+    )
+    _validate_source_capacity(
+        SourcePool(tuple(proof(index).leaf for index in range(164))),
+        track,
+    )
+    with pytest.raises(ValueError, match="reserve batch"):
+        _validate_source_capacity(
+            SourcePool(tuple(proof(index).leaf for index in range(163))),
+            track,
+        )
