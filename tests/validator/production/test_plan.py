@@ -33,6 +33,7 @@ from validator.production.service import (
     _find_valid_shard,
     _prune_local_work,
     _validate_source_capacity,
+    _work_directory_lock,
     _write_unit_completion,
 )
 from validator.production.storage import StoredObject
@@ -275,6 +276,18 @@ def test_local_work_pruning_only_removes_unretained_plan_directories(tmp_path) -
     assert (tmp_path / retained).is_dir()
     assert not (tmp_path / old).exists()
     assert (tmp_path / "operator-notes").is_dir()
+
+
+def test_local_work_directory_allows_only_one_producer(tmp_path) -> None:
+    with (
+        _work_directory_lock(tmp_path),
+        pytest.raises(RuntimeError, match="another producer"),
+        _work_directory_lock(tmp_path),
+    ):
+        pass
+
+    with _work_directory_lock(tmp_path):
+        pass
 
 
 def test_worker_pool_has_a_plan_wall_clock_ceiling() -> None:

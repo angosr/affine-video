@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import multiprocessing
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -331,6 +333,10 @@ class ProducerService:
         self.alert = alert
 
     def run(self, *, once: bool = False) -> None:
+        with _work_directory_lock(self.config.work_dir):
+            self._run_locked(once=once)
+
+    def _run_locked(self, *, once: bool) -> None:
         workers: WorkerPool | None = None
         failures: dict[str, int] = {}
         try:
@@ -755,6 +761,22 @@ def _file_sha256(path: Path) -> str:
 
 def _plan_name(block: int) -> str:
     return f"plans/{block}.json"
+
+
+@contextmanager
+def _work_directory_lock(root: Path):
+    """Keep disposable local unit files single-writer while remote CAS stays authoritative."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".producer.lock").open("a+b") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("another producer is using the configured work directory") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _retained_plan_digests(
