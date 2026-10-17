@@ -121,7 +121,7 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.initial_champion.repo_id == VEDA_REPO_ID
     assert first.cache.minimum_generation_delay_blocks == 4
     assert first.last_generation_block == 1100
-    assert first.last_submission_block == 996
+    assert first.last_submission_block == 896
     assert first.track_close_block == 1150
     assert first.scoring.minimum_frontier_gain == 0.001
     assert first.scoring.case_count == 24
@@ -134,6 +134,22 @@ def test_hidden_batch_seed_is_not_known_during_publication_grace() -> None:
     raw["cache"]["minimum_generation_delay_blocks"] = raw["publication_grace_blocks"]
 
     with pytest.raises(TrackSpecError, match="must exceed"):
+        parse_track_spec(raw)
+
+
+def test_track_reserves_enough_boundaries_to_drain_the_fifo_queue() -> None:
+    spec = parse_track_spec(valid_spec())
+    exact_block = spec.last_submission_block + spec.cache.minimum_generation_delay_blocks
+    assert (
+        exact_block
+        + spec.maximum_effective_challenges * spec.cache.generation_interval_blocks
+        == spec.last_generation_block
+    )
+
+    raw = valid_spec()
+    raw["maximum_generation_batches"] = raw["maximum_effective_challenges"]
+
+    with pytest.raises(TrackSpecError, match="leave one exact boundary"):
         parse_track_spec(raw)
 
 

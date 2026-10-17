@@ -637,7 +637,7 @@ def test_empty_track_publishes_uid_zero_veda_as_genesis_champion() -> None:
     assert status["participants"][0]["challenge_id"] == "genesis"
     assert status["participants"][0]["champion"] is True
     assert status["track_phase"] == "ACCEPTING"
-    assert status["last_submission_block"] == 996
+    assert status["last_submission_block"] == 896
     assert status["track_close_block"] == 1150
 
 

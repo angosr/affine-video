@@ -181,9 +181,13 @@ class TrackSpec:
 
     @property
     def last_submission_block(self) -> int:
+        # Strict FIFO means a challenger that clears exact scoring must finish its
+        # own later confirmation before the next challenger can advance.  Reserve
+        # one generation boundary per possible effective challenger so every
+        # accepted queue can drain by ``last_generation_block``.
         return (
             self.last_generation_block
-            - self.cache.generation_interval_blocks
+            - self.maximum_effective_challenges * self.cache.generation_interval_blocks
             - self.cache.minimum_generation_delay_blocks
         )
 
@@ -291,6 +295,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     if values["cache"].minimum_generation_delay_blocks <= values["publication_grace_blocks"]:
         raise TrackSpecError(
             "minimum generation delay must exceed the model publication grace period"
+        )
+    if values["maximum_generation_batches"] <= maximum_effective:
+        raise TrackSpecError(
+            "maximum generation batches must leave one exact boundary and one "
+            "confirmation boundary per effective challenge"
         )
     values["scoring"] = _parse_scoring(root["scoring"], values["model"].selector, maximum_effective)
     if values["full_video"].minimum_gain < values["scoring"].minimum_frontier_gain:
