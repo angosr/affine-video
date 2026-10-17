@@ -1076,6 +1076,17 @@ class ChallengeStore:
             metrics=json.loads(row["metrics_json"]),
         )
 
+    def model_path(self, identifier: str) -> str | None:
+        """Return a disposable local model path for a known challenge."""
+
+        row = self._connection.execute(
+            "SELECT model_path FROM challenges WHERE challenge_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(identifier)
+        return row["model_path"]
+
     def complete_challenge(
         self,
         identifier: str,
@@ -1297,6 +1308,30 @@ class ChallengeStore:
                         "DELETE FROM stage_scores WHERE challenge_id = ?",
                         (match.challenge_id,),
                     )
+                    if target is ChallengeState.SUCCEEDED:
+                        batch = evaluation["evaluation_batch"]
+                        metrics = {
+                            "incumbent_score": evaluation["incumbent_score"],
+                            "cache_sha256": batch["sha256"],
+                            "cache_generated_block": batch["generated_block"],
+                            "cache_source_digest": batch["source_digest"],
+                        }
+                        self._connection.execute(
+                            """
+                            INSERT INTO stage_scores (
+                                challenge_id, stage, score, score_block,
+                                metrics_json, created_at_ms
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                match.challenge_id,
+                                ChallengeState.SCORING,
+                                evaluation["final_score"],
+                                evaluation["score_block"],
+                                _json(metrics),
+                                row["created_at_ms"],
+                            ),
+                        )
                 model_digest = evaluation["model_digest"]
                 if model_digest is not None and evaluation["error_code"] != "EXACT_DUPLICATE":
                     owner = self._connection.execute(
@@ -1395,12 +1430,27 @@ class ChallengeStore:
         ).fetchall()
         stage_rows = self._connection.execute(
             """
-            SELECT stage, score, score_block, created_at_ms
+            SELECT stage, score, score_block, metrics_json, created_at_ms
             FROM stage_scores WHERE challenge_id = ?
             ORDER BY created_at_ms
             """,
             (row["challenge_id"],),
         ).fetchall()
+        paired = {}
+        if stage_rows:
+            metrics = json.loads(stage_rows[-1]["metrics_json"])
+            paired = {
+                "incumbent_score": metrics.get("incumbent_score"),
+                "evaluation_batch": (
+                    {
+                        "sha256": metrics.get("cache_sha256"),
+                        "generated_block": metrics.get("cache_generated_block"),
+                        "source_digest": metrics.get("cache_source_digest"),
+                    }
+                    if "cache_sha256" in metrics
+                    else None
+                ),
+            }
         return {
             "challenge_id": row["challenge_id"],
             "submission_id": row["submission_id"],
@@ -1420,6 +1470,8 @@ class ChallengeStore:
             "track_spec_digest": row["track_spec_digest"],
             "final_score": row["final_score"],
             "score_block": row["score_block"],
+            "incumbent_score": paired.get("incumbent_score"),
+            "evaluation_batch": paired.get("evaluation_batch"),
             "created_at_ms": row["created_at_ms"],
             "updated_at_ms": row["updated_at_ms"],
             "stages": [

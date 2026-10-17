@@ -68,8 +68,8 @@ class InitialChampionSpec:
 
 @dataclass(frozen=True, slots=True)
 class CacheSpec:
-    exact_sha256: str
     exact_max_bytes: int
+    minimum_generation_delay_blocks: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,8 +136,8 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
             "revision": spec.base_model.revision,
         },
         "cache": {
-            "exact_sha256": spec.cache.exact_sha256,
             "exact_max_bytes": spec.cache.exact_max_bytes,
+            "minimum_generation_delay_blocks": spec.cache.minimum_generation_delay_blocks,
         },
         "scoring": {
             "budgets": [
@@ -272,7 +272,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
 
     cache_raw = _object(
         root["cache"],
-        {"exact_sha256", "exact_max_bytes"},
+        {"exact_max_bytes", "minimum_generation_delay_blocks"},
         "cache",
     )
 
@@ -360,9 +360,13 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         },
         "base_model": {"repo_id": repo_id, "revision": revision.lower()},
         "cache": {
-            "exact_sha256": _digest(cache_raw["exact_sha256"], "exact cache sha256"),
             "exact_max_bytes": _integer(
                 cache_raw["exact_max_bytes"], "exact cache max bytes", minimum=1
+            ),
+            "minimum_generation_delay_blocks": _integer(
+                cache_raw["minimum_generation_delay_blocks"],
+                "minimum generation delay blocks",
+                minimum=1,
             ),
         },
         "scoring": {
@@ -407,8 +411,8 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         ),
         base_model=BaseModelSpec(repo_id, revision.lower()),
         cache=CacheSpec(
-            exact_sha256=cache["exact_sha256"],
             exact_max_bytes=cache["exact_max_bytes"],
+            minimum_generation_delay_blocks=cache["minimum_generation_delay_blocks"],
         ),
         scoring=ScoringSpec(
             budgets=budgets,

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import zipfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from math import isfinite, prod
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,93 @@ from scoring.exact import ExactCase
 
 class CacheLoadError(ValueError):
     """Raised when a frozen scoring cache is missing, changed, or malformed."""
+
+
+_BATCH_NAME = re.compile(r"^(0|[1-9][0-9]*)-([0-9a-f]{64})[.]npz$")
+
+
+@dataclass(frozen=True, slots=True)
+class ExactCacheBatch:
+    path: Path
+    sha256: str
+    generated_block: int
+    source_digest: str
+
+
+def select_exact_cache_batch(
+    directory: str | Path,
+    *,
+    submission_block: int,
+    minimum_delay_blocks: int,
+    max_bytes: int,
+    min_blocks: int,
+    max_blocks: int,
+    head_dim: int,
+    routes: tuple[str, ...],
+    strata: Mapping[str, float],
+    sample_count: int,
+) -> ExactCacheBatch:
+    """Select the earliest valid batch generated after one submission became immutable."""
+
+    if submission_block < 0 or minimum_delay_blocks <= 0:
+        raise ValueError("cache generation boundary is invalid")
+    root = Path(directory)
+    candidates: list[tuple[int, str, Path]] = []
+    try:
+        paths = sorted(root.glob("*.npz"))
+    except OSError as exc:
+        raise CacheLoadError("cache batch directory cannot be read") from exc
+    for path in paths:
+        match = _BATCH_NAME.fullmatch(path.name)
+        if match is None:
+            raise CacheLoadError("cache batch filename is invalid")
+        generated_block = int(match.group(1))
+        if generated_block >= submission_block + minimum_delay_blocks:
+            candidates.append((generated_block, match.group(2), path))
+    if not candidates:
+        raise CacheLoadError("no exact cache batch was generated after the submission")
+    named_block, named_sha256, path = min(candidates)
+    batch = inspect_exact_cache_batch(path, max_bytes=max_bytes)
+    if batch.generated_block != named_block or batch.sha256 != named_sha256:
+        raise CacheLoadError("cache batch filename does not match its content")
+    validate_exact_cache(
+        path,
+        expected_sha256=batch.sha256,
+        max_bytes=max_bytes,
+        min_blocks=min_blocks,
+        max_blocks=max_blocks,
+        head_dim=head_dim,
+        routes=routes,
+        strata=strata,
+        sample_count=sample_count,
+    )
+    return batch
+
+
+def inspect_exact_cache_batch(path: str | Path, *, max_bytes: int) -> ExactCacheBatch:
+    """Read immutable provenance from one size-bounded exact cache batch."""
+
+    cache_path = Path(path)
+    sha256 = _file_sha256(cache_path)
+    _verify_archive(cache_path, sha256, max_bytes)
+    try:
+        with np.load(cache_path, allow_pickle=False) as archive:
+            metadata = _metadata(archive, expected_format="veda-exact-cache")
+    except CacheLoadError:
+        raise
+    except (OSError, ValueError, KeyError) as exc:
+        raise CacheLoadError("cache metadata cannot be read") from exc
+    generated_block = metadata["generated_block"]
+    if type(generated_block) is not int or generated_block < 0:
+        raise CacheLoadError("cache generated block must be a non-negative integer")
+    source_digest = metadata["source_digest"]
+    if not isinstance(source_digest, str) or len(source_digest) != 64:
+        raise CacheLoadError("cache source digest must contain 32 bytes")
+    try:
+        bytes.fromhex(source_digest)
+    except ValueError as exc:
+        raise CacheLoadError("cache source digest must be hexadecimal") from exc
+    return ExactCacheBatch(cache_path, sha256, generated_block, source_digest.lower())
 
 
 def validate_exact_cache(
@@ -309,12 +398,27 @@ def _metadata(archive: Any, *, expected_format: str) -> dict[str, Any]:
         metadata = json.loads(raw.tobytes().decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CacheLoadError("cache metadata is not valid JSON") from exc
-    root = _object(metadata, {"format", "cases"}, "cache metadata")
+    root = _object(
+        metadata,
+        {"format", "generated_block", "source_digest", "cases"},
+        "cache metadata",
+    )
     if root["format"] != expected_format:
         raise CacheLoadError("cache format identifier is invalid")
     if not isinstance(root["cases"], list) or not root["cases"]:
         raise CacheLoadError("cache must contain at least one case")
     return root
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise CacheLoadError("cache is not readable") from exc
+    return digest.hexdigest()
 
 
 def _array(archive: Any, name: str) -> np.ndarray:

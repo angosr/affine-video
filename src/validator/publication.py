@@ -93,6 +93,7 @@ def build_public_artifacts(
         netuid=track.netuid,
         minimum_gain=track.scoring.minimum_frontier_gain,
         initial_champion=initial,
+        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
     )
     if any(match.document["decided_block"] > chain.finalized_block for match in tournament.matches):
         raise PublicArtifactError("a terminal decision is newer than the finalized chain snapshot")
@@ -428,6 +429,9 @@ class S3Repository:
                     netuid=track.netuid,
                     minimum_gain=track.scoring.minimum_frontier_gain,
                     incumbent=incumbent,
+                    minimum_generation_delay_blocks=(
+                        track.cache.minimum_generation_delay_blocks
+                    ),
                 )
             except ValueError as exc:
                 raise PublicArtifactError(f"public match is invalid: {name}") from exc
@@ -445,6 +449,7 @@ class S3Repository:
             netuid=track.netuid,
             minimum_gain=track.scoring.minimum_frontier_gain,
             initial_champion=genesis_champion(track),
+            minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
         )
         if summary != _summary_document(track, source_block, tournament):
             raise PublicArtifactError("public summary does not match its immutable matches")
@@ -474,6 +479,9 @@ class S3Repository:
                     netuid=track.netuid,
                     minimum_gain=track.scoring.minimum_frontier_gain,
                     incumbent=incumbent,
+                    minimum_generation_delay_blocks=(
+                        track.cache.minimum_generation_delay_blocks
+                    ),
                 )
             except ValueError as exc:
                 raise PublicArtifactError(f"public match is invalid: {name}") from exc

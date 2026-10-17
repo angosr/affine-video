@@ -116,7 +116,10 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
             tensor_schema={},
             selector=SimpleNamespace(head_dim=1, routes=("route",)),
         ),
-        cache=SimpleNamespace(exact_sha256="cd" * 32, exact_max_bytes=1_000),
+        cache=SimpleNamespace(
+            exact_max_bytes=1_000,
+            minimum_generation_delay_blocks=1,
+        ),
         scoring=SimpleNamespace(
             budgets=[SimpleNamespace(blocks=1)],
             stratum_weight_map={"stratum": 1.0},
@@ -152,12 +155,12 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
             raise StopLoop
 
     monkeypatch.setattr(run_module, "load_track_spec", lambda _path: track)
-    monkeypatch.setattr(run_module, "validate_exact_cache", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_module.bt, "Client", client_factory)
     monkeypatch.setattr(run_module, "seed_legacy_exclusions", seed)
     monkeypatch.setattr(run_module, "process_cycle", process)
     monkeypatch.setattr(run_module.asyncio, "sleep", no_sleep)
+    (tmp_path / "exact.npz").mkdir()
 
     with pytest.raises(StopLoop):
         asyncio.run(
@@ -304,7 +307,16 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         return DownloadedModel(model_path, file_digest, model_path.stat().st_size, None, None)
 
     def evaluate(_task):
-        return StageOutcome(0.9, {"stage": "scoring"})
+        return StageOutcome(
+            0.9,
+            {
+                "stage": "scoring",
+                "incumbent_score": 0.5,
+                "cache_sha256": "de" * 32,
+                "cache_generated_block": 101,
+                "cache_source_digest": "ef" * 32,
+            },
+        )
 
     arguments = {
         "netuid": 7,

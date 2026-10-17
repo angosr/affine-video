@@ -14,14 +14,21 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
-from scoring.cache import CacheLoadError, sample_exact_cache
+from scoring.cache import (
+    CacheLoadError,
+    ExactCacheBatch,
+    sample_exact_cache,
+    select_exact_cache_batch,
+)
 from scoring.evaluate import panel_seed, route_stratified_sample_indices
 from scoring.exact import ExactCase, score_selector
-from scoring.model import ModelValidationError, validate_model
+from scoring.model import ModelValidationError, ValidatedModel, validate_model
 from scoring.selector import load_selector
 from scoring.spec import TrackSpec
-from validator.queue import ChainPosition, ChallengeState, require_transition
+from validator.download import ModelDownloadError, download_public_model
+from validator.queue import ChallengeState, require_transition
 from validator.store import ChallengeStore, LeasedChallenge
+from validator.tournament import genesis_champion, resolve_tournament
 
 
 class ParticipantScoringError(RuntimeError):
@@ -106,7 +113,11 @@ class TrackEvaluator:
                 "SCORING_MODEL_CHANGED", "validated model cache checksum changed"
             )
         try:
-            selector = load_selector(task.model_path, self.track.model.selector)
+            selector = load_selector(
+                task.model_path,
+                self.track.model.selector,
+                expected_hotkey=task.hotkey,
+            )
         except ModelValidationError as exc:
             raise ParticipantScoringError(exc.code, str(exc)) from exc
 
@@ -159,6 +170,8 @@ class FileTrackEvaluator:
 
     track: TrackSpec
     exact_cache: str
+    exact_sha256: str
+    sample_seed: int
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         try:
@@ -166,10 +179,10 @@ class FileTrackEvaluator:
             if task.state is ChallengeState.SCORING:
                 exact_cases = sample_exact_cache(
                     self.exact_cache,
-                    expected_sha256=self.track.cache.exact_sha256,
+                    expected_sha256=self.exact_sha256,
                     max_bytes=self.track.cache.exact_max_bytes,
                     count=scoring.sample_count,
-                    seed=panel_seed(self.track.digest, stage="exact"),
+                    seed=self.sample_seed,
                     routes=self.track.model.selector.routes,
                     strata=scoring.stratum_weight_map,
                 )
@@ -187,10 +200,9 @@ class FileTrackEvaluator:
 def verify_initial_champion(
     track: TrackSpec,
     *,
-    exact_cache: str | Path,
     model_path: str | Path,
-) -> StageOutcome:
-    """Verify and score the fixed official VEDA baseline before processing Miners."""
+) -> ValidatedModel:
+    """Verify the fixed official VEDA baseline model before processing Miners."""
 
     initial = track.initial_champion
     try:
@@ -205,24 +217,146 @@ def verify_initial_champion(
         raise ValueError("initial VEDA evaluation file SHA-256 is incorrect")
     if validated.model_digest != initial.model_digest:
         raise ValueError("initial VEDA canonical model digest is incorrect")
-    task = LeasedChallenge(
-        challenge_id="genesis",
-        submission_id="genesis",
-        state=ChallengeState.SCORING,
-        hotkey=initial.hotkey,
-        repo_id=initial.repo_id,
-        revision=initial.revision,
-        position=ChainPosition(track.track_start_block, 0, 0),
-        lease_token="genesis",
-        lease_expires_at_ms=0,
-        attempts=1,
-        model_path=str(model_path),
-        file_sha256=validated.file_sha256,
-    )
-    outcome = FileTrackEvaluator(track, str(exact_cache))(task)
-    if abs(outcome.score - initial.score) > 1e-12:
-        raise ValueError("initial VEDA score does not match the frozen track specification")
-    return outcome
+    return validated
+
+
+@dataclass(slots=True)
+class PairedTrackEvaluator:
+    """Score challenger and current champion on one post-submission cache batch."""
+
+    track: TrackSpec
+    store: ChallengeStore
+    cache_dir: Path
+    model_cache: Path
+    initial_model_path: Path
+    timeout_seconds: float
+    max_memory_bytes: int | None = None
+    max_cpu_seconds: int | None = None
+    downloader: Callable[..., Any] = download_public_model
+
+    def __call__(self, task: LeasedChallenge) -> StageOutcome:
+        snapshot = self.store.public_snapshot()
+        tournament = resolve_tournament(
+            snapshot["challenges"],
+            track_id=self.track.track_id,
+            track_spec_digest=self.track.digest,
+            netuid=self.track.netuid,
+            minimum_gain=self.track.scoring.minimum_frontier_gain,
+            initial_champion=genesis_champion(self.track),
+            minimum_generation_delay_blocks=(
+                self.track.cache.minimum_generation_delay_blocks
+            ),
+        )
+        incumbent = tournament.champion
+        batch = self._batch(task)
+        incumbent_task = self._incumbent_task(incumbent, snapshot["challenges"])
+        seed_digest = hashlib.sha256(
+            bytes.fromhex(self.track.digest) + bytes.fromhex(batch.sha256)
+        ).hexdigest()
+        seed = panel_seed(seed_digest, stage="exact")
+        evaluator = FileTrackEvaluator(
+            self.track,
+            str(batch.path),
+            batch.sha256,
+            seed,
+        )
+        isolated = IsolatedEvaluator(
+            evaluator,
+            timeout_seconds=self.timeout_seconds,
+            max_memory_bytes=self.max_memory_bytes,
+            max_cpu_seconds=self.max_cpu_seconds,
+        )
+        challenger = isolated(task)
+        reference = isolated(incumbent_task)
+        return StageOutcome(
+            challenger.score,
+            {
+                **challenger.metrics,
+                "incumbent_score": reference.score,
+                "cache_sha256": batch.sha256,
+                "cache_generated_block": batch.generated_block,
+                "cache_source_digest": batch.source_digest,
+            },
+        )
+
+    def _batch(self, task: LeasedChallenge) -> ExactCacheBatch:
+        scoring = self.track.scoring
+        try:
+            return select_exact_cache_batch(
+                self.cache_dir,
+                submission_block=task.position.block,
+                minimum_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
+                max_bytes=self.track.cache.exact_max_bytes,
+                min_blocks=scoring.budgets[0].blocks,
+                max_blocks=scoring.budgets[-1].blocks,
+                head_dim=self.track.model.selector.head_dim,
+                routes=self.track.model.selector.routes,
+                strata=scoring.stratum_weight_map,
+                sample_count=scoring.sample_count,
+            )
+        except CacheLoadError as exc:
+            raise TemporaryScoringError("SCORING_CACHE_UNAVAILABLE", str(exc)) from exc
+
+    def _incumbent_task(
+        self,
+        incumbent: Any,
+        challenges: Sequence[Mapping[str, Any]],
+    ) -> LeasedChallenge:
+        if incumbent.challenge_id == "genesis":
+            path = self.initial_model_path
+            expected_digest = self.track.initial_champion.model_digest
+            expected_hotkey = None
+        else:
+            record = next(
+                item for item in challenges if item["challenge_id"] == incumbent.challenge_id
+            )
+            expected_digest = record["model_digest"]
+            expected_hotkey = incumbent.hotkey
+            local_path = self.store.model_path(incumbent.challenge_id)
+            if local_path is None or not Path(local_path).is_file():
+                try:
+                    downloaded = self.downloader(
+                        incumbent.repo_id,
+                        incumbent.revision,
+                        cache_dir=self.model_cache,
+                        max_bytes=self.track.model.max_bytes,
+                    )
+                except ModelDownloadError as exc:
+                    raise TemporaryScoringError(
+                        "INCUMBENT_MODEL_UNAVAILABLE", str(exc)
+                    ) from exc
+                path = Path(downloaded.path)
+            else:
+                path = Path(local_path)
+        try:
+            validated = validate_model(
+                path,
+                schema=self.track.model.tensor_schema,
+                max_bytes=self.track.model.max_bytes,
+                expected_hotkey=expected_hotkey,
+            )
+        except (OSError, ModelValidationError) as exc:
+            raise TemporaryScoringError(
+                "INCUMBENT_MODEL_INVALID", "current champion model cannot be restored"
+            ) from exc
+        if validated.model_digest != expected_digest:
+            raise TemporaryScoringError(
+                "INCUMBENT_MODEL_INVALID", "current champion model digest changed"
+            )
+        return LeasedChallenge(
+            challenge_id=incumbent.challenge_id,
+            submission_id=incumbent.challenge_id,
+            state=ChallengeState.SCORING,
+            hotkey=incumbent.hotkey,
+            repo_id=incumbent.repo_id,
+            revision=incumbent.revision,
+            position=incumbent.position,
+            lease_token="incumbent",
+            lease_expires_at_ms=0,
+            attempts=1,
+            model_path=str(path),
+            file_sha256=validated.file_sha256,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +490,15 @@ def process_next_scoring(
     if recorded is None:
         try:
             result = evaluator(task)
+            generated_block = result.metrics.get("cache_generated_block")
+            if generated_block is not None and (
+                type(generated_block) is not int
+                or generated_block > current_finalized_block
+            ):
+                raise TemporaryScoringError(
+                    "SCORING_CACHE_INVALID",
+                    "cache generation block is not finalized",
+                )
             require_transition(task.state, ChallengeState.SUCCEEDED)
         except ParticipantScoringError as exc:
             store.complete_challenge(

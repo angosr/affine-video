@@ -40,6 +40,7 @@ def challenge(
     *,
     state: str,
     score: float | None = None,
+    incumbent_score: float | None = None,
     error_code: str | None = None,
 ) -> dict:
     return {
@@ -60,6 +61,16 @@ def challenge(
         "model_size_bytes": 550_000_000 if score is not None else None,
         "track_spec_digest": None,
         "final_score": score,
+        "incumbent_score": incumbent_score,
+        "evaluation_batch": (
+            {
+                "sha256": f"{sequence + 100:064x}",
+                "generated_block": 200 + sequence,
+                "source_digest": f"{sequence + 200:064x}",
+            }
+            if score is not None
+            else None
+        ),
         "score_block": 200 + sequence if score is not None else 200 + sequence,
         "created_at_ms": sequence,
         "updated_at_ms": sequence,
@@ -77,15 +88,15 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch() -> None:
     raw["scoring"]["minimum_frontier_gain"] = 0.01
     track = parse_track_spec(raw)
     challenges = [
-        challenge(1, "alice", state="SUCCEEDED", score=0.6),
-        challenge(2, "bob", state="SUCCEEDED", score=0.605),
+        challenge(1, "alice", state="SUCCEEDED", score=0.6, incumbent_score=0.5),
+        challenge(2, "bob", state="SUCCEEDED", score=0.605, incumbent_score=0.6),
         challenge(
             3,
             "carol",
             state="PARTICIPANT_FAILED",
             error_code="REPOSITORY_UNAVAILABLE",
         ),
-        challenge(4, "dave", state="SUCCEEDED", score=0.8),
+        challenge(4, "dave", state="SUCCEEDED", score=0.8, incumbent_score=0.6),
         challenge(
             5,
             "alice",

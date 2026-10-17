@@ -14,7 +14,6 @@ from typing import Any, Protocol
 import bittensor as bt
 import httpx
 
-from scoring.cache import validate_exact_cache
 from scoring.model import ValidatedModel, validate_model
 from scoring.spec import VEDA_REPO_ID, VEDA_REVISION, TrackSpec, load_track_spec
 from validator.admission import (
@@ -33,8 +32,7 @@ from validator.publication import (
     validate_public_weights_url,
 )
 from validator.scoring import (
-    FileTrackEvaluator,
-    IsolatedEvaluator,
+    PairedTrackEvaluator,
     ScoringOutcome,
     ScoringSettings,
     StageOutcome,
@@ -148,17 +146,9 @@ async def run_evaluator(
         raise ValueError("mechanism and version identifiers must be non-negative")
     track = load_track_spec(track_spec)
     ledger = await publisher.load(track)
-    validate_exact_cache(
-        exact_cache,
-        expected_sha256=track.cache.exact_sha256,
-        max_bytes=track.cache.exact_max_bytes,
-        min_blocks=track.scoring.budgets[0].blocks,
-        max_blocks=track.scoring.budgets[-1].blocks,
-        head_dim=track.model.selector.head_dim,
-        routes=track.model.selector.routes,
-        strata=track.scoring.stratum_weight_map,
-        sample_count=track.scoring.sample_count,
-    )
+    cache_dir = Path(exact_cache)
+    if not cache_dir.is_dir():
+        raise ValueError("exact cache path must be a batch directory")
     initial_model_path = (
         Path(initial_model)
         if initial_model is not None
@@ -173,7 +163,6 @@ async def run_evaluator(
     )
     verify_initial_champion(
         track,
-        exact_cache=exact_cache,
         model_path=initial_model_path,
     )
     admission_settings = AdmissionSettings(
@@ -182,15 +171,21 @@ async def run_evaluator(
         tensor_schema=track.model.tensor_schema,
         publication_grace_blocks=track.publication_grace_blocks,
     )
-    evaluator = IsolatedEvaluator(
-        FileTrackEvaluator(track, str(exact_cache)),
-        timeout_seconds=scoring_timeout_seconds,
-        max_memory_bytes=scoring_max_memory_bytes,
-        max_cpu_seconds=scoring_max_cpu_seconds,
+    scoring_settings = ScoringSettings(
+        lease_ms=ceil(scoring_timeout_seconds * 2 * 1000) + 60_000
     )
-    scoring_settings = ScoringSettings(lease_ms=ceil(evaluator.timeout_seconds * 1000) + 60_000)
 
     with ChallengeStore(database, track_spec_digest=track.digest) as store:
+        evaluator = PairedTrackEvaluator(
+            track,
+            store,
+            cache_dir,
+            Path(model_cache),
+            initial_model_path,
+            scoring_timeout_seconds,
+            scoring_max_memory_bytes,
+            scoring_max_cpu_seconds,
+        )
         recovery_index = 0
         while True:
             try:

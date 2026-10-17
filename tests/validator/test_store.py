@@ -450,6 +450,12 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
                 "model_digest": "ef" * 32,
                 "model_size_bytes": 123,
                 "final_score": 0.8,
+                "incumbent_score": 0.5,
+                "evaluation_batch": {
+                    "sha256": "de" * 32,
+                    "generated_block": 101,
+                    "source_digest": "ef" * 32,
+                },
                 "score_block": 110,
                 "stages": [],
             }
@@ -478,7 +484,9 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
         assert restored.state is ChallengeState.SUCCEEDED
         assert restored.final_score == 0.8
         assert store.leaderboard()[0].challenge_id == identifier
-        assert store.public_challenge(identifier)["stages"] == []
+        assert [
+            stage["stage"] for stage in store.public_challenge(identifier)["stages"]
+        ] == [ChallengeState.SCORING]
 
 
 def test_stage_score_replay_must_be_identical(tmp_path) -> None:

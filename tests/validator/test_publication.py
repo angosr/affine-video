@@ -190,6 +190,12 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
                 "model_digest": "cd" * 32,
                 "model_size_bytes": 123,
                 "final_score": 0.8,
+                "incumbent_score": 0.5,
+                "evaluation_batch": {
+                    "sha256": "de" * 32,
+                    "generated_block": 101,
+                    "source_digest": "ef" * 32,
+                },
                 "score_block": 110,
                 "stages": [],
             }
@@ -276,6 +282,12 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
         "model_digest": "cd" * 32,
         "model_size_bytes": 123,
         "final_score": 0.8,
+        "incumbent_score": 0.5,
+        "evaluation_batch": {
+            "sha256": "de" * 32,
+            "generated_block": 101,
+            "source_digest": "ef" * 32,
+        },
         "score_block": 110,
         "stages": [],
     }
@@ -301,6 +313,12 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
         "block_height": 121,
         "model_digest": "ef" * 32,
         "final_score": 0.9,
+        "incumbent_score": 0.8,
+        "evaluation_batch": {
+            "sha256": "fa" * 32,
+            "generated_block": 122,
+            "source_digest": "fb" * 32,
+        },
         "score_block": 125,
     }
     snapshot["challenges"] = [first, second]
@@ -345,6 +363,12 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
                 "model_digest": "cd" * 32,
                 "model_size_bytes": 123,
                 "final_score": 0.8,
+                "incumbent_score": 0.5,
+                "evaluation_batch": {
+                    "sha256": "de" * 32,
+                    "generated_block": 101,
+                    "source_digest": "ef" * 32,
+                },
                 "score_block": 110,
                 "stages": [],
             }
@@ -368,6 +392,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
             score=0.5,
         ),
         scoring=SimpleNamespace(minimum_frontier_gain=0.001),
+        cache=SimpleNamespace(minimum_generation_delay_blocks=1),
     )
     chain = WeightChainState(
         120,

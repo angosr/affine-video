@@ -26,20 +26,24 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
 3. The evaluator accepts exactly one `selector.safetensors` file. Its only metadata entry must be
    `hotkey`, set to the complete submitting hotkey. It rejects executable code, other metadata,
    unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.
-4. Every valid model is scored once on the same hash-pinned hidden exact-attention cache. The score
-   is the conservative lower bound of its multi-budget quality-cost curve.
+4. A valid model waits for the earliest hidden exact-attention batch generated after its commitment
+   boundary. The batch records its generation block, private-source digest, and content hash.
+   Batches may serve multiple already-committed models, but no model may use an older batch.
 5. UID 0 is the genesis champion without making a commit. Its identity is pinned to the official
    VEDA repository revision, filename and file SHA-256 in the track specification. Its baseline
-   score is produced by the same frozen evaluation. A challenger replaces it, or any later
-   champion, only when `challenger_score - champion_score >= minimum_frontier_gain`.
+   For every match, the challenger and current champion are rerun on the same new batch. A
+   challenger replaces the champion only when their paired score difference reaches
+   `minimum_frontier_gain`.
 6. An immutable match record is published for every terminal item in the contiguous chain-order
    prefix. A failed or unfinished earlier submission can never be skipped to publish a later win.
 
 Scoring covers several frozen block budgets. The authoritative score combines quality and
 calibrated attention cost, so a selector must preserve quality while selecting fewer blocks. The
-track specification pins every score-affecting rule and asset hash. The evaluator covers every
-layer and head derived from the fixed architecture. Kernel-required tiles are stored in the hidden
-cache, always retained, and counted inside each block budget before predictor Top-k fills the rest.
+track specification pins every score-affecting rule and the cache-generation delay. Each match
+pins the exact batch hash and private-source digest used for its decision. The evaluator covers
+every layer and head derived from the fixed architecture. Kernel-required tiles are stored in the
+hidden cache, always retained, and counted inside each block budget before predictor Top-k fills
+the rest.
 
 The current champion receives the full subnet weight. Before any successful challenge this is UID
 0; after a valid win it is the winning Miner's hotkey. The evaluator checks the current finalized
@@ -47,7 +51,7 @@ hotkey-to-UID mapping and chain weight constraints before publishing. When the c
 longer registered or a valid vector is impossible, `weights` is `null` and Validators keep their
 last finalized weights.
 
-Before live rewards, the frozen exact-cache score must be validated against full-video quality on
+Before live rewards, the rotating exact-cache score must be validated against full-video quality on
 the target GPU. The production track must also pass ranking stability, cost calibration, baseline
 headroom, and adversarial-submission experiments. Those are track-acceptance experiments rather
 than a second runtime scoring system.
@@ -138,7 +142,7 @@ uv run --extra storage veda validator evaluate \
   --track-spec /data/track.json \
   --database /data/validator.db \
   --model-cache /data/models \
-  --exact-cache /data/exact.npz \
+  --exact-cache /data/exact-batches \
   --archive-endpoint wss://archive.example \
   --scoring-timeout-seconds 1800
 ```
@@ -153,9 +157,15 @@ This loop publishes the immutable system checks plus `status.json` and `weights.
 that the pinned hotkey is still UID 0 at every finalized snapshot and stops writing as soon as the
 evaluator publishes the immutable `track.json`.
 
+`--exact-cache` is a directory populated with immutable NPZ batches named
+`<generation-block>-<sha256>.npz`. Every batch contains the same generation block and its source
+digest in validated metadata. Publish each file with one atomic rename only after it is complete.
+Hidden arrays and source material are never published; their durable private copy must live outside
+the disposable GPU host.
+
 If `--initial-model` is omitted, the evaluator restores the pinned UID 0 VEDA weights from the
 public chunk manifest, verifies every chunk, the complete file SHA-256, the canonical tensor
-digest, and the frozen baseline score before scanning submissions. The cache is disposable.
+digest, and then reruns it beside every challenger. Local model and batch caches are disposable.
 
 Run any Validator, including the evaluator operator's independent Validator:
 

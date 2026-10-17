@@ -6,7 +6,9 @@ import pytest
 
 from scoring.cache import (
     CacheLoadError,
+    inspect_exact_cache_batch,
     load_exact_cache,
+    select_exact_cache_batch,
     validate_exact_cache,
 )
 
@@ -28,6 +30,8 @@ def test_loads_exact_cache_and_rejects_digest_or_decoded_size(tmp_path) -> None:
         metadata=metadata(
             {
                 "format": "veda-exact-cache",
+                "generated_block": 120,
+                "source_digest": "12" * 32,
                 "cases": [{"route": "route0", "stratum": "all", "epsilon": 1e-6}],
             }
         ),
@@ -56,6 +60,9 @@ def test_loads_exact_cache_and_rejects_digest_or_decoded_size(tmp_path) -> None:
 
     assert len(cases) == 1
     assert cases[0].epsilon == 1e-6
+    batch = inspect_exact_cache_batch(path, max_bytes=100_000)
+    assert batch.generated_block == 120
+    assert batch.source_digest == "12" * 32
     with pytest.raises(CacheLoadError, match="maximum block budget"):
         validate_exact_cache(
             path,
@@ -93,6 +100,8 @@ def test_exact_cache_rejects_unknown_route_and_insufficient_cases(tmp_path) -> N
         metadata=metadata(
             {
                 "format": "veda-exact-cache",
+                "generated_block": 120,
+                "source_digest": "12" * 32,
                 "cases": [{"route": "route0", "stratum": "all", "epsilon": 1e-6}],
             }
         ),
@@ -128,3 +137,43 @@ def test_exact_cache_rejects_unknown_route_and_insufficient_cases(tmp_path) -> N
             strata={"all": 0.5, "missing": 0.5},
             sample_count=2,
         )
+
+
+def test_cache_batch_must_be_generated_after_submission(tmp_path) -> None:
+    temporary = tmp_path / "temporary"
+    np.savez(
+        temporary,
+        metadata=metadata(
+            {
+                "format": "veda-exact-cache",
+                "generated_block": 120,
+                "source_digest": "34" * 32,
+                "cases": [{"route": "route0", "stratum": "all", "epsilon": 1e-6}],
+            }
+        ),
+        case_000000_q=np.ones((1, 2, 2), dtype=np.float32),
+        case_000000_k=np.ones((2, 2, 2), dtype=np.float32),
+        case_000000_v=np.ones((2, 2, 2), dtype=np.float32),
+        case_000000_dense=np.ones((1, 2, 2), dtype=np.float32),
+        case_000000_valid_keys=np.ones(2, dtype=np.bool_),
+        case_000000_required_keys=np.array([[True, False]], dtype=np.bool_),
+    )
+    temporary = temporary.with_suffix(".npz")
+    path = tmp_path / f"120-{digest(temporary)}.npz"
+    temporary.rename(path)
+    arguments = {
+        "directory": tmp_path,
+        "minimum_delay_blocks": 1,
+        "max_bytes": 100_000,
+        "min_blocks": 1,
+        "max_blocks": 1,
+        "head_dim": 2,
+        "routes": ("route0",),
+        "strata": {"all": 1.0},
+        "sample_count": 1,
+    }
+
+    selected = select_exact_cache_batch(submission_block=119, **arguments)
+    assert selected.path == path
+    with pytest.raises(CacheLoadError, match="after the submission"):
+        select_exact_cache_batch(submission_block=120, **arguments)

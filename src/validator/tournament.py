@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import StrEnum
 from math import isfinite
@@ -116,6 +116,8 @@ def challenge_from_match(document: Mapping[str, Any]) -> dict[str, Any]:
         "model_size_bytes": evaluation.get("model_size_bytes"),
         "final_score": evaluation.get("final_score"),
         "score_block": evaluation.get("score_block"),
+        "incumbent_score": evaluation.get("incumbent_score"),
+        "evaluation_batch": evaluation.get("evaluation_batch"),
         "stages": [],
     }
 
@@ -129,6 +131,7 @@ def validate_match_document(
     netuid: int,
     minimum_gain: float,
     incumbent: Champion,
+    minimum_generation_delay_blocks: int = 1,
 ) -> MatchRecord:
     """Strictly validate one stored match and its link to the previous champion."""
 
@@ -141,6 +144,7 @@ def validate_match_document(
         netuid=netuid,
         minimum_gain=minimum_gain,
         incumbent=incumbent,
+        minimum_generation_delay_blocks=minimum_generation_delay_blocks,
     )
     if dict(record.document) != dict(document):
         raise ValueError("stored match is not the canonical tournament decision")
@@ -155,6 +159,7 @@ def resolve_tournament(
     netuid: int,
     minimum_gain: float,
     initial_champion: Champion,
+    minimum_generation_delay_blocks: int = 1,
 ) -> Tournament:
     """Resolve the contiguous terminal prefix in finalized submission order."""
 
@@ -196,6 +201,7 @@ def resolve_tournament(
             netuid=netuid,
             minimum_gain=minimum_gain,
             incumbent=champion,
+            minimum_generation_delay_blocks=minimum_generation_delay_blocks,
         )
         matches.append(record)
         if state is ChallengeState.SUCCEEDED:
@@ -214,7 +220,17 @@ def resolve_tournament(
             )
             leaderboard_candidates.append(candidate)
 
-    ranked = sorted(leaderboard_candidates, key=_champion_order)
+    ranked = [champion]
+    ranked.extend(
+        sorted(
+            (
+                candidate
+                for candidate in leaderboard_candidates
+                if candidate.challenge_id != champion.challenge_id
+            ),
+            key=_champion_order,
+        )
+    )
     leaderboard = tuple(
         {"rank": rank, **candidate.public()} for rank, candidate in enumerate(ranked, start=1)
     )
@@ -230,6 +246,7 @@ def _resolve_match(
     netuid: int,
     minimum_gain: float,
     incumbent: Champion,
+    minimum_generation_delay_blocks: int,
 ) -> tuple[MatchRecord, Champion]:
     identifier = _required_string(challenge, "challenge_id")
     submission_id = _required_string(challenge, "submission_id")
@@ -258,16 +275,25 @@ def _resolve_match(
             raise ValueError("successful challenge is missing its model facts")
         score = _score(challenge.get("final_score"), "final_score")
         candidate = Champion(identifier, hotkey, repo_id, revision, score, position)
-        score_gain = canonical_score_gain(score, before.score)
+        incumbent_score = _score(challenge.get("incumbent_score"), "incumbent_score")
+        batch = _evaluation_batch(
+            challenge.get("evaluation_batch"),
+            submission_block=position.block,
+            minimum_delay_blocks=minimum_generation_delay_blocks,
+        )
+        score_gain = canonical_score_gain(score, incumbent_score)
         if score_gain >= minimum_gain:
             outcome = MatchOutcome.CHALLENGER_WON
             incumbent = candidate
         else:
             outcome = MatchOutcome.CHAMPION_RETAINED
+            incumbent = replace(incumbent, score=incumbent_score)
     else:
         if error_code is None:
             raise ValueError("failed challenge is missing its error code")
         score = None
+        incumbent_score = None
+        batch = None
         outcome = MatchOutcome.CHALLENGE_FAILED
 
     decided_block = (
@@ -289,6 +315,8 @@ def _resolve_match(
             if challenge.get("score_block") is not None
             else None
         ),
+        "incumbent_score": incumbent_score,
+        "evaluation_batch": batch,
     }
     document = {
         "track_id": track_id,
@@ -387,3 +415,30 @@ def _optional_digest(value: Any, name: str) -> str | None:
     except ValueError as exc:
         raise ValueError(f"{name} must be hexadecimal") from exc
     return result.lower()
+
+
+def _evaluation_batch(
+    value: Any,
+    *,
+    submission_block: int,
+    minimum_delay_blocks: int,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "sha256",
+        "generated_block",
+        "source_digest",
+    }:
+        raise ValueError("evaluation_batch fields are invalid")
+    sha256 = _optional_digest(value["sha256"], "evaluation batch sha256")
+    source_digest = _optional_digest(
+        value["source_digest"], "evaluation batch source_digest"
+    )
+    generated_block = _integer(value["generated_block"], "evaluation batch generated_block")
+    if generated_block < submission_block + minimum_delay_blocks:
+        raise ValueError("evaluation batch predates the submission boundary")
+    assert sha256 is not None and source_digest is not None
+    return {
+        "sha256": sha256,
+        "generated_block": generated_block,
+        "source_digest": source_digest,
+    }

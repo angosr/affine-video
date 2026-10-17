@@ -23,6 +23,7 @@ def challenge(
     *,
     state: ChallengeState = ChallengeState.SUCCEEDED,
     score: float | None = None,
+    incumbent_score: float | None = None,
     error_code: str | None = None,
 ) -> dict:
     return {
@@ -40,6 +41,16 @@ def challenge(
         "model_digest": "cd" * 32 if score is not None else None,
         "model_size_bytes": 123 if score is not None else None,
         "final_score": score,
+        "incumbent_score": incumbent_score,
+        "evaluation_batch": (
+            {
+                "sha256": f"{sequence + 100:064x}",
+                "generated_block": 200 + sequence,
+                "source_digest": f"{sequence + 200:064x}",
+            }
+            if score is not None
+            else None
+        ),
         "score_block": 200 + sequence if score is not None else None,
         "stages": [],
     }
@@ -59,9 +70,9 @@ def resolve(items: list[dict]):
 def test_fifo_matches_replace_champion_only_after_required_gain() -> None:
     tournament = resolve(
         [
-            challenge(1, "alice", score=0.6),
-            challenge(2, "bob", score=0.605),
-            challenge(3, "carol", score=0.8),
+            challenge(1, "alice", score=0.6, incumbent_score=0.1),
+            challenge(2, "bob", score=0.605, incumbent_score=0.6),
+            challenge(3, "carol", score=0.8, incumbent_score=0.6),
         ]
     )
 
@@ -79,8 +90,8 @@ def test_fifo_matches_replace_champion_only_after_required_gain() -> None:
 def test_exact_decimal_minimum_gain_is_not_lost_to_binary_rounding() -> None:
     tournament = resolve(
         [
-            challenge(1, "alice", score=0.2),
-            challenge(2, "bob", score=0.21),
+            challenge(1, "alice", score=0.2, incumbent_score=0.1),
+            challenge(2, "bob", score=0.21, incumbent_score=0.2),
         ]
     )
 
@@ -88,10 +99,21 @@ def test_exact_decimal_minimum_gain_is_not_lost_to_binary_rounding() -> None:
     assert tournament.matches[1].outcome is MatchOutcome.CHALLENGER_WON
 
 
+def test_match_uses_paired_incumbent_score_not_historical_score() -> None:
+    tournament = resolve(
+        [challenge(1, "alice", score=0.05, incumbent_score=0.04)]
+    )
+
+    assert genesis().score == 0.1
+    assert tournament.matches[0].score_gain == pytest.approx(0.01)
+    assert tournament.matches[0].outcome is MatchOutcome.CHALLENGER_WON
+    assert tournament.champion.hotkey == "alice"
+
+
 def test_failed_match_keeps_champion_and_is_publicly_auditable() -> None:
     tournament = resolve(
         [
-            challenge(1, "alice", score=0.6),
+            challenge(1, "alice", score=0.6, incumbent_score=0.1),
             challenge(
                 2,
                 "bob",
@@ -111,9 +133,9 @@ def test_failed_match_keeps_champion_and_is_publicly_auditable() -> None:
 def test_unfinished_submission_stops_the_public_match_prefix() -> None:
     tournament = resolve(
         [
-            challenge(1, "alice", score=0.6),
+            challenge(1, "alice", score=0.6, incumbent_score=0.1),
             challenge(2, "bob", state=ChallengeState.SCORING),
-            challenge(3, "carol", score=0.9),
+            challenge(3, "carol", score=0.9, incumbent_score=0.6),
         ]
     )
 
@@ -122,7 +144,9 @@ def test_unfinished_submission_stops_the_public_match_prefix() -> None:
 
 
 def test_public_match_validation_rejects_nonterminal_records() -> None:
-    public = resolve([challenge(1, "alice", score=0.6)]).matches[0].document
+    public = resolve(
+        [challenge(1, "alice", score=0.6, incumbent_score=0.1)]
+    ).matches[0].document
     tampered = {
         **public,
         "evaluation": {
@@ -151,8 +175,8 @@ def test_public_match_validation_rejects_nonterminal_records() -> None:
 def test_duplicate_hotkey_is_terminally_rejected_and_excluded_from_rankings() -> None:
     tournament = resolve(
         [
-            challenge(1, "alice", score=0.7),
-            challenge(2, "bob", score=0.8),
+            challenge(1, "alice", score=0.7, incumbent_score=0.1),
+            challenge(2, "bob", score=0.8, incumbent_score=0.7),
             challenge(
                 3,
                 "alice",
@@ -173,7 +197,7 @@ def test_tournament_rejects_a_second_non_rejected_submission_for_one_hotkey() ->
     with pytest.raises(ValueError, match="later submissions"):
         resolve(
             [
-                challenge(1, "alice", score=0.7),
-                challenge(2, "alice", score=0.8),
+                challenge(1, "alice", score=0.7, incumbent_score=0.1),
+                challenge(2, "alice", score=0.8, incumbent_score=0.7),
             ]
         )

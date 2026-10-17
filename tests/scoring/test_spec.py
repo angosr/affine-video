@@ -48,8 +48,8 @@ def valid_spec() -> dict:
             "revision": "12" * 20,
         },
         "cache": {
-            "exact_sha256": "56" * 32,
             "exact_max_bytes": 1_000_000,
+            "minimum_generation_delay_blocks": 1,
         },
         "scoring": {
             "budgets": [
@@ -82,7 +82,7 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.publication_grace_blocks == 20
     assert first.initial_champion.uid == 0
     assert first.initial_champion.repo_id == VEDA_REPO_ID
-    assert first.cache.exact_sha256 == "56" * 32
+    assert first.cache.minimum_generation_delay_blocks == 1
     assert first.scoring.minimum_frontier_gain == 0.001
     assert parse_track_spec(track_spec_dict(first)) == first
 

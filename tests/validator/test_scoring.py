@@ -1,4 +1,5 @@
 import hashlib
+import json
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from safetensors.numpy import save_file
 
 from scoring.evaluate import reference_attention
 from scoring.exact import ExactCase
+from scoring.model import validate_model
 from scoring.selector import SelectorArchitecture
 from scoring.spec import (
     VEDA_EVALUATION_FILE_SHA256,
@@ -29,6 +31,7 @@ from validator import scoring as scoring_module
 from validator.queue import ChainPosition, ChallengeState
 from validator.scoring import (
     IsolatedEvaluator,
+    PairedTrackEvaluator,
     ParticipantScoringError,
     ScoringSettings,
     StageOutcome,
@@ -43,7 +46,147 @@ from validator.store import ChallengeStore, LeasedChallenge
 from .test_store import submission_at
 
 
-def test_initial_champion_file_and_score_are_verified(monkeypatch, tmp_path) -> None:
+def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) -> None:
+    architecture = SelectorArchitecture(1, 1, 2, "float32")
+    tensors = {
+        name: np.zeros(spec.shape, dtype=np.float32)
+        for name, spec in architecture.tensor_schema.items()
+    }
+    baseline_path = tmp_path / "baseline.safetensors"
+    challenger_path = tmp_path / "challenger.safetensors"
+    save_file(tensors, baseline_path)
+    save_file(tensors, challenger_path, metadata={"hotkey": "hk1"})
+    baseline = validate_model(
+        baseline_path,
+        schema=architecture.tensor_schema,
+        max_bytes=10_000,
+    )
+    challenger = validate_model(
+        challenger_path,
+        schema=architecture.tensor_schema,
+        max_bytes=10_000,
+        expected_hotkey="hk1",
+    )
+    track = TrackSpec(
+        track_id="paired",
+        netuid=7,
+        track_start_block=1,
+        publication_grace_blocks=1,
+        initial_champion=InitialChampionSpec(
+            0,
+            "genesis-hotkey",
+            VEDA_REPO_ID,
+            VEDA_REVISION,
+            VEDA_FILENAME,
+            VEDA_FILE_SHA256,
+            baseline.file_sha256,
+            baseline.model_digest,
+            0.5,
+        ),
+        model=ModelSpec("selector.safetensors", 10_000, architecture),
+        base_model=BaseModelSpec("owner/base", "12" * 20),
+        cache=CacheSpec(1_000_000, 1),
+        scoring=ScoringSpec(
+            budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
+            sample_count=2,
+            tail_mean_weight=0.8,
+            stratum_weights=(("all", 1.0),),
+            minimum_frontier_gain=0.001,
+            bootstrap_confidence=0.95,
+            bootstrap_resamples=20,
+            bootstrap_seed=7,
+        ),
+        digest="ab" * 32,
+    )
+    cache_dir = tmp_path / "batches"
+    cache_dir.mkdir()
+    arrays = {}
+    cases = []
+    for index, seed in enumerate((1, 2)):
+        generator = np.random.default_rng(seed)
+        q = generator.normal(size=(2, 2, 2)).astype(np.float32)
+        k = generator.normal(size=(3, 2, 2)).astype(np.float32)
+        v = generator.normal(size=(3, 2, 2)).astype(np.float32)
+        dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
+        prefix = f"case_{index:06d}"
+        arrays.update(
+            {
+                f"{prefix}_q": q,
+                f"{prefix}_k": k,
+                f"{prefix}_v": v,
+                f"{prefix}_dense": dense,
+                f"{prefix}_valid_keys": np.ones(3, dtype=np.bool_),
+                f"{prefix}_required_keys": np.array(
+                    [[True, False, False], [False, True, False]], dtype=np.bool_
+                ),
+            }
+        )
+        cases.append(
+            {"route": "layer_0_head_0", "stratum": "all", "epsilon": 1e-6}
+        )
+    metadata = np.frombuffer(
+        json.dumps(
+            {
+                "format": "veda-exact-cache",
+                "generated_block": 101,
+                "source_digest": "34" * 32,
+                "cases": cases,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode(),
+        dtype=np.uint8,
+    )
+    temporary_batch = cache_dir / "temporary.npz"
+    np.savez(temporary_batch, metadata=metadata, **arrays)
+    batch_digest = hashlib.sha256(temporary_batch.read_bytes()).hexdigest()
+    temporary_batch.rename(cache_dir / f"101-{batch_digest}.npz")
+
+    with ChallengeStore(tmp_path / "validator.db", track_spec_digest=track.digest) as store:
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=1)
+        lease = store.claim_next_admission(
+            "admission", lease_ms=1_000, ready_through_block=100, now_ms=2
+        )
+        assert lease is not None
+        store.record_downloaded_model(
+            identifier,
+            lease.lease_token,
+            model_path=challenger_path,
+            file_sha256=challenger.file_sha256,
+            size_bytes=challenger.size_bytes,
+            occurred_at_ms=3,
+        )
+        store.register_validated_model(
+            identifier,
+            lease.lease_token,
+            model_digest=challenger.model_digest,
+            occurred_at_ms=4,
+        )
+        evaluator = PairedTrackEvaluator(
+            track,
+            store,
+            cache_dir,
+            tmp_path / "models",
+            baseline_path,
+            30,
+        )
+        scoring = process_next_scoring(
+            store,
+            worker_id="scoring",
+            current_finalized_block=101,
+            settings=ScoringSettings(lease_ms=60_000),
+            evaluator=evaluator,
+            now_ms=5,
+        )
+        assert scoring is not None and scoring.state is ChallengeState.SUCCEEDED
+        evaluated = store.public_challenge(identifier)
+
+    assert evaluated["final_score"] == pytest.approx(evaluated["incumbent_score"])
+    assert evaluated["evaluation_batch"]["generated_block"] == 101
+    assert evaluated["evaluation_batch"]["source_digest"] == "34" * 32
+
+
+def test_initial_champion_file_and_digest_are_verified(monkeypatch, tmp_path) -> None:
     initial = SimpleNamespace(
         hotkey="burn-hotkey",
         repo_id=VEDA_REPO_ID,
@@ -63,26 +206,16 @@ def test_initial_champion_file_and_score_are_verified(monkeypatch, tmp_path) -> 
     )
     monkeypatch.setattr(scoring_module, "validate_model", lambda *_args, **_kwargs: validated)
 
-    class FakeEvaluator:
-        def __call__(self, task):
-            assert task.challenge_id == "genesis"
-            assert task.hotkey == "burn-hotkey"
-            return StageOutcome(0.7, {"baseline": True})
-
-    monkeypatch.setattr(scoring_module, "FileTrackEvaluator", lambda *_args: FakeEvaluator())
-
     outcome = verify_initial_champion(
         track,
-        exact_cache=tmp_path / "exact.npz",
         model_path=tmp_path / "veda.safetensors",
     )
-    assert outcome.score == 0.7
+    assert outcome.model_digest == VEDA_MODEL_DIGEST
 
-    initial.score = 0.8
-    with pytest.raises(ValueError, match="score"):
+    validated.model_digest = "00" * 32
+    with pytest.raises(ValueError, match="digest"):
         verify_initial_champion(
             track,
-            exact_cache=tmp_path / "exact.npz",
             model_path=tmp_path / "veda.safetensors",
         )
 
@@ -305,7 +438,7 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
             ),
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
-        cache=CacheSpec("56" * 32, 1_000_000),
+        cache=CacheSpec(1_000_000, 1),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
             sample_count=2,

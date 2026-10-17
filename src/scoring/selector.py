@@ -124,7 +124,12 @@ class FixedSelector:
         return descriptors @ projection + mean
 
 
-def load_selector(path: str | Path, architecture: SelectorArchitecture) -> FixedSelector:
+def load_selector(
+    path: str | Path,
+    architecture: SelectorArchitecture,
+    *,
+    expected_hotkey: str | None = None,
+) -> FixedSelector:
     """Validate the file schema and materialize every submitted head.
 
     Admission already streams every tensor to validate finite values. Scoring
@@ -135,9 +140,11 @@ def load_selector(path: str | Path, architecture: SelectorArchitecture) -> Fixed
     weights: dict[str, np.ndarray] = {}
     try:
         with safe_open(Path(path), framework="numpy") as tensors:
-            if tensors.metadata():
+            metadata = tensors.metadata() or {}
+            if metadata not in ({}, {"hotkey": expected_hotkey}):
                 raise ModelValidationError(
-                    "MODEL_METADATA_INVALID", "safetensors metadata must be empty"
+                    "MODEL_OWNER_MISMATCH",
+                    "selector metadata does not match the submitting hotkey",
                 )
             if sorted(tensors.keys()) != sorted(expected):
                 raise ModelValidationError(
