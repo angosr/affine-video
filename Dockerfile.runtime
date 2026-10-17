@@ -1,0 +1,26 @@
+FROM pytorch/pytorch@sha256:6961740947d7eb3a2f25ce6a6f28aff6383a48d3ceec56257d5e9ebc02d3b92c
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates ffmpeg git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir --no-build-isolation \
+    "flash-attn-4 @ git+https://github.com/Dao-AILab/flash-attention@d15f1531a460ba456f41b01a774f33ab2db8febf#subdirectory=flash_attn/cute"
+
+RUN git init /tmp/Miowtion \
+    && git -C /tmp/Miowtion remote add origin https://github.com/veda-sparse/Miowtion.git \
+    && git -C /tmp/Miowtion fetch --depth 1 origin ffbb4c29d9b1f19f026dec0c0485840fffe4639f \
+    && git -C /tmp/Miowtion checkout --detach FETCH_HEAD \
+    && python -m pip install --no-cache-dir "/tmp/Miowtion[encode]" \
+    && rm -rf /tmp/Miowtion
+
+COPY . /tmp/veda
+RUN python -m pip install --no-cache-dir "/tmp/veda[storage]" \
+    && rm -rf /tmp/veda
+
+WORKDIR /work
+ENTRYPOINT ["veda"]

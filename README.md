@@ -182,6 +182,10 @@ partition and geometry. Batch selection ranks those public digests with the fina
 after disclosure, the nonce, leaf and Merkle path prove both pool membership and that the selected
 source was the deterministic unused candidate, without exposing future prompts or assets.
 
+`Dockerfile.runtime` builds the restorable GPU runtime from a digest-pinned PyTorch/CUDA base and
+pinned Miowtion/FlashAttention revisions. Build the source bundle and dependency lock inside that
+image, then save the image itself as the OCI artifact covered by the same manifest.
+
 Before a batch's complete challenge group becomes terminal, public artifacts exclude its hidden
 arrays, per-sample metrics, local paths, worker and lease data, retry timing, error text, stack
 traces, and credentials. Only stable error codes and retry counts are public. Use a public HTTPS
