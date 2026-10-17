@@ -234,8 +234,10 @@ uv run --extra storage veda validator evaluate \
 
 Set `VEDA_ALERT_WEBHOOK_URL` to an HTTPS push endpoint before continuous operation. Admission has
 five attempts; scoring and full-video confirmation allow nine attempts with bounded exponential
-delays, and scoring and producer workers have a four-hour wall-clock limit. Production retries a
-failed plan at most five times and sends a push alert on the first and final failure. Admission and
+delays, and scoring stages and complete producer attempts have a four-hour wall-clock limit.
+Production reserves each plan attempt in private object storage before GPU work, retries at most
+five times even across process or GPU-host loss, and sends a push alert on the first and final
+reported failure. Admission and
 scoring do the same. Waiting for a finalized batch boundary or normal producer lag does not consume
 an attempt; a batch still missing one complete generation interval after its scheduled block enters
 bounded scoring retries and sends the same first/final alerts. Scoring

@@ -29,14 +29,18 @@ from validator.production.plan import (
 from validator.production.runtime import trajectory_tensor_key
 from validator.production.service import (
     PlanCoordinator,
+    ProducerService,
+    UnitResult,
     WorkerPool,
     _find_valid_shard,
+    _plan_attempt_count,
     _prune_local_work,
+    _reserve_plan_attempt,
     _validate_source_capacity,
     _work_directory_lock,
     _write_unit_completion,
 )
-from validator.production.storage import StoredObject
+from validator.production.storage import PreconditionFailed, StoredObject
 from validator.queue import ChainPosition, ChallengeState
 
 
@@ -312,6 +316,142 @@ def test_worker_pool_has_a_plan_wall_clock_ceiling() -> None:
 
     with pytest.raises(RuntimeError, match="wall-clock limit"):
         worker.run(plan)
+
+
+class AttemptObjects:
+    def __init__(self, values=None) -> None:
+        self.values = {} if values is None else values
+
+    def list_names(self, prefix):
+        return tuple(sorted(name for name in self.values if name.startswith(prefix)))
+
+    def get(self, name):
+        return StoredObject(self.values[name], hashlib.sha256(self.values[name]).hexdigest())
+
+    def create_plan(self, name, payload):
+        existing = self.values.get(name)
+        if existing is not None and existing != payload:
+            raise PreconditionFailed("different bytes")
+        self.values[name] = payload
+        return self.get(name)
+
+
+def test_producer_retry_ceiling_survives_process_and_host_loss(monkeypatch) -> None:
+    plan = build_plan(
+        track_spec_digest="ab" * 32,
+        generation_block=120,
+        block_hash="0x" + "cd" * 32,
+        track_start_block=100,
+        minimum_generation_delay_blocks=1,
+        generation_interval_blocks=20,
+        exact_challenge_ids=("challenge",),
+        confirmation_challenge_ids=(),
+        source_proofs=(proof(0), proof(1)),
+        scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+    durable = {}
+
+    for expected in range(1, 6):
+        objects = AttemptObjects(durable)
+        assert _reserve_plan_attempt(objects, plan) == expected
+        assert _plan_attempt_count(AttemptObjects(durable), plan) == expected
+
+    assert _reserve_plan_attempt(AttemptObjects(durable), plan) == 5
+    assert len(durable) == 5
+
+    class Store:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class Coordinator:
+        def __init__(self, **_kwargs):
+            pass
+
+        def create_next(self):
+            return None
+
+        def plans(self):
+            return (("plans/120.json", StoredObject(plan.encode(), "etag"), plan),)
+
+    service = object.__new__(ProducerService)
+    service.config = SimpleNamespace(validator_database="unused.db", poll_seconds=0.01)
+    service.track = SimpleNamespace(digest=plan.track_spec_digest)
+    service.objects = AttemptObjects(durable)
+    service.pool = None
+    service.alert = None
+    monkeypatch.setattr(
+        production_service, "ChallengeStore", lambda *_args, **_kwargs: Store()
+    )
+    monkeypatch.setattr(production_service, "PlanCoordinator", Coordinator)
+    with pytest.raises(RuntimeError, match="retry ceiling"):
+        service._run_locked(once=True)
+
+
+@pytest.mark.parametrize("slow_step", ["upload", "assembly"])
+def test_producer_attempt_deadline_covers_post_generation_work(
+    tmp_path, monkeypatch, slow_step
+) -> None:
+    plan = build_plan(
+        track_spec_digest="ab" * 32,
+        generation_block=120,
+        block_hash="0x" + "cd" * 32,
+        track_start_block=100,
+        minimum_generation_delay_blocks=1,
+        generation_interval_blocks=20,
+        exact_challenge_ids=("challenge",),
+        confirmation_challenge_ids=(),
+        source_proofs=(proof(0), proof(1)),
+        scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+    clock = {"now": 0.0}
+    monkeypatch.setattr(production_service.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        production_service,
+        "_ready_file",
+        lambda _path, prefix, suffix: ReadyObject(
+            f"{prefix}/artifact{suffix}", "12" * 32, 1
+        ),
+    )
+
+    class Workers:
+        def run(self, _plan, *, deadline):
+            assert deadline == 10.0
+            return (UnitResult(plan.rollouts[0].rollout_id, "shard", "video", "latent", 1, 0),)
+
+    class Objects:
+        def put_content(self, *_args, **_kwargs):
+            if slow_step == "upload":
+                clock["now"] = 11.0
+
+    def assemble(*_args, **_kwargs):
+        clock["now"] = 11.0
+        return SimpleNamespace(path=tmp_path / "never-used.npz", sha256="34" * 32)
+
+    if slow_step == "assembly":
+        monkeypatch.setattr(production_service, "assemble_exact_cache_batch", assemble)
+    service = object.__new__(ProducerService)
+    service.objects = Objects()
+    service.config = SimpleNamespace(work_dir=tmp_path)
+    service.track = SimpleNamespace(
+        digest="ab" * 32,
+        artifact_manifest_sha256="34" * 32,
+        source_pool_merkle_root="56" * 32,
+        cache=SimpleNamespace(exact_max_bytes=10**9),
+    )
+
+    with pytest.raises(RuntimeError, match="attempt exceeded"):
+        service._execute(
+            "plans/120.json",
+            StoredObject(plan.encode(), "etag"),
+            plan,
+            Workers(),
+            deadline=10.0,
+        )
 
 
 def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkeypatch) -> None:

@@ -25,6 +25,8 @@ from validator.alerts import webhook_alerter
 from validator.production.commitment import (
     ArtifactManifest,
     SourcePool,
+    canonical_json,
+    decode_canonical_json,
     load_bound_source_pool,
     verify_source_proof,
 )
@@ -42,6 +44,9 @@ from validator.production.runtime import trajectory_tensor_key
 from validator.production.storage import PreconditionFailed, PrivateObjectStore, StoredObject
 from validator.queue import ChallengeState
 from validator.store import ChallengeStore
+
+_MAX_PLAN_ATTEMPTS = 5
+_PRODUCER_ATTEMPT_TIMEOUT_SECONDS = 4 * 60 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,13 +256,20 @@ class WorkerPool:
             self._queues.append(tasks)
             self._processes.append(process)
 
-    def run(self, plan: BatchPlan) -> tuple[UnitResult, ...]:
+    def run(
+        self,
+        plan: BatchPlan,
+        *,
+        deadline: float | None = None,
+    ) -> tuple[UnitResult, ...]:
         for index, rollout in enumerate(plan.rollouts):
             self._queues[index % len(self._queues)].put((plan, rollout))
         results: dict[str, UnitResult] = {}
-        deadline = time.monotonic() + self._timeout_seconds
+        worker_deadline = time.monotonic() + self._timeout_seconds
+        if deadline is not None:
+            worker_deadline = min(worker_deadline, deadline)
         while len(results) < len(plan.rollouts):
-            remaining = deadline - time.monotonic()
+            remaining = worker_deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("producer workers exceeded the plan wall-clock limit")
             try:
@@ -268,7 +280,7 @@ class WorkerPool:
                     raise RuntimeError(
                         f"producer worker exited unexpectedly: {failed[0].exitcode}"
                     ) from None
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= worker_deadline:
                     raise RuntimeError(
                         "producer workers exceeded the plan wall-clock limit"
                     ) from None
@@ -297,7 +309,10 @@ class ProducerService:
         config: ProducerConfig,
         *,
         alert: Callable[[str, Mapping[str, object]], None] | None = None,
+        attempt_timeout_seconds: float = _PRODUCER_ATTEMPT_TIMEOUT_SECONDS,
     ) -> None:
+        if attempt_timeout_seconds <= 0:
+            raise ValueError("producer attempt timeout must be positive")
         self.config = config
         self.track = load_track_spec(config.track_spec)
         self.objects = PrivateObjectStore.from_environment(
@@ -326,6 +341,7 @@ class ProducerService:
         _validate_source_capacity(self.pool, self.track)
         config.work_dir.mkdir(parents=True, exist_ok=True)
         self.alert = alert
+        self.attempt_timeout_seconds = attempt_timeout_seconds
 
     def run(self, *, once: bool = False) -> None:
         with _work_directory_lock(self.config.work_dir):
@@ -333,7 +349,6 @@ class ProducerService:
 
     def _run_locked(self, *, once: bool) -> None:
         workers: WorkerPool | None = None
-        failures: dict[str, int] = {}
         try:
             while True:
                 with ChallengeStore(
@@ -354,17 +369,25 @@ class ProducerService:
                     retained = _retained_plan_digests(coordinator.plans())
                 ready_block = None
                 if pending is not None:
+                    plan = pending[2]
+                    attempts = _plan_attempt_count(self.objects, plan)
+                    if attempts >= _MAX_PLAN_ATTEMPTS:
+                        raise RuntimeError(
+                            f"producer retry ceiling reached for block "
+                            f"{plan.generation_block}"
+                        )
+                    attempt = _reserve_plan_attempt(self.objects, plan)
                     if workers is None:
                         workers = WorkerPool(self.config, self.track)
                     try:
-                        ready = self._execute(pending[0], pending[1], pending[2], workers)
+                        deadline = time.monotonic() + self.attempt_timeout_seconds
+                        ready = self._execute(
+                            pending[0], pending[1], plan, workers, deadline=deadline
+                        )
                     except Exception as exc:
                         workers.close()
                         workers = None
-                        plan = pending[2]
-                        attempt = failures.get(plan.plan_digest, 0) + 1
-                        failures[plan.plan_digest] = attempt
-                        if self.alert is not None and (attempt == 1 or attempt == 5):
+                        if self.alert is not None and attempt in {1, _MAX_PLAN_ATTEMPTS}:
                             self.alert(
                                 "PRODUCER_PLAN_FAILURE",
                                 {
@@ -374,14 +397,13 @@ class ProducerService:
                                     "error": (str(exc) or type(exc).__name__)[:500],
                                 },
                             )
-                        if once or attempt >= 5:
+                        if once or attempt >= _MAX_PLAN_ATTEMPTS:
                             raise RuntimeError(
                                 f"producer retry ceiling reached for block "
                                 f"{plan.generation_block}: {exc}"
                             ) from exc
                         time.sleep(min(300.0, self.config.poll_seconds * (2 ** (attempt - 1))))
                         continue
-                    failures.pop(pending[2].plan_digest, None)
                     ready_block = ready.generation_block
                 _prune_local_work(self.config.work_dir, retained)
                 _report_cycle(
@@ -404,8 +426,12 @@ class ProducerService:
         stored: StoredObject,
         plan: BatchPlan,
         workers: WorkerPool,
+        *,
+        deadline: float,
     ) -> BatchPlan:
-        results = workers.run(plan)
+        _require_before_deadline(deadline)
+        results = workers.run(plan, deadline=deadline)
+        _require_before_deadline(deadline)
         references = []
         for result in results:
             video = _ready_file(Path(result.video_path), "videos", ".mp4")
@@ -413,9 +439,11 @@ class ProducerService:
             self.objects.put_content(
                 result.video_path, sha256=video.sha256, object_name=video.object_key
             )
+            _require_before_deadline(deadline)
             self.objects.put_content(
                 result.latent_path, sha256=latent.sha256, object_name=latent.object_key
             )
+            _require_before_deadline(deadline)
             references.append(DenseReference(result.rollout_id, video, latent))
         directory = self.config.work_dir / plan.plan_digest / "batch"
         batch = assemble_exact_cache_batch(
@@ -430,6 +458,7 @@ class ProducerService:
             source_proofs=tuple(proof.document() for proof in plan.source_proofs),
             dense_references=tuple(reference.document() for reference in references),
         )
+        _require_before_deadline(deadline)
         if batch.path.stat().st_size > self.track.cache.exact_max_bytes:
             raise RuntimeError("generated exact cache exceeds the frozen track byte limit")
         exact = ReadyObject(
@@ -438,14 +467,18 @@ class ProducerService:
             batch.path.stat().st_size,
         )
         self.objects.put_content(batch.path, sha256=exact.sha256, object_name=exact.object_key)
+        _require_before_deadline(deadline)
         ready = plan.ready(exact=exact, dense_references=tuple(references))
         try:
             self.objects.replace_plan(name, ready.encode(), etag=stored.etag)
         except PreconditionFailed:
+            _require_before_deadline(deadline)
             winner = BatchPlan.decode(self.objects.get(name).body)
+            _require_before_deadline(deadline)
             if winner.state != "READY":
                 raise RuntimeError("plan changed without reaching READY") from None
             return winner
+        _require_before_deadline(deadline)
         return ready
 
 
@@ -756,6 +789,81 @@ def _file_sha256(path: Path) -> str:
 
 def _plan_name(block: int) -> str:
     return f"plans/{block}.json"
+
+
+def _plan_attempt_count(objects: PrivateObjectStore, plan: BatchPlan) -> int:
+    prefix = f"attempts/{plan.plan_digest}/"
+    names = objects.list_names(prefix)
+    attempts: list[int] = []
+    expected_fields = {
+        "attempt",
+        "format",
+        "generation_block",
+        "plan_digest",
+        "track_spec_digest",
+    }
+    for name in names:
+        suffix = name.removeprefix(prefix)
+        if not name.startswith(prefix) or not suffix.endswith(".json"):
+            raise RuntimeError("private producer attempt index is invalid")
+        try:
+            attempt = int(suffix[:-5])
+        except ValueError as exc:
+            raise RuntimeError("private producer attempt index is invalid") from exc
+        try:
+            document = decode_canonical_json(objects.get(name).body)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("private producer attempt fact is invalid") from exc
+        if (
+            not isinstance(document, dict)
+            or set(document) != expected_fields
+            or document.get("format") != "veda-producer-attempt-v1"
+            or document.get("attempt") != attempt
+            or document.get("generation_block") != plan.generation_block
+            or document.get("plan_digest") != plan.plan_digest
+            or document.get("track_spec_digest") != plan.track_spec_digest
+        ):
+            raise RuntimeError("private producer attempt fact is invalid")
+        attempts.append(attempt)
+    attempts.sort()
+    if attempts != list(range(1, len(attempts) + 1)):
+        raise RuntimeError("private producer attempt sequence is invalid")
+    if len(attempts) > _MAX_PLAN_ATTEMPTS:
+        raise RuntimeError("private producer attempt sequence exceeds its ceiling")
+    return len(attempts)
+
+
+def _reserve_plan_attempt(
+    objects: PrivateObjectStore,
+    plan: BatchPlan,
+) -> int:
+    while True:
+        attempts = _plan_attempt_count(objects, plan)
+        if attempts >= _MAX_PLAN_ATTEMPTS:
+            return attempts
+        attempt = attempts + 1
+        payload = canonical_json(
+            {
+                "attempt": attempt,
+                "format": "veda-producer-attempt-v1",
+                "generation_block": plan.generation_block,
+                "plan_digest": plan.plan_digest,
+                "track_spec_digest": plan.track_spec_digest,
+            }
+        )
+        try:
+            objects.create_plan(
+                f"attempts/{plan.plan_digest}/{attempt}.json",
+                payload,
+            )
+        except PreconditionFailed:
+            continue
+        return attempt
+
+
+def _require_before_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise RuntimeError("producer attempt exceeded the wall-clock limit")
 
 
 @contextmanager
