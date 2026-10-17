@@ -191,9 +191,16 @@ def test_validator_query_does_not_create_a_missing_database(tmp_path, capsys) ->
 
 
 def test_validator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch, capsys) -> None:
+    from validator.production import config as config_module
+    from validator.production import retries as retries_module
+    from validator.production import storage as storage_module
+
+    calls = []
+
     class Store:
-        def __init__(self, database):
+        def __init__(self, database, *, track_spec_digest):
             assert database == "validator.db"
+            assert track_spec_digest == "ab" * 32
 
         def __enter__(self):
             return self
@@ -201,11 +208,50 @@ def test_validator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch,
         def __exit__(self, *_args):
             return None
 
-        def resume_blocked(self, challenge_id):
+        def blocked_resume_state(self, challenge_id):
             assert challenge_id == "challenge-1"
             return ChallengeState.CONFIRMING
 
+        def resume_blocked(self, challenge_id):
+            assert challenge_id == "challenge-1"
+            calls.append("local")
+            return ChallengeState.CONFIRMING
+
+    class Objects:
+        @classmethod
+        def from_environment(cls, **kwargs):
+            assert kwargs == {"bucket": "private", "prefix": f"root/tracks/{'ab' * 32}"}
+            return cls()
+
+        def verify_conditional_writes(self):
+            calls.append("probe")
+
+    class Retries:
+        def __init__(self, _objects, *, track_spec_digest):
+            assert track_spec_digest == "ab" * 32
+
+        def reset(self, challenge_id, stage):
+            assert (challenge_id, stage) == ("challenge-1", "CONFIRMING")
+            calls.append("durable")
+
     monkeypatch.setattr(cli_module, "ChallengeStore", Store)
+    monkeypatch.setattr(
+        config_module,
+        "load_producer_config",
+        lambda _path: SimpleNamespace(
+            validator_database=cli_module.Path("validator.db"),
+            track_spec=cli_module.Path("track.json"),
+            storage_bucket="private",
+            storage_prefix="root",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_track_spec",
+        lambda _path: SimpleNamespace(digest="ab" * 32),
+    )
+    monkeypatch.setattr(storage_module, "PrivateObjectStore", Objects)
+    monkeypatch.setattr(retries_module, "PrivateRetryStore", Retries)
 
     main(
         [
@@ -214,6 +260,8 @@ def test_validator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch,
             "challenge-1",
             "--database",
             "validator.db",
+            "--production-config",
+            "production.json",
         ]
     )
 
@@ -221,6 +269,7 @@ def test_validator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch,
         "challenge_id": "challenge-1",
         "state": "CONFIRMING",
     }
+    assert calls == ["probe", "durable", "local"]
 
 
 def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_path) -> None:

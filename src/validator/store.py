@@ -1410,6 +1410,29 @@ class ChallengeStore:
             self._connection.rollback()
             raise
 
+    def blocked_resume_state(self, identifier: str) -> ChallengeState:
+        """Return the stage fenced by one visible infrastructure block."""
+
+        row = self._connection.execute(
+            "SELECT state, resume_state FROM challenges WHERE challenge_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(identifier)
+        if ChallengeState(row["state"]) is not ChallengeState.SYSTEM_BLOCKED:
+            raise ValueError("challenge is not blocked by infrastructure")
+        if row["resume_state"] is None:
+            raise ValueError("blocked challenge has no resumable stage")
+        stage = ChallengeState(row["resume_state"])
+        if stage not in {
+            ChallengeState.FETCHING,
+            ChallengeState.VALIDATING,
+            ChallengeState.SCORING,
+            ChallengeState.CONFIRMING,
+        }:
+            raise ValueError("blocked challenge has an invalid resumable stage")
+        return stage
+
     def transition(
         self,
         identifier: str,

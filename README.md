@@ -260,8 +260,12 @@ scoring do the same. Waiting for a finalized batch boundary or normal producer l
 an attempt; a batch still missing one complete generation interval after its scheduled block enters
 bounded scoring retries and sends the same first/final alerts. Scoring
 exhaustion enters visible `SYSTEM_BLOCKED` state without becoming a Miner loss; after repairing the
-cause, resume its original stage with
-`veda validator retry <challenge-id> --database /data/validator.db`.
+cause, resume its original stage with:
+
+```bash
+veda validator retry <challenge-id> --database /data/validator.db \
+  --production-config /data/production.json
+```
 
 After the track close grace block, unfinished system work first publishes an irreversible
 `weights.json` fence with `track_aborted=true` and no weight plan, then the immutable

@@ -13,8 +13,10 @@ from pathlib import Path
 from miner.chain import ChainSubmissionError, submit_model
 from miner.prepare import prepare_model
 from miner.submit import ModelSubmission, SubmissionFormatError
+from scoring.spec import load_track_spec
 from validator.monitor import fetch_status, render_status
 from validator.publication import S3Repository
+from validator.retries import retry_stage
 from validator.run import (
     DEFAULT_BASELINE_MANIFEST_URL,
     DEFAULT_NETUID,
@@ -77,6 +79,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     retry.add_argument("challenge_id")
     retry.add_argument("--database", required=True)
+    retry.add_argument("--production-config", required=True)
     monitor = validator_commands.add_parser("monitor", help="watch the public ranking and queue")
     monitor.add_argument("--status-url", default=DEFAULT_PUBLIC_STATUS_URL)
     monitor.add_argument(
@@ -217,9 +220,25 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
 
     if arguments.command == "retry":
         try:
-            with ChallengeStore(arguments.database) as store:
+            from validator.production.config import load_producer_config
+            from validator.production.retries import PrivateRetryStore
+            from validator.production.storage import PrivateObjectStore
+
+            config = load_producer_config(arguments.production_config)
+            if config.validator_database.resolve() != Path(arguments.database).resolve():
+                raise ValueError("production configuration uses a different validator database")
+            track = load_track_spec(config.track_spec)
+            with ChallengeStore(arguments.database, track_spec_digest=track.digest) as store:
+                stage = store.blocked_resume_state(arguments.challenge_id)
+                objects = PrivateObjectStore.from_environment(
+                    bucket=config.storage_bucket,
+                    prefix=f"{config.storage_prefix}/tracks/{track.digest}",
+                )
+                objects.verify_conditional_writes()
+                retries = PrivateRetryStore(objects, track_spec_digest=track.digest)
+                retries.reset(arguments.challenge_id, retry_stage(stage))
                 state = store.resume_blocked(arguments.challenge_id)
-        except (KeyError, OSError, ValueError) as exc:
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
             parser.exit(1, f"error: {exc}\n")
         print(
             json.dumps(
