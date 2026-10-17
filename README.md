@@ -222,8 +222,9 @@ Set `VEDA_ALERT_WEBHOOK_URL` to an HTTPS push endpoint before continuous operati
 five attempts; scoring and full-video confirmation allow nine attempts with bounded exponential
 delays, and scoring and producer workers have a four-hour wall-clock limit. Production retries a
 failed plan at most five times and sends a push alert on the first and final failure. Admission and
-scoring do the same; waiting for a finalized batch boundary or a healthy producer does not consume
-an attempt. Scoring
+scoring do the same. Waiting for a finalized batch boundary or normal producer lag does not consume
+an attempt; a batch still missing one complete generation interval after its scheduled block enters
+bounded scoring retries and sends the same first/final alerts. Scoring
 exhaustion enters visible `SYSTEM_BLOCKED` state without becoming a Miner loss; after repairing the
 cause, resume its original stage with
 `veda validator retry <challenge-id> --database /data/validator.db`.
@@ -238,8 +239,10 @@ a new track ID.
 binds its finalized block hash, source proofs, runtime artifacts and each case's planned
 source/rollout, route, step/sigma and deterministic query selection. Private R2
 stores the source pool, runtime-specific artifacts, every generated batch and every validated
-selector. The producer verifies atomic conditional creates and replacements against that endpoint
-before starting. Local SQLite, model downloads and work directories are disposable.
+selector together with its immutable challenge binding and recoverable stage results. Admission
+replays restore this archive before contacting the submitted repository. The producer verifies
+atomic conditional creates and replacements against that endpoint before starting. Local SQLite,
+model downloads and work directories are disposable.
 
 Run the private data producer separately with the same production configuration:
 
