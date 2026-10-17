@@ -1,7 +1,12 @@
 import numpy as np
 import pytest
 
-from scoring.video import VideoCell, paired_video_gain_bound, trajectory_latent_quality
+from scoring.video import (
+    VideoCell,
+    VideoFidelityMetric,
+    paired_video_gain_bound,
+    trajectory_latent_quality,
+)
 
 
 def test_trajectory_score_distinguishes_equal_final_states() -> None:
@@ -26,6 +31,84 @@ def test_trajectory_score_distinguishes_equal_final_states() -> None:
 
     assert identity == pytest.approx(1.0)
     assert changed == pytest.approx(0.75)
+
+
+def test_non_finite_sparse_latents_receive_zero_fidelity() -> None:
+    metric = object.__new__(VideoFidelityMetric)
+    dense_rows = np.ones((2, 3), dtype=np.float32)
+    sparse_rows = dense_rows.copy()
+    sparse_rows[0, 0] = np.nan
+    frames = np.ones((2, 2, 2, 3), dtype=np.uint8)
+
+    result = metric.score(
+        dense_video_rows=dense_rows,
+        sparse_video_rows=sparse_rows,
+        dense_frames=frames,
+        sparse_frames=frames,
+        dense_trajectory={},
+        sparse_trajectory={},
+        step_window_weights={},
+        metric_version="veda-video-fidelity-v1",
+        latent_weight=0.4,
+        frame_weight=0.3,
+        temporal_weight=0.3,
+        black_frame_threshold=0.01,
+        flicker_threshold=2.0,
+    )
+
+    assert result.score == 0.0
+    assert result.eligible is False
+    assert result.latent_quality == 0.0
+
+
+def test_non_finite_dense_latents_remain_an_infrastructure_error() -> None:
+    metric = object.__new__(VideoFidelityMetric)
+    dense_rows = np.full((2, 3), np.nan, dtype=np.float32)
+    frames = np.ones((2, 2, 2, 3), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match="dense video latents"):
+        metric.score(
+            dense_video_rows=dense_rows,
+            sparse_video_rows=np.ones((2, 3), dtype=np.float32),
+            dense_frames=frames,
+            sparse_frames=frames,
+            dense_trajectory={},
+            sparse_trajectory={},
+            step_window_weights={},
+            metric_version="veda-video-fidelity-v1",
+            latent_weight=0.4,
+            frame_weight=0.3,
+            temporal_weight=0.3,
+            black_frame_threshold=0.01,
+            flicker_threshold=2.0,
+        )
+
+
+def test_non_finite_sparse_trajectory_receives_zero_fidelity() -> None:
+    metric = object.__new__(VideoFidelityMetric)
+    rows = np.ones((2, 3), dtype=np.float32)
+    sparse_trajectory = {(0, "early"): rows.copy()}
+    sparse_trajectory[(0, "early")][0, 0] = np.inf
+    frames = np.ones((2, 2, 2, 3), dtype=np.uint8)
+
+    result = metric.score(
+        dense_video_rows=rows,
+        sparse_video_rows=rows,
+        dense_frames=frames,
+        sparse_frames=frames,
+        dense_trajectory={(0, "early"): rows},
+        sparse_trajectory=sparse_trajectory,
+        step_window_weights={"early": 1.0},
+        metric_version="veda-video-fidelity-v2",
+        latent_weight=0.4,
+        frame_weight=0.3,
+        temporal_weight=0.3,
+        black_frame_threshold=0.01,
+        flicker_threshold=2.0,
+    )
+
+    assert result.score == 0.0
+    assert result.eligible is False
 
 
 def test_video_gain_bootstrap_keeps_budgets_inside_rollout_cluster() -> None:

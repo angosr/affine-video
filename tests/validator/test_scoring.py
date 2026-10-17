@@ -415,6 +415,60 @@ def test_exact_winner_requires_a_new_full_video_batch_before_completion(tmp_path
     assert challenge["evaluation_batch"]["generated_block"] == 140
 
 
+def test_zero_quality_confirmation_finishes_without_infrastructure_retry(tmp_path) -> None:
+    def evaluate(task):
+        if task.state is ChallengeState.SCORING:
+            return StageOutcome(
+                0.8,
+                {
+                    "cache_generated_block": 120,
+                    "cache_plan_digest": "12" * 32,
+                    "cache_seed_block_hash": "0x" + "ab" * 32,
+                    "cache_sha256": "34" * 32,
+                    "incumbent_score": 0.7,
+                    "paired_gain_lower_bound": 0.02,
+                    "requires_confirmation": True,
+                },
+            )
+        return StageOutcome(
+            0.0,
+            {
+                "cache_generated_block": 140,
+                "cache_plan_digest": "56" * 32,
+                "cache_seed_block_hash": "0x" + "cd" * 32,
+                "cache_sha256": "78" * 32,
+                "incumbent_score": 0.7,
+                "paired_gain_lower_bound": -0.7,
+            },
+        )
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_scoring(store)
+        exact = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=120,
+            settings=ScoringSettings(),
+            evaluator=evaluate,
+            now_ms=20,
+        )
+        confirmation = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=140,
+            settings=ScoringSettings(),
+            evaluator=evaluate,
+            now_ms=21,
+        )
+        challenge = store.get_challenge(identifier)
+
+    assert exact is not None and exact.state is ChallengeState.CONFIRMING
+    assert confirmation is not None and confirmation.state is ChallengeState.SUCCEEDED
+    assert challenge.state is ChallengeState.SUCCEEDED
+    assert challenge.final_score == 0.0
+    assert challenge.attempts == 2
+
+
 def test_recorded_score_resumes_without_repeating_evaluation(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier = ready_for_scoring(store)

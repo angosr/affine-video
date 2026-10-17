@@ -58,6 +58,10 @@ class RuntimeTraceVerification:
     output_mean_abs: tuple[float, ...]
 
 
+class SparseOutputInvalid(RuntimeError):
+    """A schema-valid selector produced unusable sparse rollout values."""
+
+
 class DenseRolloutRuntime:
     """One long-lived teacher per GPU; rollout inputs and outputs remain disposable."""
 
@@ -216,10 +220,15 @@ class DenseRolloutRuntime:
             raise RuntimeError("sparse rollout omitted frozen trajectory steps")
         video = rollout.video_rows[rollout.n_cond_video :].float().cpu().numpy()
         audio = rollout.audio_rows[rollout.n_cond_audio :].float().cpu().numpy()
-        if not np.isfinite(video).all() or not np.isfinite(audio).all():
-            raise RuntimeError("sparse rollout produced non-finite final latents")
+        invalid = (
+            not np.isfinite(video).all()
+            or not np.isfinite(audio).all()
+            or any(not np.isfinite(rows).all() for _, _, rows in trajectory)
+        )
         del predictor, state
         torch.cuda.empty_cache()
+        if invalid:
+            raise SparseOutputInvalid("sparse rollout produced non-finite latents")
         return SparseRollout(
             video,
             audio,

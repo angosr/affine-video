@@ -99,33 +99,48 @@ class VideoFidelityMetric:
             or abs(fsum(weights) - 1.0) > 1e-12
         ):
             raise ValueError("video metric weights must be non-negative and sum to one")
+        if metric_version not in {"veda-video-fidelity-v1", "veda-video-fidelity-v2"}:
+            raise ValueError("full-video metric version is unsupported")
         dense_latent = _finite_array(dense_video_rows, "dense video latents")
-        sparse_latent = _finite_array(sparse_video_rows, "sparse video latents")
+        sparse_latent = np.asarray(sparse_video_rows)
+        if sparse_latent.size == 0:
+            raise ValueError("sparse video latents must be non-empty")
         if dense_latent.shape != sparse_latent.shape:
             raise ValueError("dense and sparse video latents must have the same shape")
         dense = _frames(dense_frames, "dense frames")
         sparse = _frames(sparse_frames, "sparse frames")
         if dense.shape != sparse.shape:
             raise ValueError("dense and sparse decoded frames must have the same shape")
+        if dense.shape[0] < 2:
+            raise ValueError("full-video metric requires at least two frames")
+
+        sparse_trajectory_invalid = False
+        trajectory_pairs = None
+        if metric_version == "veda-video-fidelity-v2":
+            trajectory_pairs, sparse_trajectory_invalid = _trajectory_pairs(
+                dense_trajectory,
+                sparse_trajectory,
+                step_window_weights=step_window_weights,
+                allow_nonfinite_sparse=True,
+            )
+        if not np.isfinite(sparse_latent).all() or sparse_trajectory_invalid:
+            return _catastrophic_fidelity(dense, sparse)
+        sparse_latent = _finite_array(sparse_latent, "sparse video latents")
 
         final_latent_quality = _latent_quality(sparse_latent, dense_latent)
         if metric_version == "veda-video-fidelity-v1":
             latent_quality = final_latent_quality
             trajectory_quality = final_latent_quality
         elif metric_version == "veda-video-fidelity-v2":
-            trajectory_quality = trajectory_latent_quality(
-                dense_trajectory,
-                sparse_trajectory,
-                step_window_weights=step_window_weights,
+            assert trajectory_pairs is not None
+            trajectory_quality = _trajectory_quality(
+                trajectory_pairs,
+                step_window_weights,
             )
             latent_quality = (final_latent_quality + trajectory_quality) / 2.0
-        else:
-            raise ValueError("full-video metric version is unsupported")
         dense_features = self._embed(dense)
         sparse_features = self._embed(sparse)
         frame_quality = _mean_cosine(dense_features, sparse_features)
-        if dense_features.shape[0] < 2:
-            raise ValueError("full-video metric requires at least two temporal features")
         temporal_quality = _mean_cosine(
             np.diff(dense_features, axis=0), np.diff(sparse_features, axis=0)
         )
@@ -186,6 +201,22 @@ def trajectory_latent_quality(
 ) -> float:
     """Aggregate intermediate latent fidelity without treating steps as samples."""
 
+    by_window, _ = _trajectory_pairs(
+        dense,
+        sparse,
+        step_window_weights=step_window_weights,
+        allow_nonfinite_sparse=False,
+    )
+    return _trajectory_quality(by_window, step_window_weights)
+
+
+def _trajectory_pairs(
+    dense: Mapping[tuple[int, str], np.ndarray],
+    sparse: Mapping[tuple[int, str], np.ndarray],
+    *,
+    step_window_weights: Mapping[str, float],
+    allow_nonfinite_sparse: bool,
+) -> tuple[dict[str, list[tuple[np.ndarray, np.ndarray]]], bool]:
     if not dense or set(dense) != set(sparse):
         raise ValueError("dense and sparse trajectories must be non-empty and aligned")
     if (
@@ -194,19 +225,37 @@ def trajectory_latent_quality(
         or abs(fsum(step_window_weights.values()) - 1.0) > 1e-12
     ):
         raise ValueError("trajectory window weights must be positive and sum to one")
-    by_window: dict[str, list[float]] = {window: [] for window in step_window_weights}
+    by_window: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {
+        window: [] for window in step_window_weights
+    }
+    nonfinite_sparse = False
     for (step, window), reference in dense.items():
         if type(step) is not int or step < 0 or window not in by_window:
             raise ValueError("trajectory step identity is invalid")
-        candidate = _finite_array(sparse[(step, window)], "sparse trajectory latents")
         target = _finite_array(reference, "dense trajectory latents")
+        candidate = np.asarray(sparse[(step, window)])
+        if candidate.size == 0:
+            raise ValueError("sparse trajectory latents must be non-empty")
         if candidate.shape != target.shape:
             raise ValueError("dense and sparse trajectory latents must have the same shape")
-        by_window[window].append(_latent_quality(candidate, target))
+        finite = np.isfinite(candidate).all()
+        if not finite and not allow_nonfinite_sparse:
+            raise ValueError("sparse trajectory latents must be non-empty and finite")
+        nonfinite_sparse |= not finite
+        by_window[window].append((candidate, target))
     if any(not values for values in by_window.values()):
         raise ValueError("trajectory must cover every weighted step window")
+    return by_window, nonfinite_sparse
+
+
+def _trajectory_quality(
+    by_window: Mapping[str, list[tuple[np.ndarray, np.ndarray]]],
+    step_window_weights: Mapping[str, float],
+) -> float:
     return fsum(
-        step_window_weights[window] * fsum(values) / len(values)
+        step_window_weights[window]
+        * fsum(_latent_quality(candidate, target) for candidate, target in values)
+        / len(values)
         for window, values in by_window.items()
     )
 
@@ -318,6 +367,26 @@ def _relative_mse(candidate: np.ndarray, reference: np.ndarray) -> float:
 
 def _latent_quality(candidate: np.ndarray, reference: np.ndarray) -> float:
     return 1.0 / (1.0 + _relative_mse(candidate, reference))
+
+
+def _catastrophic_fidelity(dense_frames: np.ndarray, sparse_frames: np.ndarray) -> VideoFidelity:
+    black_fraction = float(np.mean(sparse_frames.mean(axis=(1, 2, 3)) <= 1.0))
+    dense_motion = float(
+        np.mean(np.abs(np.diff(dense_frames.astype(np.float32), axis=0)))
+    )
+    sparse_motion = float(
+        np.mean(np.abs(np.diff(sparse_frames.astype(np.float32), axis=0)))
+    )
+    return VideoFidelity(
+        score=0.0,
+        latent_quality=0.0,
+        trajectory_quality=0.0,
+        frame_quality=0.0,
+        temporal_quality=0.0,
+        black_frame_fraction=black_fraction,
+        flicker_ratio=sparse_motion / max(dense_motion, 1e-6),
+        eligible=False,
+    )
 
 
 def _finite_array(value: np.ndarray, name: str) -> np.ndarray:

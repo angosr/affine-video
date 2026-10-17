@@ -14,6 +14,7 @@ from scoring.spec import TrackSpec
 from scoring.video import VideoCell, VideoFidelityMetric, paired_video_gain_bound
 from validator.production.batches import ConfirmationBatch
 from validator.production.config import ProducerConfig
+from validator.production.runtime import SparseOutputInvalid
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,45 +188,23 @@ def _confirmation_worker(
                         dense["video_rows"], geometry=rollout.stratum
                     )
                     for budget in track.scoring.budgets:
-                        sparse = runtime.generate_sparse(
-                            sample_id=rollout.source_id,
-                            geometry=rollout.stratum,
-                            seed=rollout.noise_seed,
-                            selector_path=selector_path,
-                            architecture=track.model.selector,
-                            budget=budget,
-                            steps=tuple(
-                                (step.index, step.window) for step in batch.plan.selected_steps
-                            ),
-                        )
-                        sparse_trajectory = {
-                            (step, window): rows
-                            for step, window, rows in sparse.trajectory_video_rows
-                        }
-                        sparse_frames = runtime.decode_frames(
-                            sparse.video_rows, geometry=rollout.stratum
-                        )
-                        fidelity = metric.score(
-                            dense_video_rows=dense["video_rows"],
-                            sparse_video_rows=sparse.video_rows,
-                            dense_frames=dense_frames,
-                            sparse_frames=sparse_frames,
-                            dense_trajectory=dense_trajectory,
-                            sparse_trajectory=sparse_trajectory,
-                            step_window_weights=track.scoring.step_window_weight_map,
-                            metric_version=track.full_video.metric_version,
-                            latent_weight=track.full_video.latent_weight,
-                            frame_weight=track.full_video.frame_weight,
-                            temporal_weight=track.full_video.temporal_weight,
-                            black_frame_threshold=track.full_video.black_frame_threshold,
-                            flicker_threshold=track.full_video.flicker_threshold,
-                        )
                         cells.append(
                             VideoCell(
                                 rollout.stratum,
                                 rollout.rollout_id,
                                 budget.target_blocks,
-                                fidelity.score,
+                                _score_rollout_budget(
+                                    runtime=runtime,
+                                    metric=metric,
+                                    rollout=rollout,
+                                    selector_path=selector_path,
+                                    track=track,
+                                    budget=budget,
+                                    selected_steps=batch.plan.selected_steps,
+                                    dense=dense,
+                                    dense_frames=dense_frames,
+                                    dense_trajectory=dense_trajectory,
+                                ),
                             )
                         )
                 results.put(("ok", side, tuple(cells)))
@@ -233,3 +212,52 @@ def _confirmation_worker(
                 results.put(("error", side, f"{type(exc).__name__}: {exc}"))
     except Exception as exc:
         results.put(("error", f"gpu-{gpu_id}", f"startup failed: {type(exc).__name__}: {exc}"))
+
+
+def _score_rollout_budget(
+    *,
+    runtime: Any,
+    metric: Any,
+    rollout: Any,
+    selector_path: str,
+    track: TrackSpec,
+    budget: Any,
+    selected_steps: tuple[Any, ...],
+    dense: dict[str, Any],
+    dense_frames: Any,
+    dense_trajectory: dict[tuple[int, str], Any],
+) -> float:
+    """Score one cell, treating non-finite model output as zero quality."""
+
+    try:
+        sparse = runtime.generate_sparse(
+            sample_id=rollout.source_id,
+            geometry=rollout.stratum,
+            seed=rollout.noise_seed,
+            selector_path=selector_path,
+            architecture=track.model.selector,
+            budget=budget,
+            steps=tuple((step.index, step.window) for step in selected_steps),
+        )
+    except SparseOutputInvalid:
+        return 0.0
+    sparse_trajectory = {
+        (step, window): rows for step, window, rows in sparse.trajectory_video_rows
+    }
+    sparse_frames = runtime.decode_frames(sparse.video_rows, geometry=rollout.stratum)
+    fidelity = metric.score(
+        dense_video_rows=dense["video_rows"],
+        sparse_video_rows=sparse.video_rows,
+        dense_frames=dense_frames,
+        sparse_frames=sparse_frames,
+        dense_trajectory=dense_trajectory,
+        sparse_trajectory=sparse_trajectory,
+        step_window_weights=track.scoring.step_window_weight_map,
+        metric_version=track.full_video.metric_version,
+        latent_weight=track.full_video.latent_weight,
+        frame_weight=track.full_video.frame_weight,
+        temporal_weight=track.full_video.temporal_weight,
+        black_frame_threshold=track.full_video.black_frame_threshold,
+        flicker_threshold=track.full_video.flicker_threshold,
+    )
+    return fidelity.score
