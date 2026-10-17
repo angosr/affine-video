@@ -24,7 +24,7 @@ from validator.alerts import webhook_alerter
 from validator.chain import ScanResult, scan_finalized_blocks, seed_legacy_exclusions
 from validator.download import DownloadedModel, download_chunked_asset, download_public_model
 from validator.production.batches import ReadyBatchSource
-from validator.production.commitment import ArtifactManifest
+from validator.production.commitment import ArtifactManifest, load_bound_source_pool
 from validator.production.config import load_producer_config
 from validator.production.confirmation import ConfirmationWorkerPool
 from validator.production.storage import PrivateObjectStore
@@ -182,6 +182,15 @@ async def run_evaluator(
             raise ValueError("artifact manifest does not match the track commitment")
         objects.ensure_artifacts(manifest, data_config.artifact_root)
         data_config.verify_manifest(manifest)
+        source_pool_payload = objects.ensure_bootstrap(
+            "bootstrap/source_pool.json", data_config.source_pool
+        )
+        load_bound_source_pool(
+            source_pool_payload,
+            data_config.artifact_path(data_config.runtime.source_binding).read_bytes(),
+            expected_root=track.source_pool_merkle_root,
+            sample_cache=data_config.artifact_path(data_config.runtime.sample_cache),
+        )
         batch_source = ReadyBatchSource(track=track, objects=objects, cache_dir=cache_dir)
         confirmation_pool = ConfirmationWorkerPool(
             data_config,

@@ -10,6 +10,7 @@ from validator.production.commitment import (
     SourceLeaf,
     SourcePool,
     canonical_json,
+    load_bound_source_pool,
     verify_source_proof,
 )
 
@@ -106,6 +107,14 @@ def test_source_cache_binding_requires_exact_leaf_and_sample_coverage(tmp_path) 
 
     with pytest.raises(ValueError, match="sample IDs differ"):
         binding.verify_local(pool, cache)
+
+    with pytest.raises(ValueError, match="track commitment"):
+        load_bound_source_pool(
+            pool.encode(),
+            binding.encode(),
+            expected_root="00" * 32,
+            sample_cache=cache,
+        )
 
 
 def test_artifact_manifest_is_canonical_and_verifies_local_bytes(tmp_path) -> None:

@@ -315,6 +315,23 @@ class SourceCacheBinding:
             raise ValueError("encoded sample IDs differ from the committed source pool")
 
 
+def load_bound_source_pool(
+    source_pool: bytes,
+    source_binding: bytes,
+    *,
+    expected_root: str,
+    sample_cache: str | Path,
+) -> SourcePool:
+    """Load the only source pool whose committed inputs may enter runtime."""
+
+    pool = SourcePool.decode(source_pool)
+    if pool.root != expected_root:
+        raise ValueError("source pool does not match the track commitment")
+    binding = SourceCacheBinding.decode(source_binding)
+    binding.verify_local(pool, sample_cache)
+    return pool
+
+
 def verify_source_proof(proof: SourceProof, expected_root: str) -> bool:
     """Verify one disclosed source without revealing the remaining pool."""
 
