@@ -56,7 +56,7 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
         f"{bold}{cyan}VEDA SN{status.get('netuid', '?')}  "
         f"block {status.get('source_block', '?')}{reset}"
     )
-    headers = ("UID", "HOTKEY", "STATUS", "QUEUE", "MATCH", "SCORE", "RESULT")
+    headers = ("UID", "HOTKEY", "STATUS", "QUEUE", "MATCH", "SCORE", "GAIN", "RESULT")
     rows: list[tuple[str, ...]] = []
     for raw in participants:
         if not isinstance(raw, Mapping):
@@ -70,6 +70,7 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
         queue = raw.get("queue_position")
         match = raw.get("match_sequence")
         score = raw.get("score")
+        gain = raw.get("score_gain")
         outcome = raw.get("outcome")
         rows.append(
             (
@@ -79,6 +80,7 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
                 f"{yellow}#{queue}{reset}" if queue is not None else "-",
                 f"#{match}" if match is not None else "-",
                 f"{float(score):.6f}" if isinstance(score, (int, float)) else "-",
+                f"{float(gain):+.6f}" if isinstance(gain, (int, float)) else "-",
                 str(outcome) if outcome is not None else "-",
             )
         )

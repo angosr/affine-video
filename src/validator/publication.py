@@ -605,7 +605,14 @@ def _status_document(
             ),
             "queue_position": None,
             "match_sequence": 0,
-            "score": initial.score,
+            "score": (
+                tournament.champion.score
+                if tournament.champion.challenge_id == initial.challenge_id
+                else initial.score
+            ),
+            "incumbent_score": None,
+            "score_gain": None,
+            "batch_generated_block": None,
             "outcome": "GENESIS",
             "champion": tournament.champion.challenge_id == initial.challenge_id,
         }
@@ -615,6 +622,7 @@ def _status_document(
         if challenge is None:
             raise PublicArtifactError("active commitment has no local challenge")
         match = match_by_id.get(challenge["challenge_id"])
+        is_champion = tournament.champion.challenge_id == challenge["challenge_id"]
         active_rows.append(
             {
                 "uid": competitor["uid"],
@@ -624,9 +632,18 @@ def _status_document(
                 "state": challenge["state"],
                 "queue_position": None,
                 "match_sequence": None if match is None else match.sequence,
-                "score": challenge["final_score"],
+                "score": (
+                    tournament.champion.score if is_champion else challenge["final_score"]
+                ),
+                "incumbent_score": challenge["incumbent_score"],
+                "score_gain": None if match is None else match.score_gain,
+                "batch_generated_block": (
+                    None
+                    if challenge["evaluation_batch"] is None
+                    else challenge["evaluation_batch"]["generated_block"]
+                ),
                 "outcome": None if match is None else match.outcome,
-                "champion": (tournament.champion.challenge_id == challenge["challenge_id"]),
+                "champion": is_champion,
             }
         )
     waiting = [

@@ -165,36 +165,39 @@ class TrackEvaluator:
 
 
 @dataclass(frozen=True, slots=True)
-class FileTrackEvaluator:
-    """Load the deterministic exact sample inside the isolated worker."""
+class FilePairedEvaluator:
+    """Load one batch once and score both sides of a match in one worker."""
 
     track: TrackSpec
     exact_cache: str
     exact_sha256: str
     sample_seed: int
+    incumbent: LeasedChallenge
 
-    def __call__(self, task: LeasedChallenge) -> StageOutcome:
+    def __call__(self, challenger: LeasedChallenge) -> StageOutcome:
         try:
             scoring = self.track.scoring
-            if task.state is ChallengeState.SCORING:
-                exact_cases = sample_exact_cache(
-                    self.exact_cache,
-                    expected_sha256=self.exact_sha256,
-                    max_bytes=self.track.cache.exact_max_bytes,
-                    count=scoring.sample_count,
-                    seed=self.sample_seed,
-                    routes=self.track.model.selector.routes,
-                    strata=scoring.stratum_weight_map,
-                )
-            else:
-                exact_cases = ()
+            exact_cases = sample_exact_cache(
+                self.exact_cache,
+                expected_sha256=self.exact_sha256,
+                max_bytes=self.track.cache.exact_max_bytes,
+                count=scoring.sample_count,
+                seed=self.sample_seed,
+                routes=self.track.model.selector.routes,
+                strata=scoring.stratum_weight_map,
+            )
         except CacheLoadError as exc:
             raise TemporaryScoringError("SCORING_CACHE_INVALID", str(exc)) from exc
-        return TrackEvaluator(
-            self.track,
-            exact_cases,
-            presampled=True,
-        )(task)
+        evaluator = TrackEvaluator(self.track, exact_cases, presampled=True)
+        challenger_result = evaluator(challenger)
+        incumbent_result = evaluator(self.incumbent)
+        return StageOutcome(
+            challenger_result.score,
+            {
+                **challenger_result.metrics,
+                "incumbent_score": incumbent_result.score,
+            },
+        )
 
 
 def verify_initial_champion(
@@ -254,25 +257,26 @@ class PairedTrackEvaluator:
             bytes.fromhex(self.track.digest) + bytes.fromhex(batch.sha256)
         ).hexdigest()
         seed = panel_seed(seed_digest, stage="exact")
-        evaluator = FileTrackEvaluator(
+        evaluator = FilePairedEvaluator(
             self.track,
             str(batch.path),
             batch.sha256,
             seed,
+            incumbent_task,
         )
         isolated = IsolatedEvaluator(
             evaluator,
-            timeout_seconds=self.timeout_seconds,
+            timeout_seconds=self.timeout_seconds * 2,
             max_memory_bytes=self.max_memory_bytes,
-            max_cpu_seconds=self.max_cpu_seconds,
+            max_cpu_seconds=(
+                None if self.max_cpu_seconds is None else self.max_cpu_seconds * 2
+            ),
         )
-        challenger = isolated(task)
-        reference = isolated(incumbent_task)
+        paired = isolated(task)
         return StageOutcome(
-            challenger.score,
+            paired.score,
             {
-                **challenger.metrics,
-                "incumbent_score": reference.score,
+                **paired.metrics,
                 "cache_sha256": batch.sha256,
                 "cache_generated_block": batch.generated_block,
                 "cache_source_digest": batch.source_digest,
