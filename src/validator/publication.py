@@ -219,14 +219,14 @@ def build_public_artifacts(
                 raise PublicArtifactError(
                     "batch disclosure omitted its exact evaluation object"
                 )
-        if match.outcome.value == "CHALLENGER_WON":
+        object_name = evaluation["model_object"]
+        if object_name is not None:
             path_value = store.model_path(match.challenge_id)
             path = None if path_value is None else Path(path_value)
             if path is None or not path.is_file():
                 if model_resolver is None:
-                    raise PublicArtifactError("winning model has no durable archive source")
+                    raise PublicArtifactError("scored model has no durable archive source")
                 path = model_resolver(evaluation["file_sha256"], evaluation["model_size_bytes"])
-            object_name = evaluation["model_object"]
             files[object_name] = PublicFile(
                 object_name,
                 path,
@@ -737,6 +737,7 @@ class S3Repository:
             matches = tuple(
                 self._load_following_matches(track, 1, genesis_champion(track))
             )
+            self._verify_model_archives(matches)
             return PublicLedger(
                 None,
                 matches,
@@ -804,6 +805,7 @@ class S3Repository:
 
         matches.extend(self._load_following_matches(track, match_count + 1, incumbent))
         complete_matches = tuple(matches)
+        self._verify_model_archives(complete_matches)
         return PublicLedger(
             source_block,
             complete_matches,
@@ -938,21 +940,33 @@ class S3Repository:
             if document != expected:
                 raise PublicArtifactError("public batch disclosure is not canonical")
             for object_name, sha256, size_bytes in files:
-                self._verify_disclosed_file(object_name, sha256, size_bytes)
+                self._verify_public_file(object_name, sha256, size_bytes)
             self._confirmed_immutable[record_name] = hashlib.sha256(payload).hexdigest()
             disclosed.add(plan_digest)
         return frozenset(disclosed)
 
-    def _verify_disclosed_file(self, object_name: str, sha256: str, size_bytes: int) -> None:
+    def _verify_model_archives(self, matches: tuple[MatchRecord, ...]) -> None:
+        for match in matches:
+            evaluation = match.document["evaluation"]
+            object_name = evaluation["model_object"]
+            if object_name is None:
+                continue
+            self._verify_public_file(
+                object_name,
+                evaluation["file_sha256"],
+                evaluation["model_size_bytes"],
+            )
+
+    def _verify_public_file(self, object_name: str, sha256: str, size_bytes: int) -> None:
         payload = self._get_optional(object_name)
         if payload is None:
-            raise PublicArtifactError("public batch disclosure file is missing")
+            raise PublicArtifactError("public immutable file is missing")
         try:
             manifest = ChunkManifest.decode(payload)
         except ValueError as exc:
-            raise PublicArtifactError("public batch disclosure file manifest is invalid") from exc
+            raise PublicArtifactError("public immutable file manifest is invalid") from exc
         if manifest.sha256 != sha256 or manifest.size != size_bytes:
-            raise PublicArtifactError("public batch disclosure file identity is invalid")
+            raise PublicArtifactError("public immutable file identity is invalid")
         self._verify_public_chunks(object_name, manifest)
         self._confirmed_immutable[object_name] = sha256
 

@@ -275,7 +275,7 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch(tmp_path) -
         model_resolver=restore_model,
     )
     assert with_files is not None
-    assert resolved == [(winning_digest, winning_model.stat().st_size)] * 2
+    assert resolved == [(winning_digest, winning_model.stat().st_size)] * 3
     assert sum(item.object_name.startswith("models/") for item in with_files.files) == 1
 
     remote = MemoryS3()

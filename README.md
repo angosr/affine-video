@@ -130,8 +130,9 @@ tracks/main/
   `batches/<sha256>/manifest.json` publishes its exact QKV batch, while `batch_assets/` publishes
   every referenced source video and dense latent. Each manifest verifies every bounded part and the
   reassembled file digest.
-- `models/<track_id>/<sha256>/manifest.json` is the public durable copy of every winning selector.
-  A private copy of every validated selector is stored before scoring, so publication and later
+- `models/<track_id>/<sha256>/manifest.json` is the public durable copy of every selector that
+  completes scoring, including challengers that do not replace the champion. A private copy of
+  every validated selector is stored before scoring, so publication, independent replay and later
   matches remain recoverable even if the GPU host or original Hugging Face repository disappears.
 - `summary.json` is a bounded current view containing the champion, top leaderboard and committed
   match count.

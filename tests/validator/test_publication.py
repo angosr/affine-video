@@ -595,6 +595,13 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) ->
     assert len(ledger.matches) == 1
     assert ledger.matches[0].challenge_id == "challenge"
 
+    model_prefix = f"veda/track/models/{track.track_id}/{model_sha256}/"
+    model_part = next(key for key in client.objects if key.startswith(model_prefix + "part-"))
+    model_bytes = client.objects.pop(model_part)
+    with pytest.raises(PublicArtifactError, match="chunk is missing"):
+        asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
+    client.objects[model_part] = model_bytes
+
     original_match = client.objects.pop("veda/track/matches/veda-test-v1/000000000001.json")
     with pytest.raises(PublicArtifactError, match="committed match is missing"):
         asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
@@ -603,6 +610,73 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) ->
     client.objects["veda/track/matches/veda-test-v1/000000000001.json"] = b"{}"
     with pytest.raises(PublicArtifactError, match="match is invalid"):
         asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
+
+
+def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(tmp_path) -> None:
+    track = parse_track_spec(valid_spec())
+    model = tmp_path / "retained-challenger.safetensors"
+    model.write_bytes(b"retained challenger")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
+    batch = {
+        "sha256": "de" * 32,
+        "generated_block": 104,
+        "plan_digest": "ef" * 32,
+        "seed_block_hash": "0x" + "ab" * 32,
+    }
+    challenge = {
+        "challenge_id": "challenge",
+        "submission_id": "submission",
+        "hotkey": "alice",
+        "repo_id": "owner/model",
+        "revision": "12" * 20,
+        "block_height": 100,
+        "extrinsic_index": 0,
+        "event_index": 0,
+        "state": "SUCCEEDED",
+        "error_code": None,
+        "file_sha256": model_sha256,
+        "model_digest": "cd" * 32,
+        "model_size_bytes": model.stat().st_size,
+        "final_score": 0.49,
+        "incumbent_score": 0.5,
+        "paired_gain_lower_bound": -0.01,
+        "evaluation_batch": batch,
+        "score_block": 110,
+        "stages": [
+            {
+                "stage": "SCORING",
+                "score": 0.49,
+                "score_block": 110,
+                "incumbent_score": 0.5,
+                "paired_gain_lower_bound": -0.01,
+                "evaluation_batch": batch,
+            }
+        ],
+    }
+    store = SimpleNamespace(
+        chain_cursor=lambda: (120, "0x" + "12" * 32),
+        public_snapshot=lambda: {"challenges": [challenge]},
+        active_competitors=lambda _mapping: [],
+        model_path=lambda _challenge_id: str(model),
+    )
+    chain = WeightChainState(
+        120,
+        {track.initial_champion.hotkey: 0, "alice": 4},
+        1,
+        1.0,
+        10,
+        {},
+    )
+
+    artifacts = build_public_artifacts(store, track, chain, version_key=0)
+
+    assert artifacts is not None
+    assert json.loads(artifacts.matches[0][1])["outcome"] == "CHAMPION_RETAINED"
+    assert len(artifacts.files) == 1
+    assert artifacts.files[0].object_name == (
+        f"models/{track.track_id}/{model_sha256}/manifest.json"
+    )
+    assert artifacts.files[0].path == model
 
 
 def test_empty_track_publishes_uid_zero_veda_as_genesis_champion() -> None:
