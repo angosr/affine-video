@@ -10,7 +10,9 @@ from scoring.cache import (
     load_exact_cache,
     select_exact_cache_batch,
     validate_exact_cache,
+    write_exact_cache_batch,
 )
+from scoring.exact import ExactCase
 
 
 def digest(path) -> str:
@@ -177,3 +179,28 @@ def test_cache_batch_must_be_generated_after_submission(tmp_path) -> None:
     assert selected.path == path
     with pytest.raises(CacheLoadError, match="after the submission"):
         select_exact_cache_batch(submission_block=120, **arguments)
+
+
+def test_cache_batch_writer_is_atomic_and_self_identifying(tmp_path) -> None:
+    case = ExactCase(
+        "route0",
+        "all",
+        np.ones((1, 2, 2), dtype=np.float32),
+        np.ones((2, 2, 2), dtype=np.float32),
+        np.ones((2, 2, 2), dtype=np.float32),
+        np.ones((1, 2, 2), dtype=np.float32),
+        np.ones(2, dtype=np.bool_),
+        np.array([[True, False]], dtype=np.bool_),
+        1e-6,
+    )
+
+    batch = write_exact_cache_batch(
+        tmp_path,
+        (case,),
+        generated_block=200,
+        source_digest="56" * 32,
+    )
+
+    assert batch.path.name == f"200-{batch.sha256}.npz"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [batch.path.name]
+    assert inspect_exact_cache_batch(batch.path, max_bytes=100_000) == batch

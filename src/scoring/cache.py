@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -32,6 +34,78 @@ class ExactCacheBatch:
     sha256: str
     generated_block: int
     source_digest: str
+
+
+def write_exact_cache_batch(
+    directory: str | Path,
+    cases: tuple[ExactCase, ...],
+    *,
+    generated_block: int,
+    source_digest: str,
+) -> ExactCacheBatch:
+    """Atomically serialize one private exact-cache batch for the evaluator."""
+
+    if type(generated_block) is not int or generated_block < 0:
+        raise ValueError("cache generated block must be a non-negative integer")
+    if not cases:
+        raise ValueError("cache batch requires at least one case")
+    if not isinstance(source_digest, str) or len(source_digest) != 64:
+        raise ValueError("cache source digest must contain 32 bytes")
+    try:
+        bytes.fromhex(source_digest)
+    except ValueError as exc:
+        raise ValueError("cache source digest must be hexadecimal") from exc
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    metadata_cases = []
+    arrays: dict[str, np.ndarray] = {}
+    for index, case in enumerate(cases):
+        if not case.route or not case.stratum or not isfinite(case.epsilon) or case.epsilon <= 0:
+            raise ValueError("cache case metadata is invalid")
+        metadata_cases.append(
+            {"route": case.route, "stratum": case.stratum, "epsilon": case.epsilon}
+        )
+        prefix = f"case_{index:06d}"
+        for field in ("q", "k", "v", "dense", "valid_keys", "required_keys"):
+            value = np.asarray(getattr(case, field))
+            if value.dtype.hasobject:
+                raise ValueError("cache arrays cannot contain objects")
+            arrays[f"{prefix}_{field}"] = value
+    metadata = np.frombuffer(
+        json.dumps(
+            {
+                "format": "veda-exact-cache",
+                "generated_block": generated_block,
+                "source_digest": source_digest.lower(),
+                "cases": metadata_cases,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode(),
+        dtype=np.uint8,
+    )
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=root, suffix=".tmp", delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            np.savez(temporary, metadata=metadata, **arrays)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        sha256 = _file_sha256(temporary_path)
+        target = root / f"{generated_block}-{sha256}.npz"
+        if target.exists():
+            if _file_sha256(target) != sha256:
+                raise CacheLoadError("existing cache batch content is invalid")
+            temporary_path.unlink()
+        else:
+            os.replace(temporary_path, target)
+        return ExactCacheBatch(target, sha256, generated_block, source_digest.lower())
+    except Exception:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+        raise
 
 
 def select_exact_cache_batch(
