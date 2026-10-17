@@ -227,6 +227,50 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
     assert submitted["version_key"] == 9
 
 
+def test_independent_validator_rejects_weights_for_another_track() -> None:
+    track = run_module.load_track_spec("track.json")
+    artifact = WeightArtifact(
+        "another-track",
+        track.digest,
+        track.netuid,
+        track.mechid,
+        9,
+        120,
+        WeightPlan(120, ("alice",), (4,), (1.0,)),
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            content=(
+                json.dumps(
+                    {
+                        "track_spec_digest": track.digest,
+                        "spec": track_spec_dict(track),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                if request.url.path.endswith("track.json")
+                else encode_weight_artifact(artifact)
+            ),
+        )
+    )
+
+    async def execute():
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            return await process_weight_cycle(
+                object(),
+                http_client,
+                SimpleNamespace(name="wallet"),
+                validator_hotkey="validator",
+                public_weights_url="https://public.example/weights.json",
+                max_staleness_blocks=20,
+            )
+
+    with pytest.raises(ValueError, match="different track"):
+        asyncio.run(execute())
+
+
 def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
     model_path = tmp_path / "selector.safetensors"
     save_file(

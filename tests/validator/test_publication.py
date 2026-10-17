@@ -28,6 +28,7 @@ from validator.publication import (
     build_public_artifacts,
     decode_weight_artifact,
     encode_weight_artifact,
+    fetch_track_identity,
     fetch_weight_artifact,
     validate_public_weights_url,
 )
@@ -420,6 +421,31 @@ def test_fetch_weight_artifact_is_https_only_and_size_bounded() -> None:
         asyncio.run(oversized())
     with pytest.raises(ValueError, match="HTTPS"):
         validate_public_weights_url("http://public.example/weights.json")
+
+
+def test_weight_setter_accepts_a_digest_bound_legacy_track_identity() -> None:
+    spec = {
+        "track_id": "veda-sn120-v1",
+        "netuid": 120,
+        "mechid": 1,
+        "legacy_scoring": {"format": "retired-v1"},
+    }
+    digest = hashlib.sha256(canonical_json(spec)).hexdigest()
+    payload = canonical_json({"spec": spec, "track_spec_digest": digest})
+
+    async def run():
+        transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=payload))
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_track_identity(
+                "https://public.example/track.json",
+                client=client,
+            )
+
+    identity = asyncio.run(run())
+    assert identity.track_id == "veda-sn120-v1"
+    assert identity.track_spec_digest == digest
+    assert identity.netuid == 120
+    assert identity.mechid == 1
 
 
 @pytest.mark.parametrize("prefix", ["../track", "track//main", "track name", "track\nmain"])

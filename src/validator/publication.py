@@ -100,6 +100,16 @@ class PublicLedger:
         return max(committed, decided)
 
 
+@dataclass(frozen=True, slots=True)
+class PublicTrackIdentity:
+    """The small authenticated track boundary needed by a weight setter."""
+
+    track_id: str
+    track_spec_digest: str
+    netuid: int
+    mechid: int
+
+
 def build_public_artifacts(
     store: ChallengeStore,
     track: TrackSpec,
@@ -456,6 +466,44 @@ async def fetch_track_spec(
 ) -> TrackSpec:
     """Fetch and verify the current track document from public storage."""
 
+    document = await _fetch_track_document(url, client=client)
+    try:
+        track = parse_track_spec(document["spec"])
+    except ValueError as exc:
+        raise PublicArtifactError("public track specification is invalid") from exc
+    if document["track_spec_digest"] != track.digest:
+        raise PublicArtifactError("public track digest is invalid")
+    return track
+
+
+async def fetch_track_identity(
+    url: str,
+    *,
+    client: httpx.AsyncClient,
+) -> PublicTrackIdentity:
+    """Fetch the version-independent track identity needed for chain weights."""
+
+    document = await _fetch_track_document(url, client=client)
+    spec = document["spec"]
+    try:
+        track_id = _string(spec["track_id"], "track_id")
+        netuid = _integer(spec["netuid"], "netuid", maximum=0xFFFF)
+        mechid = _integer(spec["mechid"], "mechid")
+    except (KeyError, TypeError, PublicArtifactError) as exc:
+        raise PublicArtifactError("public track identity is invalid") from exc
+    return PublicTrackIdentity(
+        track_id,
+        document["track_spec_digest"],
+        netuid,
+        mechid,
+    )
+
+
+async def _fetch_track_document(
+    url: str,
+    *,
+    client: httpx.AsyncClient,
+) -> dict[str, Any]:
     validate_public_weights_url(url)
     received = bytearray()
     try:
@@ -472,13 +520,16 @@ async def fetch_track_spec(
     document = _decode_canonical_object(bytes(received), "track")
     if set(document) != {"track_spec_digest", "spec"}:
         raise PublicArtifactError("public track fields are invalid")
-    try:
-        track = parse_track_spec(document["spec"])
-    except ValueError as exc:
-        raise PublicArtifactError("public track specification is invalid") from exc
-    if document["track_spec_digest"] != track.digest:
+    digest = document["track_spec_digest"]
+    spec = document["spec"]
+    if (
+        not isinstance(digest, str)
+        or _HEX_32.fullmatch(digest) is None
+        or not isinstance(spec, dict)
+        or hashlib.sha256(_json_bytes(spec)).hexdigest() != digest
+    ):
         raise PublicArtifactError("public track digest is invalid")
-    return track
+    return document
 
 
 def validate_public_weights_url(url: str) -> str:

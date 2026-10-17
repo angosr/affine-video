@@ -33,7 +33,7 @@ from validator.publication import (
     PublicLedger,
     build_genesis_artifacts,
     build_public_artifacts,
-    fetch_track_spec,
+    fetch_track_identity,
     fetch_weight_artifact,
     validate_public_weights_url,
 )
@@ -501,17 +501,19 @@ async def process_weight_cycle(
     public_weights_url: str,
     max_staleness_blocks: int,
 ) -> WeightCycleResult:
-    track = await fetch_track_spec(
+    track = await fetch_track_identity(
         public_weights_url.rsplit("/", 1)[0] + "/track.json",
         client=http_client,
     )
     artifact = await fetch_weight_artifact(public_weights_url, client=http_client)
+    if artifact.track_id != track.track_id:
+        raise ValueError("public weights target a different track")
     chain = await read_weight_chain_state(client, netuid=track.netuid)
     plan = validate_weight_artifact(
         artifact,
         chain,
         expected_netuid=track.netuid,
-        expected_track_digest=track.digest,
+        expected_track_digest=track.track_spec_digest,
         expected_mechid=track.mechid,
         max_staleness_blocks=max_staleness_blocks,
     )
