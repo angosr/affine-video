@@ -228,6 +228,26 @@ class PairedTrackEvaluator:
             confirmation=task.state is ChallengeState.CONFIRMING,
         )
 
+    def batch_deadline_block(self, task: LeasedChallenge) -> int:
+        """Return the finalized block after which a missing batch is an outage."""
+
+        if task.state is ChallengeState.SCORING:
+            basis_block = task.position.block
+        elif task.state is ChallengeState.CONFIRMING:
+            exact = self.store.stage_score(task.challenge_id, ChallengeState.SCORING)
+            if exact is None:
+                raise RuntimeError("confirmation is missing its completed exact decision")
+            basis_block = exact.score_block
+        else:
+            raise ValueError("batch deadline requires a scoring stage")
+        scheduled = scheduled_generation_block(
+            basis_block,
+            track_start_block=self.track.track_start_block,
+            minimum_generation_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
+            generation_interval_blocks=self.track.cache.generation_interval_blocks,
+        )
+        return scheduled + self.track.cache.generation_interval_blocks
+
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         snapshot = self.store.public_snapshot()
         tournament = resolve_tournament(
@@ -582,6 +602,25 @@ def evaluate_next_scoring(
         try:
             batch_ready = getattr(evaluator, "batch_ready", None)
             if batch_ready is not None and not batch_ready(task):
+                deadline = getattr(evaluator, "batch_deadline_block", None)
+                deadline_block = None if deadline is None else deadline(task)
+                if deadline_block is not None and current_finalized_block > deadline_block:
+                    state = _defer_or_fail(
+                        store,
+                        task,
+                        settings,
+                        now,
+                        code="EVALUATION_BATCH_TIMEOUT",
+                        summary=(
+                            "evaluation batch remained unavailable after finalized "
+                            f"block {deadline_block}"
+                        ),
+                    )
+                    return ScoringOutcome(
+                        task.challenge_id,
+                        state,
+                        "EVALUATION_BATCH_TIMEOUT",
+                    )
                 store.wait_leased(
                     task.challenge_id,
                     task.lease_token,

@@ -662,6 +662,58 @@ def test_normal_producer_lag_waits_without_attempt_or_alert(tmp_path) -> None:
         assert completed is not None and completed.state is ChallengeState.SUCCEEDED
 
 
+def test_overdue_batch_uses_bounded_retries_and_push_alerts(tmp_path) -> None:
+    alerts = []
+
+    class MissingBatch:
+        def ready_through_block(self, _head):
+            return 100
+
+        def batch_ready(self, _task):
+            return False
+
+        def batch_deadline_block(self, _task):
+            return 100
+
+        def __call__(self, _task):
+            raise AssertionError("an unavailable batch must not be evaluated")
+
+    settings = ScoringSettings(
+        retry_base_ms=10,
+        retry_max_ms=10,
+        max_attempts=2,
+        alert=lambda event, details: alerts.append((event, details)),
+    )
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_scoring(store)
+        first = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=101,
+            settings=settings,
+            evaluator=MissingBatch(),
+            now_ms=20,
+        )
+        assert first is not None and first.state is ChallengeState.SYSTEM_DEFERRED
+        assert first.code == "EVALUATION_BATCH_TIMEOUT"
+        assert store.get_challenge(identifier).attempts == 1
+
+        final = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=102,
+            settings=settings,
+            evaluator=MissingBatch(),
+            now_ms=30,
+        )
+        assert final is not None and final.state is ChallengeState.SYSTEM_BLOCKED
+        assert final.code == "EVALUATION_BATCH_TIMEOUT"
+        assert [event for event, _details in alerts] == [
+            "SCORING_RETRY_STARTED",
+            "SCORING_RETRY_EXHAUSTED",
+        ]
+
+
 def test_scoring_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
     alerts = []
     settings = ScoringSettings(
