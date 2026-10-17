@@ -25,7 +25,7 @@ from validator.production.plan import (
     build_plan,
     validate_source_selection_sequence,
 )
-from validator.queue import TERMINAL_STATES
+from validator.queue import TERMINAL_STATES, ChallengeState
 from validator.s3 import client_config
 from validator.store import ChallengeStore
 from validator.system_matches import system_match_artifacts, system_match_summaries
@@ -870,13 +870,16 @@ class S3Repository:
 
         terminal_ids = {match.challenge_id for match in matches}
         batches: dict[str, list[Mapping[str, Any]]] = {}
+        stage_uses: dict[str, list[tuple[MatchRecord, Mapping[str, Any]]]] = {}
         for match in matches:
             evaluation = match.document["evaluation"]
-            used = [
-                stage["evaluation_batch"]
-                for stage in evaluation["stages"]
-                if "evaluation_batch" in stage
-            ]
+            used = []
+            for stage in evaluation["stages"]:
+                batch = stage.get("evaluation_batch")
+                if batch is None:
+                    continue
+                used.append(batch)
+                stage_uses.setdefault(batch["plan_digest"], []).append((match, stage))
             if evaluation["evaluation_batch"] is not None:
                 used.append(evaluation["evaluation_batch"])
             for batch in used:
@@ -918,6 +921,46 @@ class S3Repository:
                 or not challenge_ids.issubset(terminal_ids)
             ):
                 raise PublicArtifactError("public batch disclosure conflicts with the ledger")
+            uses = stage_uses.get(plan_digest, [])
+            exact_ids = tuple(
+                match.challenge_id
+                for match, stage in uses
+                if stage["stage"] == ChallengeState.SCORING
+            )
+            confirmation_ids = tuple(
+                match.challenge_id
+                for match, stage in uses
+                if stage["stage"] == ChallengeState.CONFIRMING
+            )
+            if (
+                exact_ids != plan.exact_challenge_ids
+                or confirmation_ids != plan.confirmation_challenge_ids
+            ):
+                raise PublicArtifactError(
+                    "public batch disclosure challenge assignment is invalid"
+                )
+            for match, stage in uses:
+                if stage["stage"] == ChallengeState.SCORING:
+                    scheduled_from = match.document["submission"]["block_height"]
+                else:
+                    exact_stages = [
+                        item
+                        for item in match.document["evaluation"]["stages"]
+                        if item["stage"] == ChallengeState.SCORING
+                    ]
+                    if len(exact_stages) != 1:
+                        raise PublicArtifactError(
+                            "public confirmation is missing its exact decision"
+                        )
+                    scheduled_from = exact_stages[0]["score_block"]
+                if not (
+                    plan.submission_first_block
+                    <= scheduled_from
+                    <= plan.submission_last_block
+                ):
+                    raise PublicArtifactError(
+                        "public batch disclosure uses the wrong generation boundary"
+                    )
             if any(
                 not verify_source_proof(proof, track.source_pool_merkle_root)
                 for proof in plan.source_proofs

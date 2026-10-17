@@ -1004,8 +1004,15 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
     match = SimpleNamespace(
         challenge_id="challenge",
         document={
+            "submission": {"block_height": ready.submission_first_block},
             "evaluation": {
-                "stages": [{"evaluation_batch": batch}],
+                "stages": [
+                    {
+                        "stage": "SCORING",
+                        "score_block": ready.generation_block,
+                        "evaluation_batch": batch,
+                    }
+                ],
                 "evaluation_batch": batch,
             }
         },
@@ -1022,20 +1029,99 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         {ready.plan_digest}
     )
 
+    wrong_boundary = SimpleNamespace(
+        challenge_id="challenge",
+        document={
+            **match.document,
+            "submission": {"block_height": ready.submission_first_block - 1},
+        },
+    )
+    with pytest.raises(PublicArtifactError, match="wrong generation boundary"):
+        S3Repository(client, bucket="public-data", prefix="tracks/main")._load_batch_disclosures(
+            track, (wrong_boundary,)
+        )
+
+    wrong_assignment = SimpleNamespace(
+        challenge_id="challenge",
+        document={
+            **match.document,
+            "evaluation": {
+                **match.document["evaluation"],
+                "stages": [
+                    {
+                        **match.document["evaluation"]["stages"][0],
+                        "stage": "CONFIRMING",
+                    }
+                ],
+            },
+        },
+    )
+    with pytest.raises(PublicArtifactError, match="challenge assignment"):
+        S3Repository(client, bucket="public-data", prefix="tracks/main")._load_batch_disclosures(
+            track, (wrong_assignment,)
+        )
+
+    confirmation_plan = build_plan(
+        track_spec_digest=track.digest,
+        generation_block=ready.generation_block,
+        block_hash=ready.block_hash,
+        track_start_block=track.track_start_block,
+        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
+        generation_interval_blocks=track.cache.generation_interval_blocks,
+        exact_challenge_ids=(),
+        confirmation_challenge_ids=("challenge",),
+        source_proofs=proofs,
+        scoring=track.scoring,
+        available_routes=track.model.selector.routes,
+    )
+    confirmation_ready = confirmation_plan.ready(
+        exact=exact,
+        dense_references=tuple(references),
+    )
+    confirmation_record = canonical_json(
+        {
+            "format": "veda-batch-disclosure-v1",
+            "plan": confirmation_ready.document(),
+            "public_exact_object": f"batches/{exact.sha256}/manifest.json",
+            "public_dense_references": public_references,
+        }
+    )
+    publisher._put_immutable(
+        f"batch_groups/{confirmation_ready.plan_digest}.json",
+        confirmation_record,
+    )
+    confirmation_batch = {
+        **batch,
+        "plan_digest": confirmation_ready.plan_digest,
+    }
     earlier_batch = {
         **batch,
-        "generated_block": ready.generation_block - 20,
+        "generated_block": ready.generation_block
+        - track.cache.generation_interval_blocks,
         "plan_digest": "00" * 32,
     }
+    exact_score_block = max(
+        earlier_batch["generated_block"],
+        confirmation_ready.submission_first_block,
+    )
     gap_match = SimpleNamespace(
         challenge_id="challenge",
         document={
+            "submission": {"block_height": track.track_start_block},
             "evaluation": {
                 "stages": [
-                    {"evaluation_batch": earlier_batch},
-                    {"evaluation_batch": batch},
+                    {
+                        "stage": "SCORING",
+                        "score_block": exact_score_block,
+                        "evaluation_batch": earlier_batch,
+                    },
+                    {
+                        "stage": "CONFIRMING",
+                        "score_block": confirmation_ready.generation_block,
+                        "evaluation_batch": confirmation_batch,
+                    },
                 ],
-                "evaluation_batch": batch,
+                "evaluation_batch": confirmation_batch,
             }
         },
     )
