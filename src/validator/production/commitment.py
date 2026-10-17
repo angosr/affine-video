@@ -467,9 +467,20 @@ class ArtifactManifest:
     def digest(self) -> str:
         return hashlib.sha256(canonical_json(self.document())).hexdigest()
 
-    def verify_local(self, root: str | Path) -> None:
+    def verify_local(
+        self,
+        root: str | Path,
+        *,
+        logical_names: tuple[str, ...] | None = None,
+    ) -> None:
         base = Path(root)
+        selected = None if logical_names is None else set(logical_names)
+        known = {artifact.logical_name for artifact in self.artifacts}
+        if selected is not None and (not selected or not selected <= known):
+            raise ValueError("selected artifact names are empty or absent from the manifest")
         for artifact in self.artifacts:
+            if selected is not None and artifact.logical_name not in selected:
+                continue
             path = base / artifact.logical_name
             if not path.is_file() or path.stat().st_size != artifact.size_bytes:
                 raise ValueError(

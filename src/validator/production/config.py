@@ -73,6 +73,62 @@ class ProducerConfig:
             self.artifact_path(self.runtime.dependency_lock),
         )
 
+    def evaluator_artifact_names(self, manifest: Any) -> tuple[str, ...]:
+        """Select runtime bytes needed for scoring, excluding every hidden source input."""
+
+        files = {
+            self.runtime.adapter,
+            self.runtime.predictor,
+            self.runtime.feature_model,
+            self.runtime.source_bundle,
+            self.runtime.dependency_lock,
+            self.runtime.oci_image,
+        }
+        model_prefix = self.runtime.model_root.rstrip("/") + "/"
+        files.update(
+            artifact.logical_name
+            for artifact in manifest.artifacts
+            if artifact.logical_name.startswith(model_prefix)
+        )
+        known = {artifact.logical_name for artifact in manifest.artifacts}
+        if not files <= known or not any(name.startswith(model_prefix) for name in files):
+            raise ValueError("artifact manifest omits evaluator runtime bytes")
+        forbidden = {
+            self.runtime.source_binding,
+            *(
+                artifact.logical_name
+                for artifact in manifest.artifacts
+                if artifact.logical_name.startswith(self.runtime.sample_cache.rstrip("/") + "/")
+            ),
+        }
+        if files & forbidden:
+            raise ValueError("evaluator runtime selection includes hidden source inputs")
+        return tuple(sorted(files))
+
+    def verify_evaluator_manifest(self, manifest: Any) -> None:
+        """Verify the committed runtime without reading the hidden pool or full SampleCache."""
+
+        names = self.evaluator_artifact_names(manifest)
+        manifest.verify_local(self.artifact_root, logical_names=names)
+        manifest.verify_runtime_coverage(
+            self.artifact_root,
+            files=(
+                self.runtime.adapter,
+                self.runtime.predictor,
+                self.runtime.feature_model,
+                self.runtime.source_bundle,
+                self.runtime.dependency_lock,
+                self.runtime.oci_image,
+            ),
+            directories=(self.runtime.model_root,),
+        )
+        from validator.production.environment import verify_runtime_environment
+
+        verify_runtime_environment(
+            self.artifact_path(self.runtime.source_bundle),
+            self.artifact_path(self.runtime.dependency_lock),
+        )
+
     def validate_evaluation_device(self, device: str | None) -> str:
         """Resolve a CUDA ordinal to an allowed physical evaluation GPU."""
 

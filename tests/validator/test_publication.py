@@ -16,6 +16,7 @@ from validator.production.commitment import SourceLeaf, SourcePool, canonical_js
 from validator.production.plan import (
     DenseReference,
     ReadyObject,
+    ReadySampleCache,
     build_plan,
     generation_seed,
     select_source_proofs,
@@ -987,8 +988,19 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         return path, ReadyObject(f"private/{name}", digest, len(content))
 
     exact_path, exact = ready_file("batch.npz", b"exact-batch")
+    index_path, input_index = ready_file("index.json", b'{"samples":[]}')
+    text_path, text = ready_file("text.safetensors", b"encoded-inputs")
+    sample_cache = ReadySampleCache(input_index, text)
     references = []
-    local_files = [(f"batches/{exact.sha256}/manifest.json", exact_path, exact)]
+    local_files = [
+        (f"batches/{exact.sha256}/manifest.json", exact_path, exact),
+        (
+            f"batch_inputs/{input_index.sha256}/manifest.json",
+            index_path,
+            input_index,
+        ),
+        (f"batch_inputs/{text.sha256}/manifest.json", text_path, text),
+    ]
     for index, rollout in enumerate(plan.rollouts):
         video_path, video = ready_file(f"video-{index}.mp4", f"video-{index}".encode())
         latent_path, latent = ready_file(
@@ -1001,7 +1013,11 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
                 (f"batch_assets/{latent.sha256}/manifest.json", latent_path, latent),
             )
         )
-    ready = plan.ready(exact=exact, dense_references=tuple(references))
+    ready = plan.ready(
+        exact=exact,
+        dense_references=tuple(references),
+        sample_cache=sample_cache,
+    )
     public_references = []
     for reference in ready.dense_references:
         public = {"rollout_id": reference.rollout_id}
@@ -1018,6 +1034,19 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
             "plan": ready.document(),
             "public_exact_object": f"batches/{exact.sha256}/manifest.json",
             "public_dense_references": public_references,
+            "public_selected_inputs": {
+                "condition": None,
+                "index": {
+                    "object": f"batch_inputs/{input_index.sha256}/manifest.json",
+                    "sha256": input_index.sha256,
+                    "size_bytes": input_index.size_bytes,
+                },
+                "text": {
+                    "object": f"batch_inputs/{text.sha256}/manifest.json",
+                    "sha256": text.sha256,
+                    "size_bytes": text.size_bytes,
+                },
+            },
         }
     )
     batch = {
@@ -1103,6 +1132,7 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
     confirmation_ready = confirmation_plan.ready(
         exact=exact,
         dense_references=tuple(references),
+        sample_cache=sample_cache,
     )
     confirmation_record = canonical_json(
         {
@@ -1110,6 +1140,19 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
             "plan": confirmation_ready.document(),
             "public_exact_object": f"batches/{exact.sha256}/manifest.json",
             "public_dense_references": public_references,
+            "public_selected_inputs": {
+                "condition": None,
+                "index": {
+                    "object": f"batch_inputs/{input_index.sha256}/manifest.json",
+                    "sha256": input_index.sha256,
+                    "size_bytes": input_index.size_bytes,
+                },
+                "text": {
+                    "object": f"batch_inputs/{text.sha256}/manifest.json",
+                    "sha256": text.sha256,
+                    "size_bytes": text.size_bytes,
+                },
+            },
         }
     )
     publisher._put_immutable(

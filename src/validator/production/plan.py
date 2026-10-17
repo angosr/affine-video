@@ -117,6 +117,22 @@ class DenseReference:
 
 
 @dataclass(frozen=True, slots=True)
+class ReadySampleCache:
+    """The encoded inputs selected by one READY plan, never the hidden pool."""
+
+    index: ReadyObject
+    text: ReadyObject
+    condition: ReadyObject | None = None
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "condition": None if self.condition is None else self.condition.document(),
+            "index": self.index.document(),
+            "text": self.text.document(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class BatchPlan:
     track_spec_digest: str
     generation_block: int
@@ -135,6 +151,7 @@ class BatchPlan:
     state: str = "PLANNED"
     exact: ReadyObject | None = None
     dense_references: tuple[DenseReference, ...] = ()
+    sample_cache: ReadySampleCache | None = None
 
     def __post_init__(self) -> None:
         _digest_bytes(self.track_spec_digest, "track specification digest")
@@ -161,11 +178,13 @@ class BatchPlan:
             if len(set(values)) != len(values) or any(not value for value in values):
                 raise ValueError(f"{name} identifiers must be non-empty and unique")
         if self.state == "PLANNED":
-            if self.exact is not None or self.dense_references:
+            if self.exact is not None or self.dense_references or self.sample_cache is not None:
                 raise ValueError("a PLANNED batch cannot reference completed objects")
         elif self.state == "READY":
-            if self.exact is None or not self.dense_references:
-                raise ValueError("a READY batch requires exact data and dense references")
+            if self.exact is None or not self.dense_references or self.sample_cache is None:
+                raise ValueError(
+                    "a READY batch requires exact data, dense references, and selected inputs"
+                )
         else:
             raise ValueError("batch plan state must be PLANNED or READY")
         if self.plan_digest != hashlib.sha256(canonical_json(self.planned_document())).hexdigest():
@@ -212,6 +231,9 @@ class BatchPlan:
             result["dense_references"] = [
                 reference.document() for reference in self.dense_references
             ]
+            result["sample_cache"] = (
+                None if self.sample_cache is None else self.sample_cache.document()
+            )
         return result
 
     def encode(self) -> bytes:
@@ -222,10 +244,17 @@ class BatchPlan:
         *,
         exact: ReadyObject,
         dense_references: tuple[DenseReference, ...],
+        sample_cache: ReadySampleCache,
     ) -> BatchPlan:
         if self.state != "PLANNED":
             raise ValueError("only a PLANNED batch can become READY")
-        return replace(self, state="READY", exact=exact, dense_references=dense_references)
+        return replace(
+            self,
+            state="READY",
+            exact=exact,
+            dense_references=dense_references,
+            sample_cache=sample_cache,
+        )
 
     @classmethod
     def decode(cls, payload: bytes) -> BatchPlan:
@@ -253,7 +282,9 @@ class BatchPlan:
             "track_spec_digest",
         }
         state = value.get("state")
-        expected = common | ({"dense_references", "exact"} if state == "READY" else set())
+        expected = common | (
+            {"dense_references", "exact", "sample_cache"} if state == "READY" else set()
+        )
         if set(value) != expected or value.get("format") != "veda-generation-plan-v1":
             raise ValueError("batch plan fields or format are invalid")
 
@@ -275,6 +306,7 @@ class BatchPlan:
         if not isinstance(proofs_value, list):
             raise ValueError("batch plan source_proofs must be a list")
         exact = _parse_ready(value["exact"]) if state == "READY" else None
+        sample_cache = _parse_sample_cache(value["sample_cache"]) if state == "READY" else None
         references_value = value.get("dense_references", [])
         if not isinstance(references_value, list):
             raise ValueError("batch plan dense_references must be a list")
@@ -296,6 +328,7 @@ class BatchPlan:
             state=state,
             exact=exact,
             dense_references=tuple(_parse_reference(row) for row in references_value),
+            sample_cache=sample_cache,
         )
 
 
@@ -667,6 +700,14 @@ def _parse_reference(value: Any) -> DenseReference:
     return DenseReference(
         row["rollout_id"], _parse_ready(row["video"]), _parse_ready(row["latent"])
     )
+
+
+def _parse_sample_cache(value: Any) -> ReadySampleCache:
+    row = _row(value, {"condition", "index", "text"}, "READY sample cache")
+    condition = row["condition"]
+    if condition is not None:
+        condition = _parse_ready(condition)
+    return ReadySampleCache(_parse_ready(row["index"]), _parse_ready(row["text"]), condition)
 
 
 def _row(value: Any, fields: set[str], name: str) -> dict[str, Any]:

@@ -24,9 +24,10 @@ from validator.alerts import webhook_alerter
 from validator.chain import ScanResult, scan_finalized_blocks, seed_legacy_exclusions
 from validator.download import DownloadedModel, download_chunked_asset, download_public_model
 from validator.production.batches import ReadyBatchSource
-from validator.production.commitment import ArtifactManifest, load_bound_source_pool
+from validator.production.commitment import ArtifactManifest
 from validator.production.config import load_producer_config
 from validator.production.confirmation import ConfirmationWorkerPool
+from validator.production.retries import PrivateRetryStore
 from validator.production.storage import PrivateObjectStore
 from validator.publication import (
     PublicArtifacts,
@@ -163,6 +164,7 @@ async def run_evaluator(
     )
     batch_source = None
     confirmation_pool = None
+    retry_store = None
     runtime_manifest_payload = None
     if production_config is not None:
         data_config = load_producer_config(production_config)
@@ -182,19 +184,15 @@ async def run_evaluator(
         manifest = ArtifactManifest.decode(runtime_manifest_payload)
         if manifest.digest != track.artifact_manifest_sha256:
             raise ValueError("artifact manifest does not match the track commitment")
-        objects.ensure_artifacts(manifest, data_config.artifact_root)
-        data_config.verify_manifest(manifest)
-        source_pool_payload = objects.ensure_bootstrap(
-            "bootstrap/source_pool.json", data_config.source_pool
+        evaluator_artifacts = data_config.evaluator_artifact_names(manifest)
+        objects.ensure_artifacts(
+            manifest,
+            data_config.artifact_root,
+            logical_names=evaluator_artifacts,
         )
-        load_bound_source_pool(
-            source_pool_payload,
-            data_config.artifact_path(data_config.runtime.source_binding).read_bytes(),
-            expected_root=track.source_pool_merkle_root,
-            expected_commitments=track.source_commitment_documents,
-            sample_cache=data_config.artifact_path(data_config.runtime.sample_cache),
-        )
+        data_config.verify_evaluator_manifest(manifest)
         batch_source = ReadyBatchSource(track=track, objects=objects, cache_dir=cache_dir)
+        retry_store = PrivateRetryStore(objects, track_spec_digest=track.digest)
         confirmation_pool = ConfirmationWorkerPool(
             data_config,
             track,
@@ -205,6 +203,8 @@ async def run_evaluator(
         alert=alert,
         archive_stage=None if batch_source is None else batch_source.archive_stage,
         restore_stage=None if batch_source is None else batch_source.restore_stage,
+        restore_retry=None if retry_store is None else retry_store.restore,
+        record_retry=None if retry_store is None else retry_store.record_failure,
     )
     admission_settings = AdmissionSettings(
         cache_dir=Path(model_cache),
@@ -216,6 +216,8 @@ async def run_evaluator(
         alert=alert,
         archive=None if batch_source is None else batch_source.archive_model,
         restore=None if batch_source is None else batch_source.restore_admission,
+        restore_retry=None if retry_store is None else retry_store.restore,
+        record_retry=None if retry_store is None else retry_store.record_failure,
     )
 
     with ExitStack() as resources:

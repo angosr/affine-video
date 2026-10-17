@@ -37,6 +37,7 @@ from validator.production.plan import (
     BatchPlan,
     DenseReference,
     ReadyObject,
+    ReadySampleCache,
     RolloutPlan,
     build_plan,
     select_source_proofs,
@@ -526,6 +527,14 @@ class ProducerService:
             _require_before_deadline(deadline)
             references.append(DenseReference(result.rollout_id, video, latent))
         directory = self.config.work_dir / plan.plan_digest / "batch"
+        selected_cache, cache_files = _build_selected_sample_cache(
+            self.config,
+            plan,
+            directory / "sample-cache",
+        )
+        for path, item in cache_files:
+            self.objects.put_content(path, sha256=item.sha256, object_name=item.object_key)
+            _require_before_deadline(deadline)
         batch = assemble_exact_cache_batch(
             directory,
             tuple(result.shard_path for result in results),
@@ -548,7 +557,11 @@ class ProducerService:
         )
         self.objects.put_content(batch.path, sha256=exact.sha256, object_name=exact.object_key)
         _require_before_deadline(deadline)
-        ready = plan.ready(exact=exact, dense_references=tuple(references))
+        ready = plan.ready(
+            exact=exact,
+            dense_references=tuple(references),
+            sample_cache=selected_cache,
+        )
         try:
             self.objects.replace_plan(name, ready.encode(), etag=stored.etag)
         except PreconditionFailed:
@@ -858,6 +871,59 @@ def _ready_file(path: Path, directory: str, suffix: str) -> ReadyObject:
         raise RuntimeError("producer output is missing or invalid")
     digest = _file_sha256(path)
     return ReadyObject(f"{directory}/{digest}{suffix}", digest, path.stat().st_size)
+
+
+def _build_selected_sample_cache(
+    config: ProducerConfig,
+    plan: BatchPlan,
+    destination: Path,
+) -> tuple[ReadySampleCache, tuple[tuple[Path, ReadyObject], ...]]:
+    """Export only this plan's encoded inputs for least-privilege evaluation."""
+
+    from miowtion.train.data import SampleCache, SampleCacheWriter
+
+    if destination.exists():
+        shutil.rmtree(destination)
+    source = SampleCache(str(config.artifact_path(config.runtime.sample_cache)))
+    samples = {sample.id: sample for sample in source.samples}
+    selected_ids = {proof.leaf.source_id for proof in plan.source_proofs}
+    if selected_ids != {rollout.source_id for rollout in plan.rollouts}:
+        raise RuntimeError("plan source inputs conflict with its rollouts")
+    if selected_ids - set(samples):
+        raise RuntimeError("plan source input is absent from the private SampleCache")
+    writer = SampleCacheWriter(str(destination))
+    for source_id in sorted(selected_ids):
+        sample = samples[source_id]
+        hidden, tags = source.text(sample)
+        video, audio = source.conditions(sample)
+        writer.add(
+            sample.id,
+            sample.task,
+            sample.split,
+            hidden,
+            tags,
+            keyframes=sample.keyframes,
+            references=sample.references,
+            aspect=sample.aspect,
+            latent_t=sample.latent_t,
+            cond_video=video if video.numel() else None,
+            cond_audio=audio if audio.numel() else None,
+        )
+    writer.finalize()
+    index_path = destination / "index.json"
+    text_path = destination / "text.safetensors"
+    condition_path = destination / "cond.safetensors"
+    index = _ready_file(index_path, "inputs", ".json")
+    text = _ready_file(text_path, "inputs", ".safetensors")
+    condition = (
+        _ready_file(condition_path, "inputs", ".safetensors")
+        if condition_path.is_file()
+        else None
+    )
+    files = [(index_path, index), (text_path, text)]
+    if condition is not None:
+        files.append((condition_path, condition))
+    return ReadySampleCache(index, text, condition), tuple(files)
 
 
 def _file_sha256(path: Path) -> str:

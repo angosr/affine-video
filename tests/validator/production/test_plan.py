@@ -27,6 +27,7 @@ from validator.production.plan import (
     BatchPlan,
     DenseReference,
     ReadyObject,
+    ReadySampleCache,
     build_plan,
     generation_seed,
     scheduled_generation_block,
@@ -114,6 +115,13 @@ def source_commitments(pool: SourcePool) -> tuple[SourceCommitmentSpec, ...]:
     return tuple(SourceCommitmentSpec(**item) for item in pool.public_commitments())
 
 
+def ready_sample_cache() -> ReadySampleCache:
+    return ReadySampleCache(
+        ReadyObject("inputs/index.json", "78" * 32, 10),
+        ReadyObject("inputs/text.safetensors", "89" * 32, 20),
+    )
+
+
 def test_batch_schedule_has_one_exact_submission_interval() -> None:
     assert (
         scheduled_generation_block(
@@ -171,6 +179,7 @@ def test_plan_is_deterministic_and_only_transitions_to_ready_once() -> None:
             )
             for rollout in first.rollouts
         ),
+        sample_cache=ready_sample_cache(),
     )
     assert ready.state == "READY"
     assert ready.plan_digest == first.plan_digest
@@ -182,6 +191,7 @@ def test_plan_is_deterministic_and_only_transitions_to_ready_once() -> None:
         ready.ready(
             exact=ReadyObject("exact/other.npz", "56" * 32, 100),
             dense_references=ready.dense_references,
+            sample_cache=ready_sample_cache(),
         )
 
 
@@ -561,6 +571,11 @@ def test_producer_attempt_deadline_covers_post_generation_work(
             f"{prefix}/artifact{suffix}", "12" * 32, 1
         ),
     )
+    monkeypatch.setattr(
+        production_service,
+        "_build_selected_sample_cache",
+        lambda *_args: (ready_sample_cache(), ()),
+    )
 
     class Workers:
         def run(self, _plan, *, deadline):
@@ -621,6 +636,11 @@ def test_producer_attempt_deadline_interrupts_blocking_post_generation_work(
         lambda _path, prefix, suffix: ReadyObject(
             f"{prefix}/artifact{suffix}", "12" * 32, 1
         ),
+    )
+    monkeypatch.setattr(
+        production_service,
+        "_build_selected_sample_cache",
+        lambda *_args: (ready_sample_cache(), ()),
     )
 
     class Workers:
@@ -851,6 +871,7 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
     ready = planned.ready(
         exact=ReadyObject("exact/valid.npz", batch.sha256, batch.path.stat().st_size),
         dense_references=references,
+        sample_cache=ready_sample_cache(),
     )
     _validate_plan_case_binding(batch.path, ready, track)
 
@@ -859,6 +880,7 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
     invalid_ready = planned.ready(
         exact=ReadyObject("exact/invalid.npz", invalid.sha256, invalid.path.stat().st_size),
         dense_references=references,
+        sample_cache=ready_sample_cache(),
     )
     with pytest.raises(CacheLoadError, match="metadata conflicts"):
         _validate_plan_case_binding(invalid.path, invalid_ready, track)
@@ -906,9 +928,20 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
                 ready,
             )
         )
+    index_content = json.dumps(
+        {"samples": [{"id": proof.leaf.source_id} for proof in planned.source_proofs]}
+    ).encode()
+    index_digest = hashlib.sha256(index_content).hexdigest()
+    index_object = ReadyObject("inputs/index.json", index_digest, len(index_content))
+    payloads[index_object.object_key] = index_content
+    text_content = b"selected-text-inputs"
+    text_digest = hashlib.sha256(text_content).hexdigest()
+    text_object = ReadyObject("inputs/text.safetensors", text_digest, len(text_content))
+    payloads[text_object.object_key] = text_content
     ready_plan = planned.ready(
         exact=ReadyObject("exact/data.npz", "12" * 32, 10),
         dense_references=tuple(references),
+        sample_cache=ReadySampleCache(index_object, text_object),
     )
 
     class Objects:
@@ -964,7 +997,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     disclosure = source.public_disclosure(ready_plan.plan_digest)
     assert disclosure.challenge_ids == ("exact-a", "confirm-a")
     assert disclosure.record_name == f"batch_groups/{ready_plan.plan_digest}.json"
-    assert len(disclosure.files) == 5
+    assert len(disclosure.files) == 7
     with pytest.raises(RuntimeError, match="no scheduled"):
         source.confirmation_batch("other")
 
@@ -985,7 +1018,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     exact.write_bytes(b"temporary")
     assert (tmp_path / "dense" / ready_plan.plan_digest).is_dir()
     assert source.prune_disclosed({"exact-a"}) == 0
-    assert source.prune_disclosed({"exact-a", "confirm-a"}) == 3
+    assert source.prune_disclosed({"exact-a", "confirm-a"}) == 4
     assert not exact.exists()
     assert not (tmp_path / "dense" / ready_plan.plan_digest).exists()
 
@@ -1171,6 +1204,7 @@ def test_plan_coordinator_skips_empty_intervals_and_rejects_a_conflicting_winner
             )
             for index, rollout in enumerate(plan.rollouts)
         ),
+        sample_cache=ready_sample_cache(),
     )
 
     class RecoveryObjects(ConflictObjects):

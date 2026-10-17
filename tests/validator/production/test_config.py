@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from validator.production.commitment import Artifact, ArtifactManifest
 from validator.production.config import load_producer_config
 
 
@@ -89,3 +90,33 @@ def test_config_resolves_only_formal_physical_evaluation_gpus(tmp_path, monkeypa
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     with pytest.raises(ValueError, match="verifiable physical"):
         config.validate_evaluation_device("cuda:0")
+
+
+def test_evaluator_artifact_selection_excludes_hidden_source_inputs(tmp_path) -> None:
+    path = tmp_path / "producer.json"
+    path.write_text(json.dumps(document(tmp_path)), encoding="utf-8")
+    config = load_producer_config(path)
+    names = (
+        "runtime/dependencies.lock",
+        "runtime/producer.oci.tar.zst",
+        "runtime/source.tar.zst",
+        "samples/production/index.json",
+        "samples/production/text.safetensors",
+        "samples/source-binding.json",
+        "weights/model/shard.safetensors",
+        "weights/predictor.safetensors",
+        "weights/r3d18.safetensors",
+        "weights/turbo.safetensors",
+    )
+    manifest = ArtifactManifest(
+        tuple(
+            Artifact(name, f"{index + 1:064x}", 1, f"artifacts/{index}")
+            for index, name in enumerate(names)
+        )
+    )
+
+    selected = config.evaluator_artifact_names(manifest)
+
+    assert "weights/model/shard.safetensors" in selected
+    assert "samples/source-binding.json" not in selected
+    assert not any(name.startswith("samples/production/") for name in selected)

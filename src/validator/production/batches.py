@@ -38,6 +38,7 @@ class ConfirmationBatch:
     plan: BatchPlan
     exact: ExactCacheBatch
     latent_paths: tuple[tuple[DenseReference, Path], ...]
+    sample_cache_path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +296,60 @@ class ReadyBatchSource:
                 size_bytes=latent.size_bytes,
             )
             references.append((reference, path))
-        return ConfirmationBatch(plan, self._restore_exact(plan), tuple(references))
+        return ConfirmationBatch(
+            plan,
+            self._restore_exact(plan),
+            tuple(references),
+            self._restore_sample_cache(plan),
+        )
+
+    def _restore_sample_cache(self, plan: BatchPlan) -> Path:
+        selected = plan.sample_cache
+        if selected is None:
+            raise RuntimeError("READY plan omitted its selected source inputs")
+        destination = self.cache_dir / "inputs" / plan.plan_digest
+        destination.mkdir(parents=True, exist_ok=True)
+        objects = (("index.json", selected.index), ("text.safetensors", selected.text))
+        for name, item in objects:
+            self.objects.download_content(
+                item.object_key,
+                destination / name,
+                sha256=item.sha256,
+                size_bytes=item.size_bytes,
+            )
+        condition_path = destination / "cond.safetensors"
+        if selected.condition is None:
+            if condition_path.exists():
+                condition_path.unlink()
+        else:
+            self.objects.download_content(
+                selected.condition.object_key,
+                condition_path,
+                sha256=selected.condition.sha256,
+                size_bytes=selected.condition.size_bytes,
+            )
+        try:
+            document = json.loads((destination / "index.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("READY selected source index is invalid") from exc
+        rows = document.get("samples") if isinstance(document, dict) else None
+        identifiers = (
+            [row.get("id") for row in rows if isinstance(row, dict)]
+            if isinstance(rows, list)
+            else []
+        )
+        expected = {proof.leaf.source_id for proof in plan.source_proofs}
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"samples"}
+            or not isinstance(rows, list)
+            or any(not isinstance(row, dict) for row in rows)
+            or any(not isinstance(identifier, str) for identifier in identifiers)
+            or len(identifiers) != len(set(identifiers))
+            or set(identifiers) != expected
+        ):
+            raise RuntimeError("READY selected source index conflicts with its plan")
+        return destination
 
     def is_ready(self, challenge_id: str, *, confirmation: bool) -> bool:
         """Return whether the one frozen plan for this stage reached READY."""
@@ -352,12 +406,32 @@ class ReadyBatchSource:
                     "size_bytes": item.size_bytes,
                 }
             references.append(public)
+        selected_inputs = self._restore_sample_cache(plan)
+        public_inputs = {}
+        assert plan.sample_cache is not None
+        for kind, item, name in (
+            ("index", plan.sample_cache.index, "index.json"),
+            ("text", plan.sample_cache.text, "text.safetensors"),
+            ("condition", plan.sample_cache.condition, "cond.safetensors"),
+        ):
+            if item is None:
+                public_inputs[kind] = None
+                continue
+            path = selected_inputs / name
+            object_name = f"batch_inputs/{item.sha256}/manifest.json"
+            files.append(DisclosureFile(object_name, path, item.sha256))
+            public_inputs[kind] = {
+                "object": object_name,
+                "sha256": item.sha256,
+                "size_bytes": item.size_bytes,
+            }
         record = canonical_json(
             {
                 "format": "veda-batch-disclosure-v1",
                 "plan": plan.document(),
                 "public_exact_object": f"batches/{plan.exact.sha256}/manifest.json",
                 "public_dense_references": references,
+                "public_selected_inputs": public_inputs,
             }
         )
         return BatchDisclosure(
@@ -401,6 +475,10 @@ class ReadyBatchSource:
             dense = self.cache_dir / "dense" / plan.plan_digest
             if dense.is_dir():
                 shutil.rmtree(dense)
+                removed += 1
+            inputs = self.cache_dir / "inputs" / plan.plan_digest
+            if inputs.is_dir():
+                shutil.rmtree(inputs)
                 removed += 1
             disclosure = self.cache_dir / "disclosures" / plan.plan_digest
             if disclosure.is_dir():

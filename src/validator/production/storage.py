@@ -204,12 +204,24 @@ class PrivateObjectStore:
             raise StorageError(f"private bootstrap object is empty: {name}")
         return self.create_plan(name, payload).body
 
-    def ensure_artifacts(self, manifest: ArtifactManifest, root: str | Path) -> None:
+    def ensure_artifacts(
+        self,
+        manifest: ArtifactManifest,
+        root: str | Path,
+        *,
+        logical_names: tuple[str, ...] | None = None,
+    ) -> None:
         """Mirror committed runtime bytes and restore any missing local artifact."""
 
         base = Path(root)
         base.mkdir(parents=True, exist_ok=True)
+        selected = None if logical_names is None else set(logical_names)
+        known = {artifact.logical_name for artifact in manifest.artifacts}
+        if selected is not None and (not selected or not selected <= known):
+            raise ValueError("selected artifact names are empty or absent from the manifest")
         for artifact in manifest.artifacts:
+            if selected is not None and artifact.logical_name not in selected:
+                continue
             path = base / artifact.logical_name
             local_valid = (
                 path.is_file()
@@ -229,7 +241,7 @@ class PrivateObjectStore:
                     sha256=artifact.sha256,
                     size_bytes=artifact.size_bytes,
                 )
-        manifest.verify_local(base)
+        manifest.verify_local(base, logical_names=logical_names)
 
     def put_content(self, path: str | Path, *, sha256: str, object_name: str) -> None:
         """Upload one immutable file as storage-limit-safe verified chunks."""

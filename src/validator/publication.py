@@ -957,6 +957,7 @@ class S3Repository:
                 "plan",
                 "public_dense_references",
                 "public_exact_object",
+                "public_selected_inputs",
             } or document["format"] != "veda-batch-disclosure-v1":
                 raise PublicArtifactError("public batch disclosure fields are invalid")
             try:
@@ -1066,11 +1067,30 @@ class S3Repository:
                     }
                     files.append((object_name, item.sha256, item.size_bytes))
                 public_references.append(public)
+            if plan.sample_cache is None:
+                raise PublicArtifactError("public READY plan omitted selected source inputs")
+            public_inputs = {}
+            for kind, item in (
+                ("index", plan.sample_cache.index),
+                ("text", plan.sample_cache.text),
+                ("condition", plan.sample_cache.condition),
+            ):
+                if item is None:
+                    public_inputs[kind] = None
+                    continue
+                object_name = f"batch_inputs/{item.sha256}/manifest.json"
+                public_inputs[kind] = {
+                    "object": object_name,
+                    "sha256": item.sha256,
+                    "size_bytes": item.size_bytes,
+                }
+                files.append((object_name, item.sha256, item.size_bytes))
             expected = {
                 "format": "veda-batch-disclosure-v1",
                 "plan": plan.document(),
                 "public_exact_object": exact_name,
                 "public_dense_references": public_references,
+                "public_selected_inputs": public_inputs,
             }
             if document != expected:
                 raise PublicArtifactError("public batch disclosure is not canonical")
