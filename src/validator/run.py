@@ -61,11 +61,11 @@ from validator.weights import (
 )
 
 DEFAULT_PUBLIC_WEIGHTS_URL = (
-    "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/"
+    "https://iblosevwkuiootbbgnsy.supabase.co/storage/v1/object/public/"
     "affine_video/tracks/sn120/weights.json"
 )
 DEFAULT_BASELINE_MANIFEST_URL = (
-    "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/"
+    "https://iblosevwkuiootbbgnsy.supabase.co/storage/v1/object/public/"
     "affine_video/tracks/sn120/assets/veda_baseline_f16/manifest.json"
 )
 DEFAULT_NETUID = PRODUCTION_NETUID

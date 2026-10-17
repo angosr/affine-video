@@ -32,6 +32,9 @@ from .test_chain import HOTKEY, FakeClient, chain_block
 
 def test_release_defaults_target_sn120_initial_state() -> None:
     assert run_module.DEFAULT_NETUID == 120
+    assert run_module.DEFAULT_PUBLIC_WEIGHTS_URL.startswith(
+        "https://iblosevwkuiootbbgnsy.supabase.co/"
+    )
     assert "/tracks/sn120/weights.json" in run_module.DEFAULT_PUBLIC_WEIGHTS_URL
     assert run_module.DEFAULT_TRACK_SPEC_DIGEST != "0" * 64
 
