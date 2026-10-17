@@ -167,7 +167,9 @@ dependency lock. The source bundle is a ZIP whose `cli.py`, `miner/`, `scoring/`
 `miowtion/` entries must byte-match the modules actually loaded by the process. The canonical
 dependency lock binds the Python executable and every installed distribution's metadata and current
 files. Startup re-hashes both, so an unchanged archive cannot authorize changed ambient code or
-packages. A canonical source-cache binding joins the source-pool Merkle root to the complete encoded
+packages. Release assembly calls `build_source_bundle()` and `write_dependency_lock()` from
+`validator.production.environment`; both refuse overwrite, so verifier and builder share one
+format. A canonical source-cache binding joins the source-pool Merkle root to the complete encoded
 SampleCache index, text tensors and optional condition tensors. Producer startup verifies that
 binding and exact source-ID coverage, so changing encoded input under an existing source ID is a
 hard failure rather than a new hidden dataset with the old commitment.

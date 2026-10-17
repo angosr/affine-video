@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import importlib.util
+import os
 import platform
 import re
 import sys
@@ -35,6 +36,18 @@ def build_dependency_lock() -> bytes:
     """Return the canonical lock for the currently executing Python environment."""
 
     return canonical_json(_environment_document(verify_files=True))
+
+
+def write_dependency_lock(destination: str | Path) -> Path:
+    """Write the canonical lock without replacing an existing commitment."""
+
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("xb") as stream:
+        stream.write(build_dependency_lock())
+        stream.flush()
+        os.fsync(stream.fileno())
+    return target
 
 
 def build_source_bundle(destination: str | Path) -> Path:

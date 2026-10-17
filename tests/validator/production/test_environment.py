@@ -82,6 +82,24 @@ def test_runtime_environment_rejects_a_changed_dependency_lock(tmp_path, monkeyp
         environment.verify_runtime_environment(bundle, lock)
 
 
+def test_dependency_lock_writer_refuses_overwrite(tmp_path, monkeypatch) -> None:
+    document = {
+        "distributions": [],
+        "format": "veda-python-environment-lock-v1",
+        "python_executable_sha256": "a" * 64,
+        "python_implementation": "CPython",
+        "python_version": "3.12.3",
+    }
+    monkeypatch.setattr(
+        environment, "_environment_document", lambda *, verify_files: document
+    )
+    target = environment.write_dependency_lock(tmp_path / "runtime" / "dependencies.lock")
+
+    assert target.read_bytes() == canonical_json(document)
+    with pytest.raises(FileExistsError):
+        environment.write_dependency_lock(target)
+
+
 def test_dependency_lock_must_be_canonical(tmp_path, monkeypatch) -> None:
     source = tmp_path / "example.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
