@@ -233,8 +233,8 @@ def test_validator_run_needs_no_track_or_storage_configuration(monkeypatch) -> N
     )
 
     assert called["public_weights_url"] == cli_module.DEFAULT_PUBLIC_WEIGHTS_URL
-    assert called["netuid"] == cli_module.DEFAULT_NETUID
-    assert called["track_spec_digest"] == cli_module.DEFAULT_TRACK_SPEC_DIGEST
+    assert "netuid" not in called
+    assert "track_spec_digest" not in called
     assert called["wallet_name"] == "default"
     assert called["hotkey_name"] == "default"
     assert called["once"] is True

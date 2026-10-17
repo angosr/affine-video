@@ -86,7 +86,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
         ),
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
-        cache=CacheSpec(1_000_000, 1),
+        cache=CacheSpec(1_000_000, 1, 1),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
             sample_count=1,
@@ -123,7 +123,12 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
             }
         )
         cases.append(
-            {"route": "layer_0_head_0", "stratum": "all", "epsilon": 1e-6}
+            {
+                "route": "layer_0_head_0",
+                "stratum": "all",
+                "sample_id": "sample0",
+                "epsilon": 1e-6,
+            }
         )
     metadata = np.frombuffer(
         json.dumps(
@@ -131,6 +136,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
                 "format": "veda-exact-cache",
                 "generated_block": 101,
                 "source_digest": "34" * 32,
+                "seed_block_hash": "0x" + "ab" * 32,
                 "cases": cases,
             },
             sort_keys=True,
@@ -169,6 +175,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
             cache_dir,
             tmp_path / "models",
             baseline_path,
+            "https://public.example/models/paired",
             30,
         )
         scoring = process_next_scoring(
@@ -427,20 +434,20 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
         mechid=0,
         track_start_block=1,
         publication_grace_blocks=1,
-            initial_champion=InitialChampionSpec(
-                0,
-                "genesis-hotkey",
-                VEDA_REPO_ID,
-                VEDA_REVISION,
-                VEDA_FILENAME,
-                VEDA_FILE_SHA256,
-                VEDA_EVALUATION_FILE_SHA256,
-                VEDA_MODEL_DIGEST,
-                0.7,
-            ),
+        initial_champion=InitialChampionSpec(
+            0,
+            "genesis-hotkey",
+            VEDA_REPO_ID,
+            VEDA_REVISION,
+            VEDA_FILENAME,
+            VEDA_FILE_SHA256,
+            VEDA_EVALUATION_FILE_SHA256,
+            VEDA_MODEL_DIGEST,
+            0.7,
+        ),
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
-        cache=CacheSpec(1_000_000, 1),
+        cache=CacheSpec(1_000_000, 1, 1),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
             sample_count=4,
@@ -464,7 +471,7 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
         dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
         required = np.array([[True, False, False], [False, True, False]], dtype=np.bool_)
         exact_cases.append(
-            ExactCase("layer_0_head_0", "all", q, k, v, dense, valid, required, 1e-6)
+            ExactCase("layer_0_head_0", "all", q, k, v, dense, valid, required, 1e-6, "sample")
         )
 
     evaluator = TrackEvaluator(track, exact_cases)

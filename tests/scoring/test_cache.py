@@ -34,7 +34,10 @@ def test_loads_exact_cache_and_rejects_digest_or_decoded_size(tmp_path) -> None:
                 "format": "veda-exact-cache",
                 "generated_block": 120,
                 "source_digest": "12" * 32,
-                "cases": [{"route": "route0", "stratum": "all", "epsilon": 1e-6}],
+                "seed_block_hash": "0x" + "ab" * 32,
+                "cases": [
+                    {"route": "route0", "stratum": "all", "sample_id": "sample0", "epsilon": 1e-6}
+                ],
             }
         ),
         case_000000_q=np.ones((2, 2, 2), dtype=np.float32),
@@ -104,7 +107,10 @@ def test_exact_cache_rejects_unknown_route_and_insufficient_cases(tmp_path) -> N
                 "format": "veda-exact-cache",
                 "generated_block": 120,
                 "source_digest": "12" * 32,
-                "cases": [{"route": "route0", "stratum": "all", "epsilon": 1e-6}],
+                "seed_block_hash": "0x" + "ab" * 32,
+                "cases": [
+                    {"route": "route0", "stratum": "all", "sample_id": "sample0", "epsilon": 1e-6}
+                ],
             }
         ),
         case_000000_q=np.ones((1, 2, 2), dtype=np.float32),
@@ -150,7 +156,10 @@ def test_cache_batch_must_be_generated_after_submission(tmp_path) -> None:
                 "format": "veda-exact-cache",
                 "generated_block": 120,
                 "source_digest": "34" * 32,
-                "cases": [{"route": "route0", "stratum": "all", "epsilon": 1e-6}],
+                "seed_block_hash": "0x" + "ab" * 32,
+                "cases": [
+                    {"route": "route0", "stratum": "all", "sample_id": "sample0", "epsilon": 1e-6}
+                ],
             }
         ),
         case_000000_q=np.ones((1, 2, 2), dtype=np.float32),
@@ -166,6 +175,8 @@ def test_cache_batch_must_be_generated_after_submission(tmp_path) -> None:
     arguments = {
         "directory": tmp_path,
         "minimum_delay_blocks": 1,
+        "track_start_block": 100,
+        "generation_interval_blocks": 20,
         "max_bytes": 100_000,
         "min_blocks": 1,
         "max_blocks": 1,
@@ -177,7 +188,7 @@ def test_cache_batch_must_be_generated_after_submission(tmp_path) -> None:
 
     selected = select_exact_cache_batch(submission_block=119, **arguments)
     assert selected.path == path
-    with pytest.raises(CacheLoadError, match="after the submission"):
+    with pytest.raises(CacheLoadError, match="scheduled"):
         select_exact_cache_batch(submission_block=120, **arguments)
 
 
@@ -192,6 +203,7 @@ def test_cache_batch_writer_is_atomic_and_self_identifying(tmp_path) -> None:
         np.ones(2, dtype=np.bool_),
         np.array([[True, False]], dtype=np.bool_),
         1e-6,
+        "sample0",
     )
 
     batch = write_exact_cache_batch(
@@ -199,6 +211,7 @@ def test_cache_batch_writer_is_atomic_and_self_identifying(tmp_path) -> None:
         (case,),
         generated_block=200,
         source_digest="56" * 32,
+        seed_block_hash="0x" + "ab" * 32,
     )
 
     assert batch.path.name == f"200-{batch.sha256}.npz"

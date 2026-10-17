@@ -24,7 +24,7 @@ from scoring.exact import ExactCase, paired_score_gain_bound, score_selector
 from scoring.model import ModelValidationError, ValidatedModel, validate_model
 from scoring.selector import load_selector
 from scoring.spec import TrackSpec
-from validator.download import ModelDownloadError, download_public_model
+from validator.download import ModelDownloadError, download_public_asset, download_public_model
 from validator.queue import ChallengeState, require_transition
 from validator.store import ChallengeStore, LeasedChallenge
 from validator.tournament import genesis_champion, resolve_tournament
@@ -184,9 +184,7 @@ class FilePairedEvaluator:
         incumbent_result = evaluator(self.incumbent)
         challenger_scores = challenger_result.metrics.get("sample_scores")
         incumbent_scores = incumbent_result.metrics.get("sample_scores")
-        if not isinstance(challenger_scores, list) or not isinstance(
-            incumbent_scores, list
-        ):
+        if not isinstance(challenger_scores, list) or not isinstance(incumbent_scores, list):
             raise TemporaryScoringError(
                 "SCORING_WORKER_FAILURE", "paired scorer omitted per-case scores"
             )
@@ -245,10 +243,12 @@ class PairedTrackEvaluator:
     cache_dir: Path
     model_cache: Path
     initial_model_path: Path
+    champion_archive_url: str
     timeout_seconds: float
     max_memory_bytes: int | None = None
     max_cpu_seconds: int | None = None
     downloader: Callable[..., Any] = download_public_model
+    seed_block_hashes: Mapping[int, str] | None = None
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         snapshot = self.store.public_snapshot()
@@ -259,9 +259,7 @@ class PairedTrackEvaluator:
             netuid=self.track.netuid,
             minimum_gain=self.track.scoring.minimum_frontier_gain,
             initial_champion=genesis_champion(self.track),
-            minimum_generation_delay_blocks=(
-                self.track.cache.minimum_generation_delay_blocks
-            ),
+            minimum_generation_delay_blocks=(self.track.cache.minimum_generation_delay_blocks),
         )
         incumbent = tournament.champion
         batch = self._batch(task)
@@ -276,9 +274,7 @@ class PairedTrackEvaluator:
             evaluator,
             timeout_seconds=self.timeout_seconds * 2,
             max_memory_bytes=self.max_memory_bytes,
-            max_cpu_seconds=(
-                None if self.max_cpu_seconds is None else self.max_cpu_seconds * 2
-            ),
+            max_cpu_seconds=(None if self.max_cpu_seconds is None else self.max_cpu_seconds * 2),
         )
         paired = isolated(task)
         return StageOutcome(
@@ -288,16 +284,19 @@ class PairedTrackEvaluator:
                 "cache_sha256": batch.sha256,
                 "cache_generated_block": batch.generated_block,
                 "cache_source_digest": batch.source_digest,
+                "cache_seed_block_hash": batch.seed_block_hash,
             },
         )
 
     def _batch(self, task: LeasedChallenge) -> ExactCacheBatch:
         scoring = self.track.scoring
         try:
-            return select_exact_cache_batch(
+            batch = select_exact_cache_batch(
                 self.cache_dir,
                 submission_block=task.position.block,
                 minimum_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
+                track_start_block=self.track.track_start_block,
+                generation_interval_blocks=self.track.cache.generation_interval_blocks,
                 max_bytes=self.track.cache.exact_max_bytes,
                 min_blocks=scoring.budgets[0].blocks,
                 max_blocks=scoring.budgets[-1].blocks,
@@ -306,6 +305,13 @@ class PairedTrackEvaluator:
                 strata=scoring.stratum_weight_map,
                 sample_count=scoring.sample_count,
             )
+            if self.seed_block_hashes is not None:
+                expected_hash = self.seed_block_hashes.get(batch.generated_block)
+                if expected_hash is None or batch.seed_block_hash.lower() != expected_hash.lower():
+                    raise CacheLoadError(
+                        "cache seed hash does not match its finalized generation block"
+                    )
+            return batch
         except CacheLoadError as exc:
             raise TemporaryScoringError("SCORING_CACHE_UNAVAILABLE", str(exc)) from exc
 
@@ -327,17 +333,25 @@ class PairedTrackEvaluator:
             local_path = self.store.model_path(incumbent.challenge_id)
             if local_path is None or not Path(local_path).is_file():
                 try:
-                    downloaded = self.downloader(
-                        incumbent.repo_id,
-                        incumbent.revision,
-                        cache_dir=self.model_cache,
+                    path = download_public_asset(
+                        f"{self.champion_archive_url.rstrip('/')}/{record['file_sha256']}.safetensors",
+                        cache_dir=self.model_cache / "champions",
+                        expected_sha256=record["file_sha256"],
                         max_bytes=self.track.model.max_bytes,
                     )
-                except ModelDownloadError as exc:
-                    raise TemporaryScoringError(
-                        "INCUMBENT_MODEL_UNAVAILABLE", str(exc)
-                    ) from exc
-                path = Path(downloaded.path)
+                except RuntimeError:
+                    try:
+                        downloaded = self.downloader(
+                            incumbent.repo_id,
+                            incumbent.revision,
+                            cache_dir=self.model_cache,
+                            max_bytes=self.track.model.max_bytes,
+                        )
+                    except ModelDownloadError as exc:
+                        raise TemporaryScoringError(
+                            "INCUMBENT_MODEL_UNAVAILABLE", str(exc)
+                        ) from exc
+                    path = Path(downloaded.path)
             else:
                 path = Path(local_path)
         try:
@@ -504,8 +518,7 @@ def process_next_scoring(
             result = evaluator(task)
             generated_block = result.metrics.get("cache_generated_block")
             if generated_block is not None and (
-                type(generated_block) is not int
-                or generated_block > current_finalized_block
+                type(generated_block) is not int or generated_block > current_finalized_block
             ):
                 raise TemporaryScoringError(
                     "SCORING_CACHE_INVALID",

@@ -81,9 +81,7 @@ class FixedSelector:
 
     def __post_init__(self) -> None:
         expected = {
-            f"{route}.proj_{side}"
-            for route in self.architecture.routes
-            for side in ("q", "k")
+            f"{route}.proj_{side}" for route in self.architecture.routes for side in ("q", "k")
         }
         if set(self.weights) != expected:
             raise ValueError("loaded selector projections do not cover the evaluation routes")

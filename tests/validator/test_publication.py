@@ -152,26 +152,6 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
         asyncio.run(publisher.publish(conflicting))
 
 
-def test_initial_state_publisher_stops_after_competition_track_exists() -> None:
-    client = MemoryS3()
-    publisher = S3Repository(client, bucket="public-data", prefix="tracks/main")
-
-    asyncio.run(
-        publisher.publish_initial_state(
-            status=b"status",
-            weights=b"weights",
-            system_matches=(("system_matches/000000000001.json", b"system-match"),),
-        )
-    )
-    assert client.objects["tracks/main/status.json"] == b"status"
-    assert client.objects["tracks/main/weights.json"] == b"weights"
-    assert client.objects["tracks/main/system_matches/000000000001.json"] == b"system-match"
-
-    client.objects["tracks/main/track.json"] = b"track"
-    with pytest.raises(PublicArtifactError, match="taken ownership"):
-        asyncio.run(publisher.publish_initial_state(status=b"new", weights=b"new"))
-
-
 def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
     track = parse_track_spec(valid_spec())
     snapshot = {
@@ -197,6 +177,7 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
                     "sha256": "de" * 32,
                     "generated_block": 101,
                     "source_digest": "ef" * 32,
+                    "seed_block_hash": "0x" + "ab" * 32,
                 },
                 "score_block": 110,
                 "stages": [],
@@ -290,6 +271,7 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
             "sha256": "de" * 32,
             "generated_block": 101,
             "source_digest": "ef" * 32,
+            "seed_block_hash": "0x" + "ab" * 32,
         },
         "score_block": 110,
         "stages": [],
@@ -322,6 +304,7 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
             "sha256": "fa" * 32,
             "generated_block": 122,
             "source_digest": "fb" * 32,
+            "seed_block_hash": "0x" + "ab" * 32,
         },
         "score_block": 125,
     }
@@ -372,6 +355,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
                     "sha256": "de" * 32,
                     "generated_block": 101,
                     "source_digest": "ef" * 32,
+                    "seed_block_hash": "0x" + "ab" * 32,
                 },
                 "score_block": 110,
                 "stages": [],

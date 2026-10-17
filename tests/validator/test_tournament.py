@@ -61,6 +61,7 @@ def challenge(
                 "sha256": f"{sequence + 100:064x}",
                 "generated_block": 200 + sequence,
                 "source_digest": f"{sequence + 200:064x}",
+                "seed_block_hash": "0x" + "ab" * 32,
             }
             if score is not None
             else None
@@ -114,9 +115,7 @@ def test_exact_decimal_minimum_gain_is_not_lost_to_binary_rounding() -> None:
 
 
 def test_match_uses_paired_incumbent_score_not_historical_score() -> None:
-    tournament = resolve(
-        [challenge(1, "alice", score=0.05, incumbent_score=0.04)]
-    )
+    tournament = resolve([challenge(1, "alice", score=0.05, incumbent_score=0.04)])
 
     assert genesis().score == 0.1
     assert tournament.matches[0].score_gain == pytest.approx(0.01)
@@ -125,12 +124,8 @@ def test_match_uses_paired_incumbent_score_not_historical_score() -> None:
 
 
 def test_match_decision_uses_paired_gain_bound_not_raw_score_gap() -> None:
-    retained = resolve(
-        [challenge(1, "alice", score=0.8, incumbent_score=0.5, paired_gain=0.009)]
-    )
-    won = resolve(
-        [challenge(1, "alice", score=0.51, incumbent_score=0.5, paired_gain=0.01)]
-    )
+    retained = resolve([challenge(1, "alice", score=0.8, incumbent_score=0.5, paired_gain=0.009)])
+    won = resolve([challenge(1, "alice", score=0.51, incumbent_score=0.5, paired_gain=0.01)])
 
     assert retained.matches[0].outcome is MatchOutcome.CHAMPION_RETAINED
     assert won.matches[0].outcome is MatchOutcome.CHALLENGER_WON
@@ -170,9 +165,7 @@ def test_unfinished_submission_stops_the_public_match_prefix() -> None:
 
 
 def test_public_match_validation_rejects_nonterminal_records() -> None:
-    public = resolve(
-        [challenge(1, "alice", score=0.6, incumbent_score=0.1)]
-    ).matches[0].document
+    public = resolve([challenge(1, "alice", score=0.6, incumbent_score=0.1)]).matches[0].document
     tampered = {
         **public,
         "evaluation": {

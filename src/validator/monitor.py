@@ -56,7 +56,17 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
         f"{bold}{cyan}VEDA SN{status.get('netuid', '?')}  "
         f"block {status.get('source_block', '?')}{reset}"
     )
-    headers = ("UID", "HOTKEY", "STATUS", "QUEUE", "MATCH", "SCORE", "GAIN", "RESULT")
+    headers = (
+        "UID",
+        "HOTKEY",
+        "STATUS",
+        "QUEUE",
+        "MATCH",
+        "TRIES",
+        "SCORE",
+        "GAIN",
+        "RESULT",
+    )
     rows: list[tuple[str, ...]] = []
     for raw in participants:
         if not isinstance(raw, Mapping):
@@ -67,6 +77,8 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
         champion = raw.get("champion") is True
         state = str(raw.get("state", "?"))
         status_text = f"{green}CHAMPION{reset}" if champion else state
+        if raw.get("alert") is True:
+            status_text = f"{yellow}ALERT{reset}"
         queue = raw.get("queue_position")
         match = raw.get("match_sequence")
         score = raw.get("score")
@@ -79,6 +91,7 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
                 status_text,
                 f"{yellow}#{queue}{reset}" if queue is not None else "-",
                 f"#{match}" if match is not None else "-",
+                str(raw.get("attempts", 0)),
                 f"{float(score):.6f}" if isinstance(score, (int, float)) else "-",
                 f"{float(gain):+.6f}" if isinstance(gain, (int, float)) else "-",
                 str(outcome) if outcome is not None else "-",
@@ -136,6 +149,14 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
             ]
         )
         lines.append("System benchmarks do not affect tournament rank or chain weights.")
+    alerts = [raw for raw in participants if isinstance(raw, Mapping) and raw.get("alert") is True]
+    if alerts:
+        lines.extend(["", f"{bold}{yellow}ALERTS{reset}"])
+        lines.extend(
+            f"{raw.get('hotkey', '?')[:6]}  {raw.get('error_code', 'SYSTEM_DEFERRED')}  "
+            f"retry {raw.get('attempts', '?')}"
+            for raw in alerts
+        )
     return "\n".join(lines)
 
 

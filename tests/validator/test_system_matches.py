@@ -5,7 +5,6 @@ import pytest
 from validator.system_matches import (
     PRODUCTION_NETUID,
     PRODUCTION_TRACK_ID,
-    PRODUCTION_TRACK_SPEC_DIGEST,
     system_match_artifacts,
     system_match_summaries,
 )
@@ -14,13 +13,13 @@ from validator.system_matches import (
 def test_production_system_matches_are_complete_and_separate_from_rewards() -> None:
     artifacts = system_match_artifacts(
         PRODUCTION_TRACK_ID,
-        PRODUCTION_TRACK_SPEC_DIGEST,
+        "ab" * 32,
         PRODUCTION_NETUID,
     )
 
     assert [name for name, _payload in artifacts] == [
-        "system_matches/000000000001.json",
-        "system_matches/000000000002.json",
+        f"system_matches/{PRODUCTION_TRACK_ID}/000000000001.json",
+        f"system_matches/{PRODUCTION_TRACK_ID}/000000000002.json",
     ]
     documents = [json.loads(payload) for _name, payload in artifacts]
     for document in documents:
@@ -45,7 +44,7 @@ def test_production_system_matches_are_complete_and_separate_from_rewards() -> N
         len(
             system_match_summaries(
                 PRODUCTION_TRACK_ID,
-                PRODUCTION_TRACK_SPEC_DIGEST,
+                "ab" * 32,
                 PRODUCTION_NETUID,
             )
         )

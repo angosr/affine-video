@@ -21,9 +21,7 @@ VEDA_REPO_ID = "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview"
 VEDA_REVISION = "76f202874608115408d73280be9531c4ab888242"
 VEDA_FILENAME = "minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors"
 VEDA_FILE_SHA256 = "2a8d8845c5342756a2781e8e69563940e4bb573c9a40ebb534915ff8fd76573a"
-VEDA_EVALUATION_FILE_SHA256 = (
-    "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f"
-)
+VEDA_EVALUATION_FILE_SHA256 = "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f"
 VEDA_MODEL_DIGEST = "3fef3eca0eebee238b1ed9c692b217dd25cb1082ef94779ec2ef7c93ae0560c9"
 
 
@@ -71,6 +69,7 @@ class InitialChampionSpec:
 class CacheSpec:
     exact_max_bytes: int
     minimum_generation_delay_blocks: int
+    generation_interval_blocks: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +140,7 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
         "cache": {
             "exact_max_bytes": spec.cache.exact_max_bytes,
             "minimum_generation_delay_blocks": spec.cache.minimum_generation_delay_blocks,
+            "generation_interval_blocks": spec.cache.generation_interval_blocks,
         },
         "scoring": {
             "budgets": [
@@ -221,17 +221,13 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     initial_revision = _nonempty_string(
         initial_raw["revision"], "initial champion revision"
     ).lower()
-    initial_filename = _nonempty_string(
-        initial_raw["filename"], "initial champion filename"
-    )
+    initial_filename = _nonempty_string(initial_raw["filename"], "initial champion filename")
     initial_sha256 = _digest(initial_raw["file_sha256"], "initial champion file_sha256")
     initial_evaluation_sha256 = _digest(
         initial_raw["evaluation_file_sha256"],
         "initial champion evaluation_file_sha256",
     )
-    initial_model_digest = _digest(
-        initial_raw["model_digest"], "initial champion model_digest"
-    )
+    initial_model_digest = _digest(initial_raw["model_digest"], "initial champion model_digest")
     if (
         initial_repo != VEDA_REPO_ID
         or initial_revision != VEDA_REVISION
@@ -279,7 +275,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
 
     cache_raw = _object(
         root["cache"],
-        {"exact_max_bytes", "minimum_generation_delay_blocks"},
+        {
+            "exact_max_bytes",
+            "minimum_generation_delay_blocks",
+            "generation_interval_blocks",
+        },
         "cache",
     )
 
@@ -380,6 +380,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
                 "minimum generation delay blocks",
                 minimum=1,
             ),
+            "generation_interval_blocks": _integer(
+                cache_raw["generation_interval_blocks"],
+                "generation interval blocks",
+                minimum=1,
+            ),
         },
         "scoring": {
             "budgets": [
@@ -426,6 +431,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         cache=CacheSpec(
             exact_max_bytes=cache["exact_max_bytes"],
             minimum_generation_delay_blocks=cache["minimum_generation_delay_blocks"],
+            generation_interval_blocks=cache["generation_interval_blocks"],
         ),
         scoring=ScoringSpec(
             budgets=budgets,

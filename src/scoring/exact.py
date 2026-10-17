@@ -34,6 +34,7 @@ class ExactCase:
     valid_keys: np.ndarray
     required_keys: np.ndarray
     epsilon: float
+    sample_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,9 +64,7 @@ def score_selector(
 
     sampled_routes = tuple(sorted({case.route for case in cases}))
     group_weights, group_for = _route_stratum_groups(sampled_routes, stratum_weights)
-    errors: list[dict[str, list[float]]] = [
-        {group: [] for group in group_weights} for _ in budgets
-    ]
+    errors: list[dict[str, list[float]]] = [{group: [] for group in group_weights} for _ in budgets]
     per_case_qualities: list[list[float]] = [[] for _ in cases]
     for case_index, case in enumerate(cases):
         _validate_case(case, selector)
@@ -110,9 +109,7 @@ def score_selector(
     lower_bound = stratified_bootstrap_bound(
         {
             stratum: [
-                sample_scores[index]
-                for index, case in enumerate(cases)
-                if case.stratum == stratum
+                sample_scores[index] for index, case in enumerate(cases) if case.stratum == stratum
             ]
             for stratum in stratum_weights
         },
@@ -150,9 +147,7 @@ def paired_score_gain_bound(
     return stratified_bootstrap_bound(
         {
             stratum: [
-                differences[index]
-                for index, case in enumerate(cases)
-                if case.stratum == stratum
+                differences[index] for index, case in enumerate(cases) if case.stratum == stratum
             ]
             for stratum in stratum_weights
         },
@@ -169,9 +164,7 @@ def _route_stratum_groups(
     stratum_weights: Mapping[str, float],
 ) -> tuple[dict[str, float], Callable[[str, str], str]]:
     route_positions = {route: index for index, route in enumerate(routes)}
-    stratum_positions = {
-        stratum: index for index, stratum in enumerate(stratum_weights)
-    }
+    stratum_positions = {stratum: index for index, stratum in enumerate(stratum_weights)}
     weights = {
         f"{route_index}:{stratum_positions[stratum]}": weight / len(routes)
         for route_index in range(len(routes))
@@ -189,6 +182,8 @@ def _validate_case(case: ExactCase, selector: FixedSelector) -> None:
         raise ValueError("exact case references an unknown selector route")
     if case.stratum == "":
         raise ValueError("exact case stratum cannot be empty")
+    if not case.sample_id:
+        raise ValueError("exact case sample identifier cannot be empty")
     if not isfinite(case.epsilon) or case.epsilon <= 0:
         raise ValueError("exact case epsilon must be finite and positive")
     q = np.asarray(case.q)

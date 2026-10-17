@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from math import ceil
@@ -15,7 +13,7 @@ import bittensor as bt
 import httpx
 
 from scoring.model import ValidatedModel, validate_model
-from scoring.spec import VEDA_REPO_ID, VEDA_REVISION, TrackSpec, load_track_spec
+from scoring.spec import TrackSpec, load_track_spec
 from validator.admission import (
     AdmissionOutcome,
     AdmissionSettings,
@@ -28,7 +26,7 @@ from validator.publication import (
     PublicLedger,
     build_genesis_artifacts,
     build_public_artifacts,
-    encode_weight_artifact,
+    fetch_track_spec,
     fetch_weight_artifact,
     validate_public_weights_url,
 )
@@ -43,16 +41,10 @@ from validator.scoring import (
 from validator.store import ChallengeStore, LeasedChallenge
 from validator.system_matches import (
     PRODUCTION_NETUID,
-    PRODUCTION_TRACK_ID,
-    PRODUCTION_TRACK_SPEC_DIGEST,
-    system_match_artifacts,
-    system_match_summaries,
 )
 from validator.tournament import MatchRecord
 from validator.weights import (
-    WeightArtifact,
     WeightReceipt,
-    plan_champion_weight,
     read_weight_chain_state,
     submit_weights,
     validate_weight_artifact,
@@ -66,28 +58,15 @@ PUBLIC_STORAGE_URL = (
     f"{PUBLIC_STORAGE_BUCKET}/{PUBLIC_STORAGE_PREFIX}"
 )
 DEFAULT_PUBLIC_WEIGHTS_URL = f"{PUBLIC_STORAGE_URL}/weights.json"
-DEFAULT_BASELINE_MANIFEST_URL = (
-    f"{PUBLIC_STORAGE_URL}/assets/veda_baseline_f16/manifest.json"
-)
+DEFAULT_BASELINE_MANIFEST_URL = f"{PUBLIC_STORAGE_URL}/assets/veda_baseline_f16/manifest.json"
 DEFAULT_NETUID = PRODUCTION_NETUID
 DEFAULT_MECHID = 1
-DEFAULT_TRACK_SPEC_DIGEST = PRODUCTION_TRACK_SPEC_DIGEST
-INITIAL_TRACK_ID = PRODUCTION_TRACK_ID
-INITIAL_CHAMPION_HOTKEY = "5HmYnmUYT6qe3yFMg1Ad8WLLqDvnwtjYakXBpDvoRW1Qqzb8"
 
 
 class ArtifactRepository(Protocol):
     async def publish(self, artifacts: PublicArtifacts) -> None: ...
 
     async def load(self, track: TrackSpec) -> PublicLedger: ...
-
-    async def publish_initial_state(
-        self,
-        *,
-        status: bytes,
-        weights: bytes,
-        system_matches: tuple[tuple[str, bytes], ...] = (),
-    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,12 +88,6 @@ class WeightCycleResult:
     status: str
     receipt: WeightReceipt | None = None
     error: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _InitialChampion:
-    hotkey: str = INITIAL_CHAMPION_HOTKEY
-    uid: int = 0
 
 
 async def run_evaluator(
@@ -171,20 +144,20 @@ async def run_evaluator(
         tensor_schema=track.model.tensor_schema,
         publication_grace_blocks=track.publication_grace_blocks,
     )
-    scoring_settings = ScoringSettings(
-        lease_ms=ceil(scoring_timeout_seconds * 2 * 1000) + 60_000
-    )
+    scoring_settings = ScoringSettings(lease_ms=ceil(scoring_timeout_seconds * 2 * 1000) + 60_000)
 
     with ChallengeStore(database, track_spec_digest=track.digest) as store:
         evaluator = PairedTrackEvaluator(
-            track,
-            store,
-            cache_dir,
-            Path(model_cache),
-            initial_model_path,
-            scoring_timeout_seconds,
-            scoring_max_memory_bytes,
-            scoring_max_cpu_seconds,
+            track=track,
+            store=store,
+            cache_dir=cache_dir,
+            model_cache=Path(model_cache),
+            initial_model_path=initial_model_path,
+            champion_archive_url=f"{PUBLIC_STORAGE_URL}/models/{track.track_id}",
+            timeout_seconds=scoring_timeout_seconds,
+            max_memory_bytes=scoring_max_memory_bytes,
+            max_cpu_seconds=scoring_max_cpu_seconds,
+            seed_block_hashes={},
         )
         recovery_index = 0
         while True:
@@ -225,6 +198,7 @@ async def run_evaluator(
                         before_block=track.track_start_block - 1,
                     )
                     while True:
+                        await _refresh_seed_block_hashes(client, evaluator)
                         result = await process_cycle(
                             client,
                             store,
@@ -256,6 +230,7 @@ async def run_evaluator(
                                     track,
                                     chain,
                                     version_key=version_key,
+                                    exact_cache_dir=cache_dir,
                                 )
                                 if artifacts is not None:
                                     await publisher.publish(artifacts)
@@ -297,12 +272,29 @@ async def run_evaluator(
                 await asyncio.sleep(poll_seconds)
 
 
+async def _refresh_seed_block_hashes(
+    client: Any,
+    evaluator: PairedTrackEvaluator,
+) -> None:
+    """Pin every reached generation boundary to its finalized chain hash."""
+
+    hashes = evaluator.seed_block_hashes
+    if hashes is None:
+        return
+    finalized = await client.finalized_block()
+    start = evaluator.track.track_start_block
+    interval = evaluator.track.cache.generation_interval_blocks
+    for height in range(start, finalized + 1, interval):
+        if height not in hashes:
+            value = await client._substrate.block_hash(height)
+            if not isinstance(value, str) or len(value.removeprefix("0x")) != 64:
+                raise RuntimeError(f"finalized block {height} has an invalid hash")
+            hashes[height] = value
+
+
 async def run_validator(
     *,
     public_weights_url: str,
-    netuid: int,
-    track_spec_digest: str,
-    mechid: int = DEFAULT_MECHID,
     network: str,
     wallet_name: str,
     hotkey_name: str,
@@ -316,13 +308,6 @@ async def run_validator(
 
     if not network:
         raise ValueError("network cannot be empty")
-    if netuid < 0 or netuid > 0xFFFF:
-        raise ValueError("netuid must fit in an unsigned 16-bit integer")
-    if mechid < 0:
-        raise ValueError("mechanism identifier must be non-negative")
-    normalized_track_digest = track_spec_digest.lower()
-    if re.fullmatch(r"[0-9a-f]{64}", normalized_track_digest) is None:
-        raise ValueError("track specification digest must be 32-byte hexadecimal")
     validate_public_weights_url(public_weights_url)
     if poll_seconds <= 0:
         raise ValueError("poll interval must be positive")
@@ -348,9 +333,6 @@ async def run_validator(
                     wallet,
                     validator_hotkey=validator_hotkey,
                     public_weights_url=public_weights_url,
-                    netuid=netuid,
-                    track_spec_digest=normalized_track_digest,
-                    expected_mechid=mechid,
                     max_staleness_blocks=max_staleness_blocks,
                 )
             except Exception as exc:
@@ -369,121 +351,6 @@ async def run_validator(
             await asyncio.sleep(poll_seconds)
 
 
-async def run_initial_publisher(
-    *,
-    publisher: ArtifactRepository,
-    network: str = "finney",
-    poll_seconds: float = 12.0,
-    once: bool = False,
-    report: Callable[[WeightCycleResult], None] | None = None,
-) -> None:
-    """Keep the public SN120 state current while UID0 is the only champion."""
-
-    if not network:
-        raise ValueError("network cannot be empty")
-    if poll_seconds <= 0:
-        raise ValueError("poll interval must be positive")
-    async with bt.Client(network) as client:
-        while True:
-            try:
-                chain = await read_weight_chain_state(client, netuid=DEFAULT_NETUID)
-                plan = plan_champion_weight(
-                    _InitialChampion(),
-                    uid_by_hotkey=chain.uid_by_hotkey,
-                    current_block=chain.finalized_block,
-                    min_allowed_weights=chain.min_allowed_weights,
-                    max_weight=chain.max_weight,
-                )
-                if plan is None:
-                    raise RuntimeError("UID0 cannot receive the complete chain weight")
-                artifact = WeightArtifact(
-                    INITIAL_TRACK_ID,
-                    DEFAULT_TRACK_SPEC_DIGEST,
-                    DEFAULT_NETUID,
-                    DEFAULT_MECHID,
-                    0,
-                    chain.finalized_block,
-                    plan,
-                )
-                status = _initial_status(chain.finalized_block)
-                await publisher.publish_initial_state(
-                    status=status,
-                    weights=encode_weight_artifact(artifact),
-                    system_matches=system_match_artifacts(
-                        INITIAL_TRACK_ID,
-                        DEFAULT_TRACK_SPEC_DIGEST,
-                        DEFAULT_NETUID,
-                    ),
-                )
-                result = WeightCycleResult(
-                    chain.finalized_block,
-                    chain.finalized_block,
-                    "PUBLISHED",
-                )
-            except Exception as exc:
-                result = WeightCycleResult(
-                    None,
-                    None,
-                    "ERROR",
-                    error=str(exc) or type(exc).__name__,
-                )
-            if report is not None:
-                report(result)
-            if once:
-                if result.error is not None:
-                    raise RuntimeError(result.error)
-                return
-            await asyncio.sleep(poll_seconds)
-
-
-def _initial_status(source_block: int) -> bytes:
-    champion = {
-        "challenge_id": "genesis",
-        "hotkey": INITIAL_CHAMPION_HOTKEY,
-        "repo_id": VEDA_REPO_ID,
-        "revision": VEDA_REVISION,
-        "score": None,
-        "uid": 0,
-        "source": "VEDA_BASELINE",
-        "block_height": 0,
-        "extrinsic_index": 0,
-        "event_index": 0,
-    }
-    document = {
-        "track_id": INITIAL_TRACK_ID,
-        "track_spec_digest": DEFAULT_TRACK_SPEC_DIGEST,
-        "netuid": DEFAULT_NETUID,
-        "source_block": source_block,
-        "champion": champion,
-        "system_matches": system_match_summaries(
-            INITIAL_TRACK_ID,
-            DEFAULT_TRACK_SPEC_DIGEST,
-            DEFAULT_NETUID,
-        ),
-        "participants": [
-            {
-                "uid": 0,
-                "hotkey": INITIAL_CHAMPION_HOTKEY,
-                "challenge_id": "genesis",
-                "submission_block": 0,
-                "state": "CHAMPION",
-                "queue_position": None,
-                "match_sequence": 0,
-                "score": None,
-                "outcome": "GENESIS",
-                "champion": True,
-            }
-        ],
-    }
-    return json.dumps(
-        document,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode()
-
-
 async def process_weight_cycle(
     client: Any,
     http_client: httpx.AsyncClient,
@@ -491,19 +358,20 @@ async def process_weight_cycle(
     *,
     validator_hotkey: str,
     public_weights_url: str,
-    netuid: int,
-    track_spec_digest: str,
-    expected_mechid: int = DEFAULT_MECHID,
     max_staleness_blocks: int,
 ) -> WeightCycleResult:
+    track = await fetch_track_spec(
+        public_weights_url.rsplit("/", 1)[0] + "/track.json",
+        client=http_client,
+    )
     artifact = await fetch_weight_artifact(public_weights_url, client=http_client)
-    chain = await read_weight_chain_state(client, netuid=netuid)
+    chain = await read_weight_chain_state(client, netuid=track.netuid)
     plan = validate_weight_artifact(
         artifact,
         chain,
-        expected_netuid=netuid,
-        expected_track_digest=track_spec_digest,
-        expected_mechid=expected_mechid,
+        expected_netuid=track.netuid,
+        expected_track_digest=track.digest,
+        expected_mechid=track.mechid,
         max_staleness_blocks=max_staleness_blocks,
     )
     if plan is None:

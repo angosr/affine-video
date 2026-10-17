@@ -7,7 +7,6 @@ from collections.abc import Iterable
 from typing import Any
 
 PRODUCTION_TRACK_ID = "veda-sn120-v1"
-PRODUCTION_TRACK_SPEC_DIGEST = "4aa422e215255d887dd5708925bf31723acc479b2b51b1f0f8225fe8caf866d8"
 PRODUCTION_NETUID = 120
 
 _REFERENCE = {
@@ -84,16 +83,20 @@ def system_match_artifacts(
 ) -> tuple[tuple[str, bytes], ...]:
     """Return immutable system-match objects for the production track only."""
 
-    if (
-        track_id != PRODUCTION_TRACK_ID
-        or track_spec_digest != PRODUCTION_TRACK_SPEC_DIGEST
-        or netuid != PRODUCTION_NETUID
-    ):
+    if track_id != PRODUCTION_TRACK_ID or netuid != PRODUCTION_NETUID:
         return ()
     return tuple(
         (
-            f"system_matches/{sequence:012d}.json",
-            _json_bytes(_match_document(sequence, challenger)),
+            f"system_matches/{track_id}/{sequence:012d}.json",
+            _json_bytes(
+                _match_document(
+                    sequence,
+                    challenger,
+                    track_id=track_id,
+                    track_spec_digest=track_spec_digest,
+                    netuid=netuid,
+                )
+            ),
         )
         for sequence, challenger in enumerate(_CHALLENGERS, start=1)
     )
@@ -124,7 +127,14 @@ def system_match_summaries(
     return summaries
 
 
-def _match_document(sequence: int, challenger: dict[str, str]) -> dict[str, Any]:
+def _match_document(
+    sequence: int,
+    challenger: dict[str, str],
+    *,
+    track_id: str,
+    track_spec_digest: str,
+    netuid: int,
+) -> dict[str, Any]:
     result_key = challenger["result_key"]
     panels = [
         {
@@ -144,9 +154,9 @@ def _match_document(sequence: int, challenger: dict[str, str]) -> dict[str, Any]
     return {
         "record_type": "SYSTEM_BENCHMARK",
         "sequence": sequence,
-        "track_id": PRODUCTION_TRACK_ID,
-        "track_spec_digest": PRODUCTION_TRACK_SPEC_DIGEST,
-        "netuid": PRODUCTION_NETUID,
+        "track_id": track_id,
+        "track_spec_digest": track_spec_digest,
+        "netuid": netuid,
         "affects_tournament": False,
         "reward_eligible": False,
         "reference": _REFERENCE,

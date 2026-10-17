@@ -3,7 +3,7 @@ from copy import deepcopy
 import pytest
 
 from miner.submit import ModelSubmission
-from validator.scan import extract_submissions
+from validator.scan import extract_commitment_reveals, extract_submissions, revealed_payload
 
 BLOCK_HASH = "0x" + "ab" * 32
 HOTKEY = "5C9ywXcKhSNrFY2ttziLTLNPZB9XPqGaKbLpvh6J6TuJyBQQ"
@@ -136,3 +136,30 @@ def test_successful_veda_call_requires_matching_commitment_event() -> None:
             events=events,
             netuid=7,
         )
+
+
+def test_extracts_automatic_timelock_reveal_event() -> None:
+    records = extract_commitment_reveals(
+        block_height=123,
+        events=[
+            {
+                "extrinsic_idx": None,
+                "module_id": "Commitments",
+                "event_id": "CommitmentRevealed",
+                "attributes": {"netuid": 7, "who": HOTKEY},
+            }
+        ],
+        netuid=7,
+    )
+
+    assert len(records) == 1
+    assert records[0].hotkey == HOTKEY
+    assert records[0].position.block == 123
+    assert records[0].position.extrinsic_index == 0
+
+
+def test_decodes_revealed_payload_sdk_forms() -> None:
+    assert revealed_payload("hello") == b"hello"
+    assert revealed_payload("0x56444131") == b"VDA1"
+    assert revealed_payload(b"bytes") == b"bytes"
+    assert revealed_payload("0xzz") is None

@@ -26,11 +26,11 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
 3. The evaluator accepts exactly one `selector.safetensors` file. Its only metadata entry must be
    `hotkey`, set to the complete submitting hotkey. It rejects executable code, other metadata,
    unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.
-4. A valid model waits for the earliest hidden exact-attention batch generated after its commitment
-   boundary. The batch records its generation block, private-source digest, and content hash.
-   Each batch samples unpredictable layer/head routes and covers every configured data stratum once
-   per sampled route. Batches may serve multiple already-committed models, but no model may use an
-   older batch.
+4. A valid model waits for its single scheduled exact-attention batch boundary. Boundaries occur at
+   the interval fixed by `track.json`; the finalized block hash at that boundary seeds the public
+   route/sample planner. The batch records that block hash, source digest, sample identifiers and
+   content hash. Each batch covers every configured stratum once per sampled route. A later batch
+   cannot be substituted to obtain a more favorable result.
 5. UID 0 is the genesis champion without making a commit. Its identity is pinned to the official
    VEDA repository revision, filename and file SHA-256 in the track specification. Its baseline
    and every challenger are evaluated by the same scorer. For every match, the challenger and
@@ -54,10 +54,12 @@ hotkey-to-UID mapping and chain weight constraints before publishing. When the c
 longer registered or a valid vector is impossible, `weights` is `null` and Validators keep their
 last finalized weights.
 
-Before live rewards, the rotating exact-cache score must be validated against full-video quality on
-the target GPU. The production track must also pass ranking stability, cost calibration, baseline
-headroom, and adversarial-submission experiments. Those are track-acceptance experiments rather
-than a second runtime scoring system.
+The launch checks use full-video trajectories on NVIDIA H200 hardware. The VEDA baseline beat both
+the MeanPool and shuffled-head controls on every tested geometry; those immutable measurements are
+published under `system_matches/`. Exact-cache ranking, cost calibration, bootstrap stability,
+malformed archives, non-finite weights, metadata impersonation, repacking and re-signing duplicate
+weights are covered by the executable test suite. These checks validate the one runtime scorer;
+they are not a second scoring path.
 
 ## Public object-storage state
 
@@ -70,13 +72,19 @@ tracks/main/
   status.json
   weights.json
   system_matches/
-    000000000001.json
-    ...
+    veda-sn120-v1/
+      000000000001.json
+      ...
   matches/
     veda-sn120-v1/
       000000000001.json
       000000000002.json
       ...
+  batches/
+    <sha256>.npz
+  models/
+    veda-sn120-v1/
+      <sha256>.safetensors
 ```
 
 - `track.json` is the stable pointer to the current canonical track specification and digest. An
@@ -87,6 +95,11 @@ tracks/main/
   chain weights.
 - `matches/<track_id>/*.json` are immutable terminal match facts in chain order: public model reference,
   content hashes, aggregate result, incumbent, decision, and decision block.
+- `batches/<sha256>.npz` publishes the exact QKV batch after its first match finishes, allowing
+  anyone to replay the score and verify its finalized-block seed.
+- `models/<track_id>/<sha256>.safetensors` is the durable copy of every winning selector. The next
+  match restores its incumbent from this archive, so deleting the original Hugging Face repository
+  cannot stop the tournament.
 - `summary.json` is a bounded current view containing the champion, top leaderboard and committed
   match count.
 - `status.json` is the bounded live view used by the monitoring CLI; it includes UID 0, active
@@ -106,9 +119,10 @@ downloaded model cache are disposable execution state: after loss, finalized cha
 verified published matches reconstruct completed work, and remaining submissions can be evaluated
 again.
 
-Public artifacts deliberately exclude hidden samples, per-sample or per-layer metrics, local paths,
-worker and lease data, retry timing, error text, stack traces, and credentials. Only stable error
-codes are public. Use a public HTTPS custom domain for reads; mutable objects are published with
+Before a match completes, public artifacts exclude its hidden arrays, per-sample metrics, local
+paths, worker and lease data, retry timing, error text, stack traces, and credentials. The used
+batch is revealed only with the immutable match. Only stable error codes and retry counts are
+public. Use a public HTTPS custom domain for reads; mutable objects are published with
 `Cache-Control: no-store`, while immutable objects receive long-lived immutable caching.
 
 ## Commands
@@ -130,6 +144,18 @@ uv run veda miner commit \
   --wallet-name default \
   --hotkey default
 ```
+
+Before uploading, bind the only allowed metadata field to the submitting hotkey:
+
+```bash
+uv run veda miner prepare \
+  --model trained.safetensors \
+  --output selector.safetensors \
+  --hotkey-address 5...
+```
+
+The ownership metadata is checked separately from the canonical tensor digest. Consequently,
+copying public weights and changing their hotkey still produces the same duplicate fingerprint.
 
 The production netuid defaults to `120` and the network defaults to `finney`; both can be overridden.
 Because only the hotkey's first commitment is eligible, the command sends exactly one transaction
@@ -154,21 +180,11 @@ uv run --extra storage veda validator evaluate \
   --scoring-timeout-seconds 1800
 ```
 
-Keep the live UID 0 state current before the first evaluation track is published:
-
-```bash
-uv run --extra storage veda validator initialize
-```
-
-This loop publishes the immutable system checks plus `status.json` and `weights.json`. It verifies
-that the pinned hotkey is still UID 0 at every finalized snapshot and stops writing as soon as the
-evaluator publishes the immutable `track.json`.
-
 `--exact-cache` is a directory populated with immutable NPZ batches named
-`<generation-block>-<sha256>.npz`. Every batch contains the same generation block and its source
-digest in validated metadata. Publish each file with one atomic rename only after it is complete.
-Hidden arrays and source material are never published; their durable private copy must live outside
-the disposable GPU host.
+`<generation-block>-<sha256>.npz`. Every batch contains that generation block, its finalized hash,
+source digest and selected sample identifiers in validated metadata. The evaluator verifies the
+hash against finalized chain state and publishes the used batch after the match. A lost GPU host
+can deterministically regenerate an unpublished batch from the public generator and chain seed.
 
 If `--initial-model` is omitted, the evaluator restores the pinned UID 0 VEDA weights from the
 public chunk manifest, verifies every chunk, the complete file SHA-256, the canonical tensor
@@ -180,9 +196,10 @@ Run any Validator, including the evaluator operator's independent Validator:
 uv run veda validator run
 ```
 
-This process needs no evaluator database, model cache, hidden data, GPU, or storage write credentials. It
-also needs no object-storage or track arguments: the public URL, subnet, and pinned track digest are
-release defaults. Wallet name, hotkey, network, and public track fields remain optional overrides.
+This process needs no evaluator database, model cache, hidden data, GPU, or storage credentials. It
+also needs no subnet, mechanism or digest arguments: it fetches `track.json` beside the fixed
+`weights.json` URL on every cycle and validates both together. Wallet name, hotkey and network are
+the only operator-specific settings.
 It rejects artifacts for another track or subnet, future or stale snapshots, invalid normalization
 or caps, insufficient UID count, and hotkey-to-UID mappings that differ from the finalized
 metagraph.

@@ -22,6 +22,47 @@ class ChainCommitment:
     payload: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class CommitmentReveal:
+    """One automatic timelock reveal in finalized event order."""
+
+    hotkey: str
+    position: ChainPosition
+
+
+def extract_commitment_reveals(
+    *,
+    block_height: int,
+    events: Sequence[Mapping[str, Any]],
+    netuid: int,
+) -> list[CommitmentReveal]:
+    """Extract reveal identities; plaintext is read from finalized storage."""
+
+    records: list[CommitmentReveal] = []
+    for event_position, event in enumerate(events):
+        if (
+            event.get("module_id") != "Commitments"
+            or event.get("event_id") != "CommitmentRevealed"
+            or _attribute(event, "netuid") != netuid
+        ):
+            continue
+        hotkey = _attribute(event, "who")
+        if not isinstance(hotkey, str) or not hotkey:
+            raise RuntimeError("commitment reveal contains an invalid hotkey")
+        extrinsic_index = event.get("extrinsic_idx")
+        if extrinsic_index is None:
+            extrinsic_index = 0
+        if type(extrinsic_index) is not int or extrinsic_index < 0:
+            raise RuntimeError("commitment reveal contains an invalid extrinsic index")
+        records.append(
+            CommitmentReveal(
+                hotkey,
+                ChainPosition(block_height, extrinsic_index, event_position),
+            )
+        )
+    return records
+
+
 def extract_commitments(
     *,
     block_height: int,
@@ -98,31 +139,55 @@ def extract_submissions(
         netuid=netuid,
     )
     for commitment in commitments:
-        payload = commitment.payload
-        if not payload.startswith(MAGIC):
-            continue
-        try:
-            model = ModelSubmission.decode(payload)
-        except SubmissionFormatError:
-            repo_id = None
-            revision = None
-        else:
-            repo_id = model.repo_id
-            revision = model.revision
-
-        records.append(
-            SubmissionRecord(
-                submission_id=submission_id(netuid, block_hash, commitment.position),
-                hotkey=commitment.hotkey,
-                netuid=netuid,
-                block_hash=block_hash,
-                position=commitment.position,
-                payload=payload,
-                repo_id=repo_id,
-                revision=revision,
-            )
-        )
+        submission = submission_from_commitment(commitment)
+        if submission is not None:
+            records.append(submission)
     return records
+
+
+def submission_from_commitment(commitment: ChainCommitment) -> SubmissionRecord | None:
+    """Decode one Veda payload while retaining malformed Veda attempts."""
+
+    payload = commitment.payload
+    if not payload.startswith(MAGIC):
+        return None
+    try:
+        model = ModelSubmission.decode(payload)
+    except SubmissionFormatError:
+        repo_id = None
+        revision = None
+    else:
+        repo_id = model.repo_id
+        revision = model.revision
+    return SubmissionRecord(
+        submission_id=submission_id(
+            commitment.netuid,
+            commitment.block_hash,
+            commitment.position,
+        ),
+        hotkey=commitment.hotkey,
+        netuid=commitment.netuid,
+        block_hash=commitment.block_hash,
+        position=commitment.position,
+        payload=payload,
+        repo_id=repo_id,
+        revision=revision,
+    )
+
+
+def revealed_payload(value: Any) -> bytes | None:
+    """Decode the SDK representation of one revealed commitment payload."""
+
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if not isinstance(value, str):
+        return None
+    if value.startswith("0x"):
+        try:
+            return bytes.fromhex(value[2:])
+        except ValueError:
+            return None
+    return value.encode("utf-8")
 
 
 def _attribute(event: Mapping[str, Any], name: str) -> Any:

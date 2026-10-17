@@ -90,9 +90,7 @@ def download_chunked_asset(
     temporary: Path | None = None
     try:
         manifest_bytes = bytearray()
-        with client.stream(
-            "GET", manifest_url, headers={"Accept": "application/json"}
-        ) as response:
+        with client.stream("GET", manifest_url, headers={"Accept": "application/json"}) as response:
             response.raise_for_status()
             declared = response.headers.get("content-length")
             if declared is not None and int(declared) > _MAX_MANIFEST_BYTES:
@@ -144,6 +142,75 @@ def download_chunked_asset(
         return target
     except (httpx.HTTPError, json.JSONDecodeError, OSError, ValueError) as exc:
         raise RuntimeError("public baseline asset could not be restored") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if owned_client:
+            client.close()
+
+
+def download_public_asset(
+    url: str,
+    *,
+    cache_dir: str | Path,
+    expected_sha256: str,
+    max_bytes: int,
+    timeout_seconds: float = 120,
+    http_client: httpx.Client | None = None,
+) -> Path:
+    """Restore one immutable content-addressed public object with bounded streaming."""
+
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not _DIGEST.fullmatch(expected_sha256)
+        or not parsed.path.endswith(f"/{expected_sha256}.safetensors")
+    ):
+        raise ValueError("public model asset URL is invalid")
+    if max_bytes <= 0 or timeout_seconds <= 0:
+        raise ValueError("asset download limits must be positive")
+    cache = Path(cache_dir).resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / f"{expected_sha256}.safetensors"
+    if (
+        target.is_file()
+        and target.stat().st_size <= max_bytes
+        and _sha256(target) == expected_sha256
+    ):
+        return target
+    owned_client = http_client is None
+    client = http_client or httpx.Client(follow_redirects=False, timeout=timeout_seconds)
+    temporary: Path | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(prefix=".partial-champion-", dir=cache)
+        temporary = Path(name)
+        digest = hashlib.sha256()
+        received = 0
+        with os.fdopen(descriptor, "wb") as output, client.stream("GET", url) as response:
+            response.raise_for_status()
+            declared = response.headers.get("content-length")
+            if declared is not None and int(declared) > max_bytes:
+                raise ValueError("public model asset exceeds the byte limit")
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                received += len(chunk)
+                if received > max_bytes:
+                    raise ValueError("public model asset exceeds the byte limit")
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if received == 0 or digest.hexdigest() != expected_sha256:
+            raise ValueError("public model asset digest is incorrect")
+        os.replace(temporary, target)
+        temporary = None
+        return target
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        raise RuntimeError("public champion asset could not be restored") from exc
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -256,11 +323,7 @@ def download_public_model(
 
     try:
         sibling = next(
-            (
-                item
-                for item in (info.siblings or ())
-                if item.rfilename == MODEL_FILENAME
-            ),
+            (item for item in (info.siblings or ()) if item.rfilename == MODEL_FILENAME),
             None,
         )
     except (AttributeError, TypeError) as exc:
@@ -288,9 +351,7 @@ def download_public_model(
                 temporary=True,
             )
         declared_size = lfs.get("size")
-    if declared_size is not None and (
-        type(declared_size) is not int or declared_size < 0
-    ):
+    if declared_size is not None and (type(declared_size) is not int or declared_size < 0):
         raise ModelDownloadError(
             "DOWNLOAD_TEMPORARY_FAILURE",
             "Hugging Face returned invalid model size metadata",

@@ -322,6 +322,11 @@ def _resolve_match(
         "incumbent_score": incumbent_score,
         "paired_gain_lower_bound": score_gain,
         "evaluation_batch": batch,
+        "model_object": (
+            f"models/{track_id}/{file_sha256}.safetensors"
+            if state is ChallengeState.SUCCEEDED
+            else None
+        ),
     }
     document = {
         "track_id": track_id,
@@ -437,22 +442,41 @@ def _evaluation_batch(
     submission_block: int,
     minimum_delay_blocks: int,
 ) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != {
+    expected = {
         "sha256",
         "generated_block",
         "source_digest",
-    }:
+        "seed_block_hash",
+    }
+    if not isinstance(value, Mapping) or set(value) not in (expected, expected | {"object"}):
         raise ValueError("evaluation_batch fields are invalid")
     sha256 = _optional_digest(value["sha256"], "evaluation batch sha256")
-    source_digest = _optional_digest(
-        value["source_digest"], "evaluation batch source_digest"
-    )
+    source_digest = _optional_digest(value["source_digest"], "evaluation batch source_digest")
     generated_block = _integer(value["generated_block"], "evaluation batch generated_block")
     if generated_block < submission_block + minimum_delay_blocks:
         raise ValueError("evaluation batch predates the submission boundary")
     assert sha256 is not None and source_digest is not None
+    seed_block_hash = _block_hash(value["seed_block_hash"])
+    object_name = f"batches/{sha256}.npz"
+    if "object" in value and value["object"] != object_name:
+        raise ValueError("evaluation batch object name is invalid")
     return {
         "sha256": sha256,
         "generated_block": generated_block,
         "source_digest": source_digest,
+        "seed_block_hash": seed_block_hash,
+        "object": object_name,
     }
+
+
+def _block_hash(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("evaluation batch seed block hash must be hexadecimal")
+    normalized = value.removeprefix("0x").lower()
+    try:
+        decoded = bytes.fromhex(normalized)
+    except ValueError as exc:
+        raise ValueError("evaluation batch seed block hash must be hexadecimal") from exc
+    if len(decoded) != 32:
+        raise ValueError("evaluation batch seed block hash must contain 32 bytes")
+    return "0x" + normalized

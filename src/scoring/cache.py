@@ -18,6 +18,7 @@ import numpy as np
 from numpy.lib.format import read_array_header_1_0, read_array_header_2_0, read_magic
 
 from scoring.exact import ExactCase
+from scoring.generator import scheduled_seed_block
 
 
 class CacheLoadError(ValueError):
@@ -33,6 +34,7 @@ class ExactCacheBatch:
     sha256: str
     generated_block: int
     source_digest: str
+    seed_block_hash: str
 
 
 def write_exact_cache_batch(
@@ -41,6 +43,7 @@ def write_exact_cache_batch(
     *,
     generated_block: int,
     source_digest: str,
+    seed_block_hash: str,
 ) -> ExactCacheBatch:
     """Atomically serialize one private exact-cache batch for the evaluator."""
 
@@ -54,15 +57,27 @@ def write_exact_cache_batch(
         bytes.fromhex(source_digest)
     except ValueError as exc:
         raise ValueError("cache source digest must be hexadecimal") from exc
+    seed_block_hash = _block_hash(seed_block_hash, ValueError)
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     metadata_cases = []
     arrays: dict[str, np.ndarray] = {}
     for index, case in enumerate(cases):
-        if not case.route or not case.stratum or not isfinite(case.epsilon) or case.epsilon <= 0:
+        if (
+            not case.route
+            or not case.stratum
+            or not case.sample_id
+            or not isfinite(case.epsilon)
+            or case.epsilon <= 0
+        ):
             raise ValueError("cache case metadata is invalid")
         metadata_cases.append(
-            {"route": case.route, "stratum": case.stratum, "epsilon": case.epsilon}
+            {
+                "route": case.route,
+                "stratum": case.stratum,
+                "sample_id": case.sample_id,
+                "epsilon": case.epsilon,
+            }
         )
         prefix = f"case_{index:06d}"
         for field in ("q", "k", "v", "dense", "valid_keys", "required_keys"):
@@ -76,6 +91,7 @@ def write_exact_cache_batch(
                 "format": "veda-exact-cache",
                 "generated_block": generated_block,
                 "source_digest": source_digest.lower(),
+                "seed_block_hash": seed_block_hash,
                 "cases": metadata_cases,
             },
             sort_keys=True,
@@ -100,7 +116,13 @@ def write_exact_cache_batch(
             temporary_path.unlink()
         else:
             os.replace(temporary_path, target)
-        return ExactCacheBatch(target, sha256, generated_block, source_digest.lower())
+        return ExactCacheBatch(
+            target,
+            sha256,
+            generated_block,
+            source_digest.lower(),
+            seed_block_hash,
+        )
     except Exception:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
@@ -112,6 +134,8 @@ def select_exact_cache_batch(
     *,
     submission_block: int,
     minimum_delay_blocks: int,
+    track_start_block: int,
+    generation_interval_blocks: int,
     max_bytes: int,
     min_blocks: int,
     max_blocks: int,
@@ -120,10 +144,21 @@ def select_exact_cache_batch(
     strata: Mapping[str, float],
     sample_count: int,
 ) -> ExactCacheBatch:
-    """Select the earliest valid batch generated after one submission became immutable."""
+    """Select the single scheduled batch after one submission became immutable."""
 
-    if submission_block < 0 or minimum_delay_blocks <= 0:
+    if (
+        submission_block < 0
+        or minimum_delay_blocks <= 0
+        or track_start_block < 0
+        or generation_interval_blocks <= 0
+    ):
         raise ValueError("cache generation boundary is invalid")
+    expected_block = scheduled_seed_block(
+        submission_block,
+        track_start_block=track_start_block,
+        minimum_delay_blocks=minimum_delay_blocks,
+        generation_interval_blocks=generation_interval_blocks,
+    )
     root = Path(directory)
     candidates: list[tuple[int, str, Path]] = []
     try:
@@ -135,10 +170,10 @@ def select_exact_cache_batch(
         if match is None:
             raise CacheLoadError("cache batch filename is invalid")
         generated_block = int(match.group(1))
-        if generated_block >= submission_block + minimum_delay_blocks:
+        if generated_block == expected_block:
             candidates.append((generated_block, match.group(2), path))
     if not candidates:
-        raise CacheLoadError("no exact cache batch was generated after the submission")
+        raise CacheLoadError("the scheduled exact cache batch is unavailable")
     named_block, named_sha256, path = min(candidates)
     batch = inspect_exact_cache_batch(path, max_bytes=max_bytes)
     if batch.generated_block != named_block or batch.sha256 != named_sha256:
@@ -180,7 +215,17 @@ def inspect_exact_cache_batch(path: str | Path, *, max_bytes: int) -> ExactCache
         bytes.fromhex(source_digest)
     except ValueError as exc:
         raise CacheLoadError("cache source digest must be hexadecimal") from exc
-    return ExactCacheBatch(cache_path, sha256, generated_block, source_digest.lower())
+    try:
+        seed_block_hash = _block_hash(metadata["seed_block_hash"], CacheLoadError)
+    except KeyError as exc:
+        raise CacheLoadError("cache seed block hash is missing") from exc
+    return ExactCacheBatch(
+        cache_path,
+        sha256,
+        generated_block,
+        source_digest.lower(),
+        seed_block_hash,
+    )
 
 
 def validate_exact_cache(
@@ -202,7 +247,7 @@ def validate_exact_cache(
         expected_sha256=expected_sha256,
         max_bytes=max_bytes,
         expected_format="veda-exact-cache",
-        case_fields={"route", "stratum", "epsilon"},
+        case_fields={"route", "stratum", "sample_id", "epsilon"},
         array_fields=("q", "k", "v", "dense", "valid_keys", "required_keys"),
         routes=routes,
         strata=strata,
@@ -234,7 +279,11 @@ def _load_exact_cache(
         with np.load(cache_path, allow_pickle=False) as archive:
             metadata = _metadata(archive, expected_format="veda-exact-cache")
             cases = [
-                _object(raw_case, {"route", "stratum", "epsilon"}, "exact case")
+                _object(
+                    raw_case,
+                    {"route", "stratum", "sample_id", "epsilon"},
+                    "exact case",
+                )
                 for raw_case in metadata["cases"]
             ]
             expected = {"metadata"}
@@ -260,6 +309,7 @@ def _load_exact_cache(
                         valid_keys=_array(archive, names["valid_keys"]),
                         required_keys=_array(archive, names["required_keys"]),
                         epsilon=float(epsilon),
+                        sample_id=_string(case["sample_id"], "sample identifier"),
                     )
                 )
             _exact_keys(archive, expected)
@@ -296,9 +346,10 @@ def _validate_cache_index(
         raise ValueError("attention head dimension must be a positive integer")
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
     try:
-        with np.load(cache_path, allow_pickle=False) as archive, zipfile.ZipFile(
-            cache_path
-        ) as zipped:
+        with (
+            np.load(cache_path, allow_pickle=False) as archive,
+            zipfile.ZipFile(cache_path) as zipped,
+        ):
             metadata = _metadata(archive, expected_format=expected_format)
             cases = [
                 _object(raw_case, case_fields, f"{expected_format} case")
@@ -341,9 +392,7 @@ def _validate_cache_index(
                     or valid_keys.dtype != np.bool_
                     or np.count_nonzero(valid_keys) < max_blocks
                 ):
-                    raise CacheLoadError(
-                        "cache case cannot satisfy the maximum block budget"
-                    )
+                    raise CacheLoadError("cache case cannot satisfy the maximum block budget")
                 if (
                     required_keys.dtype != np.bool_
                     or np.any(required_keys & ~valid_keys[None, :])
@@ -355,9 +404,7 @@ def _validate_cache_index(
             sampled_routes = set(case_routes)
             if sample_count is not None and len(sampled_routes) != sample_count // len(strata):
                 raise CacheLoadError("cache route sample count does not match the track")
-            expected_pairs = {
-                (route, stratum) for route in sampled_routes for stratum in strata
-            }
+            expected_pairs = {(route, stratum) for route in sampled_routes for stratum in strata}
             actual_pairs = set(zip(case_routes, case_strata, strict=True))
             if len(actual_pairs) != len(cases) or actual_pairs != expected_pairs:
                 raise CacheLoadError(
@@ -413,7 +460,7 @@ def _metadata(archive: Any, *, expected_format: str) -> dict[str, Any]:
         raise CacheLoadError("cache metadata is not valid JSON") from exc
     root = _object(
         metadata,
-        {"format", "generated_block", "source_digest", "cases"},
+        {"format", "generated_block", "source_digest", "seed_block_hash", "cases"},
         "cache metadata",
     )
     if root["format"] != expected_format:
@@ -432,6 +479,19 @@ def _file_sha256(path: Path) -> str:
     except OSError as exc:
         raise CacheLoadError("cache is not readable") from exc
     return digest.hexdigest()
+
+
+def _block_hash(value: Any, error: type[Exception]) -> str:
+    if not isinstance(value, str):
+        raise error("cache seed block hash must be hexadecimal")
+    normalized = value.removeprefix("0x").lower()
+    try:
+        decoded = bytes.fromhex(normalized)
+    except ValueError as exc:
+        raise error("cache seed block hash must be hexadecimal") from exc
+    if len(decoded) != 32:
+        raise error("cache seed block hash must contain 32 bytes")
+    return "0x" + normalized
 
 
 def _array(archive: Any, name: str) -> np.ndarray:

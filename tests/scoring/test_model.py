@@ -96,6 +96,29 @@ def test_requires_exact_submitting_hotkey_metadata(tmp_path) -> None:
     assert caught.value.code == "MODEL_OWNER_MISMATCH"
 
 
+def test_resigning_copied_weights_does_not_change_duplicate_fingerprint(tmp_path) -> None:
+    victim = tmp_path / "victim.safetensors"
+    attacker = tmp_path / "attacker.safetensors"
+    write_model(victim, metadata={"hotkey": "victim"})
+    write_model(attacker, metadata={"hotkey": "attacker"})
+
+    victim_result = validate_model(
+        victim,
+        schema=SCHEMA,
+        max_bytes=10_000,
+        expected_hotkey="victim",
+    )
+    attacker_result = validate_model(
+        attacker,
+        schema=SCHEMA,
+        max_bytes=10_000,
+        expected_hotkey="attacker",
+    )
+
+    assert victim_result.file_sha256 != attacker_result.file_sha256
+    assert victim_result.model_digest == attacker_result.model_digest
+
+
 def test_rejects_non_finite_weights(tmp_path) -> None:
     path = tmp_path / "model.safetensors"
     write_model(path, non_finite=True)

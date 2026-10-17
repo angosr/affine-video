@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from validator.competition import LEGACY_ACTIVATION_PREFIX, is_valid_legacy_activation
-from validator.scan import extract_commitments, extract_submissions
+from validator.scan import (
+    ChainCommitment,
+    extract_commitment_reveals,
+    extract_commitments,
+    revealed_payload,
+    submission_from_commitment,
+)
 from validator.store import ChallengeStore
 
 
@@ -57,16 +63,44 @@ async def scan_finalized_blocks(
             events=events,
             netuid=netuid,
         )
-        submissions = extract_submissions(
+        reveals = extract_commitment_reveals(
             block_height=block_height,
-            block_hash=block_hash,
-            block=block,
             events=events,
             netuid=netuid,
         )
-        submissions_by_position = {
-            submission.position: submission for submission in submissions
-        }
+        if reveals:
+            snapshot = await client.at(block_height)
+            current_commitments = await snapshot.subnets.commitments(netuid)
+            by_hotkey = {getattr(item, "hotkey", None): item for item in current_commitments or ()}
+            for reveal in reveals:
+                item = by_hotkey.get(reveal.hotkey)
+                values = getattr(item, "revealed", ()) if item is not None else ()
+                matching = [
+                    revealed_payload(value)
+                    for height, value in values or ()
+                    if height == block_height
+                ]
+                matching = [payload for payload in matching if payload is not None]
+                if len(matching) != 1:
+                    raise RuntimeError(
+                        "commitment reveal plaintext is missing or ambiguous in finalized storage"
+                    )
+                commitments.append(
+                    ChainCommitment(
+                        reveal.hotkey,
+                        netuid,
+                        block_hash,
+                        reveal.position,
+                        matching[0],
+                    )
+                )
+        commitments.sort(key=lambda item: item.position)
+        submissions = tuple(
+            submission
+            for commitment in commitments
+            if (submission := submission_from_commitment(commitment)) is not None
+        )
+        submissions_by_position = {submission.position: submission for submission in submissions}
         for commitment in commitments:
             submission = submissions_by_position.get(commitment.position)
             if submission is not None:

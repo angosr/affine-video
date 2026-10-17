@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from miner.chain import ChainSubmissionError, submit_model
+from miner.prepare import prepare_model
 from miner.submit import ModelSubmission, SubmissionFormatError
 from validator.monitor import fetch_status, render_status
 from validator.publication import S3Repository
@@ -17,13 +18,11 @@ from validator.run import (
     DEFAULT_BASELINE_MANIFEST_URL,
     DEFAULT_NETUID,
     DEFAULT_PUBLIC_WEIGHTS_URL,
-    DEFAULT_TRACK_SPEC_DIGEST,
     PUBLIC_STORAGE_BUCKET,
     PUBLIC_STORAGE_PREFIX,
     EvaluationCycleResult,
     WeightCycleResult,
     run_evaluator,
-    run_initial_publisher,
     run_validator,
 )
 from validator.store import ChallengeStore
@@ -53,6 +52,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate and print the payload without opening a chain connection",
     )
+    prepare = miner_commands.add_parser(
+        "prepare", help="bind selector.safetensors metadata to a Miner hotkey"
+    )
+    prepare.add_argument("--model", required=True)
+    prepare.add_argument("--output", required=True)
+    prepare.add_argument("--hotkey-address", required=True)
 
     validator = modules.add_parser("validator", help="evaluate models or set chain weights")
     validator_commands = validator.add_subparsers(dest="command", required=True)
@@ -95,19 +100,8 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--version-key", default=0, type=int)
     evaluate.add_argument("--once", action="store_true")
 
-    initialize = validator_commands.add_parser(
-        "initialize", help="publish the live UID0 state before the first challenge"
-    )
-    initialize.add_argument("--network", default="finney")
-    initialize.add_argument("--poll-seconds", default=12.0, type=float)
-    initialize.add_argument("--once", action="store_true")
-
-    run = validator_commands.add_parser(
-        "run", help="fetch public weights and submit them on-chain"
-    )
+    run = validator_commands.add_parser("run", help="fetch public weights and submit them on-chain")
     run.add_argument("--public-weights-url", default=DEFAULT_PUBLIC_WEIGHTS_URL)
-    run.add_argument("--netuid", default=DEFAULT_NETUID, type=int)
-    run.add_argument("--track-spec-digest", default=DEFAULT_TRACK_SPEC_DIGEST)
     run.add_argument("--network", default="finney")
     run.add_argument("--wallet-name", default="default")
     run.add_argument("--hotkey", default="default")
@@ -129,6 +123,23 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
     try:
+        if arguments.command == "prepare":
+            prepared = prepare_model(
+                arguments.model,
+                arguments.output,
+                hotkey=arguments.hotkey_address,
+            )
+            print(
+                json.dumps(
+                    {
+                        "path": str(prepared.path),
+                        "sha256": prepared.sha256,
+                        "size_bytes": prepared.size_bytes,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
         if arguments.netuid < 0 or arguments.netuid > 0xFFFF:
             raise ValueError("netuid must fit in an unsigned 16-bit integer")
         if not arguments.network:
@@ -181,27 +192,6 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
             parser.exit(1, f"error: {exc}\n")
         return
 
-    if arguments.command == "initialize":
-        try:
-            publisher = S3Repository.from_environment(
-                bucket=PUBLIC_STORAGE_BUCKET,
-                prefix=PUBLIC_STORAGE_PREFIX,
-            )
-            asyncio.run(
-                run_initial_publisher(
-                    publisher=publisher,
-                    network=arguments.network,
-                    poll_seconds=arguments.poll_seconds,
-                    once=arguments.once,
-                    report=_print_weight_cycle,
-                )
-            )
-        except KeyboardInterrupt:
-            return
-        except (RuntimeError, OSError, ValueError) as exc:
-            parser.exit(1, f"error: {exc}\n")
-        return
-
     if arguments.command == "evaluate":
         try:
             publisher = S3Repository.from_environment(
@@ -241,8 +231,6 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
             asyncio.run(
                 run_validator(
                     public_weights_url=arguments.public_weights_url,
-                    netuid=arguments.netuid,
-                    track_spec_digest=arguments.track_spec_digest,
                     network=arguments.network,
                     wallet_name=arguments.wallet_name,
                     hotkey_name=arguments.hotkey,

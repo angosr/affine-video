@@ -8,6 +8,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -54,6 +55,14 @@ class PublicArtifacts:
     matches: tuple[tuple[str, bytes], ...]
     status: bytes | None = None
     system_matches: tuple[tuple[str, bytes], ...] = ()
+    files: tuple[PublicFile, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PublicFile:
+    object_name: str
+    path: Path
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +86,7 @@ def build_public_artifacts(
     chain: WeightChainState,
     *,
     version_key: int,
+    exact_cache_dir: str | Path | None = None,
 ) -> PublicArtifacts | None:
     """Build one auditable public snapshot when chain scanning is caught up."""
 
@@ -120,6 +130,23 @@ def build_public_artifacts(
         store.active_competitors(chain.uid_by_hotkey),
         snapshot["challenges"],
     )
+    files: dict[str, PublicFile] = {}
+    for match in tournament.matches:
+        evaluation = match.document["evaluation"]
+        batch = evaluation["evaluation_batch"]
+        if batch is not None and exact_cache_dir is not None:
+            path = Path(exact_cache_dir) / f"{batch['generated_block']}-{batch['sha256']}.npz"
+            files[batch["object"]] = PublicFile(batch["object"], path, batch["sha256"])
+        if exact_cache_dir is not None and match.outcome.value == "CHALLENGER_WON":
+            path_value = store.model_path(match.challenge_id)
+            if path_value is None:
+                raise PublicArtifactError("winning model has no local archive source")
+            object_name = evaluation["model_object"]
+            files[object_name] = PublicFile(
+                object_name,
+                Path(path_value),
+                evaluation["file_sha256"],
+            )
     return PublicArtifacts(
         source_block=chain.finalized_block,
         track=_json_bytes(
@@ -135,6 +162,7 @@ def build_public_artifacts(
         ),
         status=_json_bytes(status),
         system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
+        files=tuple(files.values()),
     )
 
 
@@ -175,15 +203,11 @@ def build_genesis_artifacts(
     )
     return PublicArtifacts(
         source_block=chain.finalized_block,
-        track=_json_bytes(
-            {"track_spec_digest": track.digest, "spec": track_spec_dict(track)}
-        ),
+        track=_json_bytes({"track_spec_digest": track.digest, "spec": track_spec_dict(track)}),
         summary=_json_bytes(_summary_document(track, chain.finalized_block, tournament)),
         weights=encode_weight_artifact(weights),
         matches=(),
-        status=_json_bytes(
-            _status_document(track, chain.finalized_block, tournament, [], [])
-        ),
+        status=_json_bytes(_status_document(track, chain.finalized_block, tournament, [], [])),
         system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
     )
 
@@ -311,6 +335,38 @@ async def fetch_weight_artifact(
     return decode_weight_artifact(bytes(received))
 
 
+async def fetch_track_spec(
+    url: str,
+    *,
+    client: httpx.AsyncClient,
+) -> TrackSpec:
+    """Fetch and verify the current track document from public storage."""
+
+    validate_public_weights_url(url)
+    received = bytearray()
+    try:
+        async with client.stream(
+            "GET", url, headers={"Accept": "application/json", "Cache-Control": "no-cache"}
+        ) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                received.extend(chunk)
+                if len(received) > _MAX_PUBLIC_OBJECT_BYTES:
+                    raise PublicArtifactError("track artifact exceeds the byte limit")
+    except httpx.HTTPError as exc:
+        raise PublicArtifactError("track artifact could not be fetched") from exc
+    document = _decode_canonical_object(bytes(received), "track")
+    if set(document) != {"track_spec_digest", "spec"}:
+        raise PublicArtifactError("public track fields are invalid")
+    try:
+        track = parse_track_spec(document["spec"])
+    except ValueError as exc:
+        raise PublicArtifactError("public track specification is invalid") from exc
+    if document["track_spec_digest"] != track.digest:
+        raise PublicArtifactError("public track digest is invalid")
+    return track
+
+
 def validate_public_weights_url(url: str) -> str:
     """Validate the public Validator-side weight URL configured by an operator."""
 
@@ -378,6 +434,8 @@ class S3Repository:
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
         await asyncio.to_thread(self._put, "track.json", artifacts.track, False)
+        for artifact in artifacts.files:
+            await asyncio.to_thread(self._put_file_immutable, artifact)
         for name, payload in artifacts.system_matches:
             await asyncio.to_thread(self._put_immutable, name, payload)
         for name, payload in artifacts.matches:
@@ -387,31 +445,47 @@ class S3Repository:
             await asyncio.to_thread(self._put, "status.json", artifacts.status, False)
         await asyncio.to_thread(self._put, "weights.json", artifacts.weights, False)
 
-    async def publish_initial_state(
-        self,
-        *,
-        status: bytes,
-        weights: bytes,
-        system_matches: tuple[tuple[str, bytes], ...] = (),
-    ) -> None:
-        """Publish UID0 state until the immutable competition track exists."""
-
-        await asyncio.to_thread(self._publish_initial_state, status, weights, system_matches)
-
-    def _publish_initial_state(
-        self,
-        status: bytes,
-        weights: bytes,
-        system_matches: tuple[tuple[str, bytes], ...],
-    ) -> None:
-        if self._get_optional("track.json") is not None:
-            raise PublicArtifactError("the competition evaluator has already taken ownership")
-        for name, payload in system_matches:
-            self._put_immutable(name, payload)
-        self._put("status.json", status, False)
-        if self._get_optional("track.json") is not None:
-            raise PublicArtifactError("the competition evaluator started during publication")
-        self._put("weights.json", weights, False)
+    def _put_file_immutable(self, artifact: PublicFile) -> None:
+        if not artifact.path.is_file():
+            raise PublicArtifactError(f"public file source is missing: {artifact.object_name}")
+        if _file_sha256(artifact.path) != artifact.sha256:
+            raise PublicArtifactError(f"public file digest changed: {artifact.object_name}")
+        key = f"{self._prefix}/{artifact.object_name}"
+        try:
+            existing = self._client.head_object(Bucket=self._bucket, Key=key)
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            code = (response or {}).get("Error", {}).get("Code")
+            if str(code) not in {"404", "NoSuchKey", "NotFound"}:
+                raise
+        else:
+            metadata = existing.get("Metadata", {})
+            if (
+                metadata.get("sha256") != artifact.sha256
+                or existing.get("ContentLength") != artifact.path.stat().st_size
+            ):
+                raise PublicArtifactError(
+                    f"immutable public object conflicts with local content: {artifact.object_name}"
+                )
+            return
+        self._client.upload_file(
+            str(artifact.path),
+            self._bucket,
+            key,
+            ExtraArgs={
+                "ContentType": "application/octet-stream",
+                "CacheControl": "public, max-age=31536000, immutable",
+                "Metadata": {"sha256": artifact.sha256},
+            },
+        )
+        uploaded = self._client.head_object(Bucket=self._bucket, Key=key)
+        if (
+            uploaded.get("Metadata", {}).get("sha256") != artifact.sha256
+            or uploaded.get("ContentLength") != artifact.path.stat().st_size
+        ):
+            raise PublicArtifactError(
+                f"public file upload verification failed: {artifact.object_name}"
+            )
 
     async def load(self, track: TrackSpec) -> PublicLedger:
         """Load and verify the committed public tournament ledger from object storage."""
@@ -479,9 +553,7 @@ class S3Repository:
                     netuid=track.netuid,
                     minimum_gain=track.scoring.minimum_frontier_gain,
                     incumbent=incumbent,
-                    minimum_generation_delay_blocks=(
-                        track.cache.minimum_generation_delay_blocks
-                    ),
+                    minimum_generation_delay_blocks=(track.cache.minimum_generation_delay_blocks),
                 )
             except ValueError as exc:
                 raise PublicArtifactError(f"public match is invalid: {name}") from exc
@@ -529,9 +601,7 @@ class S3Repository:
                     netuid=track.netuid,
                     minimum_gain=track.scoring.minimum_frontier_gain,
                     incumbent=incumbent,
-                    minimum_generation_delay_blocks=(
-                        track.cache.minimum_generation_delay_blocks
-                    ),
+                    minimum_generation_delay_blocks=(track.cache.minimum_generation_delay_blocks),
                 )
             except ValueError as exc:
                 raise PublicArtifactError(f"public match is invalid: {name}") from exc
@@ -611,6 +681,14 @@ def _json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _summary_document(
     track: TrackSpec,
     source_block: int,
@@ -665,6 +743,9 @@ def _status_document(
             "batch_generated_block": None,
             "outcome": "GENESIS",
             "champion": tournament.champion.challenge_id == initial.challenge_id,
+            "attempts": 0,
+            "error_code": None,
+            "alert": False,
         }
     ]
     for competitor in competitors:
@@ -682,9 +763,7 @@ def _status_document(
                 "state": challenge["state"],
                 "queue_position": None,
                 "match_sequence": None if match is None else match.sequence,
-                "score": (
-                    tournament.champion.score if is_champion else challenge["final_score"]
-                ),
+                "score": (tournament.champion.score if is_champion else challenge["final_score"]),
                 "incumbent_score": challenge["incumbent_score"],
                 "score_gain": None if match is None else match.score_gain,
                 "batch_generated_block": (
@@ -694,6 +773,9 @@ def _status_document(
                 ),
                 "outcome": None if match is None else match.outcome,
                 "champion": is_champion,
+                "attempts": challenge["attempts"],
+                "error_code": challenge["error_code"],
+                "alert": (challenge["state"] == "SYSTEM_DEFERRED" and challenge["attempts"] >= 3),
             }
         )
     waiting = [

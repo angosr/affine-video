@@ -133,12 +133,8 @@ def test_champion_plan_fails_closed_on_uid_change_or_infeasible_chain_rules() ->
         "current_block": 120,
     }
 
-    assert plan_champion_weight(
-        **arguments, min_allowed_weights=1, max_weight=1.0
-    ) is None
-    assert plan_champion_weight(
-        **arguments, min_allowed_weights=2, max_weight=1.0
-    ) is None
+    assert plan_champion_weight(**arguments, min_allowed_weights=1, max_weight=1.0) is None
+    assert plan_champion_weight(**arguments, min_allowed_weights=2, max_weight=1.0) is None
 
 
 def test_public_weights_are_checked_against_current_chain_state() -> None:

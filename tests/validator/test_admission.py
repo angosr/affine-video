@@ -222,9 +222,7 @@ def test_copied_reference_cannot_front_run_model_owner(tmp_path) -> None:
     write_model(model, "victim")
 
     with ChallengeStore(tmp_path / "validator.db") as store:
-        attacker_id, _ = store.add_submission(
-            submission_at(100, "attacker"), occurred_at_ms=1
-        )
+        attacker_id, _ = store.add_submission(submission_at(100, "attacker"), occurred_at_ms=1)
         attacker = process_next_admission(
             store,
             worker_id="admission",
@@ -236,9 +234,7 @@ def test_copied_reference_cannot_front_run_model_owner(tmp_path) -> None:
         assert attacker is not None and attacker.code == "MODEL_OWNER_MISMATCH"
         assert store.get_challenge(attacker_id).state is ChallengeState.PARTICIPANT_FAILED
 
-        victim_id, _ = store.add_submission(
-            submission_at(101, "victim"), occurred_at_ms=2
-        )
+        victim_id, _ = store.add_submission(submission_at(101, "victim"), occurred_at_ms=2)
         victim = process_next_admission(
             store,
             worker_id="admission",

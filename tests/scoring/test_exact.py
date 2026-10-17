@@ -10,8 +10,7 @@ from scoring.spec import BudgetSpec
 def tied_selector() -> FixedSelector:
     architecture = SelectorArchitecture(1, 1, 2, "float32")
     weights = {
-        f"layer_0_head_0.proj_{side}": np.zeros((6, 2), dtype=np.float32)
-        for side in ("q", "k")
+        f"layer_0_head_0.proj_{side}": np.zeros((6, 2), dtype=np.float32) for side in ("q", "k")
     }
     weights["layer_0_head_0.proj_q"][:2] = -np.eye(2, dtype=np.float32)
     weights["layer_0_head_0.proj_k"][:2] = -np.eye(2, dtype=np.float32)
@@ -34,6 +33,7 @@ def exact_case(seed: int, *, stratum: str = "all") -> ExactCase:
         valid_keys=np.ones(3, dtype=np.bool_),
         required_keys=np.array([[True, False, False], [False, True, False]], dtype=np.bool_),
         epsilon=1e-6,
+        sample_id=f"sample-{seed}",
     )
 
 

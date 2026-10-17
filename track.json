@@ -5,6 +5,7 @@
   },
   "cache": {
     "exact_max_bytes": 1073741824,
+    "generation_interval_blocks": 100,
     "minimum_generation_delay_blocks": 1
   },
   "initial_champion": {
@@ -60,5 +61,5 @@
     "tail_mean_weight": 0.8
   },
   "track_id": "veda-sn120-v1",
-  "track_start_block": 9305000
+  "track_start_block": 9310000
 }

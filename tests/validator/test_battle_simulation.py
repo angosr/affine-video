@@ -75,6 +75,7 @@ def challenge(
                 "sha256": f"{sequence + 100:064x}",
                 "generated_block": 200 + sequence,
                 "source_digest": f"{sequence + 200:064x}",
+                "seed_block_hash": "0x" + "ab" * 32,
             }
             if score is not None
             else None
@@ -162,14 +163,17 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch() -> None:
     ]
     assert summary["champion"]["hotkey"] == "dave"
     assert weights.plan is not None and weights.plan.uids == (14,)
-    assert validate_weight_artifact(
-        weights,
-        chain,
-        expected_netuid=120,
-        expected_track_digest=track.digest,
-        expected_mechid=0,
-        max_staleness_blocks=1,
-    ) == weights.plan
+    assert (
+        validate_weight_artifact(
+            weights,
+            chain,
+            expected_netuid=120,
+            expected_track_digest=track.digest,
+            expected_mechid=0,
+            max_staleness_blocks=1,
+        )
+        == weights.plan
+    )
     rows = {row["hotkey"]: row for row in status["participants"]}
     assert rows["uid0"]["state"] == "DISPLACED"
     assert rows["dave"]["champion"] is True

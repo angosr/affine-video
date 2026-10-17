@@ -10,11 +10,12 @@ from safetensors.numpy import save_file
 
 from miner.submit import ModelSubmission
 from scoring.model import TensorSpec
+from scoring.spec import track_spec_dict
 from validator import run as run_module
 from validator.admission import AdmissionSettings, AdmissionStatus
 from validator.chain import ScanResult
 from validator.download import DownloadedModel
-from validator.publication import decode_weight_artifact, encode_weight_artifact
+from validator.publication import encode_weight_artifact
 from validator.queue import ChainPosition, ChallengeState
 from validator.run import EvaluationCycleResult, process_cycle, process_weight_cycle
 from validator.scoring import ScoringSettings, StageOutcome
@@ -39,59 +40,6 @@ def test_release_defaults_target_sn120_initial_state() -> None:
     assert "/tracks/main/weights.json" in run_module.DEFAULT_PUBLIC_WEIGHTS_URL
     assert "/tracks/main/assets/" in run_module.DEFAULT_BASELINE_MANIFEST_URL
     assert run_module.DEFAULT_MECHID == 1
-    assert run_module.DEFAULT_TRACK_SPEC_DIGEST != "0" * 64
-
-
-def test_initial_publisher_emits_current_uid_zero_weight(monkeypatch) -> None:
-    chain = WeightChainState(
-        321,
-        {run_module.INITIAL_CHAMPION_HOTKEY: 0},
-        1,
-        1.0,
-        100,
-        {},
-    )
-    published = {}
-
-    class Client:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def finalized_block(self):
-            return 100
-
-    class Publisher:
-        async def publish_initial_state(self, **kwargs):
-            published.update(kwargs)
-
-    async def read_state(_client, *, netuid):
-        assert netuid == 120
-        return chain
-
-    monkeypatch.setattr(run_module.bt, "Client", lambda _network: Client())
-    monkeypatch.setattr(run_module, "read_weight_chain_state", read_state)
-    asyncio.run(run_module.run_initial_publisher(publisher=Publisher(), once=True))
-
-    weights = decode_weight_artifact(published["weights"])
-    status = json.loads(published["status"])
-    assert weights.source_block == 321
-    assert weights.netuid == 120
-    assert weights.mechid == 1
-    assert weights.plan == WeightPlan(
-        321,
-        (run_module.INITIAL_CHAMPION_HOTKEY,),
-        (0,),
-        (1.0,),
-    )
-    assert status["participants"][0]["champion"] is True
-    assert [match["challenger"] for match in status["system_matches"]] == [
-        "MeanPool control",
-        "Shuffled-heads control",
-    ]
-    assert len(published["system_matches"]) == 2
 
 
 def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_path) -> None:
@@ -114,6 +62,7 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
 
     track = SimpleNamespace(
         digest="ab" * 32,
+        track_id="track",
         netuid=120,
         track_start_block=100,
         publication_grace_blocks=1,
@@ -125,6 +74,7 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
         cache=SimpleNamespace(
             exact_max_bytes=1_000,
             minimum_generation_delay_blocks=1,
+            generation_interval_blocks=1,
         ),
         scoring=SimpleNamespace(
             budgets=[SimpleNamespace(blocks=1)],
@@ -164,6 +114,7 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
     monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_module.bt, "Client", client_factory)
     monkeypatch.setattr(run_module, "seed_legacy_exclusions", seed)
+    monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", seed)
     monkeypatch.setattr(run_module, "process_cycle", process)
     monkeypatch.setattr(run_module.asyncio, "sleep", no_sleep)
     (tmp_path / "exact.npz").mkdir()
@@ -214,7 +165,7 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
     submitted = {}
 
     async def read_state(_client, *, netuid: int):
-        assert netuid == 7
+        assert netuid == 120
         return chain
 
     async def submit(plan, **kwargs):
@@ -226,8 +177,32 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
     monkeypatch.setattr(run_module, "submit_weights", submit)
 
     async def execute():
+        track = run_module.load_track_spec("track.json")
+        artifact = WeightArtifact(
+            track.track_id,
+            track.digest,
+            track.netuid,
+            track.mechid,
+            9,
+            120,
+            WeightPlan(120, ("alice",), (4,), (1.0,)),
+        )
         transport = httpx.MockTransport(
-            lambda _request: httpx.Response(200, content=encode_weight_artifact(artifact))
+            lambda request: httpx.Response(
+                200,
+                content=(
+                    json.dumps(
+                        {
+                            "track_spec_digest": track.digest,
+                            "spec": track_spec_dict(track),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                    if request.url.path.endswith("track.json")
+                    else encode_weight_artifact(artifact)
+                ),
+            )
         )
         async with httpx.AsyncClient(transport=transport) as http_client:
             return await process_weight_cycle(
@@ -236,9 +211,6 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
                 SimpleNamespace(name="wallet"),
                 validator_hotkey="validator",
                 public_weights_url="https://public.example/weights.json",
-                netuid=7,
-                track_spec_digest="ab" * 32,
-                expected_mechid=2,
                 max_staleness_blocks=20,
             )
 
@@ -246,7 +218,7 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
     assert result.status == "SUBMITTED"
     assert result.receipt is not None and result.receipt.extrinsic_id == "120-1"
     assert submitted["plan"] == artifact.plan
-    assert submitted["mechid"] == 2
+    assert submitted["mechid"] == 1
     assert submitted["version_key"] == 9
 
 
@@ -323,6 +295,7 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
                 "cache_sha256": "de" * 32,
                 "cache_generated_block": 101,
                 "cache_source_digest": "ef" * 32,
+                "cache_seed_block_hash": "0x" + "ab" * 32,
             },
         )
 

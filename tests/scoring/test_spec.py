@@ -51,6 +51,7 @@ def valid_spec() -> dict:
         "cache": {
             "exact_max_bytes": 1_000_000,
             "minimum_generation_delay_blocks": 1,
+            "generation_interval_blocks": 100,
         },
         "scoring": {
             "budgets": [
@@ -153,6 +154,7 @@ def test_selector_semantics_are_explicit_and_frozen() -> None:
     del missing["model"]["selector"]["head_dim"]
     with pytest.raises(TrackSpecError, match="exactly"):
         parse_track_spec(missing)
+
 
 def test_unknown_fields_and_invalid_budget_order_are_rejected() -> None:
     unknown = valid_spec()

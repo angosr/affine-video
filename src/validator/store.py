@@ -565,10 +565,13 @@ class ChallengeStore:
                 raise RuntimeError("submissions must be inserted in finalized chain order")
 
             malformed = submission.repo_id is None or submission.revision is None
-            excluded = self._connection.execute(
-                "SELECT 1 FROM competition_exclusions WHERE hotkey = ?",
-                (submission.hotkey,),
-            ).fetchone() is not None
+            excluded = (
+                self._connection.execute(
+                    "SELECT 1 FROM competition_exclusions WHERE hotkey = ?",
+                    (submission.hotkey,),
+                ).fetchone()
+                is not None
+            )
             previous_hotkey_submission = self._connection.execute(
                 """
                 SELECT submission_id FROM submissions
@@ -1244,9 +1247,7 @@ class ChallengeStore:
                 current = ChallengeState(row["state"])
                 if current in TERMINAL_STATES:
                     if current is not target or row["error_code"] != evaluation["error_code"]:
-                        raise RuntimeError(
-                            "public match conflicts with a local terminal challenge"
-                        )
+                        raise RuntimeError("public match conflicts with a local terminal challenge")
                     if row["score_block"] != evaluation["score_block"]:
                         raise RuntimeError("public decision block conflicts with local state")
                     if (
@@ -1312,9 +1313,7 @@ class ChallengeStore:
                         batch = evaluation["evaluation_batch"]
                         metrics = {
                             "incumbent_score": evaluation["incumbent_score"],
-                            "paired_gain_lower_bound": evaluation[
-                                "paired_gain_lower_bound"
-                            ],
+                            "paired_gain_lower_bound": evaluation["paired_gain_lower_bound"],
                             "cache_sha256": batch["sha256"],
                             "cache_generated_block": batch["generated_block"],
                             "cache_source_digest": batch["source_digest"],
@@ -1450,6 +1449,7 @@ class ChallengeStore:
                         "sha256": metrics.get("cache_sha256"),
                         "generated_block": metrics.get("cache_generated_block"),
                         "source_digest": metrics.get("cache_source_digest"),
+                        "seed_block_hash": metrics.get("cache_seed_block_hash"),
                     }
                     if "cache_sha256" in metrics
                     else None

@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,6 +65,18 @@ class FakeClient:
 
     async def finalized_block(self) -> int:
         return self._finalized
+
+    async def at(self, height: int):
+        values = getattr(self, "revealed", {}).get(height, ())
+        return SimpleNamespace(
+            subnets=SimpleNamespace(
+                commitments=lambda netuid: _ready(values),
+            )
+        )
+
+
+async def _ready(value):
+    return value
 
 
 def test_scanner_advances_persistent_cursor_in_bounded_batches(tmp_path) -> None:
@@ -173,3 +186,40 @@ def test_scanner_tolerates_another_process_advancing_finalized_cursor(tmp_path) 
         assert result.blocks_scanned == 2
         assert store.chain_cursor() == (101, blocks[101][0])
         assert len(store.public_snapshot()["challenges"]) == 2
+
+
+def test_scanner_processes_timelock_reveal_plaintext(tmp_path) -> None:
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    block_hash = "0x" + f"{100:064x}"
+    blocks = {
+        100: (
+            block_hash,
+            {"extrinsics": []},
+            [
+                {
+                    "extrinsic_idx": None,
+                    "module_id": "Commitments",
+                    "event_id": "CommitmentRevealed",
+                    "attributes": {"netuid": 7, "who": HOTKEY},
+                }
+            ],
+        )
+    }
+    client = FakeClient(blocks)
+    client.revealed = {
+        100: [SimpleNamespace(hotkey=HOTKEY, revealed=[(100, "0x" + payload.hex())])]
+    }
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        result = asyncio.run(
+            scan_finalized_blocks(
+                client,
+                store,
+                netuid=7,
+                track_start_block=100,
+            )
+        )
+
+        assert result.submissions_found == 1
+        challenge = store.public_snapshot()["challenges"][0]
+        assert challenge["repo_id"] == "owner/model"
