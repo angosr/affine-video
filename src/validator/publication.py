@@ -16,6 +16,7 @@ import httpx
 from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
 from validator.queue import TERMINAL_STATES
 from validator.store import ChallengeStore
+from validator.system_matches import system_match_artifacts, system_match_summaries
 from validator.tournament import (
     Champion,
     MatchRecord,
@@ -52,6 +53,7 @@ class PublicArtifacts:
     weights: bytes
     matches: tuple[tuple[str, bytes], ...]
     status: bytes | None = None
+    system_matches: tuple[tuple[str, bytes], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +134,7 @@ def build_public_artifacts(
             (match.object_name, _json_bytes(match.document)) for match in tournament.matches
         ),
         status=_json_bytes(status),
+        system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
     )
 
 
@@ -325,6 +328,8 @@ class S3Repository:
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
         await asyncio.to_thread(self._put_immutable, "track.json", artifacts.track)
+        for name, payload in artifacts.system_matches:
+            await asyncio.to_thread(self._put_immutable, name, payload)
         for name, payload in artifacts.matches:
             await asyncio.to_thread(self._put_immutable, name, payload)
         await asyncio.to_thread(self._put, "summary.json", artifacts.summary, False)
@@ -332,14 +337,27 @@ class S3Repository:
             await asyncio.to_thread(self._put, "status.json", artifacts.status, False)
         await asyncio.to_thread(self._put, "weights.json", artifacts.weights, False)
 
-    async def publish_initial_state(self, *, status: bytes, weights: bytes) -> None:
+    async def publish_initial_state(
+        self,
+        *,
+        status: bytes,
+        weights: bytes,
+        system_matches: tuple[tuple[str, bytes], ...] = (),
+    ) -> None:
         """Publish UID0 state until the immutable competition track exists."""
 
-        await asyncio.to_thread(self._publish_initial_state, status, weights)
+        await asyncio.to_thread(self._publish_initial_state, status, weights, system_matches)
 
-    def _publish_initial_state(self, status: bytes, weights: bytes) -> None:
+    def _publish_initial_state(
+        self,
+        status: bytes,
+        weights: bytes,
+        system_matches: tuple[tuple[str, bytes], ...],
+    ) -> None:
         if self._get_optional("track.json") is not None:
             raise PublicArtifactError("the competition evaluator has already taken ownership")
+        for name, payload in system_matches:
+            self._put_immutable(name, payload)
         self._put("status.json", status, False)
         if self._get_optional("track.json") is not None:
             raise PublicArtifactError("the competition evaluator started during publication")
@@ -600,17 +618,14 @@ def _status_document(
                 "match_sequence": None if match is None else match.sequence,
                 "score": challenge["final_score"],
                 "outcome": None if match is None else match.outcome,
-                "champion": (
-                    tournament.champion.challenge_id == challenge["challenge_id"]
-                ),
+                "champion": (tournament.champion.challenge_id == challenge["challenge_id"]),
             }
         )
     waiting = [
         row
         for row in active_rows
         if row["match_sequence"] is None
-        and row["state"]
-        not in {str(state) for state in TERMINAL_STATES}
+        and row["state"] not in {str(state) for state in TERMINAL_STATES}
     ]
     waiting.sort(key=lambda row: (row["submission_block"], row["challenge_id"]))
     queue_positions = {
@@ -625,6 +640,7 @@ def _status_document(
         "netuid": track.netuid,
         "source_block": source_block,
         "champion": tournament.champion.public(),
+        "system_matches": system_match_summaries(track.track_id, track.digest, track.netuid),
         "participants": active_rows,
     }
 

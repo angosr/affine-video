@@ -61,6 +61,9 @@ tracks/<track>/
   summary.json
   status.json
   weights.json
+  system_matches/
+    000000000001.json
+    ...
   matches/
     000000000001.json
     000000000002.json
@@ -68,6 +71,9 @@ tracks/<track>/
 ```
 
 - `track.json` is immutable and contains the canonical public track specification and digest.
+- `system_matches/*.json` are immutable launch checks produced from real GPU panels. They compare
+  the VEDA baseline with fixed control models, but never enter the Miner queue, tournament rank, or
+  chain weights.
 - `matches/*.json` are immutable terminal match facts in chain order: public model reference,
   content hashes, aggregate result, incumbent, decision, and decision block.
 - `summary.json` is a bounded current view containing the champion, top leaderboard and committed
@@ -140,9 +146,9 @@ Keep the live UID 0 state current before the first evaluation track is published
 uv run --extra storage veda validator initialize
 ```
 
-This loop publishes only `status.json` and `weights.json`. It verifies that the pinned hotkey is
-still UID 0 at every finalized snapshot and stops writing as soon as the evaluator publishes the
-immutable `track.json`.
+This loop publishes the immutable system checks plus `status.json` and `weights.json`. It verifies
+that the pinned hotkey is still UID 0 at every finalized snapshot and stops writing as soon as the
+evaluator publishes the immutable `track.json`.
 
 If `--initial-model` is omitted, the evaluator restores the pinned UID 0 VEDA weights from the
 public chunk manifest, verifies every chunk, the complete file SHA-256, the canonical tensor

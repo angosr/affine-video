@@ -96,6 +96,44 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
         )
     else:
         lines.append("No participants yet")
+    system_matches = status.get("system_matches", [])
+    if not isinstance(system_matches, Sequence) or isinstance(system_matches, (str, bytes)):
+        raise PublicArtifactError("public status system matches are invalid")
+    if system_matches:
+        lines.extend(["", f"{bold}SYSTEM BENCHMARKS{reset}"])
+        system_headers = ("MATCH", "REFERENCE", "CHALLENGER", "REF SCORE", "CHAL SCORE", "RESULT")
+        system_rows: list[tuple[str, ...]] = []
+        for raw in system_matches:
+            if not isinstance(raw, Mapping):
+                raise PublicArtifactError("public status system match is invalid")
+            reference_score = raw.get("reference_score")
+            challenger_score = raw.get("challenger_score")
+            if not isinstance(reference_score, (int, float)) or not isinstance(
+                challenger_score, (int, float)
+            ):
+                raise PublicArtifactError("public status system match score is invalid")
+            system_rows.append(
+                (
+                    f"#{raw.get('sequence', '?')}",
+                    str(raw.get("reference", "?")),
+                    str(raw.get("challenger", "?")),
+                    f"{float(reference_score):.6f}",
+                    f"{float(challenger_score):.6f}",
+                    str(raw.get("outcome", "?")),
+                )
+            )
+        system_widths = [len(header) for header in system_headers]
+        for row in system_rows:
+            for index, cell in enumerate(row):
+                system_widths[index] = max(system_widths[index], len(cell))
+        lines.extend(
+            [
+                _format_row(system_headers, system_widths),
+                "  ".join("─" * width for width in system_widths),
+                *(_format_row(row, system_widths) for row in system_rows),
+            ]
+        )
+        lines.append("System benchmarks do not affect tournament rank or chain weights.")
     return "\n".join(lines)
 
 
@@ -103,9 +141,7 @@ def _format_row(row: Sequence[str], widths: Sequence[int]) -> str:
     return "  ".join(value.ljust(width) for value, width in zip(row, widths, strict=True))
 
 
-def _format_colored_row(
-    row: Sequence[str], plain: Sequence[str], widths: Sequence[int]
-) -> str:
+def _format_colored_row(row: Sequence[str], plain: Sequence[str], widths: Sequence[int]) -> str:
     return "  ".join(
         value + " " * (width - len(plain_value))
         for value, plain_value, width in zip(row, plain, widths, strict=True)

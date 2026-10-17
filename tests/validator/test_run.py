@@ -76,6 +76,11 @@ def test_initial_publisher_emits_current_uid_zero_weight(monkeypatch) -> None:
         (1.0,),
     )
     assert status["participants"][0]["champion"] is True
+    assert [match["challenger"] for match in status["system_matches"]] == [
+        "MeanPool control",
+        "Shuffled-heads control",
+    ]
+    assert len(published["system_matches"]) == 2
 
 
 def empty_chain_block(block_height: int) -> tuple[str, dict, list[dict]]:
@@ -166,9 +171,7 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
             "worker_id": "validator-a",
             "downloader": download,
         }
-        paused = asyncio.run(
-            process_cycle(client, store, minimum_finalized_block=102, **arguments)
-        )
+        paused = asyncio.run(process_cycle(client, store, minimum_finalized_block=102, **arguments))
         first = asyncio.run(process_cycle(client, store, **arguments))
 
         assert paused.scan.submissions_found == 1

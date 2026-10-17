@@ -155,9 +155,16 @@ def test_initial_state_publisher_stops_after_competition_track_exists() -> None:
     client = MemoryS3()
     publisher = S3Repository(client, bucket="public-data", prefix="tracks/sn120")
 
-    asyncio.run(publisher.publish_initial_state(status=b"status", weights=b"weights"))
+    asyncio.run(
+        publisher.publish_initial_state(
+            status=b"status",
+            weights=b"weights",
+            system_matches=(("system_matches/000000000001.json", b"system-match"),),
+        )
+    )
     assert client.objects["tracks/sn120/status.json"] == b"status"
     assert client.objects["tracks/sn120/weights.json"] == b"weights"
+    assert client.objects["tracks/sn120/system_matches/000000000001.json"] == b"system-match"
 
     client.objects["tracks/sn120/track.json"] = b"track"
     with pytest.raises(PublicArtifactError, match="taken ownership"):

@@ -42,6 +42,13 @@ from validator.scoring import (
     verify_initial_champion,
 )
 from validator.store import ChallengeStore, LeasedChallenge
+from validator.system_matches import (
+    PRODUCTION_NETUID,
+    PRODUCTION_TRACK_ID,
+    PRODUCTION_TRACK_SPEC_DIGEST,
+    system_match_artifacts,
+    system_match_summaries,
+)
 from validator.tournament import MatchRecord
 from validator.weights import (
     WeightArtifact,
@@ -61,9 +68,9 @@ DEFAULT_BASELINE_MANIFEST_URL = (
     "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/"
     "affine_video/tracks/sn120/assets/veda_baseline_f16/manifest.json"
 )
-DEFAULT_NETUID = 120
-DEFAULT_TRACK_SPEC_DIGEST = "e853e8635ee229c2c7e37610d2ca852981cd3b32e963926e939e8f92545d7744"
-INITIAL_TRACK_ID = "veda-sn120-v1"
+DEFAULT_NETUID = PRODUCTION_NETUID
+DEFAULT_TRACK_SPEC_DIGEST = PRODUCTION_TRACK_SPEC_DIGEST
+INITIAL_TRACK_ID = PRODUCTION_TRACK_ID
 INITIAL_CHAMPION_HOTKEY = "5HmYnmUYT6qe3yFMg1Ad8WLLqDvnwtjYakXBpDvoRW1Qqzb8"
 
 
@@ -72,7 +79,13 @@ class ArtifactRepository(Protocol):
 
     async def load(self, track: TrackSpec) -> PublicLedger: ...
 
-    async def publish_initial_state(self, *, status: bytes, weights: bytes) -> None: ...
+    async def publish_initial_state(
+        self,
+        *,
+        status: bytes,
+        weights: bytes,
+        system_matches: tuple[tuple[str, bytes], ...] = (),
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +363,11 @@ async def run_initial_publisher(
                 await publisher.publish_initial_state(
                     status=status,
                     weights=encode_weight_artifact(artifact),
+                    system_matches=system_match_artifacts(
+                        INITIAL_TRACK_ID,
+                        DEFAULT_TRACK_SPEC_DIGEST,
+                        DEFAULT_NETUID,
+                    ),
                 )
                 result = WeightCycleResult(
                     chain.finalized_block,
@@ -391,6 +409,11 @@ def _initial_status(source_block: int) -> bytes:
         "netuid": DEFAULT_NETUID,
         "source_block": source_block,
         "champion": champion,
+        "system_matches": system_match_summaries(
+            INITIAL_TRACK_ID,
+            DEFAULT_TRACK_SPEC_DIGEST,
+            DEFAULT_NETUID,
+        ),
         "participants": [
             {
                 "uid": 0,

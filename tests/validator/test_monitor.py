@@ -5,6 +5,17 @@ def test_monitor_renders_all_active_competitors_in_uid_order() -> None:
     status = {
         "netuid": 120,
         "source_block": 12345,
+        "system_matches": [
+            {
+                "sequence": 1,
+                "reference": "VEDA baseline",
+                "challenger": "MeanPool control",
+                "reference_score": 0.549221386869737,
+                "challenger_score": 0.505509267860990,
+                "outcome": "REFERENCE_WON",
+                "detail": "system_matches/000000000001.json",
+            }
+        ],
         "participants": [
             {
                 "uid": 0,
@@ -36,3 +47,7 @@ def test_monitor_renders_all_active_competitors_in_uid_order() -> None:
     assert "CHAMPION" in rendered
     assert "#1" in rendered and "#2" in rendered
     assert "0.812346" in rendered
+    assert "SYSTEM BENCHMARKS" in rendered
+    assert "MeanPool control" in rendered
+    assert "0.549221" in rendered and "0.505509" in rendered
+    assert "do not affect tournament rank" in rendered
