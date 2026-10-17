@@ -42,7 +42,7 @@ from validator.production.plan import (
 )
 from validator.production.runtime import trajectory_tensor_key
 from validator.production.storage import PreconditionFailed, PrivateObjectStore, StoredObject
-from validator.queue import ChallengeState
+from validator.queue import TERMINAL_STATES, ChallengeState
 from validator.store import ChallengeStore
 
 _MAX_PLAN_ATTEMPTS = 5
@@ -203,10 +203,16 @@ class PlanCoordinator:
             recovered = self.store.stage_score(challenge_id, stage)
             if recovered is None:
                 return False
+            local_state = self.store.get_challenge(challenge_id).state
+            metrics_match = recovered.metrics == document.get("metrics")
+            if not metrics_match and local_state in TERMINAL_STATES:
+                metrics_match = recovered.metrics == _public_stage_metrics(
+                    document.get("metrics")
+                )
             if (
                 recovered.score != document.get("score")
                 or recovered.score_block != document.get("score_block")
-                or recovered.metrics != document.get("metrics")
+                or not metrics_match
             ):
                 raise RuntimeError("local stage fact conflicts with its private archive")
             if not self.store.stage_transition_applied(challenge_id, stage):
@@ -226,6 +232,22 @@ class PlanCoordinator:
             for proof in plan.source_proofs
         ):
             raise RuntimeError("private plan contains an invalid source proof")
+
+
+def _public_stage_metrics(value: object) -> dict[str, object]:
+    """Project a private score result onto the fields preserved in public matches."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    keys = (
+        "incumbent_score",
+        "paired_gain_lower_bound",
+        "cache_sha256",
+        "cache_generated_block",
+        "cache_plan_digest",
+        "cache_seed_block_hash",
+    )
+    return {key: value[key] for key in keys if key in value}
 
 
 class WorkerPool:

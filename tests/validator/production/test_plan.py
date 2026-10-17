@@ -1098,6 +1098,15 @@ def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
                 metrics=archived["metrics"],
             )
 
+        def get_challenge(self, identifier):
+            assert identifier == challenge_id
+            state = (
+                ChallengeState.CONFIRMING
+                if self.transition_applied
+                else ChallengeState.SCORING
+            )
+            return SimpleNamespace(state=state)
+
         def stage_transition_applied(self, identifier, stage):
             assert identifier == challenge_id
             assert stage is ChallengeState.SCORING
@@ -1155,6 +1164,86 @@ def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
     assert plan is not None
     assert plan.generation_block == 140
     assert plan.confirmation_challenge_ids == (challenge_id,)
+
+
+def test_terminal_public_stage_projection_matches_private_archive() -> None:
+    pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
+    challenge_id = "12" * 32
+    public_metrics = {
+        "incumbent_score": 0.7,
+        "paired_gain_lower_bound": 0.02,
+        "cache_sha256": "34" * 32,
+        "cache_generated_block": 120,
+        "cache_plan_digest": "56" * 32,
+        "cache_seed_block_hash": "0x" + "78" * 32,
+    }
+    archived = {
+        "format": "veda-stage-result-v1",
+        "track_spec_digest": "ab" * 32,
+        "challenge_id": challenge_id,
+        "submission_id": "submission-a",
+        "hotkey": "hotkey-a",
+        "repo_id": "owner/repo",
+        "revision": "34" * 20,
+        "file_sha256": "56" * 32,
+        "stage": ChallengeState.SCORING.value,
+        "score": 0.8,
+        "score_block": 125,
+        "metrics": {
+            **public_metrics,
+            "case_count": 384,
+            "exact_score": 0.8,
+            "requires_confirmation": True,
+        },
+    }
+    track = SimpleNamespace(
+        digest="ab" * 32,
+        source_pool_merkle_root=pool.root,
+    )
+
+    class Store:
+        state = ChallengeState.SUCCEEDED
+
+        def stage_score(self, identifier, stage):
+            assert identifier == challenge_id
+            assert stage is ChallengeState.SCORING
+            return SimpleNamespace(
+                score=archived["score"],
+                score_block=archived["score_block"],
+                metrics=public_metrics,
+            )
+
+        def get_challenge(self, identifier):
+            assert identifier == challenge_id
+            return SimpleNamespace(state=self.state)
+
+        def stage_transition_applied(self, identifier, stage):
+            assert identifier == challenge_id
+            assert stage is ChallengeState.SCORING
+            return True
+
+    class Objects:
+        def list_names(self, prefix):
+            assert prefix == "stages/"
+            return (f"stages/{challenge_id}/SCORING.json",)
+
+        def get(self, name):
+            assert name == f"stages/{challenge_id}/SCORING.json"
+            return StoredObject(json.dumps(archived).encode(), "stage-etag")
+
+    store = Store()
+    coordinator = PlanCoordinator(
+        track=track,
+        store=store,
+        objects=Objects(),
+        source_pool=pool,
+    )
+
+    assert coordinator._stage_recovery_complete()
+
+    store.state = ChallengeState.CONFIRMING
+    with pytest.raises(RuntimeError, match="conflicts with its private archive"):
+        coordinator._stage_recovery_complete()
 
 
 def test_source_pool_capacity_is_proved_before_production_starts() -> None:
