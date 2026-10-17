@@ -6,6 +6,7 @@
   "cache": {
     "exact_max_bytes": 1073741824,
     "generation_interval_blocks": 100,
+    "generator": "veda-source-v1",
     "minimum_generation_delay_blocks": 1
   },
   "initial_champion": {

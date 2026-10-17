@@ -21,6 +21,7 @@ from scoring.cache import (
     select_exact_cache_batch,
 )
 from scoring.exact import ExactCase, paired_score_gain_bound, score_selector
+from scoring.generator import generate_sources, plan_batch, source_digest
 from scoring.model import ModelValidationError, ValidatedModel, validate_model
 from scoring.selector import load_selector
 from scoring.spec import TrackSpec
@@ -311,6 +312,30 @@ class PairedTrackEvaluator:
                     raise CacheLoadError(
                         "cache seed hash does not match its finalized generation block"
                     )
+            if self.track.cache.generator != "veda-source-v1":
+                raise CacheLoadError("track cache generator is unsupported")
+            route_count = scoring.sample_count // len(scoring.stratum_weights)
+            sources = generate_sources(
+                track_spec_digest=self.track.digest,
+                seed_block_hash=batch.seed_block_hash,
+                strata=tuple(scoring.stratum_weight_map),
+                samples_per_stratum=route_count,
+            )
+            if batch.source_digest != source_digest(sources):
+                raise CacheLoadError("cache source digest does not match its generated manifest")
+            by_stratum = {
+                stratum: tuple(sample.sample_id for sample in sources if sample.stratum == stratum)
+                for stratum in scoring.stratum_weight_map
+            }
+            planned = plan_batch(
+                track_spec_digest=self.track.digest,
+                seed_block_hash=batch.seed_block_hash,
+                routes=self.track.model.selector.routes,
+                samples_by_stratum=by_stratum,
+                sample_count=scoring.sample_count,
+            )
+            if batch.cases != tuple((case.route, case.stratum, case.sample_id) for case in planned):
+                raise CacheLoadError("cache cases do not match the finalized batch plan")
             return batch
         except CacheLoadError as exc:
             raise TemporaryScoringError("SCORING_CACHE_UNAVAILABLE", str(exc)) from exc

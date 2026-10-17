@@ -52,6 +52,7 @@ def valid_spec() -> dict:
             "exact_max_bytes": 1_000_000,
             "minimum_generation_delay_blocks": 1,
             "generation_interval_blocks": 100,
+            "generator": "veda-source-v1",
         },
         "scoring": {
             "budgets": [

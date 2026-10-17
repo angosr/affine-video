@@ -10,6 +10,7 @@ from safetensors.numpy import save_file
 
 from scoring.evaluate import reference_attention
 from scoring.exact import ExactCase
+from scoring.generator import generate_sources, source_digest
 from scoring.model import validate_model
 from scoring.selector import SelectorArchitecture
 from scoring.spec import (
@@ -86,7 +87,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
         ),
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
-        cache=CacheSpec(1_000_000, 1, 1),
+        cache=CacheSpec(1_000_000, 1, 1, "veda-source-v1"),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
             sample_count=1,
@@ -103,6 +104,12 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
     cache_dir.mkdir()
     arrays = {}
     cases = []
+    generated = generate_sources(
+        track_spec_digest=track.digest,
+        seed_block_hash="0x" + "ab" * 32,
+        strata=("all",),
+        samples_per_stratum=1,
+    )
     for index, seed in enumerate((1,)):
         generator = np.random.default_rng(seed)
         q = generator.normal(size=(2, 2, 2)).astype(np.float32)
@@ -126,7 +133,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
             {
                 "route": "layer_0_head_0",
                 "stratum": "all",
-                "sample_id": "sample0",
+                "sample_id": generated[0].sample_id,
                 "epsilon": 1e-6,
             }
         )
@@ -135,7 +142,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
             {
                 "format": "veda-exact-cache",
                 "generated_block": 101,
-                "source_digest": "34" * 32,
+                "source_digest": source_digest(generated),
                 "seed_block_hash": "0x" + "ab" * 32,
                 "cases": cases,
             },
@@ -191,7 +198,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
 
     assert evaluated["final_score"] == pytest.approx(evaluated["incumbent_score"])
     assert evaluated["evaluation_batch"]["generated_block"] == 101
-    assert evaluated["evaluation_batch"]["source_digest"] == "34" * 32
+    assert evaluated["evaluation_batch"]["source_digest"] == source_digest(generated)
 
 
 def test_initial_champion_file_and_digest_are_verified(monkeypatch, tmp_path) -> None:
@@ -447,7 +454,7 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
         ),
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
-        cache=CacheSpec(1_000_000, 1, 1),
+        cache=CacheSpec(1_000_000, 1, 1, "veda-source-v1"),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
             sample_count=4,

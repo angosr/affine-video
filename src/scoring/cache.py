@@ -35,6 +35,7 @@ class ExactCacheBatch:
     generated_block: int
     source_digest: str
     seed_block_hash: str
+    cases: tuple[tuple[str, str, str], ...]
 
 
 def write_exact_cache_batch(
@@ -122,6 +123,7 @@ def write_exact_cache_batch(
             generated_block,
             source_digest.lower(),
             seed_block_hash,
+            tuple((case.route, case.stratum, case.sample_id) for case in cases),
         )
     except Exception:
         if temporary_path is not None and temporary_path.exists():
@@ -219,12 +221,31 @@ def inspect_exact_cache_batch(path: str | Path, *, max_bytes: int) -> ExactCache
         seed_block_hash = _block_hash(metadata["seed_block_hash"], CacheLoadError)
     except KeyError as exc:
         raise CacheLoadError("cache seed block hash is missing") from exc
+    try:
+        cases = tuple(
+            (
+                _string(case["route"], "cache route"),
+                _string(case["stratum"], "cache stratum"),
+                _string(case["sample_id"], "sample identifier"),
+            )
+            for case in (
+                _object(
+                    item,
+                    {"route", "stratum", "sample_id", "epsilon"},
+                    "exact case",
+                )
+                for item in metadata["cases"]
+            )
+        )
+    except (KeyError, TypeError) as exc:
+        raise CacheLoadError("cache case provenance is invalid") from exc
     return ExactCacheBatch(
         cache_path,
         sha256,
         generated_block,
         source_digest.lower(),
         seed_block_hash,
+        cases,
     )
 
 

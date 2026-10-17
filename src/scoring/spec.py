@@ -70,6 +70,7 @@ class CacheSpec:
     exact_max_bytes: int
     minimum_generation_delay_blocks: int
     generation_interval_blocks: int
+    generator: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +142,7 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
             "exact_max_bytes": spec.cache.exact_max_bytes,
             "minimum_generation_delay_blocks": spec.cache.minimum_generation_delay_blocks,
             "generation_interval_blocks": spec.cache.generation_interval_blocks,
+            "generator": spec.cache.generator,
         },
         "scoring": {
             "budgets": [
@@ -279,6 +281,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "exact_max_bytes",
             "minimum_generation_delay_blocks",
             "generation_interval_blocks",
+            "generator",
         },
         "cache",
     )
@@ -385,6 +388,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
                 "generation interval blocks",
                 minimum=1,
             ),
+            "generator": _nonempty_string(cache_raw["generator"], "cache generator"),
         },
         "scoring": {
             "budgets": [
@@ -432,6 +436,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             exact_max_bytes=cache["exact_max_bytes"],
             minimum_generation_delay_blocks=cache["minimum_generation_delay_blocks"],
             generation_interval_blocks=cache["generation_interval_blocks"],
+            generator=cache["generator"],
         ),
         scoring=ScoringSpec(
             budgets=budgets,
