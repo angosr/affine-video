@@ -11,8 +11,12 @@ from validator.admission import (
     process_next_admission,
 )
 from validator.download import DownloadedModel, ModelDownloadError
+from validator.production.retries import PrivateRetryStore
+from validator.production.storage import PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
+
+from .production.test_storage import MemoryS3
 
 SCHEMA = {"selector.weight": TensorSpec((2, 2), "float32")}
 
@@ -772,6 +776,50 @@ def test_admission_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
                 },
             )
         ]
+
+
+def test_admission_retry_ceiling_survives_total_local_state_loss(tmp_path) -> None:
+    retries = PrivateRetryStore(
+        PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc"),
+        track_spec_digest="ab" * 32,
+    )
+    calls = 0
+
+    def unavailable(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "temporary outage", temporary=True)
+
+    configured = replace(
+        settings(tmp_path),
+        max_attempts=2,
+        restore_retry=retries.restore,
+        record_retry=retries.record_failure,
+    )
+    submission = submission_at(100, "hk1")
+    outcomes = []
+    for index, now in enumerate((100, 30_100, 1_000_000), start=1):
+        with ChallengeStore(tmp_path / f"validator-{index}.db") as store:
+            identifier, _ = store.add_submission(submission, occurred_at_ms=1)
+            outcomes.append(
+                process_next_admission(
+                    store,
+                    worker_id="admission",
+                    settings=configured,
+                    current_finalized_block=10_000,
+                    now_ms=now,
+                    downloader=unavailable,
+                )
+            )
+            if index >= 2:
+                assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_BLOCKED
+
+    assert [outcome.status for outcome in outcomes if outcome is not None] == [
+        AdmissionStatus.DEFERRED,
+        AdmissionStatus.BLOCKED,
+        AdmissionStatus.BLOCKED,
+    ]
+    assert calls == 2
 
 
 def test_permanent_download_failure_records_no_authoritative_score(tmp_path) -> None:

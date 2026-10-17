@@ -21,6 +21,12 @@ from validator.download import (
     download_public_model,
 )
 from validator.queue import ChallengeState
+from validator.retries import (
+    RetryRecorder,
+    RetryRestore,
+    persist_retry_failure,
+    prepare_durable_retry,
+)
 from validator.store import ChallengeStore, LeasedChallenge
 
 
@@ -46,6 +52,8 @@ class AdmissionSettings:
     alert: Callable[[str, Mapping[str, object]], None] | None = None
     archive: Callable[[object, str | Path, ValidatedModel], None] | None = None
     restore: Callable[[object], DownloadedModel | None] | None = None
+    restore_retry: RetryRestore | None = None
+    record_retry: RetryRecorder | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -67,6 +75,8 @@ class AdmissionSettings:
             raise ValueError("retry base cannot exceed retry maximum")
         if self.publication_grace_blocks <= 0:
             raise ValueError("publication grace blocks must be positive")
+        if (self.restore_retry is None) != (self.record_retry is None):
+            raise ValueError("durable admission retry callbacks must be configured together")
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +110,23 @@ def process_next_admission(
     )
     if task is None:
         return None
+
+    challenge_id = task.challenge_id
+    task, restored_retry = prepare_durable_retry(
+        store,
+        task,
+        stage="ADMISSION",
+        now_ms=now,
+        restore=settings.restore_retry,
+        wait_ms=settings.retry_base_ms,
+    )
+    if task is None:
+        assert restored_retry is not None
+        return AdmissionOutcome(
+            challenge_id,
+            AdmissionStatus.BLOCKED if restored_retry.blocked else AdmissionStatus.DEFERRED,
+            restored_retry.error_code,
+        )
 
     if (
         settings.last_submission_block is not None
@@ -162,9 +189,7 @@ def process_next_admission(
                 )
                 status = _defer_or_fail(
                     store,
-                    task.challenge_id,
-                    task.lease_token,
-                    task.attempts,
+                    task,
                     settings,
                     now,
                     error,
@@ -182,9 +207,7 @@ def process_next_admission(
             if exc.temporary:
                 status = _defer_or_fail(
                     store,
-                    task.challenge_id,
-                    task.lease_token,
-                    task.attempts,
+                    task,
                     settings,
                     now,
                     exc,
@@ -218,9 +241,7 @@ def process_next_admission(
         )
         status = _defer_or_fail(
             store,
-            task.challenge_id,
-            task.lease_token,
-            task.attempts,
+            task,
             settings,
             now,
             error,
@@ -319,9 +340,7 @@ def process_next_admission(
             )
             status = _defer_or_fail(
                 store,
-                task.challenge_id,
-                task.lease_token,
-                task.attempts,
+                task,
                 settings,
                 now,
                 error,
@@ -357,9 +376,7 @@ def _defer_cached_model(
     error = ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", summary, temporary=True)
     status = _defer_or_fail(
         store,
-        task.challenge_id,
-        task.lease_token,
-        task.attempts,
+        task,
         settings,
         now_ms,
         error,
@@ -422,24 +439,37 @@ def _reject_track_capacity(
 
 def _defer_or_fail(
     store: ChallengeStore,
-    challenge_id: str,
-    lease_token: str,
-    attempts: int,
+    task: LeasedChallenge,
     settings: AdmissionSettings,
     now_ms: int,
     error: ModelDownloadError,
     *,
     resume_state: ChallengeState | None = None,
 ) -> AdmissionStatus:
+    attempts = task.attempts
+    multiplier = 1 << min(max(attempts - 1, 0), 20)
+    delay = min(settings.retry_max_ms, settings.retry_base_ms * multiplier)
+    checkpoint = persist_retry_failure(
+        task,
+        stage="ADMISSION",
+        code=error.code,
+        summary=str(error),
+        retry_after_ms=now_ms + delay,
+        max_attempts=settings.max_attempts,
+        record=settings.record_retry,
+    )
+    if checkpoint is not None:
+        attempts = checkpoint.attempts
     if attempts == 1 and attempts < settings.max_attempts and settings.alert is not None:
         settings.alert(
             "ADMISSION_RETRY_STARTED",
-            {"challenge_id": challenge_id, "attempts": attempts, "code": error.code},
+            {"challenge_id": task.challenge_id, "attempts": attempts, "code": error.code},
         )
-    if attempts >= settings.max_attempts:
+    blocked = checkpoint.blocked if checkpoint is not None else attempts >= settings.max_attempts
+    if blocked:
         store.block_leased(
-            challenge_id,
-            lease_token,
+            task.challenge_id,
+            task.lease_token,
             error_code=error.code,
             error_summary=str(error),
             occurred_at_ms=now_ms,
@@ -447,15 +477,17 @@ def _defer_or_fail(
         if settings.alert is not None:
             settings.alert(
                 "ADMISSION_RETRY_EXHAUSTED",
-                {"challenge_id": challenge_id, "attempts": attempts, "code": error.code},
+                {"challenge_id": task.challenge_id, "attempts": attempts, "code": error.code},
             )
         return AdmissionStatus.BLOCKED
-    multiplier = 1 << min(max(attempts - 1, 0), 20)
-    delay = min(settings.retry_max_ms, settings.retry_base_ms * multiplier)
+    retry_after_ms = now_ms + delay
+    if checkpoint is not None:
+        assert checkpoint.retry_after_ms is not None
+        retry_after_ms = checkpoint.retry_after_ms
     store.defer_leased(
-        challenge_id,
-        lease_token,
-        retry_after_ms=now_ms + delay,
+        task.challenge_id,
+        task.lease_token,
+        retry_after_ms=retry_after_ms,
         error_code=error.code,
         error_summary=str(error),
         resume_state=resume_state,

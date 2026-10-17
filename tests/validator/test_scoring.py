@@ -32,6 +32,8 @@ from scoring.spec import (
 )
 from validator import scoring as scoring_module
 from validator.production.batches import ArchivedStage
+from validator.production.retries import PrivateRetryStore
+from validator.production.storage import PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState
 from validator.scoring import (
     IsolatedEvaluator,
@@ -46,6 +48,7 @@ from validator.scoring import (
 )
 from validator.store import ChallengeStore, LeasedChallenge
 
+from .production.test_storage import MemoryS3
 from .test_store import submission_at
 
 
@@ -825,3 +828,47 @@ def test_scoring_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
             now_ms=40,
         )
         assert success is not None and success.state is ChallengeState.SUCCEEDED
+
+
+def test_scoring_retry_ceiling_survives_total_local_state_loss(tmp_path) -> None:
+    retries = PrivateRetryStore(
+        PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc"),
+        track_spec_digest="ab" * 32,
+    )
+    calls = 0
+
+    def unavailable(_task):
+        nonlocal calls
+        calls += 1
+        raise TemporaryScoringError("SCORING_UNAVAILABLE", "worker unavailable")
+
+    settings = ScoringSettings(
+        max_attempts=2,
+        retry_base_ms=10,
+        retry_max_ms=10,
+        restore_retry=retries.restore,
+        record_retry=retries.record_failure,
+    )
+    outcomes = []
+    for index, now in enumerate((20, 30, 1_000), start=1):
+        with ChallengeStore(tmp_path / f"validator-{index}.db") as store:
+            identifier = ready_for_scoring(store)
+            outcomes.append(
+                process_next_scoring(
+                    store,
+                    worker_id="worker",
+                    current_finalized_block=100,
+                    settings=settings,
+                    evaluator=unavailable,
+                    now_ms=now,
+                )
+            )
+            if index >= 2:
+                assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_BLOCKED
+
+    assert [outcome.state for outcome in outcomes if outcome is not None] == [
+        ChallengeState.SYSTEM_DEFERRED,
+        ChallengeState.SYSTEM_BLOCKED,
+        ChallengeState.SYSTEM_BLOCKED,
+    ]
+    assert calls == 2

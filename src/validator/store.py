@@ -1007,7 +1007,7 @@ class ChallengeStore:
         reason: str,
         occurred_at_ms: int | None = None,
     ) -> None:
-        """Release a normal data-pipeline wait without consuming a failure attempt."""
+        """Release a normal wait without consuming a failure attempt."""
 
         timestamp = _timestamp(occurred_at_ms)
         if retry_after_ms <= timestamp:
@@ -1017,8 +1017,13 @@ class ChallengeStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             current = self._require_lease_locked(identifier, lease_token)
-            if current not in {ChallengeState.SCORING, ChallengeState.CONFIRMING}:
-                raise ValueError("challenge is not waiting for evaluation data")
+            if current not in {
+                ChallengeState.FETCHING,
+                ChallengeState.VALIDATING,
+                ChallengeState.SCORING,
+                ChallengeState.CONFIRMING,
+            }:
+                raise ValueError("challenge is not in a waitable stage")
             self._transition_locked(
                 identifier,
                 ChallengeState.SYSTEM_DEFERRED,
@@ -1041,6 +1046,40 @@ class ChallengeStore:
                 WHERE challenge_id = ?
                 """,
                 (current, retry_after_ms, identifier),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def synchronize_leased_attempts(
+        self,
+        identifier: str,
+        lease_token: str,
+        *,
+        attempts: int,
+    ) -> None:
+        """Align a disposable local lease with its durable retry ordinal."""
+
+        if attempts <= 0:
+            raise ValueError("leased attempts must be positive")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._require_lease_locked(identifier, lease_token)
+            if current not in {
+                ChallengeState.FETCHING,
+                ChallengeState.VALIDATING,
+                ChallengeState.SCORING,
+                ChallengeState.CONFIRMING,
+            }:
+                raise ValueError("challenge is not in a retryable stage")
+            self._connection.execute(
+                """
+                UPDATE challenges
+                SET attempts = ?, total_attempts = max(total_attempts, ?)
+                WHERE challenge_id = ?
+                """,
+                (attempts, attempts, identifier),
             )
             self._connection.commit()
         except Exception:

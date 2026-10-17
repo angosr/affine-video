@@ -29,6 +29,13 @@ from validator.production.batches import ReadyBatchSource
 from validator.production.confirmation import ConfirmationWorkerPool
 from validator.production.plan import scheduled_generation_block
 from validator.queue import ChallengeState, require_transition
+from validator.retries import (
+    RetryRecorder,
+    RetryRestore,
+    persist_retry_failure,
+    prepare_durable_retry,
+    retry_stage,
+)
 from validator.store import ChallengeStore, LeasedChallenge
 from validator.tournament import genesis_champion, resolve_tournament
 
@@ -80,12 +87,16 @@ class ScoringSettings:
     alert: Callable[[str, Mapping[str, object]], None] | None = None
     archive_stage: Callable[[LeasedChallenge, StageOutcome, int], None] | None = None
     restore_stage: Callable[[LeasedChallenge], object | None] | None = None
+    restore_retry: RetryRestore | None = None
+    record_retry: RetryRecorder | None = None
 
     def __post_init__(self) -> None:
         if min(self.lease_ms, self.retry_base_ms, self.retry_max_ms, self.max_attempts) <= 0:
             raise ValueError("scoring timing limits must be positive")
         if self.retry_base_ms > self.retry_max_ms:
             raise ValueError("retry base cannot exceed retry maximum")
+        if (self.restore_retry is None) != (self.record_retry is None):
+            raise ValueError("durable scoring retry callbacks must be configured together")
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,6 +609,27 @@ def evaluate_next_scoring(
     if task is None:
         return None
 
+    challenge_id = task.challenge_id
+    task, restored_retry = prepare_durable_retry(
+        store,
+        task,
+        stage=retry_stage(task.state),
+        now_ms=now,
+        restore=settings.restore_retry,
+        wait_ms=settings.retry_base_ms,
+    )
+    if task is None:
+        assert restored_retry is not None
+        return ScoringOutcome(
+            challenge_id,
+            (
+                ChallengeState.SYSTEM_BLOCKED
+                if restored_retry.blocked
+                else ChallengeState.SYSTEM_DEFERRED
+            ),
+            restored_retry.error_code,
+        )
+
     recorded = store.stage_score(task.challenge_id, task.state)
     if recorded is None:
         try:
@@ -840,17 +872,32 @@ def _defer_or_fail(
     code: str,
     summary: str,
 ) -> ChallengeState:
-    if task.attempts == 1 and task.attempts < settings.max_attempts and settings.alert is not None:
+    attempts = task.attempts
+    multiplier = 1 << min(max(attempts - 1, 0), 20)
+    delay = min(settings.retry_max_ms, settings.retry_base_ms * multiplier)
+    checkpoint = persist_retry_failure(
+        task,
+        stage=retry_stage(task.state),
+        code=code,
+        summary=summary,
+        retry_after_ms=now_ms + delay,
+        max_attempts=settings.max_attempts,
+        record=settings.record_retry,
+    )
+    if checkpoint is not None:
+        attempts = checkpoint.attempts
+    if attempts == 1 and attempts < settings.max_attempts and settings.alert is not None:
         settings.alert(
             "SCORING_RETRY_STARTED",
             {
                 "challenge_id": task.challenge_id,
-                "attempts": task.attempts,
+                "attempts": attempts,
                 "code": code,
                 "stage": str(task.state),
             },
         )
-    if task.attempts >= settings.max_attempts:
+    blocked = checkpoint.blocked if checkpoint is not None else attempts >= settings.max_attempts
+    if blocked:
         store.block_leased(
             task.challenge_id,
             task.lease_token,
@@ -863,18 +910,20 @@ def _defer_or_fail(
                 "SCORING_RETRY_EXHAUSTED",
                 {
                     "challenge_id": task.challenge_id,
-                    "attempts": task.attempts,
+                    "attempts": attempts,
                     "code": code,
                     "stage": str(task.state),
                 },
             )
         return ChallengeState.SYSTEM_BLOCKED
-    multiplier = 1 << min(max(task.attempts - 1, 0), 20)
-    delay = min(settings.retry_max_ms, settings.retry_base_ms * multiplier)
+    retry_after_ms = now_ms + delay
+    if checkpoint is not None:
+        assert checkpoint.retry_after_ms is not None
+        retry_after_ms = checkpoint.retry_after_ms
     store.defer_leased(
         task.challenge_id,
         task.lease_token,
-        retry_after_ms=now_ms + delay,
+        retry_after_ms=retry_after_ms,
         error_code=code,
         error_summary=summary,
         occurred_at_ms=now_ms,
