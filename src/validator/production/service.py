@@ -555,7 +555,8 @@ def _prune_local_work(root: Path, retained: frozenset[str]) -> None:
 
 
 def _validate_source_capacity(pool: SourcePool, track: TrackSpec) -> None:
-    required = track.maximum_generation_batches * track.scoring.rollouts_per_stratum
+    per_batch = track.scoring.rollouts_per_stratum
+    required = (track.maximum_generation_batches + 1) * per_batch
     for stratum in track.scoring.stratum_weight_map:
         families = {
             leaf.source_family_id
@@ -563,7 +564,9 @@ def _validate_source_capacity(pool: SourcePool, track: TrackSpec) -> None:
             if leaf.partition == "production" and leaf.generation_geometry == stratum
         }
         if len(families) < required:
-            raise ValueError(f"source pool cannot cover the track capacity for stratum {stratum}")
+            raise ValueError(
+                f"source pool cannot cover the track plus one reserve batch for stratum {stratum}"
+            )
 
 
 def _report_cycle(cycle: ProducerCycle) -> None:

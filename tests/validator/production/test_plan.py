@@ -714,7 +714,7 @@ def test_plan_coordinator_maps_confirmation_from_its_exact_decision_block() -> N
 
 
 def test_source_pool_capacity_is_proved_before_production_starts() -> None:
-    pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
+    pool = SourcePool(tuple(proof(index).leaf for index in range(6)))
     track = SimpleNamespace(
         maximum_generation_batches=2,
         scoring=SimpleNamespace(
@@ -724,6 +724,7 @@ def test_source_pool_capacity_is_proved_before_production_starts() -> None:
     )
 
     _validate_source_capacity(pool, track)
-    track.maximum_generation_batches = 3
-    with pytest.raises(ValueError, match="track capacity"):
+    track.maximum_generation_batches = 2
+    track.scoring.rollouts_per_stratum = 3
+    with pytest.raises(ValueError, match="reserve batch"):
         _validate_source_capacity(pool, track)
