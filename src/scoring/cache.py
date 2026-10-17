@@ -410,20 +410,19 @@ def _validate_cache_index(
                     or np.any(required_keys.sum(axis=1) > min_blocks)
                 ):
                     raise CacheLoadError("cache required-key mask is invalid")
-            coverage_count = len(routes) * len(strata) if sample_count is None else sample_count
-            try:
-                route_stratified_sample_indices(
-                    case_routes,
-                    case_strata,
-                    coverage_count,
-                    0,
-                    routes,
-                    strata,
-                )
-            except ValueError as exc:
+            if sample_count is not None and len(cases) != sample_count:
+                raise CacheLoadError("cache case count does not match the track")
+            sampled_routes = set(case_routes)
+            if sample_count is not None and len(sampled_routes) != sample_count // len(strata):
+                raise CacheLoadError("cache route sample count does not match the track")
+            expected_pairs = {
+                (route, stratum) for route in sampled_routes for stratum in strata
+            }
+            actual_pairs = set(zip(case_routes, case_strata, strict=True))
+            if len(actual_pairs) != len(cases) or actual_pairs != expected_pairs:
                 raise CacheLoadError(
-                    "cache does not cover every route and frozen stratum"
-                ) from exc
+                    "cache must cover every sampled route across every stratum exactly once"
+                )
             _exact_keys(archive, expected)
     except CacheLoadError:
         raise

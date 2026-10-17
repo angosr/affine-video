@@ -57,7 +57,7 @@ def valid_spec() -> dict:
                 {"blocks": 4, "calibrated_cost": 2.0},
                 {"blocks": 8, "calibrated_cost": 4.0},
             ],
-            "sample_count": 20,
+            "sample_count": 2,
             "tail_mean_weight": 0.8,
             "stratum_weights": {"layer-0": 0.5, "layer-1": 0.5},
             "minimum_frontier_gain": 0.001,
@@ -93,6 +93,23 @@ def test_score_affecting_change_changes_digest() -> None:
     second["scoring"]["budgets"][1]["calibrated_cost"] = 2.5
 
     assert parse_track_spec(first).digest != parse_track_spec(second).digest
+
+
+def test_production_shape_uses_bounded_hidden_route_sample() -> None:
+    raw = valid_spec()
+    raw["model"]["selector"] = {
+        "num_layers": 50,
+        "num_heads": 56,
+        "head_dim": 128,
+        "storage_dtype": "float16",
+    }
+    raw["model"]["max_bytes"] = 600_000_000
+    raw["scoring"]["sample_count"] = 128
+
+    track = parse_track_spec(raw)
+
+    assert len(track.model.selector.routes) == 2_800
+    assert track.scoring.sample_count == 128
 
 
 def test_publication_grace_is_positive_and_changes_digest() -> None:
@@ -168,13 +185,13 @@ def test_unknown_fields_and_invalid_budget_order_are_rejected() -> None:
     undersampled = valid_spec()
     undersampled["scoring"]["stratum_weights"] = {f"layer-{index}": 0.2 for index in range(5)}
     undersampled["scoring"]["sample_count"] = 3
-    with pytest.raises(TrackSpecError, match="cover every"):
+    with pytest.raises(TrackSpecError, match="whole routes"):
         parse_track_spec(undersampled)
 
     uncovered_route = valid_spec()
     uncovered_route["model"]["selector"]["num_heads"] = 2
-    uncovered_route["scoring"]["sample_count"] = 3
-    with pytest.raises(TrackSpecError, match="every route"):
+    uncovered_route["scoring"]["sample_count"] = 6
+    with pytest.raises(TrackSpecError, match="available selector routes"):
         parse_track_spec(uncovered_route)
 
 

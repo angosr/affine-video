@@ -17,7 +17,7 @@ from typing import Any
 from scoring.cache import (
     CacheLoadError,
     ExactCacheBatch,
-    sample_exact_cache,
+    load_exact_cache,
     select_exact_cache_batch,
 )
 from scoring.evaluate import panel_seed, route_stratified_sample_indices
@@ -171,21 +171,18 @@ class FilePairedEvaluator:
     track: TrackSpec
     exact_cache: str
     exact_sha256: str
-    sample_seed: int
     incumbent: LeasedChallenge
 
     def __call__(self, challenger: LeasedChallenge) -> StageOutcome:
         try:
             scoring = self.track.scoring
-            exact_cases = sample_exact_cache(
+            exact_cases = load_exact_cache(
                 self.exact_cache,
                 expected_sha256=self.exact_sha256,
                 max_bytes=self.track.cache.exact_max_bytes,
-                count=scoring.sample_count,
-                seed=self.sample_seed,
-                routes=self.track.model.selector.routes,
-                strata=scoring.stratum_weight_map,
             )
+            if len(exact_cases) != scoring.sample_count:
+                raise CacheLoadError("cache case count does not match the track")
         except CacheLoadError as exc:
             raise TemporaryScoringError("SCORING_CACHE_INVALID", str(exc)) from exc
         evaluator = TrackEvaluator(self.track, exact_cases, presampled=True)
@@ -253,15 +250,10 @@ class PairedTrackEvaluator:
         incumbent = tournament.champion
         batch = self._batch(task)
         incumbent_task = self._incumbent_task(incumbent, snapshot["challenges"])
-        seed_digest = hashlib.sha256(
-            bytes.fromhex(self.track.digest) + bytes.fromhex(batch.sha256)
-        ).hexdigest()
-        seed = panel_seed(seed_digest, stage="exact")
         evaluator = FilePairedEvaluator(
             self.track,
             str(batch.path),
             batch.sha256,
-            seed,
             incumbent_task,
         )
         isolated = IsolatedEvaluator(

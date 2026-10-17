@@ -325,8 +325,10 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     if abs(fsum(weight for _, weight in strata) - 1.0) > 1e-12:
         raise TrackSpecError("stratum weights must sum to one")
     sample_count = _integer(scoring_raw["sample_count"], "sample_count", minimum=1)
-    if sample_count < len(selector.routes) * len(strata):
-        raise TrackSpecError("sample count must cover every route and scoring stratum")
+    if sample_count % len(strata) != 0:
+        raise TrackSpecError("sample count must cover whole routes across every stratum")
+    if sample_count // len(strata) > len(selector.routes):
+        raise TrackSpecError("sample count cannot exceed the available selector routes")
 
     spec_without_digest = {
         "track_id": track_id,

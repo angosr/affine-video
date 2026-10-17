@@ -88,7 +88,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
         cache=CacheSpec(1_000_000, 1),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
-            sample_count=2,
+            sample_count=1,
             tail_mean_weight=0.8,
             stratum_weights=(("all", 1.0),),
             minimum_frontier_gain=0.001,
@@ -102,7 +102,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
     cache_dir.mkdir()
     arrays = {}
     cases = []
-    for index, seed in enumerate((1, 2)):
+    for index, seed in enumerate((1,)):
         generator = np.random.default_rng(seed)
         q = generator.normal(size=(2, 2, 2)).astype(np.float32)
         k = generator.normal(size=(3, 2, 2)).astype(np.float32)

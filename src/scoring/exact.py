@@ -61,10 +61,8 @@ def score_selector(
     if len(budgets) < 3:
         raise ValueError("exact evaluation requires at least three budgets")
 
-    group_weights, group_for = _route_stratum_groups(
-        selector.architecture.routes,
-        stratum_weights,
-    )
+    sampled_routes = tuple(sorted({case.route for case in cases}))
+    group_weights, group_for = _route_stratum_groups(sampled_routes, stratum_weights)
     errors: list[dict[str, list[float]]] = [
         {group: [] for group in group_weights} for _ in budgets
     ]

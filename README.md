@@ -28,7 +28,9 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
    unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.
 4. A valid model waits for the earliest hidden exact-attention batch generated after its commitment
    boundary. The batch records its generation block, private-source digest, and content hash.
-   Batches may serve multiple already-committed models, but no model may use an older batch.
+   Each batch samples unpredictable layer/head routes and covers every configured data stratum once
+   per sampled route. Batches may serve multiple already-committed models, but no model may use an
+   older batch.
 5. UID 0 is the genesis champion without making a commit. Its identity is pinned to the official
    VEDA repository revision, filename and file SHA-256 in the track specification. Its baseline
    For every match, the challenger and current champion are rerun on the same new batch. A

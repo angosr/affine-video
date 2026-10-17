@@ -125,9 +125,9 @@ def test_exact_cache_rejects_unknown_route_and_insufficient_cases(tmp_path) -> N
 
     with pytest.raises(CacheLoadError, match="unknown selector route"):
         validate_exact_cache(path, routes=("other",), sample_count=1, **arguments)
-    with pytest.raises(CacheLoadError, match="every route"):
+    with pytest.raises(CacheLoadError, match="case count"):
         validate_exact_cache(path, routes=("route0", "missing"), sample_count=2, **arguments)
-    with pytest.raises(CacheLoadError, match="cover every"):
+    with pytest.raises(CacheLoadError, match="case count"):
         validate_exact_cache(
             path,
             routes=("route0",),
