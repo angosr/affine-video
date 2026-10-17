@@ -240,7 +240,7 @@ def reference_attention(
 def percentile(values: Sequence[float], probability: float) -> float:
     """Return a linearly interpolated percentile with an explicit definition."""
 
-    checked = _finite_nonnegative(values, name="percentile values")
+    checked = _finite_values(values, name="percentile values")
     if not isfinite(probability) or not 0 <= probability <= 1:
         raise ValueError("percentile probability must be within [0, 1]")
     ordered = sorted(checked)
@@ -337,7 +337,7 @@ def stratified_bootstrap_bound(
     if set(values_by_group) != set(group_weights) or not values_by_group:
         raise ValueError("bootstrap values must cover the exact evaluation groups")
     checked = {
-        group: _finite_unit_interval(values, name=f"bootstrap group {group}")
+        group: _finite_values(values, name=f"bootstrap group {group}")
         for group, values in values_by_group.items()
     }
     if (
@@ -369,10 +369,10 @@ def _finite_nonnegative(values: Sequence[float], *, name: str) -> tuple[float, .
     return checked
 
 
-def _finite_unit_interval(values: Sequence[float], *, name: str) -> tuple[float, ...]:
+def _finite_values(values: Sequence[float], *, name: str) -> tuple[float, ...]:
     checked = tuple(values)
-    if not checked or any(not isfinite(value) or not 0 <= value <= 1 for value in checked):
-        raise ValueError(f"{name} must be non-empty, finite, and within [0, 1]")
+    if not checked or any(not isfinite(value) for value in checked):
+        raise ValueError(f"{name} must be non-empty and finite")
     return checked
 
 

@@ -451,6 +451,7 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
                 "model_size_bytes": 123,
                 "final_score": 0.8,
                 "incumbent_score": 0.5,
+                "paired_gain_lower_bound": 0.3,
                 "evaluation_batch": {
                     "sha256": "de" * 32,
                     "generated_block": 101,

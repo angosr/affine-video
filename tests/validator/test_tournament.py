@@ -1,7 +1,13 @@
 import pytest
 
 from validator.queue import ChainPosition, ChallengeState
-from validator.tournament import Champion, MatchOutcome, resolve_tournament, validate_match_document
+from validator.tournament import (
+    Champion,
+    MatchOutcome,
+    canonical_score_gain,
+    resolve_tournament,
+    validate_match_document,
+)
 
 
 def genesis() -> Champion:
@@ -24,6 +30,7 @@ def challenge(
     state: ChallengeState = ChallengeState.SUCCEEDED,
     score: float | None = None,
     incumbent_score: float | None = None,
+    paired_gain: float | None = None,
     error_code: str | None = None,
 ) -> dict:
     return {
@@ -42,6 +49,13 @@ def challenge(
         "model_size_bytes": 123 if score is not None else None,
         "final_score": score,
         "incumbent_score": incumbent_score,
+        "paired_gain_lower_bound": (
+            paired_gain
+            if paired_gain is not None
+            else canonical_score_gain(score, incumbent_score)
+            if score is not None and incumbent_score is not None
+            else None
+        ),
         "evaluation_batch": (
             {
                 "sha256": f"{sequence + 100:064x}",
@@ -110,6 +124,18 @@ def test_match_uses_paired_incumbent_score_not_historical_score() -> None:
     assert tournament.champion.hotkey == "alice"
 
 
+def test_match_decision_uses_paired_gain_bound_not_raw_score_gap() -> None:
+    retained = resolve(
+        [challenge(1, "alice", score=0.8, incumbent_score=0.5, paired_gain=0.009)]
+    )
+    won = resolve(
+        [challenge(1, "alice", score=0.51, incumbent_score=0.5, paired_gain=0.01)]
+    )
+
+    assert retained.matches[0].outcome is MatchOutcome.CHAMPION_RETAINED
+    assert won.matches[0].outcome is MatchOutcome.CHALLENGER_WON
+
+
 def test_failed_match_keeps_champion_and_is_publicly_auditable() -> None:
     tournament = resolve(
         [
@@ -140,7 +166,7 @@ def test_unfinished_submission_stops_the_public_match_prefix() -> None:
     )
 
     assert [match.challenge_id for match in tournament.matches] == ["challenge-1"]
-    assert tournament.matches[0].object_name == "matches/000000000001.json"
+    assert tournament.matches[0].object_name == "matches/track/000000000001.json"
 
 
 def test_public_match_validation_rejects_nonterminal_records() -> None:

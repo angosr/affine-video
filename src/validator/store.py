@@ -1312,6 +1312,9 @@ class ChallengeStore:
                         batch = evaluation["evaluation_batch"]
                         metrics = {
                             "incumbent_score": evaluation["incumbent_score"],
+                            "paired_gain_lower_bound": evaluation[
+                                "paired_gain_lower_bound"
+                            ],
                             "cache_sha256": batch["sha256"],
                             "cache_generated_block": batch["generated_block"],
                             "cache_source_digest": batch["source_digest"],
@@ -1441,6 +1444,7 @@ class ChallengeStore:
             metrics = json.loads(stage_rows[-1]["metrics_json"])
             paired = {
                 "incumbent_score": metrics.get("incumbent_score"),
+                "paired_gain_lower_bound": metrics.get("paired_gain_lower_bound"),
                 "evaluation_batch": (
                     {
                         "sha256": metrics.get("cache_sha256"),
@@ -1471,6 +1475,7 @@ class ChallengeStore:
             "final_score": row["final_score"],
             "score_block": row["score_block"],
             "incumbent_score": paired.get("incumbent_score"),
+            "paired_gain_lower_bound": paired.get("paired_gain_lower_bound"),
             "evaluation_batch": paired.get("evaluation_batch"),
             "created_at_ms": row["created_at_ms"],
             "updated_at_ms": row["updated_at_ms"],

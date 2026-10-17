@@ -15,6 +15,7 @@ from scoring.model import TensorSpec
 from scoring.selector import SelectorArchitecture
 
 _REVISION = re.compile(r"^[0-9a-fA-F]{40}$")
+_TRACK_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
 VEDA_REPO_ID = "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview"
 VEDA_REVISION = "76f202874608115408d73280be9531c4ab888242"
@@ -92,6 +93,7 @@ class ScoringSpec:
 class TrackSpec:
     track_id: str
     netuid: int
+    mechid: int
     track_start_block: int
     publication_grace_blocks: int
     initial_champion: InitialChampionSpec
@@ -108,6 +110,7 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
     return {
         "track_id": spec.track_id,
         "netuid": spec.netuid,
+        "mechid": spec.mechid,
         "track_start_block": spec.track_start_block,
         "publication_grace_blocks": spec.publication_grace_blocks,
         "initial_champion": {
@@ -176,6 +179,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         {
             "track_id",
             "netuid",
+            "mechid",
             "track_start_block",
             "publication_grace_blocks",
             "initial_champion",
@@ -187,9 +191,12 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         "track specification",
     )
     track_id = _nonempty_string(root["track_id"], "track_id")
+    if not _TRACK_ID.fullmatch(track_id):
+        raise TrackSpecError("track_id must contain only lowercase letters, digits, and hyphens")
     netuid = _integer(root["netuid"], "netuid", minimum=0)
     if netuid > 0xFFFF:
         raise TrackSpecError("netuid must fit in an unsigned 16-bit integer")
+    mechid = _integer(root["mechid"], "mechid", minimum=0)
 
     initial_raw = _object(
         root["initial_champion"],
@@ -327,12 +334,15 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     sample_count = _integer(scoring_raw["sample_count"], "sample_count", minimum=1)
     if sample_count % len(strata) != 0:
         raise TrackSpecError("sample count must cover whole routes across every stratum")
+    if sample_count // len(strata) < 2:
+        raise TrackSpecError("scoring requires at least two sampled routes per stratum")
     if sample_count // len(strata) > len(selector.routes):
         raise TrackSpecError("sample count cannot exceed the available selector routes")
 
     spec_without_digest = {
         "track_id": track_id,
         "netuid": netuid,
+        "mechid": mechid,
         "track_start_block": _integer(root["track_start_block"], "track_start_block", minimum=0),
         "publication_grace_blocks": _integer(
             root["publication_grace_blocks"],
@@ -403,6 +413,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     return TrackSpec(
         track_id=track_id,
         netuid=netuid,
+        mechid=mechid,
         track_start_block=spec_without_digest["track_start_block"],
         publication_grace_blocks=spec_without_digest["publication_grace_blocks"],
         initial_champion=InitialChampionSpec(**spec_without_digest["initial_champion"]),

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from scoring.evaluate import reference_attention
-from scoring.exact import ExactCase, score_selector
+from scoring.exact import ExactCase, paired_score_gain_bound, score_selector
 from scoring.selector import FixedSelector, SelectorArchitecture
 from scoring.spec import BudgetSpec
 
@@ -92,3 +92,21 @@ def test_exact_scoring_rejects_unknown_stratum_and_oversized_budget() -> None:
             bootstrap_resamples=10,
             bootstrap_seed=7,
         )
+
+
+def test_paired_gain_bound_supports_losses_and_is_deterministic() -> None:
+    cases = [exact_case(seed) for seed in range(4)]
+    arguments = {
+        "challenger_scores": [0.4, 0.5, 0.6, 0.7],
+        "incumbent_scores": [0.5, 0.6, 0.7, 0.8],
+        "cases": cases,
+        "stratum_weights": {"all": 1.0},
+        "confidence": 0.95,
+        "resamples": 1000,
+        "seed": 7,
+    }
+
+    first = paired_score_gain_bound(**arguments)
+
+    assert first == paired_score_gain_bound(**arguments)
+    assert first == pytest.approx(-0.1)

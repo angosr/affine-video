@@ -76,7 +76,6 @@ def build_public_artifacts(
     track: TrackSpec,
     chain: WeightChainState,
     *,
-    mechid: int,
     version_key: int,
 ) -> PublicArtifacts | None:
     """Build one auditable public snapshot when chain scanning is caught up."""
@@ -108,7 +107,7 @@ def build_public_artifacts(
         track_id=track.track_id,
         track_spec_digest=track.digest,
         netuid=track.netuid,
-        mechid=mechid,
+        mechid=track.mechid,
         version_key=version_key,
         source_block=chain.finalized_block,
         plan=plan,
@@ -135,6 +134,56 @@ def build_public_artifacts(
             (match.object_name, _json_bytes(match.document)) for match in tournament.matches
         ),
         status=_json_bytes(status),
+        system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
+    )
+
+
+def build_genesis_artifacts(
+    track: TrackSpec,
+    chain: WeightChainState,
+    *,
+    version_key: int,
+) -> PublicArtifacts:
+    """Build the complete pre-launch snapshot with UID0 as champion."""
+
+    tournament = resolve_tournament(
+        (),
+        track_id=track.track_id,
+        track_spec_digest=track.digest,
+        netuid=track.netuid,
+        minimum_gain=track.scoring.minimum_frontier_gain,
+        initial_champion=genesis_champion(track),
+        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
+    )
+    plan = plan_champion_weight(
+        tournament.champion,
+        uid_by_hotkey=chain.uid_by_hotkey,
+        current_block=chain.finalized_block,
+        min_allowed_weights=chain.min_allowed_weights,
+        max_weight=chain.max_weight,
+    )
+    if plan is None:
+        raise PublicArtifactError("UID0 cannot receive the complete chain weight")
+    weights = WeightArtifact(
+        track_id=track.track_id,
+        track_spec_digest=track.digest,
+        netuid=track.netuid,
+        mechid=track.mechid,
+        version_key=version_key,
+        source_block=chain.finalized_block,
+        plan=plan,
+    )
+    return PublicArtifacts(
+        source_block=chain.finalized_block,
+        track=_json_bytes(
+            {"track_spec_digest": track.digest, "spec": track_spec_dict(track)}
+        ),
+        summary=_json_bytes(_summary_document(track, chain.finalized_block, tournament)),
+        weights=encode_weight_artifact(weights),
+        matches=(),
+        status=_json_bytes(
+            _status_document(track, chain.finalized_block, tournament, [], [])
+        ),
         system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
     )
 
@@ -278,7 +327,7 @@ def validate_public_weights_url(url: str) -> str:
 
 
 class S3Repository:
-    """Persist immutable public facts and publish bounded current-state pointers."""
+    """Persist versioned match facts and publish bounded current-state pointers."""
 
     def __init__(self, client: Any, *, bucket: str, prefix: str) -> None:
         if not _STORAGE_NAME.fullmatch(bucket) or len(bucket) > 64:
@@ -328,7 +377,7 @@ class S3Repository:
         return cls(client, bucket=bucket, prefix=prefix)
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
-        await asyncio.to_thread(self._put_immutable, "track.json", artifacts.track)
+        await asyncio.to_thread(self._put, "track.json", artifacts.track, False)
         for name, payload in artifacts.system_matches:
             await asyncio.to_thread(self._put_immutable, name, payload)
         for name, payload in artifacts.matches:
@@ -384,9 +433,12 @@ class S3Repository:
             stored_track = parse_track_spec(track_document["spec"])
         except ValueError as exc:
             raise PublicArtifactError("public track specification is invalid") from exc
-        if track_document["track_spec_digest"] != stored_track.digest or stored_track != track:
-            raise PublicArtifactError("public track does not match the configured track")
-        self._confirmed_immutable["track.json"] = hashlib.sha256(track_payload).hexdigest()
+        if track_document["track_spec_digest"] != stored_track.digest:
+            raise PublicArtifactError("public track digest is invalid")
+        if stored_track != track:
+            if stored_track.track_id == track.track_id:
+                raise PublicArtifactError("an active track ID cannot change its specification")
+            return PublicLedger(None, ())
 
         if summary_payload is None:
             return PublicLedger(
@@ -408,14 +460,12 @@ class S3Repository:
         if set(summary) != expected_fields:
             raise PublicArtifactError("public summary fields are invalid")
         source_block = _integer(summary["source_block"], "source_block")
-        if source_block < track.track_start_block:
-            raise PublicArtifactError("public summary predates the configured track")
         match_count = _integer(summary["match_count"], "match_count")
         matches: list[MatchRecord] = []
         committed_challenges: list[dict[str, Any]] = []
         incumbent = genesis_champion(track)
         for sequence in range(1, match_count + 1):
-            name = f"matches/{sequence:012d}.json"
+            name = f"matches/{track.track_id}/{sequence:012d}.json"
             payload = self._get_optional(name)
             if payload is None:
                 raise PublicArtifactError(f"committed match is missing: {name}")
@@ -465,7 +515,7 @@ class S3Repository:
     ) -> list[MatchRecord]:
         matches: list[MatchRecord] = []
         while True:
-            name = f"matches/{sequence:012d}.json"
+            name = f"matches/{track.track_id}/{sequence:012d}.json"
             payload = self._get_optional(name)
             if payload is None:
                 break

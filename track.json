@@ -1,0 +1,64 @@
+{
+  "base_model": {
+    "repo_id": "MiniMaxAI/MiniMax-H3",
+    "revision": "42ed227ee7df40d41602854ae760620d6eb651fe"
+  },
+  "cache": {
+    "exact_max_bytes": 1073741824,
+    "minimum_generation_delay_blocks": 1
+  },
+  "initial_champion": {
+    "evaluation_file_sha256": "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f",
+    "file_sha256": "2a8d8845c5342756a2781e8e69563940e4bb573c9a40ebb534915ff8fd76573a",
+    "filename": "minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors",
+    "hotkey": "5HmYnmUYT6qe3yFMg1Ad8WLLqDvnwtjYakXBpDvoRW1Qqzb8",
+    "model_digest": "3fef3eca0eebee238b1ed9c692b217dd25cb1082ef94779ec2ef7c93ae0560c9",
+    "repo_id": "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview",
+    "revision": "76f202874608115408d73280be9531c4ab888242",
+    "score": 0.0,
+    "uid": 0
+  },
+  "mechid": 1,
+  "model": {
+    "filename": "selector.safetensors",
+    "max_bytes": 560000000,
+    "selector": {
+      "head_dim": 128,
+      "num_heads": 56,
+      "num_layers": 50,
+      "storage_dtype": "float16"
+    }
+  },
+  "netuid": 120,
+  "publication_grace_blocks": 300,
+  "scoring": {
+    "bootstrap_confidence": 0.95,
+    "bootstrap_resamples": 5000,
+    "bootstrap_seed": 12020261017,
+    "budgets": [
+      {
+        "blocks": 16,
+        "calibrated_cost": 0.04096
+      },
+      {
+        "blocks": 32,
+        "calibrated_cost": 0.063936
+      },
+      {
+        "blocks": 64,
+        "calibrated_cost": 0.111328
+      }
+    ],
+    "minimum_frontier_gain": 0.005,
+    "sample_count": 64,
+    "stratum_weights": {
+      "1x1_t72": 0.25,
+      "4x3_t102": 0.25,
+      "9x16_t37": 0.25,
+      "16x9_t37": 0.25
+    },
+    "tail_mean_weight": 0.8
+  },
+  "track_id": "veda-sn120-v1",
+  "track_start_block": 9305000
+}

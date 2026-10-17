@@ -20,8 +20,7 @@ from scoring.cache import (
     load_exact_cache,
     select_exact_cache_batch,
 )
-from scoring.evaluate import panel_seed, route_stratified_sample_indices
-from scoring.exact import ExactCase, score_selector
+from scoring.exact import ExactCase, paired_score_gain_bound, score_selector
 from scoring.model import ModelValidationError, ValidatedModel, validate_model
 from scoring.selector import load_selector
 from scoring.spec import TrackSpec
@@ -95,7 +94,6 @@ class TrackEvaluator:
 
     track: TrackSpec
     exact_cases: Sequence[ExactCase]
-    presampled: bool = False
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         if task.model_path is None or task.file_sha256 is None:
@@ -124,14 +122,9 @@ class TrackEvaluator:
         scoring = self.track.scoring
         try:
             if task.state is ChallengeState.SCORING:
-                cases = _exact_cases_for_stage(
-                    self.exact_cases,
-                    count=scoring.sample_count,
-                    seed=panel_seed(self.track.digest, stage="exact"),
-                    routes=self.track.model.selector.routes,
-                    strata=scoring.stratum_weight_map,
-                    presampled=self.presampled,
-                )
+                cases = tuple(self.exact_cases)
+                if len(cases) != scoring.sample_count:
+                    raise ValueError("exact cache case count does not match the track")
                 result = score_selector(
                     selector,
                     cases,
@@ -149,6 +142,7 @@ class TrackEvaluator:
                         "lower_bound": result.lower_bound,
                         "budget_scores": [item.quality for item in result.aggregate.budgets],
                         "sample_count": len(cases),
+                        "sample_scores": list(result.sample_scores),
                     },
                 )
         except (ParticipantScoringError, TemporaryScoringError):
@@ -185,14 +179,36 @@ class FilePairedEvaluator:
                 raise CacheLoadError("cache case count does not match the track")
         except CacheLoadError as exc:
             raise TemporaryScoringError("SCORING_CACHE_INVALID", str(exc)) from exc
-        evaluator = TrackEvaluator(self.track, exact_cases, presampled=True)
+        evaluator = TrackEvaluator(self.track, exact_cases)
         challenger_result = evaluator(challenger)
         incumbent_result = evaluator(self.incumbent)
+        challenger_scores = challenger_result.metrics.get("sample_scores")
+        incumbent_scores = incumbent_result.metrics.get("sample_scores")
+        if not isinstance(challenger_scores, list) or not isinstance(
+            incumbent_scores, list
+        ):
+            raise TemporaryScoringError(
+                "SCORING_WORKER_FAILURE", "paired scorer omitted per-case scores"
+            )
+        paired_gain = paired_score_gain_bound(
+            challenger_scores,
+            incumbent_scores,
+            exact_cases,
+            stratum_weights=scoring.stratum_weight_map,
+            confidence=scoring.bootstrap_confidence,
+            resamples=scoring.bootstrap_resamples,
+            seed=scoring.bootstrap_seed,
+        )
         return StageOutcome(
             challenger_result.score,
             {
-                **challenger_result.metrics,
+                **{
+                    key: value
+                    for key, value in challenger_result.metrics.items()
+                    if key != "sample_scores"
+                },
                 "incumbent_score": incumbent_result.score,
+                "paired_gain_lower_bound": paired_gain,
             },
         )
 
@@ -582,30 +598,6 @@ def _defer_or_fail(
         occurred_at_ms=now_ms,
     )
     return ChallengeState.SYSTEM_DEFERRED
-
-
-def _exact_cases_for_stage(
-    cases: Sequence[ExactCase],
-    *,
-    count: int,
-    seed: int,
-    routes: tuple[str, ...],
-    strata: Mapping[str, float],
-    presampled: bool,
-) -> tuple[ExactCase, ...]:
-    if not presampled:
-        indices = route_stratified_sample_indices(
-            [case.route for case in cases],
-            [case.stratum for case in cases],
-            count,
-            seed,
-            routes,
-            strata,
-        )
-        return tuple(cases[index] for index in indices)
-    if len(cases) != count:
-        raise ValueError("sampled cache returned the wrong number of cases")
-    return tuple(cases)
 
 
 def _file_sha256(path: Path) -> str:

@@ -225,6 +225,7 @@ def validate_weight_artifact(
     *,
     expected_netuid: int,
     expected_track_digest: str,
+    expected_mechid: int,
     max_staleness_blocks: int,
 ) -> WeightPlan | None:
     """Validate an untrusted public recommendation against current finalized chain state."""
@@ -236,10 +237,14 @@ def validate_weight_artifact(
         raise ValueError("expected track specification digest is invalid")
     if max_staleness_blocks <= 0:
         raise ValueError("maximum staleness must be positive")
+    if expected_mechid < 0:
+        raise ValueError("expected mechanism identifier must be non-negative")
     if artifact.netuid != expected_netuid:
         raise ValueError("public weights target a different subnet")
     if artifact.track_spec_digest != normalized_digest:
         raise ValueError("public weights target a different track specification")
+    if artifact.mechid != expected_mechid:
+        raise ValueError("public weights target a different mechanism")
     if artifact.source_block > chain.finalized_block:
         raise ValueError("public weights come from a future block")
     if chain.finalized_block - artifact.source_block > max_staleness_blocks:

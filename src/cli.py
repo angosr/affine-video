@@ -15,7 +15,6 @@ from validator.monitor import fetch_status, render_status
 from validator.publication import S3Repository
 from validator.run import (
     DEFAULT_BASELINE_MANIFEST_URL,
-    DEFAULT_MECHID,
     DEFAULT_NETUID,
     DEFAULT_PUBLIC_WEIGHTS_URL,
     DEFAULT_TRACK_SPEC_DIGEST,
@@ -93,7 +92,6 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--scoring-timeout-seconds", default=1800.0, type=float)
     evaluate.add_argument("--scoring-max-memory-bytes", type=int)
     evaluate.add_argument("--scoring-max-cpu-seconds", type=int)
-    evaluate.add_argument("--mechid", default=DEFAULT_MECHID, type=int)
     evaluate.add_argument("--version-key", default=0, type=int)
     evaluate.add_argument("--once", action="store_true")
 
@@ -222,7 +220,6 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
                     archive_endpoints=arguments.archive_endpoints,
                     worker_id=arguments.worker_id,
                     publisher=publisher,
-                    mechid=arguments.mechid,
                     version_key=arguments.version_key,
                     poll_seconds=arguments.poll_seconds,
                     max_scan_blocks=arguments.max_scan_blocks,

@@ -20,6 +20,7 @@ def valid_spec() -> dict:
     return {
         "track_id": "veda-test-v1",
         "netuid": 7,
+        "mechid": 0,
         "track_start_block": 100,
         "publication_grace_blocks": 20,
         "initial_champion": {
@@ -38,7 +39,7 @@ def valid_spec() -> dict:
             "max_bytes": 1024,
             "selector": {
                 "num_layers": 1,
-                "num_heads": 1,
+                "num_heads": 2,
                 "head_dim": 2,
                 "storage_dtype": "float32",
             },
@@ -59,7 +60,7 @@ def valid_spec() -> dict:
             ],
             "sample_count": 2,
             "tail_mean_weight": 0.8,
-            "stratum_weights": {"layer-0": 0.5, "layer-1": 0.5},
+            "stratum_weights": {"all": 1.0},
             "minimum_frontier_gain": 0.001,
             "bootstrap_confidence": 0.95,
             "bootstrap_resamples": 1000,
@@ -76,9 +77,10 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
 
     assert first.digest == second.digest
     assert len(first.digest) == 64
-    assert first.model.tensor_schema["layers.0.proj_q"].shape == (1, 6, 2)
-    assert first.scoring.stratum_weight_map == {"layer-0": 0.5, "layer-1": 0.5}
+    assert first.model.tensor_schema["layers.0.proj_q"].shape == (2, 6, 2)
+    assert first.scoring.stratum_weight_map == {"all": 1.0}
     assert first.base_model.revision == "12" * 20
+    assert first.mechid == 0
     assert first.publication_grace_blocks == 20
     assert first.initial_champion.uid == 0
     assert first.initial_champion.repo_id == VEDA_REPO_ID
@@ -174,13 +176,13 @@ def test_unknown_fields_and_invalid_budget_order_are_rejected() -> None:
         parse_track_spec(impossible_size)
 
     header_too_large = valid_spec()
-    header_too_large["model"]["max_bytes"] = 255
+    header_too_large["model"]["max_bytes"] = 351
     with pytest.raises(TrackSpecError, match="cannot hold"):
         parse_track_spec(header_too_large)
 
     exact_minimum_size = valid_spec()
-    exact_minimum_size["model"]["max_bytes"] = 256
-    assert parse_track_spec(exact_minimum_size).model.max_bytes == 256
+    exact_minimum_size["model"]["max_bytes"] = 352
+    assert parse_track_spec(exact_minimum_size).model.max_bytes == 352
 
     undersampled = valid_spec()
     undersampled["scoring"]["stratum_weights"] = {f"layer-{index}": 0.2 for index in range(5)}

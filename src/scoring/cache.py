@@ -17,7 +17,6 @@ from typing import Any
 import numpy as np
 from numpy.lib.format import read_array_header_1_0, read_array_header_2_0, read_magic
 
-from scoring.evaluate import route_stratified_sample_indices
 from scoring.exact import ExactCase
 
 
@@ -225,38 +224,10 @@ def load_exact_cache(
     return _load_exact_cache(path, expected_sha256, max_bytes)
 
 
-def sample_exact_cache(
-    path: str | Path,
-    *,
-    expected_sha256: str,
-    max_bytes: int,
-    count: int,
-    seed: int,
-    routes: tuple[str, ...],
-    strata: Mapping[str, float],
-) -> tuple[ExactCase, ...]:
-    """Load only the deterministic exact sample needed by one challenge."""
-
-    return _load_exact_cache(
-        path,
-        expected_sha256,
-        max_bytes,
-        count=count,
-        seed=seed,
-        routes=routes,
-        strata=strata,
-    )
-
-
 def _load_exact_cache(
     path: str | Path,
     expected_sha256: str,
     max_bytes: int,
-    *,
-    count: int | None = None,
-    seed: int = 0,
-    routes: tuple[str, ...] | None = None,
-    strata: Mapping[str, float] | None = None,
 ) -> tuple[ExactCase, ...]:
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
     try:
@@ -266,16 +237,8 @@ def _load_exact_cache(
                 _object(raw_case, {"route", "stratum", "epsilon"}, "exact case")
                 for raw_case in metadata["cases"]
             ]
-            indices = _selected_indices(
-                cases,
-                count=count,
-                seed=seed,
-                routes=routes,
-                strata=strata,
-            )
-            selected = set(indices)
             expected = {"metadata"}
-            loaded: dict[int, ExactCase] = {}
+            loaded: list[ExactCase] = []
             for index, case in enumerate(cases):
                 prefix = f"case_{index:06d}"
                 names = {
@@ -286,8 +249,8 @@ def _load_exact_cache(
                 epsilon = case["epsilon"]
                 if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
                     raise CacheLoadError("exact case epsilon must be numeric")
-                if index in selected:
-                    loaded[index] = ExactCase(
+                loaded.append(
+                    ExactCase(
                         route=_string(case["route"], "exact route"),
                         stratum=_string(case["stratum"], "exact stratum"),
                         q=_array(archive, names["q"]),
@@ -298,36 +261,13 @@ def _load_exact_cache(
                         required_keys=_array(archive, names["required_keys"]),
                         epsilon=float(epsilon),
                     )
+                )
             _exact_keys(archive, expected)
     except CacheLoadError:
         raise
     except (OSError, ValueError, KeyError) as exc:
         raise CacheLoadError("exact cache arrays cannot be read") from exc
-    return tuple(loaded[index] for index in indices)
-
-
-def _selected_indices(
-    cases: list[dict[str, Any]],
-    *,
-    count: int | None,
-    seed: int,
-    routes: tuple[str, ...] | None,
-    strata: Mapping[str, float] | None,
-) -> tuple[int, ...]:
-    if count is None:
-        return tuple(range(len(cases)))
-    if routes is None or strata is None:
-        raise ValueError("routes and strata are required for sampled cache loading")
-    case_routes = tuple(_string(case["route"], "case route") for case in cases)
-    case_strata = tuple(_string(case["stratum"], "case stratum") for case in cases)
-    return route_stratified_sample_indices(
-        case_routes,
-        case_strata,
-        count,
-        seed,
-        routes,
-        strata,
-    )
+    return tuple(loaded)
 
 
 def _validate_cache_index(

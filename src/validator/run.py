@@ -26,6 +26,7 @@ from validator.download import DownloadedModel, download_chunked_asset, download
 from validator.publication import (
     PublicArtifacts,
     PublicLedger,
+    build_genesis_artifacts,
     build_public_artifacts,
     encode_weight_artifact,
     fetch_weight_artifact,
@@ -128,7 +129,6 @@ async def run_evaluator(
     archive_endpoints: list[str] | None,
     worker_id: str,
     publisher: ArtifactRepository,
-    mechid: int = 0,
     version_key: int = 0,
     poll_seconds: float = 12.0,
     max_scan_blocks: int = 100,
@@ -142,8 +142,8 @@ async def run_evaluator(
 
     if poll_seconds <= 0:
         raise ValueError("poll interval must be positive")
-    if min(mechid, version_key) < 0:
-        raise ValueError("mechanism and version identifiers must be non-negative")
+    if version_key < 0:
+        raise ValueError("version identifier must be non-negative")
     track = load_track_spec(track_spec)
     ledger = await publisher.load(track)
     cache_dir = Path(exact_cache)
@@ -190,6 +190,34 @@ async def run_evaluator(
         while True:
             try:
                 async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
+                    while True:
+                        finalized_block = await client.finalized_block()
+                        if finalized_block >= track.track_start_block:
+                            break
+                        chain = await read_weight_chain_state(
+                            client,
+                            netuid=track.netuid,
+                            finalized_block=finalized_block,
+                        )
+                        artifacts = build_genesis_artifacts(
+                            track,
+                            chain,
+                            version_key=version_key,
+                        )
+                        await publisher.publish(artifacts)
+                        if report is not None:
+                            report(
+                                EvaluationCycleResult(
+                                    finalized_block,
+                                    None,
+                                    None,
+                                    None,
+                                    published_block=finalized_block,
+                                )
+                            )
+                        if once:
+                            return
+                        await asyncio.sleep(poll_seconds)
                     await seed_legacy_exclusions(
                         client,
                         store,
@@ -227,7 +255,6 @@ async def run_evaluator(
                                     store,
                                     track,
                                     chain,
-                                    mechid=mechid,
                                     version_key=version_key,
                                 )
                                 if artifacts is not None:
@@ -275,6 +302,7 @@ async def run_validator(
     public_weights_url: str,
     netuid: int,
     track_spec_digest: str,
+    mechid: int = DEFAULT_MECHID,
     network: str,
     wallet_name: str,
     hotkey_name: str,
@@ -290,6 +318,8 @@ async def run_validator(
         raise ValueError("network cannot be empty")
     if netuid < 0 or netuid > 0xFFFF:
         raise ValueError("netuid must fit in an unsigned 16-bit integer")
+    if mechid < 0:
+        raise ValueError("mechanism identifier must be non-negative")
     normalized_track_digest = track_spec_digest.lower()
     if re.fullmatch(r"[0-9a-f]{64}", normalized_track_digest) is None:
         raise ValueError("track specification digest must be 32-byte hexadecimal")
@@ -320,6 +350,7 @@ async def run_validator(
                     public_weights_url=public_weights_url,
                     netuid=netuid,
                     track_spec_digest=normalized_track_digest,
+                    expected_mechid=mechid,
                     max_staleness_blocks=max_staleness_blocks,
                 )
             except Exception as exc:
@@ -462,6 +493,7 @@ async def process_weight_cycle(
     public_weights_url: str,
     netuid: int,
     track_spec_digest: str,
+    expected_mechid: int = DEFAULT_MECHID,
     max_staleness_blocks: int,
 ) -> WeightCycleResult:
     artifact = await fetch_weight_artifact(public_weights_url, client=http_client)
@@ -471,6 +503,7 @@ async def process_weight_cycle(
         chain,
         expected_netuid=netuid,
         expected_track_digest=track_spec_digest,
+        expected_mechid=expected_mechid,
         max_staleness_blocks=max_staleness_blocks,
     )
     if plan is None:

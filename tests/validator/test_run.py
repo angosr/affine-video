@@ -60,6 +60,9 @@ def test_initial_publisher_emits_current_uid_zero_weight(monkeypatch) -> None:
         async def __aexit__(self, *_args):
             return None
 
+        async def finalized_block(self):
+            return 100
+
     class Publisher:
         async def publish_initial_state(self, **kwargs):
             published.update(kwargs)
@@ -101,6 +104,9 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
 
         async def __aexit__(self, *_args):
             return None
+
+        async def finalized_block(self):
+            return 100
 
     class Publisher:
         async def load(self, _track):
@@ -232,6 +238,7 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
                 public_weights_url="https://public.example/weights.json",
                 netuid=7,
                 track_spec_digest="ab" * 32,
+                expected_mechid=2,
                 max_staleness_blocks=20,
             )
 
@@ -312,6 +319,7 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
             {
                 "stage": "scoring",
                 "incumbent_score": 0.5,
+                "paired_gain_lower_bound": 0.4,
                 "cache_sha256": "de" * 32,
                 "cache_generated_block": 101,
                 "cache_source_digest": "ef" * 32,

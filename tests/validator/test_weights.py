@@ -151,6 +151,7 @@ def test_public_weights_are_checked_against_current_chain_state() -> None:
             state,
             expected_netuid=7,
             expected_track_digest="ab" * 32,
+            expected_mechid=0,
             max_staleness_blocks=20,
         )
         == plan
@@ -162,6 +163,16 @@ def test_public_weights_are_checked_against_current_chain_state() -> None:
             state,
             expected_netuid=7,
             expected_track_digest="ab" * 32,
+            expected_mechid=0,
+            max_staleness_blocks=20,
+        )
+    with pytest.raises(ValueError, match="mechanism"):
+        validate_weight_artifact(
+            artifact(plan=plan),
+            state,
+            expected_netuid=7,
+            expected_track_digest="ab" * 32,
+            expected_mechid=1,
             max_staleness_blocks=20,
         )
     with pytest.raises(ValueError, match="mapping"):
@@ -170,6 +181,7 @@ def test_public_weights_are_checked_against_current_chain_state() -> None:
             state,
             expected_netuid=7,
             expected_track_digest="ab" * 32,
+            expected_mechid=0,
             max_staleness_blocks=20,
         )
 
@@ -186,6 +198,7 @@ def test_public_weights_are_checked_against_current_chain_state() -> None:
             chain_state(minimum=2),
             expected_netuid=7,
             expected_track_digest="ab" * 32,
+            expected_mechid=0,
             max_staleness_blocks=20,
         )
 

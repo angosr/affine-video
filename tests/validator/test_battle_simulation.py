@@ -41,6 +41,7 @@ def challenge(
     state: str,
     score: float | None = None,
     incumbent_score: float | None = None,
+    paired_gain: float | None = None,
     error_code: str | None = None,
 ) -> dict:
     return {
@@ -62,6 +63,13 @@ def challenge(
         "track_spec_digest": None,
         "final_score": score,
         "incumbent_score": incumbent_score,
+        "paired_gain_lower_bound": (
+            paired_gain
+            if paired_gain is not None
+            else score - incumbent_score
+            if score is not None and incumbent_score is not None
+            else None
+        ),
         "evaluation_batch": (
             {
                 "sha256": f"{sequence + 100:064x}",
@@ -131,7 +139,7 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch() -> None:
         {},
     )
 
-    artifacts = build_public_artifacts(store, track, chain, mechid=0, version_key=1)
+    artifacts = build_public_artifacts(store, track, chain, version_key=1)
 
     assert artifacts is not None
     summary = json.loads(artifacts.summary)
@@ -159,6 +167,7 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch() -> None:
         chain,
         expected_netuid=120,
         expected_track_digest=track.digest,
+        expected_mechid=0,
         max_staleness_blocks=1,
     ) == weights.plan
     rows = {row["hotkey"]: row for row in status["participants"]}
@@ -174,8 +183,9 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch() -> None:
     assert len(recovered.matches) == 5
     assert recovered.matches[-1].champion_after.hotkey == "dave"
 
-    tampered = bytearray(remote.objects["tracks/main/matches/000000000004.json"])
+    name = "tracks/main/matches/veda-sn120/000000000004.json"
+    tampered = bytearray(remote.objects[name])
     tampered[-2] ^= 1
-    remote.objects["tracks/main/matches/000000000004.json"] = bytes(tampered)
+    remote.objects[name] = bytes(tampered)
     with pytest.raises(PublicArtifactError):
         asyncio.run(S3Repository(remote, bucket="public-data", prefix="tracks/main").load(track))

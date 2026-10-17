@@ -70,6 +70,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
     track = TrackSpec(
         track_id="paired",
         netuid=7,
+        mechid=0,
         track_start_block=1,
         publication_grace_blocks=1,
         initial_champion=InitialChampionSpec(
@@ -423,6 +424,7 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
     track = TrackSpec(
         track_id="test",
         netuid=7,
+        mechid=0,
         track_start_block=1,
         publication_grace_blocks=1,
             initial_champion=InitialChampionSpec(
@@ -441,7 +443,7 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
         cache=CacheSpec(1_000_000, 1),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
-            sample_count=2,
+            sample_count=4,
             tail_mean_weight=0.8,
             stratum_weights=(("all", 1.0),),
             minimum_frontier_gain=0.001,
@@ -483,4 +485,4 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
     assert changed.value.code == "SCORING_MODEL_CHANGED"
     assert first == second == other_submission
     assert 0 <= first.score <= 1
-    assert first.metrics["sample_count"] == 2
+    assert first.metrics["sample_count"] == 4

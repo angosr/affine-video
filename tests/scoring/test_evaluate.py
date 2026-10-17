@@ -193,3 +193,25 @@ def test_stratified_bootstrap_keeps_frozen_macro_weights() -> None:
 
     assert lower == pytest.approx(0.5)
     assert upper == pytest.approx(0.5)
+
+
+def test_bootstrap_confidence_changes_a_nonconstant_lower_bound() -> None:
+    values = {"all": [0.1, 0.2, 0.8, 0.9]}
+    low_confidence = stratified_bootstrap_bound(
+        values,
+        group_weights={"all": 1.0},
+        confidence=0.5,
+        resamples=5000,
+        seed=7,
+        upper=False,
+    )
+    high_confidence = stratified_bootstrap_bound(
+        values,
+        group_weights={"all": 1.0},
+        confidence=0.95,
+        resamples=5000,
+        seed=7,
+        upper=False,
+    )
+
+    assert high_confidence < low_confidence

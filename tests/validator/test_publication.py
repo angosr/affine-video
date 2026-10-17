@@ -118,24 +118,25 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
         b"track",
         b"summary",
         b"weights",
-        (("matches/000000000001.json", b"match"),),
+        (("matches/track/000000000001.json", b"match"),),
     )
     asyncio.run(publisher.publish(artifacts))
 
     writes = [call for call in client.calls if "Key" in call and "Body" in call]
     assert [call["Key"] for call in writes] == [
         "veda/track/track.json",
-        "veda/track/matches/000000000001.json",
+        "veda/track/matches/track/000000000001.json",
         "veda/track/summary.json",
         "veda/track/weights.json",
     ]
-    assert writes[0]["CacheControl"].endswith("immutable")
+    assert writes[0]["CacheControl"] == "no-store, max-age=0"
     assert writes[1]["CacheControl"].endswith("immutable")
     assert writes[2]["CacheControl"] == writes[3]["CacheControl"] == "no-store, max-age=0"
 
     client.calls.clear()
     asyncio.run(publisher.publish(artifacts))
     assert [call["Key"] for call in client.calls if "Body" in call] == [
+        "veda/track/track.json",
         "veda/track/summary.json",
         "veda/track/weights.json",
     ]
@@ -145,7 +146,7 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
         b"track",
         b"summary",
         b"weights",
-        (("matches/000000000001.json", b"different"),),
+        (("matches/track/000000000001.json", b"different"),),
     )
     with pytest.raises(PublicArtifactError, match="conflicts"):
         asyncio.run(publisher.publish(conflicting))
@@ -191,6 +192,7 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
                 "model_size_bytes": 123,
                 "final_score": 0.8,
                 "incumbent_score": 0.5,
+                "paired_gain_lower_bound": 0.3,
                 "evaluation_batch": {
                     "sha256": "de" * 32,
                     "generated_block": 101,
@@ -207,7 +209,7 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
         active_competitors=lambda _mapping: [],
     )
     chain = WeightChainState(120, {"alice": 4}, 1, 1.0, 10, {"alice": 0})
-    artifacts = build_public_artifacts(store, track, chain, mechid=0, version_key=0)
+    artifacts = build_public_artifacts(store, track, chain, version_key=0)
     assert artifacts is not None
 
     client = MemoryS3()
@@ -220,12 +222,12 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
     assert len(ledger.matches) == 1
     assert ledger.matches[0].challenge_id == "challenge"
 
-    original_match = client.objects.pop("veda/track/matches/000000000001.json")
+    original_match = client.objects.pop("veda/track/matches/veda-test-v1/000000000001.json")
     with pytest.raises(PublicArtifactError, match="committed match is missing"):
         asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
-    client.objects["veda/track/matches/000000000001.json"] = original_match
+    client.objects["veda/track/matches/veda-test-v1/000000000001.json"] = original_match
 
-    client.objects["veda/track/matches/000000000001.json"] = b"{}"
+    client.objects["veda/track/matches/veda-test-v1/000000000001.json"] = b"{}"
     with pytest.raises(PublicArtifactError, match="match is invalid"):
         asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
 
@@ -246,7 +248,7 @@ def test_empty_track_publishes_uid_zero_veda_as_genesis_champion() -> None:
         {track.initial_champion.hotkey: 0},
     )
 
-    artifacts = build_public_artifacts(store, track, chain, mechid=0, version_key=0)
+    artifacts = build_public_artifacts(store, track, chain, version_key=0)
 
     assert artifacts is not None
     weights = decode_weight_artifact(artifacts.weights)
@@ -283,6 +285,7 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
         "model_size_bytes": 123,
         "final_score": 0.8,
         "incumbent_score": 0.5,
+        "paired_gain_lower_bound": 0.3,
         "evaluation_batch": {
             "sha256": "de" * 32,
             "generated_block": 101,
@@ -298,7 +301,7 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
         active_competitors=lambda _mapping: [],
     )
     chain = WeightChainState(120, {"alice": 4, "bob": 5}, 1, 1.0, 10, {})
-    committed = build_public_artifacts(store, track, chain, mechid=0, version_key=0)
+    committed = build_public_artifacts(store, track, chain, version_key=0)
     assert committed is not None
     client = MemoryS3()
     asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").publish(committed))
@@ -314,6 +317,7 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
         "model_digest": "ef" * 32,
         "final_score": 0.9,
         "incumbent_score": 0.8,
+        "paired_gain_lower_bound": 0.1,
         "evaluation_batch": {
             "sha256": "fa" * 32,
             "generated_block": 122,
@@ -327,7 +331,6 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
         store,
         track,
         WeightChainState(130, {"alice": 4, "bob": 5}, 1, 1.0, 10, {}),
-        mechid=0,
         version_key=0,
     )
     assert newer is not None
@@ -364,6 +367,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
                 "model_size_bytes": 123,
                 "final_score": 0.8,
                 "incumbent_score": 0.5,
+                "paired_gain_lower_bound": 0.3,
                 "evaluation_batch": {
                     "sha256": "de" * 32,
                     "generated_block": 101,
@@ -383,6 +387,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
         track_id="track",
         digest="ab" * 32,
         netuid=7,
+        mechid=2,
         track_start_block=100,
         initial_champion=SimpleNamespace(
             uid=0,
@@ -404,7 +409,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
     )
     monkeypatch.setattr(publication_module, "track_spec_dict", lambda _track: {"track_id": "track"})
 
-    artifacts = build_public_artifacts(store, track, chain, mechid=2, version_key=9)
+    artifacts = build_public_artifacts(store, track, chain, version_key=9)
     assert artifacts is not None
     public_weights = decode_weight_artifact(artifacts.weights)
     public_summary = json.loads(artifacts.summary)
@@ -418,9 +423,9 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
     assert public_match["outcome"] == "CHALLENGER_WON"
 
     store.chain_cursor = lambda: (119, "0x" + "11" * 32)
-    assert build_public_artifacts(store, track, chain, mechid=2, version_key=9) is None
+    assert build_public_artifacts(store, track, chain, version_key=9) is None
 
     store.chain_cursor = lambda: (120, "0x" + "12" * 32)
     snapshot["challenges"][0]["score_block"] = 121
     with pytest.raises(PublicArtifactError, match="newer"):
-        build_public_artifacts(store, track, chain, mechid=2, version_key=9)
+        build_public_artifacts(store, track, chain, version_key=9)

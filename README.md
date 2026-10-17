@@ -33,8 +33,9 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
    older batch.
 5. UID 0 is the genesis champion without making a commit. Its identity is pinned to the official
    VEDA repository revision, filename and file SHA-256 in the track specification. Its baseline
-   For every match, the challenger and current champion are rerun on the same new batch. A
-   challenger replaces the champion only when their paired score difference reaches
+   and every challenger are evaluated by the same scorer. For every match, the challenger and
+   current champion are rerun on the same new batch. A challenger replaces the champion only when
+   the lower confidence bound of their paired per-case score gain reaches
    `minimum_frontier_gain`.
 6. An immutable match record is published for every terminal item in the contiguous chain-order
    prefix. A failed or unfinished earlier submission can never be skipped to publish a later win.
@@ -72,16 +73,19 @@ tracks/main/
     000000000001.json
     ...
   matches/
-    000000000001.json
-    000000000002.json
-    ...
+    veda-sn120-v1/
+      000000000001.json
+      000000000002.json
+      ...
 ```
 
-- `track.json` is immutable and contains the canonical public track specification and digest.
+- `track.json` is the stable pointer to the current canonical track specification and digest. An
+  active `track_id` has one fixed specification; an upgrade uses a new `track_id`, while the URL
+  remains unchanged.
 - `system_matches/*.json` are immutable launch checks produced from real GPU panels. They compare
   the VEDA baseline with fixed control models, but never enter the Miner queue, tournament rank, or
   chain weights.
-- `matches/*.json` are immutable terminal match facts in chain order: public model reference,
+- `matches/<track_id>/*.json` are immutable terminal match facts in chain order: public model reference,
   content hashes, aggregate result, incumbent, decision, and decision block.
 - `summary.json` is a bounded current view containing the champion, top leaderboard and committed
   match count.
@@ -89,7 +93,8 @@ tracks/main/
   entrants, queue positions, match numbers, scores and outcomes.
 - `weights.json` is the small mutable artifact consumed by Validators.
 
-Publication writes the immutable track and matches first, then `summary.json`, then `weights.json`.
+Publication writes the current track and immutable matches first, then `summary.json`, then
+`weights.json`.
 A crash can therefore leave an extra immutable match but cannot expose weights for an uncommitted
 summary. On restart the evaluator validates every committed match, follows any contiguous orphaned
 matches, and restores them instead of evaluating them again. Conflicting immutable bytes stop

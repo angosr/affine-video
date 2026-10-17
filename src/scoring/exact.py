@@ -109,20 +109,59 @@ def score_selector(
     sample_scores = tuple(log_cost_auc(costs, qualities) for qualities in per_case_qualities)
     lower_bound = stratified_bootstrap_bound(
         {
-            group: [
+            stratum: [
                 sample_scores[index]
                 for index, case in enumerate(cases)
-                if group_for(case.route, case.stratum) == group
+                if case.stratum == stratum
             ]
-            for group in group_weights
+            for stratum in stratum_weights
         },
-        group_weights=group_weights,
+        group_weights=stratum_weights,
         confidence=bootstrap_confidence,
         resamples=bootstrap_resamples,
         seed=bootstrap_seed,
         upper=False,
     )
     return SelectorScore(aggregate, lower_bound, sample_scores)
+
+
+def paired_score_gain_bound(
+    challenger_scores: Sequence[float],
+    incumbent_scores: Sequence[float],
+    cases: Sequence[ExactCase],
+    *,
+    stratum_weights: Mapping[str, float],
+    confidence: float,
+    resamples: int,
+    seed: int,
+) -> float:
+    """Return the lower confidence bound of paired per-case score gains."""
+
+    if len(challenger_scores) != len(cases) or len(incumbent_scores) != len(cases):
+        raise ValueError("paired scores must align with every exact case")
+    differences = tuple(
+        candidate - current
+        for candidate, current in zip(
+            challenger_scores,
+            incumbent_scores,
+            strict=True,
+        )
+    )
+    return stratified_bootstrap_bound(
+        {
+            stratum: [
+                differences[index]
+                for index, case in enumerate(cases)
+                if case.stratum == stratum
+            ]
+            for stratum in stratum_weights
+        },
+        group_weights=stratum_weights,
+        confidence=confidence,
+        resamples=resamples,
+        seed=seed,
+        upper=False,
+    )
 
 
 def _route_stratum_groups(

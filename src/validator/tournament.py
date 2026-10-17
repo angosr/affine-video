@@ -59,7 +59,7 @@ class MatchRecord:
 
     @property
     def object_name(self) -> str:
-        return f"matches/{self.sequence:012d}.json"
+        return f"matches/{self.document['track_id']}/{self.sequence:012d}.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +117,7 @@ def challenge_from_match(document: Mapping[str, Any]) -> dict[str, Any]:
         "final_score": evaluation.get("final_score"),
         "score_block": evaluation.get("score_block"),
         "incumbent_score": evaluation.get("incumbent_score"),
+        "paired_gain_lower_bound": evaluation.get("paired_gain_lower_bound"),
         "evaluation_batch": evaluation.get("evaluation_batch"),
         "stages": [],
     }
@@ -281,7 +282,10 @@ def _resolve_match(
             submission_block=position.block,
             minimum_delay_blocks=minimum_generation_delay_blocks,
         )
-        score_gain = canonical_score_gain(score, incumbent_score)
+        score_gain = _gain(
+            challenge.get("paired_gain_lower_bound"),
+            "paired_gain_lower_bound",
+        )
         if score_gain >= minimum_gain:
             outcome = MatchOutcome.CHALLENGER_WON
             incumbent = candidate
@@ -316,6 +320,7 @@ def _resolve_match(
             else None
         ),
         "incumbent_score": incumbent_score,
+        "paired_gain_lower_bound": score_gain,
         "evaluation_batch": batch,
     }
     document = {
@@ -400,6 +405,15 @@ def _score(value: Any, name: str) -> float:
     result = float(value)
     if not isfinite(result) or not 0 <= result <= 1:
         raise ValueError(f"{name} must be within [0, 1]")
+    return result
+
+
+def _gain(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    result = float(value)
+    if not isfinite(result) or not -1 <= result <= 1:
+        raise ValueError(f"{name} must be within [-1, 1]")
     return result
 
 
