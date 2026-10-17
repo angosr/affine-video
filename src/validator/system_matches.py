@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from math import fsum
 from typing import Any
 
+from scoring.spec import TrackSpec, track_spec_dict
+
 PRODUCTION_TRACK_ID = "veda-sn120-v2"
-PRODUCTION_TRACK_SPEC_DIGEST = "c44359ffb68c098ad780124aed8de3e0260fa39e7b162cbbba244c6614c45846"
 PRODUCTION_NETUID = 120
+PRODUCTION_EVIDENCE_CONTRACT_DIGEST = (
+    "eb091449d2ab176ad6f9136461d9b88c1d69061b1db3175b11192e289c58aa59"
+)
 _EVIDENCE_SHA256 = "87ba4871c29df4f5113b4051c4f2d1e6905be834ef9a54dfcb780a675fc357db"
 _RUNTIME_TRACE_EVIDENCE_SHA256 = "c6e873d8d9acbcb02814eae888fb30fa73e620d73fca03f99a7f8f30f10b3fa5"
 _MINIMUM_GAIN = 0.005
@@ -135,33 +140,29 @@ _CONTROLS = (
 )
 
 
-def system_match_artifacts(
-    track_id: str, track_spec_digest: str, netuid: int
-) -> tuple[tuple[str, bytes], ...]:
-    """Return evidence only for the exact track specification that produced it."""
+def system_match_artifacts(track: TrackSpec) -> tuple[tuple[str, bytes], ...]:
+    """Return evidence only for its frozen, non-circular scoring contract."""
 
     if (
-        track_id != PRODUCTION_TRACK_ID
-        or track_spec_digest != PRODUCTION_TRACK_SPEC_DIGEST
-        or netuid != PRODUCTION_NETUID
+        track.track_id != PRODUCTION_TRACK_ID
+        or track.netuid != PRODUCTION_NETUID
+        or _evidence_contract_digest(track) != PRODUCTION_EVIDENCE_CONTRACT_DIGEST
     ):
         return ()
     return tuple(
         (
-            f"system_matches/{track_id}/{sequence:012d}.json",
-            _json_bytes(_match_document(sequence, control)),
+            f"system_matches/{track.track_id}/{sequence:012d}.json",
+            _json_bytes(_match_document(sequence, control, track.digest)),
         )
         for sequence, control in enumerate(_CONTROLS, start=1)
     )
 
 
-def system_match_summaries(
-    track_id: str, track_spec_digest: str, netuid: int
-) -> list[dict[str, Any]]:
+def system_match_summaries(track: TrackSpec) -> list[dict[str, Any]]:
     """Return compact launch-check rows for the live status document."""
 
     summaries = []
-    for name, payload in system_match_artifacts(track_id, track_spec_digest, netuid):
+    for name, payload in system_match_artifacts(track):
         document = json.loads(payload)
         summaries.append(
             {
@@ -177,7 +178,11 @@ def system_match_summaries(
     return summaries
 
 
-def _match_document(sequence: int, control: dict[str, Any]) -> dict[str, Any]:
+def _match_document(
+    sequence: int,
+    control: dict[str, Any],
+    track_spec_digest: str,
+) -> dict[str, Any]:
     challenger_scores = control["scores"]
     batches = [
         {
@@ -203,7 +208,7 @@ def _match_document(sequence: int, control: dict[str, Any]) -> dict[str, Any]:
         "record_type": "SYSTEM_BENCHMARK",
         "sequence": sequence,
         "track_id": PRODUCTION_TRACK_ID,
-        "track_spec_digest": PRODUCTION_TRACK_SPEC_DIGEST,
+        "track_spec_digest": track_spec_digest,
         "netuid": PRODUCTION_NETUID,
         "affects_tournament": False,
         "reward_eligible": False,
@@ -213,6 +218,7 @@ def _match_document(sequence: int, control: dict[str, Any]) -> dict[str, Any]:
             "hardware": "NVIDIA H200",
             "torch": "2.12.0+cu130",
             "cuda": "13.0",
+            "track_contract_sha256": PRODUCTION_EVIDENCE_CONTRACT_DIGEST,
             "batch_count": 10,
             "cases_per_batch": 384,
             "independent_videos_per_stratum": 4,
@@ -248,3 +254,11 @@ def _json_bytes(value: Any) -> bytes:
         ensure_ascii=True,
         allow_nan=False,
     ).encode()
+
+
+def _evidence_contract_digest(track: TrackSpec) -> str:
+    """Bind score-affecting track data without depending on its runtime manifest."""
+
+    document = track_spec_dict(track)
+    del document["artifact_manifest_sha256"]
+    return hashlib.sha256(_json_bytes(document)).hexdigest()

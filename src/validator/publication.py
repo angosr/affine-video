@@ -261,7 +261,7 @@ def build_public_artifacts(
             (match.object_name, _json_bytes(match.document)) for match in tournament.matches
         ),
         status=_json_bytes(status),
-        system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
+        system_matches=system_match_artifacts(track),
         files=tuple(files.values()),
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
         abort=_track_abort_artifact(track) if aborted else None,
@@ -313,7 +313,7 @@ def build_genesis_artifacts(
         weights=encode_weight_artifact(weights),
         matches=(),
         status=_json_bytes(_status_document(track, chain.finalized_block, tournament, [], [])),
-        system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
+        system_matches=system_match_artifacts(track),
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
     )
 
@@ -1421,7 +1421,7 @@ def _status_document(
             }
         ),
         "champion": tournament.champion.public(),
-        "system_matches": system_match_summaries(track.track_id, track.digest, track.netuid),
+        "system_matches": system_match_summaries(track),
         "participants": active_rows,
     }
 
