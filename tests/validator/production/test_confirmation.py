@@ -1,9 +1,12 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
-from validator.production.confirmation import _score_rollout_budget
+from scoring.video import VideoCell
+from validator.production import confirmation
+from validator.production.confirmation import ConfirmationWorkerPool, _score_rollout_budget
 from validator.production.runtime import SparseOutputInvalid
 
 
@@ -52,3 +55,127 @@ def test_infrastructure_runtime_failure_is_not_converted_to_zero() -> None:
 
     with pytest.raises(RuntimeError, match="gpu unavailable"):
         _score_rollout_budget(**arguments(Runtime()))
+
+
+def test_partial_worker_start_is_cleaned_up_and_pool_can_be_reused(monkeypatch) -> None:
+    cells = (VideoCell("wide", "rollout", 16, 0.5),)
+
+    class FakeQueue:
+        def __init__(self, values=(), *, fail_shutdown=False):
+            self.values = list(values)
+            self.closed = False
+            self.fail_shutdown = fail_shutdown
+
+        def put(self, value):
+            if self.closed:
+                raise ValueError("queue is closed")
+            if value is None and self.fail_shutdown:
+                raise OSError("injected shutdown write failure")
+            self.values.append(value)
+
+        def get(self, *, timeout):
+            del timeout
+            if not self.values:
+                pytest.fail("result queue was unexpectedly empty")
+            return self.values.pop(0)
+
+        def close(self):
+            self.closed = True
+
+        def join_thread(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self, *, fail_start=False):
+            self.fail_start = fail_start
+            self.started = False
+            self.terminated = False
+            self.joined = False
+            self.exitcode = None
+
+        def start(self):
+            if self.fail_start:
+                raise RuntimeError("injected second start failure")
+            self.started = True
+
+        def join(self, *, timeout):
+            del timeout
+            if not self.started:
+                raise AssertionError("cannot join before start")
+            self.joined = True
+
+        def is_alive(self):
+            if not self.started:
+                raise AssertionError("cannot inspect before start")
+            return not self.terminated
+
+        def terminate(self):
+            if not self.started:
+                raise AttributeError("cannot terminate before start")
+            self.terminated = True
+
+    class FakeContext:
+        def __init__(self):
+            self.attempt = 0
+            self.queue_index = 0
+            self.process_index = 0
+            self.processes = []
+
+        def Queue(self):
+            if self.queue_index == 0 and self.attempt == 1:
+                value = FakeQueue((("ok", "challenger", cells), ("ok", "incumbent", cells)))
+            else:
+                value = FakeQueue(fail_shutdown=self.attempt == 0 and self.queue_index == 1)
+            self.queue_index += 1
+            return value
+
+        def Process(self, **_kwargs):
+            fail = self.attempt == 0 and self.process_index == 1
+            value = FakeProcess(fail_start=fail)
+            self.processes.append(value)
+            self.process_index += 1
+            if self.process_index == 2:
+                self.attempt += 1
+                self.queue_index = 0
+                self.process_index = 0
+            return value
+
+    context = FakeContext()
+    monkeypatch.setattr(confirmation.multiprocessing, "get_context", lambda _mode: context)
+    monkeypatch.setattr(
+        confirmation,
+        "paired_video_gain_bound",
+        Mock(
+            return_value=SimpleNamespace(
+                challenger_score=0.5,
+                incumbent_score=0.5,
+                gain_lower_bound=0.0,
+            )
+        ),
+    )
+    config = SimpleNamespace(evaluation_gpu_ids=(0, 1))
+    candidate_track = SimpleNamespace(
+        scoring=SimpleNamespace(
+            stratum_weight_map={"wide": 1.0},
+            budgets=(SimpleNamespace(target_blocks=16, calibrated_cost=1.0),),
+            bootstrap_resamples=10,
+            bootstrap_seed=1,
+        ),
+        match_confidence=0.95,
+    )
+    pool = ConfirmationWorkerPool(config, candidate_track, timeout_seconds=1)
+
+    with pytest.raises(RuntimeError, match="injected second start failure"):
+        pool.run(challenger_path="challenger", incumbent_path="incumbent", batch=object())
+
+    first_process = context.processes[0]
+    assert first_process.joined
+    assert first_process.terminated
+    assert pool._processes == []
+    assert pool._queues == []
+
+    result = pool.run(challenger_path="challenger", incumbent_path="incumbent", batch=object())
+
+    assert result.gain_lower_bound == 0.0
+    assert pool._processes == []
+    assert pool._queues == []

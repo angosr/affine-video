@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import queue
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,7 @@ class ConfirmationWorkerPool:
         self.timeout_seconds = timeout_seconds
         self._queues: list[Any] = []
         self._processes: list[multiprocessing.Process] = []
+        self._result: Any | None = None
 
     def _start(self) -> None:
         context = multiprocessing.get_context("spawn")
@@ -56,9 +58,9 @@ class ConfirmationWorkerPool:
                 args=(gpu_id, self.config, self.track, tasks, self._result),
                 name=f"veda-confirmation-gpu-{gpu_id}",
             )
-            process.start()
             self._queues.append(tasks)
             self._processes.append(process)
+            process.start()
 
     def run(
         self,
@@ -69,16 +71,16 @@ class ConfirmationWorkerPool:
     ) -> ConfirmationResult:
         if self._processes:
             raise RuntimeError("a full-video confirmation is already running")
-        self._start()
-        jobs = (
-            ("challenger", str(challenger_path)),
-            ("incumbent", str(incumbent_path)),
-        )
-        for tasks, job in zip(self._queues, jobs, strict=True):
-            tasks.put((*job, batch))
-        deadline = time.monotonic() + self.timeout_seconds
-        cells: dict[str, tuple[VideoCell, ...]] = {}
         try:
+            self._start()
+            jobs = (
+                ("challenger", str(challenger_path)),
+                ("incumbent", str(incumbent_path)),
+            )
+            for tasks, job in zip(self._queues, jobs, strict=True):
+                tasks.put((*job, batch))
+            deadline = time.monotonic() + self.timeout_seconds
+            cells: dict[str, tuple[VideoCell, ...]] = {}
             while len(cells) < 2:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -100,10 +102,6 @@ class ConfirmationWorkerPool:
                 if not value or any(not isinstance(item, VideoCell) for item in value):
                     raise RuntimeError("confirmation worker returned invalid video cells")
                 cells[side] = value
-        except Exception:
-            self.close()
-            raise
-        try:
             paired = paired_video_gain_bound(
                 cells["challenger"],
                 cells["incumbent"],
@@ -127,15 +125,49 @@ class ConfirmationWorkerPool:
             self.close()
 
     def close(self) -> None:
-        for tasks in self._queues:
-            tasks.put(None)
-        for process in self._processes:
-            process.join(timeout=30)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-        self._queues = []
-        self._processes = []
+        queues, self._queues = self._queues, []
+        processes, self._processes = self._processes, []
+        result, self._result = self._result, None
+        signal_failed: set[int] = set()
+        for index, tasks in enumerate(queues):
+            try:
+                tasks.put(None)
+            except Exception:  # cleanup must survive a broken multiprocessing queue
+                signal_failed.add(index)
+        for index, process in enumerate(processes):
+            if index in signal_failed:
+                _terminate_process(process)
+                continue
+            with suppress(Exception):  # includes a Process which failed before start()
+                process.join(timeout=30)
+            try:
+                alive = process.is_alive()
+            except Exception:
+                alive = False
+            if alive:
+                _terminate_process(process)
+        for tasks in queues:
+            _dispose_queue(tasks)
+        if result is not None:
+            _dispose_queue(result)
+
+
+def _terminate_process(process: Any) -> None:
+    try:
+        process.terminate()
+    except Exception:
+        return
+    with suppress(Exception):
+        process.join(timeout=5)
+
+
+def _dispose_queue(value: Any) -> None:
+    try:
+        value.close()
+    except Exception:
+        return
+    with suppress(Exception):
+        value.join_thread()
 
 
 def _confirmation_worker(
