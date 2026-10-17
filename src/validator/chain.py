@@ -94,12 +94,45 @@ async def scan_finalized_blocks(
             for reveal in reveals:
                 item = by_hotkey.get(reveal.hotkey)
                 values = getattr(item, "revealed", ()) if item is not None else ()
-                matching = [
-                    revealed_payload(value)
-                    for height, value in values or ()
-                    if height == block_height
-                ]
-                matching = [payload for payload in matching if payload is not None]
+                context = {
+                    "block_height": block_height,
+                    "event_index": reveal.position.event_index,
+                    "hotkey": reveal.hotkey,
+                    "netuid": netuid,
+                }
+                if not isinstance(values, Sequence) or isinstance(
+                    values, (str, bytes, bytearray)
+                ):
+                    LOGGER.warning(
+                        "skipping malformed finalized commitment reveal history",
+                        extra=context,
+                    )
+                    values = ()
+                matching = []
+                for stored in values:
+                    if not isinstance(stored, (tuple, list)) or len(stored) != 2:
+                        LOGGER.warning(
+                            "skipping malformed finalized commitment reveal entry",
+                            extra=context,
+                        )
+                        continue
+                    height, value = stored
+                    if type(height) is not int or height < 0:
+                        LOGGER.warning(
+                            "skipping finalized commitment reveal with invalid block",
+                            extra=context,
+                        )
+                        continue
+                    if height != block_height:
+                        continue
+                    payload = revealed_payload(value)
+                    if payload is None:
+                        LOGGER.warning(
+                            "skipping undecodable finalized commitment reveal",
+                            extra=context,
+                        )
+                        continue
+                    matching.append(payload)
                 if len(matching) != 1:
                     LOGGER.warning(
                         "skipping unmatched finalized commitment reveal",

@@ -202,7 +202,10 @@ def revealed_payload(value: Any) -> bytes | None:
             return bytes.fromhex(value[2:])
         except ValueError:
             return None
-    return value.encode("utf-8")
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
 
 
 def _attribute(event: Mapping[str, Any], name: str) -> Any:

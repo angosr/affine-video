@@ -38,6 +38,19 @@ def submission_at(block: int, *, hotkey: str = "hk1") -> SubmissionRecord:
     )
 
 
+def genesis_champion() -> Champion:
+    return Champion(
+        "genesis",
+        "genesis-hotkey",
+        "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview",
+        "76f202874608115408d73280be9531c4ab888242",
+        0.5,
+        ChainPosition(100, 0, 0),
+        uid=0,
+        source="VEDA_BASELINE",
+    )
+
+
 def test_submission_replay_is_idempotent(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, inserted = store.add_submission(make_submission(), occurred_at_ms=10)
@@ -272,6 +285,11 @@ def test_model_owner_lookup_validates_and_returns_the_registered_challenge(tmp_p
             "worker", lease_ms=1_000, ready_through_block=1_000, now_ms=13
         )
         assert task is not None
+        assert store.reserve_season_slot(
+            identifier,
+            task.lease_token,
+            maximum_effective_challenges=None,
+        )
         digest = "ab" * 32
         registration = store.register_validated_model(
             identifier,
@@ -287,7 +305,7 @@ def test_model_owner_lookup_validates_and_returns_the_registered_challenge(tmp_p
             store.model_owner("bad")
 
 
-def test_model_registration_enforces_capacity_in_the_ownership_transaction(tmp_path) -> None:
+def test_season_reservation_enforces_capacity_before_model_registration(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         second_id, _ = store.add_submission(
@@ -299,11 +317,15 @@ def test_model_registration_enforces_capacity_in_the_ownership_transaction(tmp_p
             "worker", lease_ms=1_000, ready_through_block=1_000, now_ms=14
         )
         assert first is not None
+        assert store.reserve_season_slot(
+            first_id,
+            first.lease_token,
+            maximum_effective_challenges=1,
+        )
         assert store.register_validated_model(
             first_id,
             first.lease_token,
             model_digest="ab" * 32,
-            maximum_effective_challenges=1,
             occurred_at_ms=15,
         ).accepted
 
@@ -313,21 +335,24 @@ def test_model_registration_enforces_capacity_in_the_ownership_transaction(tmp_p
             "worker", lease_ms=1_000, ready_through_block=1_000, now_ms=18
         )
         assert second is not None
-        registration = store.register_validated_model(
+        reserved = store.reserve_season_slot(
             second_id,
             second.lease_token,
-            model_digest="cd" * 32,
             maximum_effective_challenges=1,
-            occurred_at_ms=19,
         )
 
-        assert not registration.accepted
-        assert registration.capacity_reached
-        assert registration.duplicate_of is None
+        assert not reserved
         assert store.effective_challenge_count() == 1
         assert not store.has_season_slot(second_id)
         assert store.model_owner("cd" * 32) is None
         assert store.get_challenge(second_id).state is ChallengeState.VALIDATING
+        with pytest.raises(RuntimeError, match="no reserved season slot"):
+            store.register_validated_model(
+                second_id,
+                second.lease_token,
+                model_digest="cd" * 32,
+                occurred_at_ms=19,
+            )
 
 
 def test_uid_zero_baseline_hotkey_is_cleanly_rejected_as_duplicate(tmp_path) -> None:
@@ -527,6 +552,40 @@ def test_later_participant_failure_preserves_previous_authoritative_score(tmp_pa
         assert store.leaderboard()[0].final_score == 0.9
 
 
+def test_failed_public_match_restores_its_consumed_season_slot(tmp_path) -> None:
+    digest = "ab" * 32
+    with ChallengeStore(tmp_path / "validator.db", track_spec_digest=digest) as store:
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        public = store.public_challenge(identifier)
+        public.update(
+            {
+                "state": ChallengeState.PARTICIPANT_FAILED,
+                "error_code": "REPOSITORY_UNAVAILABLE",
+                "score_block": 110,
+            }
+        )
+        tournament = resolve_tournament(
+            [public],
+            track_id="track",
+            track_spec_digest=digest,
+            netuid=7,
+            minimum_gain=0.001,
+            minimum_exact_gain=0.5,
+            initial_champion=genesis_champion(),
+        )
+
+        assert (
+            store.restore_public_matches(
+                tournament.matches,
+                maximum_effective_challenges=1,
+            )
+            == 1
+        )
+        assert store.has_season_slot(identifier)
+        assert store.effective_challenge_count() == 1
+        assert store.model_owner("ef" * 32) is None
+
+
 def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None:
     digest = "ab" * 32
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest=digest) as store:
@@ -573,16 +632,7 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
             netuid=7,
             minimum_gain=0.001,
             minimum_exact_gain=0.5,
-            initial_champion=Champion(
-                "genesis",
-                "genesis-hotkey",
-                "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview",
-                "76f202874608115408d73280be9531c4ab888242",
-                0.5,
-                ChainPosition(100, 0, 0),
-                uid=0,
-                source="VEDA_BASELINE",
-            ),
+            initial_champion=genesis_champion(),
         )
 
         assert (
@@ -729,6 +779,11 @@ def test_deferred_admission_blocks_later_model_ownership_until_retry(tmp_path) -
             "worker", lease_ms=100, ready_through_block=10_000, now_ms=100
         )
         assert first is not None
+        assert store.reserve_season_slot(
+            first_id,
+            first.lease_token,
+            maximum_effective_challenges=None,
+        )
         store.defer_leased(
             first_id,
             first.lease_token,
@@ -749,6 +804,11 @@ def test_deferred_admission_blocks_later_model_ownership_until_retry(tmp_path) -
         assert retry is not None
         assert retry.challenge_id == first_id
         assert retry.state is ChallengeState.FETCHING
+        assert store.reserve_season_slot(
+            first_id,
+            retry.lease_token,
+            maximum_effective_challenges=None,
+        )
 
         store.advance_leased(
             first_id,
@@ -851,6 +911,11 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
             "secret-worker", lease_ms=1_000, ready_through_block=10_000, now_ms=20
         )
         assert lease is not None
+        assert store.reserve_season_slot(
+            identifier,
+            lease.lease_token,
+            maximum_effective_challenges=None,
+        )
         store.record_downloaded_model(
             identifier,
             lease.lease_token,

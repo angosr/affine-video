@@ -22,7 +22,11 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
    A hotkey already in the old contest is rejected, while a hotkey's first recognized choice for
    the new contest remains fixed even if it later writes unrelated commitments.
 2. After the fixed publication grace period, the evaluator processes submissions by finalized
-   `(block, extrinsic, event)` order. The pinned revision must then be anonymously downloadable.
+   `(block, extrinsic, event)` order. Before any model I/O, each admission-eligible submission
+   atomically consumes one of `maximum_effective_challenges` season sequences; a download,
+   validation, duplicate-model, or scoring failure does not return it. Later submissions are
+   rejected before download when the frozen limit is full. The pinned revision must be anonymously
+   downloadable.
 3. The evaluator accepts exactly one `selector.safetensors` file. Its only metadata entry must be
    `hotkey`, set to the complete submitting hotkey. It rejects executable code, other metadata,
    unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.

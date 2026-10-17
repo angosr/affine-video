@@ -199,6 +199,11 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
             "admission", lease_ms=1_000, ready_through_block=100, now_ms=2
         )
         assert lease is not None
+        assert store.reserve_season_slot(
+            identifier,
+            lease.lease_token,
+            maximum_effective_challenges=track.maximum_effective_challenges,
+        )
         store.record_downloaded_model(
             identifier,
             lease.lease_token,

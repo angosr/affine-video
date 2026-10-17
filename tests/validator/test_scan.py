@@ -163,6 +163,7 @@ def test_decodes_revealed_payload_sdk_forms() -> None:
     assert revealed_payload("0x56444131") == b"VDA1"
     assert revealed_payload(b"bytes") == b"bytes"
     assert revealed_payload("0xzz") is None
+    assert revealed_payload("\ud800") is None
 
 
 def test_malformed_timelock_reveal_is_skipped_without_losing_valid_reveals(caplog) -> None:

@@ -121,7 +121,6 @@ class LeasedChallenge:
 class ModelRegistration:
     accepted: bool
     duplicate_of: str | None
-    capacity_reached: bool = False
 
 
 class ChallengeStore:
@@ -505,7 +504,7 @@ class ChallengeStore:
         return int(self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0])
 
     def has_season_slot(self, identifier: str) -> bool:
-        """Return whether one validated unique model owns a season test."""
+        """Return whether one admission-eligible challenge consumed a season slot."""
 
         return (
             self._connection.execute(
@@ -529,6 +528,53 @@ class ChallengeStore:
         ).fetchone()
         return None if row is None else row["challenge_id"]
 
+    def reserve_season_slot(
+        self,
+        identifier: str,
+        lease_token: str,
+        *,
+        maximum_effective_challenges: int | None,
+    ) -> bool:
+        """Reserve one immutable FIFO test sequence before any model I/O."""
+
+        if maximum_effective_challenges is not None and maximum_effective_challenges <= 0:
+            raise ValueError("maximum effective challenges must be positive")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._require_lease_locked(identifier, lease_token)
+            if current not in {ChallengeState.FETCHING, ChallengeState.VALIDATING}:
+                raise ValueError("challenge is not in admission")
+            existing = self._connection.execute(
+                "SELECT sequence FROM season_slots WHERE challenge_id = ?",
+                (identifier,),
+            ).fetchone()
+            if existing is not None:
+                self._connection.commit()
+                return True
+            slot_count = int(
+                self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0]
+            )
+            if (
+                maximum_effective_challenges is not None
+                and slot_count >= maximum_effective_challenges
+            ):
+                self._connection.commit()
+                return False
+            next_sequence = int(
+                self._connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM season_slots"
+                ).fetchone()[0]
+            )
+            self._connection.execute(
+                "INSERT INTO season_slots (sequence, challenge_id) VALUES (?, ?)",
+                (next_sequence, identifier),
+            )
+            self._connection.commit()
+            return True
+        except Exception:
+            self._connection.rollback()
+            raise
+
     def chain_cursor(self) -> tuple[int, str] | None:
         row = self._connection.execute(
             "SELECT block_height, block_hash FROM chain_cursor WHERE singleton = 1"
@@ -547,6 +593,7 @@ class ChallengeStore:
             SELECT c.challenge_id
             FROM season_slots slot
             JOIN challenges c ON c.challenge_id = slot.challenge_id
+            JOIN model_owners owner ON owner.challenge_id = c.challenge_id
             JOIN submissions s ON s.submission_id = c.submission_id
             WHERE s.block_height BETWEEN ? AND ?
             ORDER BY s.block_height, s.extrinsic_index, s.event_index
@@ -1122,21 +1169,24 @@ class ChallengeStore:
         lease_token: str,
         *,
         model_digest: str,
-        maximum_effective_challenges: int | None = None,
         occurred_at_ms: int | None = None,
     ) -> ModelRegistration:
-        """Atomically allocate one test, assign model ownership, and enter scoring."""
+        """Assign unique model ownership and enter scoring for a reserved challenge."""
 
         if len(model_digest) != 64:
             raise ValueError("model digest must contain 32 bytes")
-        if maximum_effective_challenges is not None and maximum_effective_challenges <= 0:
-            raise ValueError("maximum effective challenges must be positive")
         timestamp = _timestamp(occurred_at_ms)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             current = self._require_lease_locked(identifier, lease_token)
             if current is not ChallengeState.VALIDATING:
                 raise ValueError("challenge is not validating")
+            slot = self._connection.execute(
+                "SELECT sequence FROM season_slots WHERE challenge_id = ?",
+                (identifier,),
+            ).fetchone()
+            if slot is None:
+                raise RuntimeError("validated model has no reserved season slot")
             owner = self._connection.execute(
                 """
                 SELECT o.challenge_id, c.state
@@ -1154,30 +1204,6 @@ class ChallengeStore:
                 self._connection.commit()
                 return ModelRegistration(False, owner["challenge_id"])
 
-            slot_count = int(
-                self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0]
-            )
-            if (
-                maximum_effective_challenges is not None
-                and slot_count > maximum_effective_challenges
-            ):
-                raise RuntimeError("season test count exceeds the frozen capacity")
-            if (
-                maximum_effective_challenges is not None
-                and slot_count >= maximum_effective_challenges
-            ):
-                self._connection.commit()
-                return ModelRegistration(False, None, capacity_reached=True)
-
-            next_sequence = int(
-                self._connection.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM season_slots"
-                ).fetchone()[0]
-            )
-            self._connection.execute(
-                "INSERT INTO season_slots (sequence, challenge_id) VALUES (?, ?)",
-                (next_sequence, identifier),
-            )
             self._connection.execute(
                 "UPDATE challenges SET model_digest = ? WHERE challenge_id = ?",
                 (model_digest, identifier),
@@ -1811,22 +1837,10 @@ class ChallengeStore:
                                 row["created_at_ms"] + index,
                             ),
                         )
-                model_digest = evaluation["model_digest"]
-                if model_digest is not None and evaluation["error_code"] not in {
-                    "EXACT_DUPLICATE",
-                    "TRACK_CAPACITY_REACHED",
+                if target in {
+                    ChallengeState.SUCCEEDED,
+                    ChallengeState.PARTICIPANT_FAILED,
                 }:
-                    owner = self._connection.execute(
-                        "SELECT challenge_id FROM model_owners WHERE model_digest = ?",
-                        (model_digest,),
-                    ).fetchone()
-                    if owner is None:
-                        self._connection.execute(
-                            "INSERT INTO model_owners (model_digest, challenge_id) VALUES (?, ?)",
-                            (model_digest, match.challenge_id),
-                        )
-                    elif owner["challenge_id"] != match.challenge_id:
-                        raise RuntimeError("public model ownership conflicts with local state")
                     slot = self._connection.execute(
                         "SELECT sequence FROM season_slots WHERE challenge_id = ?",
                         (match.challenge_id,),
@@ -1853,6 +1867,23 @@ class ChallengeStore:
                             "INSERT INTO season_slots (sequence, challenge_id) VALUES (?, ?)",
                             (next_sequence, match.challenge_id),
                         )
+
+                model_digest = evaluation["model_digest"]
+                if model_digest is not None and evaluation["error_code"] not in {
+                    "EXACT_DUPLICATE",
+                    "TRACK_CAPACITY_REACHED",
+                }:
+                    owner = self._connection.execute(
+                        "SELECT challenge_id FROM model_owners WHERE model_digest = ?",
+                        (model_digest,),
+                    ).fetchone()
+                    if owner is None:
+                        self._connection.execute(
+                            "INSERT INTO model_owners (model_digest, challenge_id) VALUES (?, ?)",
+                            (model_digest, match.challenge_id),
+                        )
+                    elif owner["challenge_id"] != match.challenge_id:
+                        raise RuntimeError("public model ownership conflicts with local state")
                 restored += 1
             self._connection.commit()
         except Exception:

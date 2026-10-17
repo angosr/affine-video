@@ -287,6 +287,61 @@ def test_scanner_skips_bad_timelock_reveals_and_advances_cursor(tmp_path, caplog
     assert "skipping unmatched finalized commitment reveal" in caplog.text
 
 
+def test_scanner_skips_malformed_reveal_entries_without_losing_following_work(
+    tmp_path, caplog
+) -> None:
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+
+    def reveal_block(height: int):
+        block_hash = "0x" + f"{height:064x}"
+        return (
+            block_hash,
+            {"extrinsics": []},
+            [
+                {
+                    "extrinsic_idx": None,
+                    "module_id": "Commitments",
+                    "event_id": "CommitmentRevealed",
+                    "attributes": {"netuid": 7, "who": HOTKEY},
+                }
+            ],
+        )
+
+    blocks = {height: reveal_block(height) for height in (100, 101)}
+    client = FakeClient(blocks)
+    client.revealed = {
+        100: [
+            SimpleNamespace(
+                hotkey=HOTKEY,
+                revealed=[
+                    (100,),
+                    (True, "wrong-height-type"),
+                    (100, "\ud800"),
+                    (100, "0x" + payload.hex()),
+                ],
+            )
+        ],
+        101: [
+            SimpleNamespace(
+                hotkey=HOTKEY,
+                revealed=[(101, "0x" + payload.hex())],
+            )
+        ],
+    }
+
+    with ChallengeStore(tmp_path / "validator.db") as store, caplog.at_level(logging.WARNING):
+        result = asyncio.run(
+            scan_finalized_blocks(client, store, netuid=7, track_start_block=100)
+        )
+
+        assert result.submissions_found == 2
+        assert store.chain_cursor() == (101, blocks[101][0])
+        assert len(store.public_snapshot()["challenges"]) == 2
+    assert "malformed finalized commitment reveal entry" in caplog.text
+    assert "invalid block" in caplog.text
+    assert "undecodable finalized commitment reveal" in caplog.text
+
+
 def test_legacy_snapshot_decodes_hex_timelock_reveals(monkeypatch, tmp_path) -> None:
     activation = b"affine2|activate|signed"
     commitment = SimpleNamespace(revealed=[(99, "0x" + activation.hex())])
