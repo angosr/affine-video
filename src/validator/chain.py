@@ -209,12 +209,30 @@ async def seed_legacy_exclusions(
     if graph is None:
         raise RuntimeError(f"subnet {netuid} does not exist at block {before_block}")
     exclusions: dict[str, int] = {}
+    commitments: dict[str, Any] = {}
     for neuron in graph.neurons:
         hotkey = getattr(neuron, "hotkey", None)
         commitment = getattr(neuron, "commitment", None)
-        revealed = getattr(commitment, "revealed", ()) if commitment is not None else ()
-        if not isinstance(hotkey, str) or not hotkey:
-            continue
+        if isinstance(hotkey, str) and hotkey and commitment is not None:
+            commitments[hotkey] = commitment
+    unregistered = getattr(graph, "unregistered_commitments", {})
+    if isinstance(unregistered, Mapping):
+        for key, commitment in unregistered.items():
+            hotkey = getattr(commitment, "hotkey", key)
+            if (
+                isinstance(key, str)
+                and key
+                and hotkey == key
+                and commitment is not None
+            ):
+                commitments.setdefault(key, commitment)
+            else:
+                LOGGER.warning("skipping inconsistent unregistered commitment identity")
+    elif unregistered:
+        LOGGER.warning("unregistered commitment snapshot has an unsupported shape")
+
+    for hotkey, commitment in commitments.items():
+        revealed = getattr(commitment, "revealed", ())
         for item in revealed or ():
             if not isinstance(item, (tuple, list)) or len(item) != 2:
                 continue

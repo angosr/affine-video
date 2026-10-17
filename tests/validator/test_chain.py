@@ -384,3 +384,57 @@ def test_legacy_snapshot_decodes_hex_timelock_reveals(monkeypatch, tmp_path) -> 
 
         assert count == 1
         assert store.get_challenge(identifier).state is ChallengeState.REJECTED_OTHER_COMPETITION
+
+
+def test_legacy_snapshot_includes_deregistered_hotkey_history(monkeypatch, tmp_path) -> None:
+    activation = b"affine2|activate|signed"
+    commitment = SimpleNamespace(
+        hotkey=HOTKEY,
+        revealed=[(99, "0x" + activation.hex())],
+    )
+
+    class SnapshotClient:
+        async def at(self, height: int):
+            assert height == 99
+            return SimpleNamespace(
+                subnets=SimpleNamespace(
+                    metagraph=lambda _netuid, commitments: _ready(
+                        SimpleNamespace(
+                            neurons=[],
+                            unregistered_commitments={HOTKEY: commitment},
+                        )
+                    )
+                )
+            )
+
+    monkeypatch.setattr(
+        chain_module,
+        "is_valid_legacy_activation",
+        lambda payload, **_kwargs: payload == activation,
+    )
+    encoded = ModelSubmission("owner/model", "12" * 20).encode()
+    block_hash, block, events = chain_block(encoded, 100)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        count = asyncio.run(
+            seed_legacy_exclusions(
+                SnapshotClient(),
+                store,
+                netuid=7,
+                before_block=99,
+            )
+        )
+        identifier, _ = store.add_submission(
+            extract_submissions(
+                block_height=100,
+                block_hash=block_hash,
+                block=block,
+                events=events,
+                netuid=7,
+            )[0]
+        )
+
+        assert count == 1
+        assert (
+            store.get_challenge(identifier).state
+            is ChallengeState.REJECTED_OTHER_COMPETITION
+        )
