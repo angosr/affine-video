@@ -30,7 +30,9 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
    at that boundary selects new private sources, noise, routes, steps and query tiles. It is not
    known when the model is committed. Each batch contains four independent videos in each of four
    strata, eight routes and three denoising steps: 384 paired cases in total. A later batch cannot
-   be substituted to obtain a more favorable result.
+   be substituted to obtain a more favorable result. Submission admission closes
+   `maximum_effective_challenges` generation intervals before the final batch, plus the hidden-data
+   delay, so a worst-case FIFO queue retains one later confirmation boundary per eligible Miner.
 5. UID 0 is the genesis champion without making a commit. Its identity is pinned to the official
    VEDA repository revision, filename and file SHA-256 in the track specification. Its baseline
    and every challenger are evaluated on the same new batch. The exact stage resamples complete
