@@ -14,6 +14,7 @@ import numpy as np
 
 from scoring.evaluate import tail_error
 from scoring.metrics import relative_squared_error
+from scoring.model import ModelValidationError
 
 if TYPE_CHECKING:
     from scoring.exact import ExactCase
@@ -69,8 +70,7 @@ class TorchCaseScorer:
         q_hat = self.q_descriptors @ q_projection + self.q_descriptors[:, :dimension]
         k_hat = self.k_descriptors @ k_projection + self.k_descriptors[:, :dimension]
         logits = q_hat @ k_hat.T / sqrt(dimension)
-        if not bool(torch.isfinite(logits).all()):
-            raise ValueError("selector produced non-finite logits")
+        _require_finite_logits(torch, logits)
 
         qualities: list[float] = []
         all_errors: list[list[float]] = []
@@ -146,3 +146,8 @@ class TorchCaseScorer:
             probabilities = torch.softmax(self.q[query, :count] @ keys.T * scale, dim=-1)
             output[query, :count] = probabilities @ values
         return output
+
+
+def _require_finite_logits(torch: Any, logits: Any) -> None:
+    if not bool(torch.isfinite(logits).all()):
+        raise ModelValidationError("MODEL_RUNTIME_INVALID", "selector produced non-finite logits")
