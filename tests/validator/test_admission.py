@@ -616,6 +616,48 @@ def test_archive_failure_defers_without_consuming_the_submission(tmp_path) -> No
         ]
 
 
+def test_corrupted_cached_model_is_recovered_instead_of_blaming_participant(tmp_path) -> None:
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
+    download = model_downloader(model)
+
+    def unavailable_archive(*_args):
+        raise RuntimeError("object store unavailable")
+
+    def repository_must_not_be_used(*_args, **_kwargs):
+        raise AssertionError("validation retry must detect corruption before repository access")
+
+    configured = replace(settings(tmp_path), archive=unavailable_archive)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        first = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=download,
+        )
+        assert first is not None and first.code == "MODEL_ARCHIVE_UNAVAILABLE"
+
+        model.write_bytes(b"damaged local cache")
+        second = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=30_100,
+            downloader=repository_must_not_be_used,
+        )
+
+        assert second is not None
+        assert second.status is AdmissionStatus.DEFERRED
+        assert second.code == "DOWNLOAD_TEMPORARY_FAILURE"
+        challenge = store.get_challenge(identifier)
+        assert challenge.state is ChallengeState.SYSTEM_DEFERRED
+        assert challenge.error_code == "DOWNLOAD_TEMPORARY_FAILURE"
+
+
 def test_admission_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
     alerts = []
 

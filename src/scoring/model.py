@@ -98,16 +98,17 @@ def validate_model(
         raise ModelValidationError("MODEL_SCHEMA_INVALID", "invalid safetensors file") from exc
 
     return ValidatedModel(
-        file_sha256=_file_sha256(model_path),
+        file_sha256=model_file_sha256(model_path),
         model_digest=digest.hexdigest(),
         size_bytes=size,
         tensor_count=len(schema),
     )
 
 
-def _file_sha256(path: Path) -> str:
+def model_file_sha256(path: str | Path) -> str:
+    model_path = Path(path)
     digest = hashlib.sha256()
-    with path.open("rb") as file:
+    with model_path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()

@@ -8,14 +8,20 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from scoring.model import ModelValidationError, TensorSpec, ValidatedModel, validate_model
+from scoring.model import (
+    ModelValidationError,
+    TensorSpec,
+    ValidatedModel,
+    model_file_sha256,
+    validate_model,
+)
 from validator.download import (
     DownloadedModel,
     ModelDownloadError,
     download_public_model,
 )
 from validator.queue import ChallengeState
-from validator.store import ChallengeStore
+from validator.store import ChallengeStore, LeasedChallenge
 
 
 class AdmissionStatus(StrEnum):
@@ -220,6 +226,24 @@ def process_next_admission(
         )
         return AdmissionOutcome(task.challenge_id, status, error.code)
 
+    cache_error = None
+    if expected_file_sha256 is None:
+        cache_error = "cached model identity is unavailable"
+    else:
+        try:
+            if model_file_sha256(model_path) != expected_file_sha256:
+                cache_error = "cached model checksum changed"
+        except OSError:
+            cache_error = "cached model cannot be read"
+    if cache_error is not None:
+        return _defer_cached_model(
+            store,
+            task,
+            settings,
+            now_ms=now,
+            summary=cache_error,
+        )
+
     try:
         validated = model_validator(
             model_path,
@@ -228,21 +252,29 @@ def process_next_admission(
             expected_hotkey=task.hotkey,
         )
     except OSError:
-        error = ModelDownloadError(
-            "DOWNLOAD_TEMPORARY_FAILURE", "cached model cannot be read", temporary=True
-        )
-        status = _defer_or_fail(
+        return _defer_cached_model(
             store,
-            task.challenge_id,
-            task.lease_token,
-            task.attempts,
+            task,
             settings,
-            now,
-            error,
-            resume_state=ChallengeState.FETCHING,
+            now_ms=now,
+            summary="cached model cannot be read",
         )
-        return AdmissionOutcome(task.challenge_id, status, error.code)
     except ModelValidationError as exc:
+        try:
+            identity_still_matches = (
+                expected_file_sha256 is not None
+                and model_file_sha256(model_path) == expected_file_sha256
+            )
+        except OSError:
+            identity_still_matches = False
+        if not identity_still_matches:
+            return _defer_cached_model(
+                store,
+                task,
+                settings,
+                now_ms=now,
+                summary="cached model changed during validation",
+            )
         store.complete_challenge(
             task.challenge_id,
             ChallengeState.PARTICIPANT_FAILED,
@@ -255,20 +287,13 @@ def process_next_admission(
         return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, exc.code)
 
     if expected_file_sha256 is not None and validated.file_sha256 != expected_file_sha256:
-        error = ModelDownloadError(
-            "DOWNLOAD_TEMPORARY_FAILURE", "cached model checksum changed", temporary=True
-        )
-        status = _defer_or_fail(
+        return _defer_cached_model(
             store,
-            task.challenge_id,
-            task.lease_token,
-            task.attempts,
+            task,
             settings,
-            now,
-            error,
-            resume_state=ChallengeState.FETCHING,
+            now_ms=now,
+            summary="cached model changed during validation",
         )
-        return AdmissionOutcome(task.challenge_id, status, error.code)
 
     duplicate_owner = store.model_owner(validated.model_digest)
     if duplicate_owner is not None:
@@ -317,6 +342,28 @@ def process_next_admission(
             now_ms=now,
         )
     return AdmissionOutcome(task.challenge_id, AdmissionStatus.ACCEPTED)
+
+
+def _defer_cached_model(
+    store: ChallengeStore,
+    task: LeasedChallenge,
+    settings: AdmissionSettings,
+    *,
+    now_ms: int,
+    summary: str,
+) -> AdmissionOutcome:
+    error = ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", summary, temporary=True)
+    status = _defer_or_fail(
+        store,
+        task.challenge_id,
+        task.lease_token,
+        task.attempts,
+        settings,
+        now_ms,
+        error,
+        resume_state=ChallengeState.FETCHING,
+    )
+    return AdmissionOutcome(task.challenge_id, status, error.code)
 
 
 def _reject_exact_duplicate(
