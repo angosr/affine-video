@@ -148,7 +148,7 @@ def _confirmation_worker(
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         from safetensors.numpy import load_file
 
-        from validator.production.runtime import DenseRolloutRuntime
+        from validator.production.runtime import DenseRolloutRuntime, trajectory_tensor_key
 
         runtime = DenseRolloutRuntime(
             model_root=str(config.artifact_path(config.runtime.model_root)),
@@ -174,8 +174,15 @@ def _confirmation_worker(
                 paths = {reference.rollout_id: path for reference, path in batch.latent_paths}
                 for rollout in batch.plan.rollouts:
                     dense = load_file(paths[rollout.rollout_id])
-                    if set(dense) != {"audio_rows", "video_rows"}:
+                    trajectory_keys = {
+                        trajectory_tensor_key(step.index) for step in batch.plan.selected_steps
+                    }
+                    if set(dense) != {"audio_rows", "video_rows", *trajectory_keys}:
                         raise ValueError("dense latent object contains unexpected tensors")
+                    dense_trajectory = {
+                        (step.index, step.window): dense[trajectory_tensor_key(step.index)]
+                        for step in batch.plan.selected_steps
+                    }
                     dense_frames = runtime.decode_frames(
                         dense["video_rows"], geometry=rollout.stratum
                     )
@@ -187,7 +194,14 @@ def _confirmation_worker(
                             selector_path=selector_path,
                             architecture=track.model.selector,
                             budget=budget,
+                            steps=tuple(
+                                (step.index, step.window) for step in batch.plan.selected_steps
+                            ),
                         )
+                        sparse_trajectory = {
+                            (step, window): rows
+                            for step, window, rows in sparse.trajectory_video_rows
+                        }
                         sparse_frames = runtime.decode_frames(
                             sparse.video_rows, geometry=rollout.stratum
                         )
@@ -196,6 +210,10 @@ def _confirmation_worker(
                             sparse_video_rows=sparse.video_rows,
                             dense_frames=dense_frames,
                             sparse_frames=sparse_frames,
+                            dense_trajectory=dense_trajectory,
+                            sparse_trajectory=sparse_trajectory,
+                            step_window_weights=track.scoring.step_window_weight_map,
+                            metric_version=track.full_video.metric_version,
                             latent_weight=track.full_video.latent_weight,
                             frame_weight=track.full_video.frame_weight,
                             temporal_weight=track.full_video.temporal_weight,

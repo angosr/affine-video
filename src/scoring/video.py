@@ -19,6 +19,7 @@ from scoring.metrics import log_cost_auc
 class VideoFidelity:
     score: float
     latent_quality: float
+    trajectory_quality: float
     frame_quality: float
     temporal_quality: float
     black_frame_fraction: float
@@ -80,6 +81,10 @@ class VideoFidelityMetric:
         sparse_video_rows: np.ndarray,
         dense_frames: np.ndarray,
         sparse_frames: np.ndarray,
+        dense_trajectory: Mapping[tuple[int, str], np.ndarray],
+        sparse_trajectory: Mapping[tuple[int, str], np.ndarray],
+        step_window_weights: Mapping[str, float],
+        metric_version: str,
         latent_weight: float,
         frame_weight: float,
         temporal_weight: float,
@@ -103,8 +108,19 @@ class VideoFidelityMetric:
         if dense.shape != sparse.shape:
             raise ValueError("dense and sparse decoded frames must have the same shape")
 
-        latent_error = _relative_mse(sparse_latent, dense_latent)
-        latent_quality = 1.0 / (1.0 + latent_error)
+        final_latent_quality = _latent_quality(sparse_latent, dense_latent)
+        if metric_version == "veda-video-fidelity-v1":
+            latent_quality = final_latent_quality
+            trajectory_quality = final_latent_quality
+        elif metric_version == "veda-video-fidelity-v2":
+            trajectory_quality = trajectory_latent_quality(
+                dense_trajectory,
+                sparse_trajectory,
+                step_window_weights=step_window_weights,
+            )
+            latent_quality = (final_latent_quality + trajectory_quality) / 2.0
+        else:
+            raise ValueError("full-video metric version is unsupported")
         dense_features = self._embed(dense)
         sparse_features = self._embed(sparse)
         frame_quality = _mean_cosine(dense_features, sparse_features)
@@ -128,6 +144,7 @@ class VideoFidelityMetric:
         return VideoFidelity(
             float(score),
             float(latent_quality),
+            float(trajectory_quality),
             float(frame_quality),
             float(temporal_quality),
             black_fraction,
@@ -159,6 +176,39 @@ class VideoFidelityMetric:
         with torch.inference_mode():
             features = self._features((resized - mean) / std).mean(dim=(-1, -2))
         return features[0].transpose(0, 1).float().cpu().numpy()
+
+
+def trajectory_latent_quality(
+    dense: Mapping[tuple[int, str], np.ndarray],
+    sparse: Mapping[tuple[int, str], np.ndarray],
+    *,
+    step_window_weights: Mapping[str, float],
+) -> float:
+    """Aggregate intermediate latent fidelity without treating steps as samples."""
+
+    if not dense or set(dense) != set(sparse):
+        raise ValueError("dense and sparse trajectories must be non-empty and aligned")
+    if (
+        not step_window_weights
+        or any(not isfinite(weight) or weight <= 0 for weight in step_window_weights.values())
+        or abs(fsum(step_window_weights.values()) - 1.0) > 1e-12
+    ):
+        raise ValueError("trajectory window weights must be positive and sum to one")
+    by_window: dict[str, list[float]] = {window: [] for window in step_window_weights}
+    for (step, window), reference in dense.items():
+        if type(step) is not int or step < 0 or window not in by_window:
+            raise ValueError("trajectory step identity is invalid")
+        candidate = _finite_array(sparse[(step, window)], "sparse trajectory latents")
+        target = _finite_array(reference, "dense trajectory latents")
+        if candidate.shape != target.shape:
+            raise ValueError("dense and sparse trajectory latents must have the same shape")
+        by_window[window].append(_latent_quality(candidate, target))
+    if any(not values for values in by_window.values()):
+        raise ValueError("trajectory must cover every weighted step window")
+    return fsum(
+        step_window_weights[window] * fsum(values) / len(values)
+        for window, values in by_window.items()
+    )
 
 
 def paired_video_gain_bound(
@@ -264,6 +314,10 @@ def _relative_mse(candidate: np.ndarray, reference: np.ndarray) -> float:
         np.mean(np.square(candidate.astype(np.float32) - reference.astype(np.float32)))
         / max(float(np.mean(np.square(reference.astype(np.float32)))), 1e-8)
     )
+
+
+def _latent_quality(candidate: np.ndarray, reference: np.ndarray) -> float:
+    return 1.0 / (1.0 + _relative_mse(candidate, reference))
 
 
 def _finite_array(value: np.ndarray, name: str) -> np.ndarray:

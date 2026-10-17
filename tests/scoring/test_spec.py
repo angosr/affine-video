@@ -145,6 +145,17 @@ def test_confirmation_gate_cannot_be_weaker_than_exact_gate() -> None:
         parse_track_spec(raw)
 
 
+def test_full_video_metric_version_is_frozen() -> None:
+    version_two = valid_spec()
+    version_two["full_video"]["metric_version"] = "veda-video-fidelity-v2"
+    assert parse_track_spec(version_two).full_video.metric_version.endswith("-v2")
+
+    unknown = valid_spec()
+    unknown["full_video"]["metric_version"] = "operator-choice"
+    with pytest.raises(TrackSpecError, match="metric version"):
+        parse_track_spec(unknown)
+
+
 def test_score_affecting_change_changes_digest() -> None:
     first = valid_spec()
     second = valid_spec()

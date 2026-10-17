@@ -26,6 +26,7 @@ from validator.production.plan import (
     select_source_proofs,
     submission_interval,
 )
+from validator.production.runtime import trajectory_tensor_key
 from validator.production.service import (
     PlanCoordinator,
     WorkerPool,
@@ -370,6 +371,10 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkey
         {
             "audio_rows": np.zeros((2, 32), dtype=np.float32),
             "video_rows": np.zeros((2, 96), dtype=np.float32),
+            **{
+                trajectory_tensor_key(item.index): np.zeros((2, 96), dtype=np.float32)
+                for item in plan.selected_steps
+            },
         },
         latent,
         metadata={"geometry": rollout.stratum, "rollout_id": rollout.rollout_id},

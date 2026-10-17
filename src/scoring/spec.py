@@ -566,9 +566,12 @@ def _parse_full_video(value: Any) -> FullVideoSpec:
     )
     if abs(fsum(weights) - 1.0) > 1e-12:
         raise TrackSpecError("full-video metric weights must sum to one")
+    metric_version = _nonempty_string(raw["metric_version"], "full-video metric version")
+    if metric_version not in {"veda-video-fidelity-v1", "veda-video-fidelity-v2"}:
+        raise TrackSpecError("full-video metric version is unsupported")
     return FullVideoSpec(
         _unit(raw["minimum_gain"], "full-video minimum gain", include_zero=False),
-        _nonempty_string(raw["metric_version"], "full-video metric version"),
+        metric_version,
         _digest(raw["feature_model_sha256"], "full-video feature model SHA-256"),
         weights[0],
         weights[1],

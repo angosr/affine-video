@@ -28,6 +28,7 @@ class RolloutCapture:
     key_tiles_by_route: tuple[tuple[str, int], ...]
     video_rows: np.ndarray
     audio_rows: np.ndarray
+    trajectory_video_rows: tuple[tuple[int, str, np.ndarray], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,7 @@ class SparseRollout:
     elapsed_seconds: float
     sparse_calls: int
     dense_calls: int
+    trajectory_video_rows: tuple[tuple[int, str, np.ndarray], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,10 +126,10 @@ class DenseRolloutRuntime:
         selector_path: str | Path,
         architecture: SelectorArchitecture,
         budget: BudgetSpec,
+        steps: tuple[tuple[int, str], ...],
     ) -> SparseRollout:
         """Run one real VEDA trajectory with submitted projection weights."""
 
-        from miowtion.infer import pipeline
         from miowtion.veda import mask as veda_mask
         from miowtion.veda import predictor as veda_predictor
         from safetensors import safe_open
@@ -167,24 +169,53 @@ class DenseRolloutRuntime:
             target_budget=veda_mask.Budget(tiles=budget.target_blocks),
             ref_budget=ref_budget,
         )
-        started = time.monotonic()
-        generated = pipeline.generate(
+        step_windows = dict(steps)
+        if len(step_windows) != len(steps) or any(index < 0 for index in step_windows):
+            raise ValueError("sparse trajectory steps must be non-negative and unique")
+        rollout = self.trajectory_lib.Trajectory(
             self.teacher.model,
-            self.teacher.schedule,
-            self.teacher.tables,
             self.cache,
             self.samples[sample_id],
             parsed_geometry,
+            self.teacher.schedule,
             seed,
             self.environment.device,
-            attention="veda",
-            plan=tile_plan,
-            predictor=predictor,
-            veda_config=config,
         )
+        clip = self.veda_attention.ClipTiling(rollout.layout, config, self.environment.device)
+        trajectory = []
+        sparse_calls = 0
+        dense_calls = 0
+        torch.cuda.synchronize(self.environment.device)
+        started = time.monotonic()
+        with torch.no_grad():
+            while not rollout.done:
+                inputs = rollout.inputs()
+                attention = self.veda_attention.SparseStudent(clip, tile_plan, predictor)
+                video_v, audio_v = self.teacher.model(
+                    rollout.clip,
+                    inputs.video_rows,
+                    inputs.audio_rows,
+                    inputs.timestep,
+                    attention,
+                    self.teacher.tables.get(inputs.timestep.timesteps),
+                )
+                sparse_calls += attention.calls["sparse"]
+                dense_calls += attention.calls["dense"]
+                rollout.advance(video_v, audio_v)
+                if inputs.step in step_windows:
+                    trajectory.append(
+                        (
+                            inputs.step,
+                            step_windows[inputs.step],
+                            rollout.video_rows[rollout.n_cond_video :].float().cpu().numpy(),
+                        )
+                    )
+        torch.cuda.synchronize(self.environment.device)
         elapsed = time.monotonic() - started
-        video = generated.video_rows.float().numpy()
-        audio = generated.audio_rows.float().numpy()
+        if len(trajectory) != len(steps):
+            raise RuntimeError("sparse rollout omitted frozen trajectory steps")
+        video = rollout.video_rows[rollout.n_cond_video :].float().cpu().numpy()
+        audio = rollout.audio_rows[rollout.n_cond_audio :].float().cpu().numpy()
         if not np.isfinite(video).all() or not np.isfinite(audio).all():
             raise RuntimeError("sparse rollout produced non-finite final latents")
         del predictor, state
@@ -193,8 +224,9 @@ class DenseRolloutRuntime:
             video,
             audio,
             elapsed,
-            generated.sparse_calls,
-            generated.dense_calls,
+            sparse_calls,
+            dense_calls,
+            tuple(trajectory),
         )
 
     def decode_frames(self, video_rows: np.ndarray, *, geometry: str) -> np.ndarray:
@@ -340,6 +372,7 @@ class DenseRolloutRuntime:
                 del rows, shaped
 
         probe = CaptureProbe()
+        trajectory = []
         started = time.monotonic()
         with torch.no_grad():
             while not rollout.done:
@@ -354,9 +387,19 @@ class DenseRolloutRuntime:
                     self.teacher.tables.get(inputs.timestep.timesteps),
                 )
                 rollout.advance(video_v, audio_v)
+                if inputs.step in step_windows:
+                    trajectory.append(
+                        (
+                            inputs.step,
+                            step_windows[inputs.step],
+                            rollout.video_rows[rollout.n_cond_video :].float().cpu().numpy(),
+                        )
+                    )
         expected = len(routes) * len(steps)
         if len(probe.cases) != expected:
             raise RuntimeError(f"runtime captured {len(probe.cases)} cells, expected {expected}")
+        if len(trajectory) != len(steps):
+            raise RuntimeError("dense rollout omitted frozen trajectory steps")
         return RolloutCapture(
             tuple(probe.cases),
             time.monotonic() - started,
@@ -364,6 +407,7 @@ class DenseRolloutRuntime:
             tuple(sorted(probe.key_tiles.items())),
             rollout.video_rows[rollout.n_cond_video :].float().cpu().numpy(),
             rollout.audio_rows[rollout.n_cond_audio :].float().cpu().numpy(),
+            tuple(trajectory),
         )
 
     def write_dense_outputs(
@@ -381,7 +425,11 @@ class DenseRolloutRuntime:
 
         if not rollout_id:
             raise ValueError("rollout ID cannot be empty")
-        if not np.isfinite(capture.video_rows).all() or not np.isfinite(capture.audio_rows).all():
+        if (
+            not np.isfinite(capture.video_rows).all()
+            or not np.isfinite(capture.audio_rows).all()
+            or any(not np.isfinite(rows).all() for _, _, rows in capture.trajectory_video_rows)
+        ):
             raise RuntimeError("dense rollout produced non-finite final latents")
         root = Path(directory)
         root.mkdir(parents=True, exist_ok=True)
@@ -390,11 +438,16 @@ class DenseRolloutRuntime:
         latent_temporary = root / f".{rollout_id}.latent.tmp"
         video_temporary = root / f".{rollout_id}.video.tmp.mp4"
         try:
-            save_file(
-                {
-                    "audio_rows": np.ascontiguousarray(capture.audio_rows),
-                    "video_rows": np.ascontiguousarray(capture.video_rows),
+            tensors = {
+                "audio_rows": np.ascontiguousarray(capture.audio_rows),
+                "video_rows": np.ascontiguousarray(capture.video_rows),
+                **{
+                    trajectory_tensor_key(step): np.ascontiguousarray(rows)
+                    for step, _window, rows in capture.trajectory_video_rows
                 },
+            }
+            save_file(
+                tensors,
                 latent_temporary,
                 metadata={"geometry": geometry, "rollout_id": rollout_id},
             )
@@ -596,6 +649,12 @@ def _pool_layout(counts: np.ndarray, device: Any, torch: Any) -> Any:
 def _fsync(path: Path) -> None:
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
+
+
+def trajectory_tensor_key(step_index: int) -> str:
+    if type(step_index) is not int or step_index < 0:
+        raise ValueError("trajectory step index must be non-negative")
+    return f"video_step_{step_index:03d}_rows"
 
 
 def _tile_plan_hash(shape: Any, layout: Any, heads: list[int]) -> str:

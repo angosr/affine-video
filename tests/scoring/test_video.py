@@ -1,6 +1,31 @@
+import numpy as np
 import pytest
 
-from scoring.video import VideoCell, paired_video_gain_bound
+from scoring.video import VideoCell, paired_video_gain_bound, trajectory_latent_quality
+
+
+def test_trajectory_score_distinguishes_equal_final_states() -> None:
+    dense = {
+        (0, "early"): np.ones((2, 3), dtype=np.float32),
+        (1, "late"): np.ones((2, 3), dtype=np.float32),
+    }
+    matching = {key: value.copy() for key, value in dense.items()}
+    drifting = {key: value.copy() for key, value in dense.items()}
+    drifting[(0, "early")] = np.zeros((2, 3), dtype=np.float32)
+
+    identity = trajectory_latent_quality(
+        dense,
+        matching,
+        step_window_weights={"early": 0.5, "late": 0.5},
+    )
+    changed = trajectory_latent_quality(
+        dense,
+        drifting,
+        step_window_weights={"early": 0.5, "late": 0.5},
+    )
+
+    assert identity == pytest.approx(1.0)
+    assert changed == pytest.approx(0.75)
 
 
 def test_video_gain_bootstrap_keeps_budgets_inside_rollout_cluster() -> None:

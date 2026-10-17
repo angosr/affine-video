@@ -36,6 +36,7 @@ from validator.production.plan import (
     select_source_proofs,
     submission_interval,
 )
+from validator.production.runtime import trajectory_tensor_key
 from validator.production.storage import PreconditionFailed, PrivateObjectStore, StoredObject
 from validator.queue import ChallengeState
 from validator.store import ChallengeStore
@@ -589,7 +590,7 @@ def _find_valid_shard(
             or reader.metadata["seed_block_hash"].lower() != plan.block_hash.lower()
             or {row["rollout_id"] for row in reader.metadata["cases"]}
             != {rollout.rollout_id}
-            or not _valid_dense_latent(latent, rollout)
+            or not _valid_dense_latent(latent, rollout, plan)
             or not _video_decodes(video)
         ):
             return None
@@ -664,17 +665,24 @@ def _completed_file(root: Path, value: object, suffix: str) -> Path:
     return path
 
 
-def _valid_dense_latent(path: Path, rollout: RolloutPlan) -> bool:
+def _valid_dense_latent(path: Path, rollout: RolloutPlan, plan: BatchPlan) -> bool:
     try:
         with safe_open(path, framework="numpy") as tensors:
-            if set(tensors.keys()) != {"audio_rows", "video_rows"} or tensors.metadata() != {
+            trajectory_keys = {
+                trajectory_tensor_key(step.index) for step in plan.selected_steps
+            }
+            if set(tensors.keys()) != {
+                "audio_rows",
+                "video_rows",
+                *trajectory_keys,
+            } or tensors.metadata() != {
                 "geometry": rollout.stratum,
                 "rollout_id": rollout.rollout_id,
             }:
                 return False
             audio = tensors.get_slice("audio_rows")
             video = tensors.get_slice("video_rows")
-            return (
+            valid = (
                 audio.get_dtype() == "F32"
                 and video.get_dtype() == "F32"
                 and len(audio.get_shape()) == 2
@@ -683,6 +691,11 @@ def _valid_dense_latent(path: Path, rollout: RolloutPlan) -> bool:
                 and video.get_shape()[0] > 0
                 and audio.get_shape()[1] == 32
                 and video.get_shape()[1] == 96
+            )
+            return valid and all(
+                tensors.get_slice(key).get_dtype() == "F32"
+                and tensors.get_slice(key).get_shape() == video.get_shape()
+                for key in trajectory_keys
             )
     except (OSError, ValueError, SafetensorError):
         return False
