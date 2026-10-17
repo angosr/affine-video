@@ -57,13 +57,13 @@ def test_batch_plan_is_reproducible_complete_and_seeded() -> None:
     }
 
 
-def test_batch_plan_rejects_insufficient_source_pool() -> None:
-    with pytest.raises(ValueError, match="not enough samples"):
+def test_batch_plan_rejects_empty_source_pool() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
         plan_batch(
             track_spec_digest="12" * 32,
             seed_block_hash="34" * 32,
             routes=("r0", "r1"),
-            samples_by_stratum={"all": ("only",)},
+            samples_by_stratum={"all": ()},
             sample_count=2,
         )
 

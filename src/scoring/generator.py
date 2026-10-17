@@ -159,13 +159,14 @@ def plan_batch(
     selected_samples: dict[str, tuple[str, ...]] = {}
     for stratum in strata:
         items = _unique(samples_by_stratum[stratum], "sample identifier")
-        if route_count > len(items):
-            raise ValueError(f"not enough samples in stratum {stratum}")
-        selected_samples[stratum] = _ranked(
+        selected = _ranked(
             items,
             seed,
             b"sample\0" + stratum.encode("utf-8"),
-        )[:route_count]
+        )
+        selected_samples[stratum] = tuple(
+            selected[index % len(selected)] for index in range(route_count)
+        )
     return tuple(
         PlannedCase(route, stratum, selected_samples[stratum][index])
         for index, route in enumerate(selected_routes)

@@ -312,14 +312,13 @@ class PairedTrackEvaluator:
                     raise CacheLoadError(
                         "cache seed hash does not match its finalized generation block"
                     )
-            if self.track.cache.generator != "veda-source-v1":
+            if self.track.cache.generator != "veda-source-v2":
                 raise CacheLoadError("track cache generator is unsupported")
-            route_count = scoring.sample_count // len(scoring.stratum_weights)
             sources = generate_sources(
                 track_spec_digest=self.track.digest,
                 seed_block_hash=batch.seed_block_hash,
                 strata=tuple(scoring.stratum_weight_map),
-                samples_per_stratum=route_count,
+                samples_per_stratum=1,
             )
             if batch.source_digest != source_digest(sources):
                 raise CacheLoadError("cache source digest does not match its generated manifest")

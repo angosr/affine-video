@@ -87,7 +87,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
         ),
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
-        cache=CacheSpec(1_000_000, 1, 1, "veda-source-v1"),
+        cache=CacheSpec(1_000_000, 1, 1, "veda-source-v2"),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
             sample_count=1,
@@ -454,7 +454,7 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
         ),
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
-        cache=CacheSpec(1_000_000, 1, 1, "veda-source-v1"),
+        cache=CacheSpec(1_000_000, 1, 1, "veda-source-v2"),
         scoring=ScoringSpec(
             budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
             sample_count=4,
