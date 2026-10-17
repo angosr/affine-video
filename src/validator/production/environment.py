@@ -180,19 +180,31 @@ def _select_distribution(
     name: str,
     candidates: list[importlib.metadata.Distribution],
 ) -> tuple[importlib.metadata.Distribution, Path | None]:
-    versions = {distribution.version for distribution in candidates}
-    if len(versions) != 1:
-        raise ValueError(f"installed distribution has conflicting versions: {name}")
-    with_records = [
-        (distribution, record)
-        for distribution in candidates
-        if (record := _distribution_record(distribution)) is not None
-    ]
-    if len(with_records) == 1:
-        return with_records[0]
-    if not with_records and len(candidates) == 1:
-        return candidates[0], None
-    raise ValueError(f"installed distribution identity is ambiguous: {name}")
+    ranked = sorted(
+        ((_distribution_priority(distribution), distribution) for distribution in candidates),
+        key=lambda item: item[0],
+    )
+    if not ranked or ranked[0][0] >= len(sys.path):
+        raise ValueError(f"installed distribution is outside the active Python path: {name}")
+    if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
+        raise ValueError(f"installed distribution identity is ambiguous: {name}")
+    selected = ranked[0][1]
+    return selected, _distribution_record(selected)
+
+
+def _distribution_priority(distribution: importlib.metadata.Distribution) -> int:
+    metadata_path = getattr(distribution, "_path", None)
+    if metadata_path is None:
+        return len(sys.path)
+    root = Path(metadata_path).resolve().parent
+    for index, entry in enumerate(sys.path):
+        try:
+            active = Path(entry or ".").resolve()
+        except OSError:
+            continue
+        if active == root:
+            return index
+    return len(sys.path)
 
 
 def _distribution_record(distribution: importlib.metadata.Distribution) -> Path | None:

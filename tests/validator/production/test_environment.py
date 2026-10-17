@@ -101,7 +101,7 @@ def test_dependency_lock_writer_refuses_overwrite(tmp_path, monkeypatch) -> None
         environment.write_dependency_lock(target)
 
 
-def test_dependency_selection_prefers_one_record_over_editable_metadata(
+def test_dependency_selection_uses_active_python_path_precedence(
     tmp_path, monkeypatch
 ) -> None:
     record = tmp_path / "RECORD"
@@ -113,16 +113,20 @@ def test_dependency_selection_prefers_one_record_over_editable_metadata(
         "_distribution_record",
         lambda distribution: record if distribution is installed else None,
     )
+    monkeypatch.setattr(
+        environment,
+        "_distribution_priority",
+        lambda distribution: 2 if distribution is installed else 8,
+    )
 
     assert environment._select_distribution("example", [legacy, installed]) == (
         installed,
         record,
     )
 
-    with pytest.raises(ValueError, match="conflicting versions"):
-        environment._select_distribution(
-            "example", [legacy, SimpleNamespace(version="2.0")]
-        )
+    monkeypatch.setattr(environment, "_distribution_priority", lambda _distribution: 2)
+    with pytest.raises(ValueError, match="ambiguous"):
+        environment._select_distribution("example", [legacy, installed])
 
 
 def test_dependency_lock_must_be_canonical(tmp_path, monkeypatch) -> None:
