@@ -881,15 +881,10 @@ def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
                 metrics=archived["metrics"],
             )
 
-        def get_challenge(self, identifier):
+        def stage_transition_applied(self, identifier, stage):
             assert identifier == challenge_id
-            return SimpleNamespace(
-                state=(
-                    ChallengeState.CONFIRMING
-                    if self.transition_applied
-                    else ChallengeState.SCORING
-                )
-            )
+            assert stage is ChallengeState.SCORING
+            return self.transition_applied
 
         def chain_cursor(self):
             return (140, "0x" + "ef" * 32)

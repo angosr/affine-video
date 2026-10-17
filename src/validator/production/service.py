@@ -203,13 +203,7 @@ class PlanCoordinator:
                 or recovered.metrics != document.get("metrics")
             ):
                 raise RuntimeError("local stage fact conflicts with its private archive")
-            state = self.store.get_challenge(challenge_id).state
-            applied_states = (
-                {ChallengeState.CONFIRMING, ChallengeState.SUCCEEDED}
-                if stage is ChallengeState.SCORING
-                else {ChallengeState.SUCCEEDED}
-            )
-            if state not in applied_states:
+            if not self.store.stage_transition_applied(challenge_id, stage):
                 return False
         return True
 

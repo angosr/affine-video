@@ -843,6 +843,7 @@ def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -
             metrics={"cache_generated_block": 120, "requires_confirmation": True},
             occurred_at_ms=15,
         )
+        assert not store.stage_transition_applied(identifier, ChallengeState.SCORING)
         store.advance_leased(
             identifier,
             task.lease_token,
@@ -850,6 +851,8 @@ def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -
             release=True,
             occurred_at_ms=16,
         )
+        assert store.stage_transition_applied(identifier, ChallengeState.SCORING)
+        assert not store.stage_transition_applied(identifier, ChallengeState.CONFIRMING)
 
         assert store.confirmation_challenge_ids(149, 149) == ()
         assert store.confirmation_challenge_ids(150, 150) == (identifier,)
@@ -866,6 +869,8 @@ def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -
             occurred_at_ms=18,
         )
         assert store.confirmation_challenge_ids(150, 150) == (identifier,)
+        assert store.stage_transition_applied(identifier, ChallengeState.SCORING)
+        assert not store.stage_transition_applied(identifier, ChallengeState.CONFIRMING)
 
         confirming = store.claim_next_scoring("confirm", lease_ms=1_000, now_ms=20)
         assert confirming is not None
@@ -877,6 +882,8 @@ def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -
             occurred_at_ms=21,
         )
         assert store.confirmation_challenge_ids(150, 150) == (identifier,)
+        assert store.stage_transition_applied(identifier, ChallengeState.SCORING)
+        assert not store.stage_transition_applied(identifier, ChallengeState.CONFIRMING)
 
 
 def test_public_challenge_reads_state_and_history_from_one_snapshot(monkeypatch, tmp_path) -> None:

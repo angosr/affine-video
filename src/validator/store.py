@@ -1410,6 +1410,29 @@ class ChallengeStore:
             metrics=json.loads(row["metrics_json"]),
         )
 
+    def stage_transition_applied(self, identifier: str, stage: ChallengeState) -> bool:
+        """Return whether one archived stage fact has advanced the state machine."""
+
+        if stage not in {ChallengeState.SCORING, ChallengeState.CONFIRMING}:
+            raise ValueError("stage does not produce a score")
+        row = self._connection.execute(
+            "SELECT state, resume_state FROM challenges WHERE challenge_id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(identifier)
+        state = ChallengeState(row["state"])
+        if state in TERMINAL_STATES:
+            return True
+        if stage is ChallengeState.CONFIRMING:
+            return False
+        if state is ChallengeState.CONFIRMING:
+            return True
+        return (
+            state in {ChallengeState.SYSTEM_DEFERRED, ChallengeState.SYSTEM_BLOCKED}
+            and row["resume_state"] == ChallengeState.CONFIRMING
+        )
+
     def model_path(self, identifier: str) -> str | None:
         """Return a disposable local model path for a known challenge."""
 
