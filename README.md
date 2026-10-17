@@ -121,7 +121,9 @@ tracks/main/
   remains unchanged.
 - `system_matches/*.json` are immutable launch checks produced from real GPU panels. They compare
   the VEDA baseline with fixed control models, but never enter the Miner queue, tournament rank, or
-  chain weights.
+  chain weights. A panel is attached only when its track contract, score-affecting source bytes,
+  third-party environment and committed model/source assets match; rebuilding the same release
+  packaging does not invalidate it.
 - `events/<track_id>/track-aborted.json` is the immutable stop fact created when system work remains
   unfinished after the close grace block. It survives loss of local state and prevents that track
   from resuming evaluation or weight refresh.

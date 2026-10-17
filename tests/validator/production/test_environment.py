@@ -51,6 +51,63 @@ def test_source_bundle_builder_is_deterministic(tmp_path, monkeypatch) -> None:
         environment.build_source_bundle(first)
 
 
+def test_evaluation_source_digest_excludes_only_non_scoring_inputs(
+    tmp_path, monkeypatch
+) -> None:
+    scoring = tmp_path / "scoring.py"
+    system_matches = tmp_path / "system_matches.py"
+    miner = tmp_path / "miner.py"
+    scoring.write_text("VALUE = 1\n", encoding="utf-8")
+    system_matches.write_text("RESULTS = 1\n", encoding="utf-8")
+    miner.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        environment,
+        "_active_source_files",
+        lambda: {
+            "miner/submit.py": miner,
+            "scoring/exact.py": scoring,
+            "validator/system_matches.py": system_matches,
+        },
+    )
+
+    environment.evaluation_source_digest.cache_clear()
+    first = environment.evaluation_source_digest()
+    system_matches.write_text("RESULTS = 2\n", encoding="utf-8")
+    miner.write_text("VALUE = 2\n", encoding="utf-8")
+    environment.evaluation_source_digest.cache_clear()
+    assert environment.evaluation_source_digest() == first
+    scoring.write_text("VALUE = 2\n", encoding="utf-8")
+    environment.evaluation_source_digest.cache_clear()
+    assert environment.evaluation_source_digest() != first
+    environment.evaluation_source_digest.cache_clear()
+
+
+def test_evaluation_environment_digest_excludes_project_distributions(monkeypatch) -> None:
+    document = {
+        "distributions": [
+            {"content_sha256": "11" * 32, "name": "torch", "version": "1"},
+            {"content_sha256": "22" * 32, "name": "veda-subnet", "version": "1"},
+        ],
+        "python_executable_sha256": "33" * 32,
+        "python_implementation": "CPython",
+        "python_version": "3.12.3",
+    }
+    monkeypatch.setattr(
+        environment,
+        "_environment_document",
+        lambda *, verify_files: document,
+    )
+    environment.evaluation_environment_digest.cache_clear()
+    first = environment.evaluation_environment_digest()
+    document["distributions"][1]["content_sha256"] = "44" * 32
+    environment.evaluation_environment_digest.cache_clear()
+    assert environment.evaluation_environment_digest() == first
+    document["distributions"][0]["content_sha256"] = "55" * 32
+    environment.evaluation_environment_digest.cache_clear()
+    assert environment.evaluation_environment_digest() != first
+    environment.evaluation_environment_digest.cache_clear()
+
+
 def test_runtime_environment_rejects_a_changed_dependency_lock(tmp_path, monkeypatch) -> None:
     source = tmp_path / "example.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")

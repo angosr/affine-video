@@ -177,6 +177,7 @@ def build_public_artifacts(
         track_aborted=aborted,
     )
     summary = _summary_document(track, chain.finalized_block, tournament)
+    system_matches = system_match_artifacts(track, runtime_manifest)
     status = _status_document(
         track,
         chain.finalized_block,
@@ -184,6 +185,7 @@ def build_public_artifacts(
         store.active_competitors(chain.uid_by_hotkey),
         snapshot["challenges"],
         track_aborted=aborted,
+        system_matches=system_match_summaries(track, runtime_manifest),
     )
     files: dict[str, PublicFile] = {}
     batch_groups: dict[str, bytes] = {}
@@ -261,7 +263,7 @@ def build_public_artifacts(
             (match.object_name, _json_bytes(match.document)) for match in tournament.matches
         ),
         status=_json_bytes(status),
-        system_matches=system_match_artifacts(track),
+        system_matches=system_matches,
         files=tuple(files.values()),
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
         abort=_track_abort_artifact(track) if aborted else None,
@@ -306,14 +308,24 @@ def build_genesis_artifacts(
         source_block=chain.finalized_block,
         plan=plan,
     )
+    system_matches = system_match_artifacts(track, runtime_manifest)
     return PublicArtifacts(
         source_block=chain.finalized_block,
         track=_json_bytes({"track_spec_digest": track.digest, "spec": track_spec_dict(track)}),
         summary=_json_bytes(_summary_document(track, chain.finalized_block, tournament)),
         weights=encode_weight_artifact(weights),
         matches=(),
-        status=_json_bytes(_status_document(track, chain.finalized_block, tournament, [], [])),
-        system_matches=system_match_artifacts(track),
+        status=_json_bytes(
+            _status_document(
+                track,
+                chain.finalized_block,
+                tournament,
+                [],
+                [],
+                system_matches=system_match_summaries(track, runtime_manifest),
+            )
+        ),
+        system_matches=system_matches,
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
     )
 
@@ -1332,6 +1344,7 @@ def _status_document(
     challenges: list[dict[str, Any]],
     *,
     track_aborted: bool = False,
+    system_matches: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Build the bounded live view used by the operator monitor."""
 
@@ -1441,7 +1454,7 @@ def _status_document(
             }
         ),
         "champion": tournament.champion.public(),
-        "system_matches": system_match_summaries(track),
+        "system_matches": system_matches,
         "participants": active_rows,
     }
 

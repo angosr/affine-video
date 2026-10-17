@@ -8,11 +8,19 @@ from math import fsum
 from typing import Any
 
 from scoring.spec import TrackSpec, track_spec_dict
+from validator.production.commitment import ArtifactManifest, canonical_json
+from validator.production.environment import (
+    evaluation_environment_digest,
+    evaluation_source_digest,
+)
 
 PRODUCTION_TRACK_ID = "veda-sn120-v2"
 PRODUCTION_NETUID = 120
 PRODUCTION_EVIDENCE_CONTRACT_DIGEST = (
     "eb091449d2ab176ad6f9136461d9b88c1d69061b1db3175b11192e289c58aa59"
+)
+PRODUCTION_EVIDENCE_RUNTIME_DIGEST = (
+    "0000000000000000000000000000000000000000000000000000000000000000"
 )
 _EVIDENCE_SHA256 = "87ba4871c29df4f5113b4051c4f2d1e6905be834ef9a54dfcb780a675fc357db"
 _RUNTIME_TRACE_EVIDENCE_SHA256 = "c6e873d8d9acbcb02814eae888fb30fa73e620d73fca03f99a7f8f30f10b3fa5"
@@ -140,13 +148,18 @@ _CONTROLS = (
 )
 
 
-def system_match_artifacts(track: TrackSpec) -> tuple[tuple[str, bytes], ...]:
+def system_match_artifacts(
+    track: TrackSpec,
+    runtime_manifest: bytes | None,
+) -> tuple[tuple[str, bytes], ...]:
     """Return evidence only for its frozen, non-circular scoring contract."""
 
     if (
-        track.track_id != PRODUCTION_TRACK_ID
+        runtime_manifest is None
+        or track.track_id != PRODUCTION_TRACK_ID
         or track.netuid != PRODUCTION_NETUID
         or _evidence_contract_digest(track) != PRODUCTION_EVIDENCE_CONTRACT_DIGEST
+        or _evidence_runtime_digest(runtime_manifest) != PRODUCTION_EVIDENCE_RUNTIME_DIGEST
     ):
         return ()
     return tuple(
@@ -158,11 +171,14 @@ def system_match_artifacts(track: TrackSpec) -> tuple[tuple[str, bytes], ...]:
     )
 
 
-def system_match_summaries(track: TrackSpec) -> list[dict[str, Any]]:
+def system_match_summaries(
+    track: TrackSpec,
+    runtime_manifest: bytes | None,
+) -> list[dict[str, Any]]:
     """Return compact launch-check rows for the live status document."""
 
     summaries = []
-    for name, payload in system_match_artifacts(track):
+    for name, payload in system_match_artifacts(track, runtime_manifest):
         document = json.loads(payload)
         summaries.append(
             {
@@ -219,6 +235,7 @@ def _match_document(
             "torch": "2.12.0+cu130",
             "cuda": "13.0",
             "track_contract_sha256": PRODUCTION_EVIDENCE_CONTRACT_DIGEST,
+            "runtime_contract_sha256": PRODUCTION_EVIDENCE_RUNTIME_DIGEST,
             "batch_count": 10,
             "cases_per_batch": 384,
             "independent_videos_per_stratum": 4,
@@ -262,3 +279,38 @@ def _evidence_contract_digest(track: TrackSpec) -> str:
     document = track_spec_dict(track)
     del document["artifact_manifest_sha256"]
     return hashlib.sha256(_json_bytes(document)).hexdigest()
+
+
+def _evidence_runtime_digest(runtime_manifest: bytes) -> str:
+    """Bind benchmark evidence to scoring semantics without binding release packaging."""
+
+    manifest = ArtifactManifest.decode(runtime_manifest)
+    artifacts = [
+        {
+            "logical_name": artifact.logical_name,
+            "sha256": artifact.sha256,
+            "size_bytes": artifact.size_bytes,
+        }
+        for artifact in manifest.artifacts
+        if not _is_release_packaging(artifact.logical_name)
+    ]
+    if not artifacts:
+        raise ValueError("evidence runtime asset contract cannot be empty")
+    document = {
+        "artifacts": artifacts,
+        "environment_sha256": evaluation_environment_digest(),
+        "format": "veda-evidence-runtime-contract-v1",
+        "source_sha256": evaluation_source_digest(),
+    }
+    return hashlib.sha256(canonical_json(document)).hexdigest()
+
+
+def _is_release_packaging(logical_name: str) -> bool:
+    return any(
+        logical_name == name or logical_name.endswith("/" + name)
+        for name in (
+            "runtime/dependencies.lock",
+            "runtime/image.tar",
+            "runtime/source.zip",
+        )
+    )

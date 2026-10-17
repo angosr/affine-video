@@ -6,6 +6,7 @@ import pytest
 
 from scoring.spec import load_track_spec
 from validator import system_matches as system_matches_module
+from validator.production.commitment import Artifact, ArtifactManifest
 from validator.system_matches import (
     PRODUCTION_NETUID,
     PRODUCTION_TRACK_ID,
@@ -14,16 +15,46 @@ from validator.system_matches import (
 )
 
 
-def test_production_system_matches_are_complete_and_separate_from_rewards(monkeypatch) -> None:
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    assert track.track_id == PRODUCTION_TRACK_ID
-    assert system_match_artifacts(track) == ()
+def _runtime_manifest(*, asset_sha256: str = "ab" * 32, package_sha256: str = "cd" * 32) -> bytes:
+    return ArtifactManifest(
+        (
+            Artifact("runtime/source.zip", package_sha256, 10, "artifacts/" + package_sha256),
+            Artifact(
+                "weights/predictor.safetensors",
+                asset_sha256,
+                20,
+                "artifacts/" + asset_sha256,
+            ),
+        )
+    ).encode()
+
+
+def _bind_evidence(monkeypatch, track, runtime_manifest: bytes) -> None:
+    monkeypatch.setattr(system_matches_module, "evaluation_source_digest", lambda: "12" * 32)
+    monkeypatch.setattr(
+        system_matches_module,
+        "evaluation_environment_digest",
+        lambda: "34" * 32,
+    )
     monkeypatch.setattr(
         system_matches_module,
         "PRODUCTION_EVIDENCE_CONTRACT_DIGEST",
         system_matches_module._evidence_contract_digest(track),
     )
-    artifacts = system_match_artifacts(track)
+    monkeypatch.setattr(
+        system_matches_module,
+        "PRODUCTION_EVIDENCE_RUNTIME_DIGEST",
+        system_matches_module._evidence_runtime_digest(runtime_manifest),
+    )
+
+
+def test_production_system_matches_are_complete_and_separate_from_rewards(monkeypatch) -> None:
+    track = load_track_spec(Path(__file__).parents[2] / "track.json")
+    runtime_manifest = _runtime_manifest()
+    assert track.track_id == PRODUCTION_TRACK_ID
+    assert system_match_artifacts(track, runtime_manifest) == ()
+    _bind_evidence(monkeypatch, track, runtime_manifest)
+    artifacts = system_match_artifacts(track, runtime_manifest)
 
     assert [name for name, _payload in artifacts] == [
         f"system_matches/{PRODUCTION_TRACK_ID}/000000000001.json",
@@ -38,6 +69,9 @@ def test_production_system_matches_are_complete_and_separate_from_rewards(monkey
         assert document["track_spec_digest"] == track.digest
         assert document["evaluation"]["track_contract_sha256"] == (
             system_matches_module._evidence_contract_digest(track)
+        )
+        assert document["evaluation"]["runtime_contract_sha256"] == (
+            system_matches_module._evidence_runtime_digest(runtime_manifest)
         )
         assert document["outcome"] in {"REFERENCE_RETAINED", "REFERENCE_WON"}
         assert len(document["evaluation"]["batches"]) == 10
@@ -55,7 +89,7 @@ def test_production_system_matches_are_complete_and_separate_from_rewards(monkey
     )
     assert (
         len(
-            system_match_summaries(track)
+            system_match_summaries(track, runtime_manifest)
         )
         == 3
     )
@@ -79,37 +113,50 @@ def test_candidate_track_keeps_the_exact_runtime_schedule() -> None:
 
 def test_system_evidence_binding_does_not_depend_on_release_artifact_hash(monkeypatch) -> None:
     track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    monkeypatch.setattr(
-        system_matches_module,
-        "PRODUCTION_EVIDENCE_CONTRACT_DIGEST",
-        system_matches_module._evidence_contract_digest(track),
-    )
+    runtime_manifest = _runtime_manifest()
+    _bind_evidence(monkeypatch, track, runtime_manifest)
     rebuilt = replace(
         track,
         artifact_manifest_sha256="ef" * 32,
         digest="cd" * 32,
     )
 
-    documents = [json.loads(payload) for _name, payload in system_match_artifacts(rebuilt)]
+    documents = [
+        json.loads(payload)
+        for _name, payload in system_match_artifacts(rebuilt, runtime_manifest)
+    ]
 
     assert len(documents) == 3
     assert {document["track_spec_digest"] for document in documents} == {"cd" * 32}
 
 
+def test_system_evidence_rejects_changed_scoring_assets_but_not_repackaging(monkeypatch) -> None:
+    track = load_track_spec(Path(__file__).parents[2] / "track.json")
+    runtime_manifest = _runtime_manifest()
+    _bind_evidence(monkeypatch, track, runtime_manifest)
+
+    assert system_match_artifacts(track, _runtime_manifest(package_sha256="ef" * 32))
+    assert system_match_artifacts(track, _runtime_manifest(asset_sha256="ef" * 32)) == ()
+    assert system_match_artifacts(track, None) == ()
+
+
 def test_system_matches_are_not_attached_to_another_track(monkeypatch) -> None:
     track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    monkeypatch.setattr(
-        system_matches_module,
-        "PRODUCTION_EVIDENCE_CONTRACT_DIGEST",
-        system_matches_module._evidence_contract_digest(track),
-    )
+    runtime_manifest = _runtime_manifest()
+    _bind_evidence(monkeypatch, track, runtime_manifest)
 
-    assert system_match_artifacts(track)
-    assert system_match_artifacts(replace(track, track_id="another-track")) == ()
-    assert system_match_artifacts(replace(track, netuid=PRODUCTION_NETUID + 1)) == ()
+    assert system_match_artifacts(track, runtime_manifest)
+    assert system_match_artifacts(replace(track, track_id="another-track"), runtime_manifest) == ()
+    assert (
+        system_match_artifacts(
+            replace(track, netuid=PRODUCTION_NETUID + 1), runtime_manifest
+        )
+        == ()
+    )
     assert system_match_artifacts(
         replace(
             track,
             scoring=replace(track.scoring, minimum_frontier_gain=0.006),
-        )
+        ),
+        runtime_manifest,
     ) == ()

@@ -10,6 +10,7 @@ import platform
 import re
 import sys
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,43 @@ def build_source_bundle(destination: str | Path) -> Path:
             info.external_attr = 0o100644 << 16
             archive.writestr(info, path.read_bytes())
     return target
+
+
+@lru_cache(maxsize=1)
+def evaluation_source_digest() -> str:
+    """Hash every score-affecting source byte without benchmark result constants."""
+
+    rows = []
+    for name, path in sorted(_active_source_files().items()):
+        if not name.startswith(("scoring/", "validator/", "miowtion/")):
+            continue
+        if name == "validator/system_matches.py":
+            continue
+        rows.append({"name": name, "sha256": _file_sha256(path)})
+    if not rows:
+        raise ValueError("evaluation source contract cannot be empty")
+    return hashlib.sha256(canonical_json(rows)).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def evaluation_environment_digest() -> str:
+    """Hash the third-party execution environment independently of project source."""
+
+    environment = _environment_document(verify_files=True)
+    distributions = [
+        row
+        for row in environment["distributions"]
+        if row["name"] not in {"miowtion", "veda-subnet"}
+    ]
+    if not distributions:
+        raise ValueError("evaluation environment contract cannot be empty")
+    document = {
+        "distributions": distributions,
+        "python_executable_sha256": environment["python_executable_sha256"],
+        "python_implementation": environment["python_implementation"],
+        "python_version": environment["python_version"],
+    }
+    return hashlib.sha256(canonical_json(document)).hexdigest()
 
 
 def _active_source_files() -> dict[str, Path]:
