@@ -136,6 +136,12 @@ downloaded model cache are disposable execution state: after loss, finalized cha
 verified published matches reconstruct completed work, and remaining submissions can be evaluated
 again.
 
+Private R2 is the durable source for unrevealed plans, the committed source pool, the artifact
+manifest, every runtime artifact, exact batches, validated selectors and recoverable scoring stages.
+Both production services verify conditional-write support before starting, seed missing immutable
+objects from a complete local runtime, and restore missing local bytes by committed size and SHA-256.
+The GPU host therefore contains no unique tournament state.
+
 Before a batch's complete challenge group becomes terminal, public artifacts exclude its hidden
 arrays, per-sample metrics, local paths, worker and lease data, retry timing, error text, stack
 traces, and credentials. Only stable error codes and retry counts are public. Use a public HTTPS

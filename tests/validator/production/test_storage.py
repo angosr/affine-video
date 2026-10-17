@@ -5,6 +5,7 @@ import pickle
 import pytest
 
 from validator import chunks
+from validator.production.commitment import Artifact, ArtifactManifest
 from validator.production.storage import PreconditionFailed, PrivateObjectStore
 from validator.s3 import client_config
 
@@ -161,3 +162,30 @@ def test_content_is_chunked_and_restored_with_complete_verification(tmp_path, mo
         "tracks/abc/objects/file.parts/part-00001",
         "tracks/abc/objects/file.parts/part-00002",
     ]
+
+
+def test_bootstrap_and_manifest_restore_survive_loss_of_local_artifacts(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(chunks, "CHUNK_BYTES", 4)
+    root = tmp_path / "runtime"
+    root.mkdir()
+    path = root / "model.bin"
+    path.write_bytes(b"abcdefghij")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest = ArtifactManifest((Artifact("model.bin", digest, 10, f"artifacts/{digest}"),))
+    bootstrap = tmp_path / "manifest.json"
+    bootstrap.write_bytes(manifest.encode())
+    client = MemoryS3()
+    store = PrivateObjectStore(client, bucket="private", prefix="tracks/abc")
+
+    payload = store.ensure_bootstrap("bootstrap/artifact_manifest.json", bootstrap)
+    store.ensure_artifacts(ArtifactManifest.decode(payload), root)
+    path.unlink()
+    bootstrap.unlink()
+
+    restored_payload = store.ensure_bootstrap("bootstrap/artifact_manifest.json", bootstrap)
+    store.ensure_artifacts(ArtifactManifest.decode(restored_payload), root)
+
+    assert restored_payload == manifest.encode()
+    assert path.read_bytes() == b"abcdefghij"

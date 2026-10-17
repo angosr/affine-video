@@ -17,6 +17,7 @@ from validator.chunks import (
     chunk_object_name,
     read_part,
 )
+from validator.production.commitment import ArtifactManifest
 from validator.s3 import client_config
 
 
@@ -188,6 +189,47 @@ class PrivateObjectStore:
             if _is_missing(exc) or isinstance(exc, KeyError):
                 return None
             raise
+
+    def ensure_bootstrap(self, name: str, local_path: str | Path) -> bytes:
+        """Restore a small authoritative bootstrap object or seed it once."""
+
+        stored = self.get_optional(name)
+        if stored is not None:
+            return stored.body
+        path = Path(local_path)
+        if not path.is_file():
+            raise StorageError(f"private bootstrap object is unavailable: {name}")
+        payload = path.read_bytes()
+        if not payload:
+            raise StorageError(f"private bootstrap object is empty: {name}")
+        return self.create_plan(name, payload).body
+
+    def ensure_artifacts(self, manifest: ArtifactManifest, root: str | Path) -> None:
+        """Mirror committed runtime bytes and restore any missing local artifact."""
+
+        base = Path(root)
+        base.mkdir(parents=True, exist_ok=True)
+        for artifact in manifest.artifacts:
+            path = base / artifact.logical_name
+            local_valid = (
+                path.is_file()
+                and path.stat().st_size == artifact.size_bytes
+                and _file_sha256(path) == artifact.sha256
+            )
+            if local_valid:
+                self.put_content(
+                    path,
+                    sha256=artifact.sha256,
+                    object_name=artifact.object_key,
+                )
+            else:
+                self.download_content(
+                    artifact.object_key,
+                    path,
+                    sha256=artifact.sha256,
+                    size_bytes=artifact.size_bytes,
+                )
+        manifest.verify_local(base)
 
     def put_content(self, path: str | Path, *, sha256: str, object_name: str) -> None:
         """Upload one immutable file as storage-limit-safe verified chunks."""

@@ -120,3 +120,9 @@ def test_artifact_manifest_rejects_an_object_key_collision() -> None:
                 Artifact("two", "b" * 64, 1, "artifacts/shared"),
             )
         )
+
+
+@pytest.mark.parametrize("logical_name", ("/absolute", "../escape", "dir//file"))
+def test_artifact_manifest_rejects_unsafe_logical_paths(logical_name) -> None:
+    with pytest.raises(ValueError, match="logical name"):
+        Artifact(logical_name, "a" * 64, 1, "artifacts/safe")

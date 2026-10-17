@@ -238,10 +238,12 @@ class Artifact:
     def __post_init__(self) -> None:
         if not self.logical_name or not self.object_key:
             raise ValueError("artifact name and object key cannot be empty")
-        if self.object_key.startswith("/") or any(
-            part in {"", ".", ".."} for part in self.object_key.split("/")
+        for value, name in (
+            (self.logical_name, "logical name"),
+            (self.object_key, "object key"),
         ):
-            raise ValueError("artifact object key is invalid")
+            if value.startswith("/") or any(part in {"", ".", ".."} for part in value.split("/")):
+                raise ValueError(f"artifact {name} is invalid")
         _require_digest(self.sha256, "artifact SHA-256")
         if type(self.size_bytes) is not int or self.size_bytes <= 0:
             raise ValueError("artifact size must be a positive integer")
@@ -279,6 +281,9 @@ class ArtifactManifest:
             "artifacts": [artifact.document() for artifact in self.artifacts],
             "format": "veda-artifact-manifest-v1",
         }
+
+    def encode(self) -> bytes:
+        return canonical_json(self.document())
 
     @property
     def digest(self) -> str:

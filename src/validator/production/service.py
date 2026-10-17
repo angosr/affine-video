@@ -238,17 +238,24 @@ class ProducerService:
     ) -> None:
         self.config = config
         self.track = load_track_spec(config.track_spec)
-        self.pool = SourcePool.decode(config.source_pool.read_bytes())
-        _validate_source_capacity(self.pool, self.track)
-        self.manifest = ArtifactManifest.decode(config.artifact_manifest.read_bytes())
-        if self.manifest.digest != self.track.artifact_manifest_sha256:
-            raise ValueError("artifact manifest does not match the track commitment")
-        config.verify_manifest(self.manifest)
         self.objects = PrivateObjectStore.from_environment(
             bucket=config.storage_bucket,
             prefix=f"{config.storage_prefix}/tracks/{self.track.digest}",
         )
         self.objects.verify_conditional_writes()
+        self.pool = SourcePool.decode(
+            self.objects.ensure_bootstrap("bootstrap/source_pool.json", config.source_pool)
+        )
+        _validate_source_capacity(self.pool, self.track)
+        self.manifest = ArtifactManifest.decode(
+            self.objects.ensure_bootstrap(
+                "bootstrap/artifact_manifest.json", config.artifact_manifest
+            )
+        )
+        if self.manifest.digest != self.track.artifact_manifest_sha256:
+            raise ValueError("artifact manifest does not match the track commitment")
+        self.objects.ensure_artifacts(self.manifest, config.artifact_root)
+        config.verify_manifest(self.manifest)
         config.work_dir.mkdir(parents=True, exist_ok=True)
         self.alert = alert
 
