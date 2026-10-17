@@ -177,9 +177,6 @@ def plan_champion_weight(
     uid = uid_by_hotkey.get(hotkey)
     if uid is None:
         return None
-    expected_uid = champion.uid
-    if expected_uid is not None and uid != expected_uid:
-        return None
     return WeightPlan(current_block, (hotkey,), (uid,), (1.0,))
 
 
@@ -260,15 +257,25 @@ def validate_weight_artifact(
     required = max(1, chain.min_allowed_weights)
     if len(plan.hotkeys) < required:
         raise ValueError("public weights do not meet the chain minimum")
-    quantized_uids, _ = normalize_weights(plan.uids, plan.weights)
+    resolved = []
+    for hotkey, weight in zip(plan.hotkeys, plan.weights, strict=True):
+        uid = chain.uid_by_hotkey.get(hotkey)
+        if uid is None:
+            raise ValueError("public weight hotkey is no longer registered")
+        resolved.append((uid, hotkey, weight))
+    resolved.sort()
+    current_plan = WeightPlan(
+        plan.source_block,
+        tuple(row[1] for row in resolved),
+        tuple(row[0] for row in resolved),
+        tuple(row[2] for row in resolved),
+    )
+    quantized_uids, _ = normalize_weights(current_plan.uids, current_plan.weights)
     if len(quantized_uids) < required:
         raise ValueError("public weights fall below the chain minimum after quantization")
-    if any(weight > chain.max_weight + 1e-12 for weight in plan.weights):
+    if any(weight > chain.max_weight + 1e-12 for weight in current_plan.weights):
         raise ValueError("public weights exceed the current chain cap")
-    for hotkey, uid in zip(plan.hotkeys, plan.uids, strict=True):
-        if chain.uid_by_hotkey.get(hotkey) != uid:
-            raise ValueError("public hotkey and UID mapping is no longer current")
-    return plan
+    return current_plan
 
 
 def weight_update_due(

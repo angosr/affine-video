@@ -116,7 +116,7 @@ def test_champion_plan_assigns_all_weight_to_uid_zero_baseline() -> None:
     assert plan == WeightPlan(120, ("burn-hotkey",), (0,), (1.0,))
 
 
-def test_champion_plan_fails_closed_on_uid_change_or_infeasible_chain_rules() -> None:
+def test_champion_plan_resolves_current_uid_and_fails_closed_on_infeasible_rules() -> None:
     champion = Champion(
         "genesis",
         "burn-hotkey",
@@ -133,7 +133,9 @@ def test_champion_plan_fails_closed_on_uid_change_or_infeasible_chain_rules() ->
         "current_block": 120,
     }
 
-    assert plan_champion_weight(**arguments, min_allowed_weights=1, max_weight=1.0) is None
+    assert plan_champion_weight(
+        **arguments, min_allowed_weights=1, max_weight=1.0
+    ) == WeightPlan(120, ("burn-hotkey",), (4,), (1.0,))
     assert plan_champion_weight(**arguments, min_allowed_weights=2, max_weight=1.0) is None
 
 
@@ -171,10 +173,41 @@ def test_public_weights_are_checked_against_current_chain_state() -> None:
             expected_mechid=1,
             max_staleness_blocks=20,
         )
-    with pytest.raises(ValueError, match="mapping"):
+    assert validate_weight_artifact(
+        artifact(plan=WeightPlan(120, ("alice",), (5,), (1.0,))),
+        state,
+        expected_netuid=7,
+        expected_track_digest="ab" * 32,
+        expected_mechid=0,
+        max_staleness_blocks=20,
+    ) == WeightPlan(120, ("alice",), (4,), (1.0,))
+
+    remapped = validate_weight_artifact(
+        artifact(
+            plan=WeightPlan(
+                120,
+                ("alice", "validator"),
+                (4, 9),
+                (0.6, 0.4),
+            )
+        ),
+        chain_state(mapping={"alice": 12, "validator": 2}),
+        expected_netuid=7,
+        expected_track_digest="ab" * 32,
+        expected_mechid=0,
+        max_staleness_blocks=20,
+    )
+    assert remapped == WeightPlan(
+        120,
+        ("validator", "alice"),
+        (2, 12),
+        (0.4, 0.6),
+    )
+
+    with pytest.raises(ValueError, match="no longer registered"):
         validate_weight_artifact(
-            artifact(plan=WeightPlan(120, ("alice",), (5,), (1.0,))),
-            state,
+            artifact(plan=WeightPlan(120, ("alice",), (4,), (1.0,))),
+            chain_state(mapping={"validator": 9}),
             expected_netuid=7,
             expected_track_digest="ab" * 32,
             expected_mechid=0,
