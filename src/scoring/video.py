@@ -33,6 +33,7 @@ class VideoCell:
     rollout_id: str
     budget: int
     score: float
+    output_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

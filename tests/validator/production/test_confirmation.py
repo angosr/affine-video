@@ -45,7 +45,10 @@ def test_non_finite_sparse_rollout_becomes_a_zero_score_cell() -> None:
         def generate_sparse(self, **_kwargs):
             raise SparseOutputInvalid("non-finite")
 
-    assert _score_rollout_budget(**arguments(Runtime())) == 0.0
+    score, output_sha256 = _score_rollout_budget(**arguments(Runtime()))
+
+    assert score == 0.0
+    assert len(output_sha256) == 64
 
 
 def test_infrastructure_runtime_failure_is_not_converted_to_zero() -> None:
@@ -55,6 +58,34 @@ def test_infrastructure_runtime_failure_is_not_converted_to_zero() -> None:
 
     with pytest.raises(RuntimeError, match="gpu unavailable"):
         _score_rollout_budget(**arguments(Runtime()))
+
+
+def test_full_video_cell_hash_binds_raw_sparse_outputs() -> None:
+    class Runtime:
+        def __init__(self, value):
+            self.value = value
+
+        def generate_sparse(self, **_kwargs):
+            return SimpleNamespace(
+                audio_rows=np.array([[1.0]], dtype=np.float16),
+                video_rows=np.array([[self.value, 2.0, 3.0]], dtype=np.float16),
+                trajectory_video_rows=(
+                    (0, "early", np.array([[4.0, 5.0, 6.0]], dtype=np.float16)),
+                ),
+            )
+
+        def decode_frames(self, _rows, *, geometry):
+            del geometry
+            return np.ones((2, 2, 2, 3), dtype=np.uint8)
+
+    values = arguments(Runtime(1.0))
+    values["metric"] = SimpleNamespace(score=lambda **_kwargs: SimpleNamespace(score=0.75))
+    first_score, first_hash = _score_rollout_budget(**values)
+    values["runtime"] = Runtime(1.5)
+    second_score, second_hash = _score_rollout_budget(**values)
+
+    assert first_score == second_score == 0.75
+    assert first_hash != second_hash
 
 
 def test_partial_worker_start_is_cleaned_up_and_pool_can_be_reused(monkeypatch) -> None:

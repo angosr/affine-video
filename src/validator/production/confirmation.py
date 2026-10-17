@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import multiprocessing
 import os
 import queue
@@ -11,6 +12,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from scoring.spec import TrackSpec
 from scoring.video import VideoCell, VideoFidelityMetric, paired_video_gain_bound
@@ -244,23 +247,25 @@ def _confirmation_worker(
                         dense["video_rows"], geometry=rollout.stratum
                     )
                     for budget in track.scoring.budgets:
+                        score, output_sha256 = _score_rollout_budget(
+                            runtime=runtime,
+                            metric=metric,
+                            rollout=rollout,
+                            selector_path=selector_path,
+                            track=track,
+                            budget=budget,
+                            selected_steps=batch.plan.selected_steps,
+                            dense=dense,
+                            dense_frames=dense_frames,
+                            dense_trajectory=dense_trajectory,
+                        )
                         cells.append(
                             VideoCell(
                                 rollout.stratum,
                                 rollout.rollout_id,
                                 budget.target_blocks,
-                                _score_rollout_budget(
-                                    runtime=runtime,
-                                    metric=metric,
-                                    rollout=rollout,
-                                    selector_path=selector_path,
-                                    track=track,
-                                    budget=budget,
-                                    selected_steps=batch.plan.selected_steps,
-                                    dense=dense,
-                                    dense_frames=dense_frames,
-                                    dense_trajectory=dense_trajectory,
-                                ),
+                                score,
+                                output_sha256,
                             )
                         )
                 results.put(("ok", side, tuple(cells)))
@@ -282,7 +287,7 @@ def _score_rollout_budget(
     dense: dict[str, Any],
     dense_frames: Any,
     dense_trajectory: dict[tuple[int, str], Any],
-) -> float:
+) -> tuple[float, str]:
     """Score one cell, treating non-finite model output as zero quality."""
 
     try:
@@ -296,7 +301,15 @@ def _score_rollout_budget(
             steps=tuple((step.index, step.window) for step in selected_steps),
         )
     except SparseOutputInvalid:
-        return 0.0
+        digest = hashlib.sha256(
+            (
+                "veda-invalid-sparse-output-v1\0"
+                f"{rollout.source_id}\0{rollout.stratum}\0{rollout.noise_seed}\0"
+                f"{budget.target_blocks}"
+            ).encode()
+        ).hexdigest()
+        return 0.0, digest
+    output_sha256 = _sparse_output_sha256(sparse)
     sparse_trajectory = {
         (step, window): rows for step, window, rows in sparse.trajectory_video_rows
     }
@@ -316,4 +329,23 @@ def _score_rollout_budget(
         black_frame_threshold=track.full_video.black_frame_threshold,
         flicker_threshold=track.full_video.flicker_threshold,
     )
-    return fidelity.score
+    return fidelity.score, output_sha256
+
+
+def _sparse_output_sha256(sparse: Any) -> str:
+    """Commit raw sparse tensors without retaining their multi-gigabyte byte streams."""
+
+    digest = hashlib.sha256(b"veda-full-video-sparse-output-v1\0")
+
+    def update(name: str, value: Any) -> None:
+        array = value if isinstance(value, np.ndarray) else np.asarray(value)
+        contiguous = np.ascontiguousarray(array)
+        identity = f"{name}\0{contiguous.dtype.str}\0{','.join(map(str, contiguous.shape))}\0"
+        digest.update(identity.encode("ascii"))
+        digest.update(memoryview(contiguous).cast("B"))
+
+    update("audio_rows", sparse.audio_rows)
+    update("video_rows", sparse.video_rows)
+    for step, window, rows in sparse.trajectory_video_rows:
+        update(f"trajectory/{step}/{window}", rows)
+    return digest.hexdigest()
