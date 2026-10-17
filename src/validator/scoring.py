@@ -208,6 +208,26 @@ class PairedTrackEvaluator:
     batch_source: ReadyBatchSource | None = None
     confirmation_pool: ConfirmationWorkerPool | None = None
 
+    def ready_through_block(self, current_finalized_block: int) -> int:
+        """Latest submission or stage-decision block whose batch boundary is final."""
+
+        start = self.track.track_start_block
+        interval = self.track.cache.generation_interval_blocks
+        if current_finalized_block < start:
+            return -1
+        boundary = start + ((current_finalized_block - start) // interval) * interval
+        return boundary - self.track.cache.minimum_generation_delay_blocks
+
+    def batch_ready(self, task: LeasedChallenge) -> bool:
+        """Distinguish expected producer lag from an evaluation failure."""
+
+        if self.batch_source is None:
+            return True
+        return self.batch_source.is_ready(
+            task.challenge_id,
+            confirmation=task.state is ChallengeState.CONFIRMING,
+        )
+
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         snapshot = self.store.public_snapshot()
         tournament = resolve_tournament(
@@ -546,9 +566,12 @@ def evaluate_next_scoring(
     """Evaluate at most one stage while retaining its lease for atomic commit."""
 
     now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
+    readiness = getattr(evaluator, "ready_through_block", None)
+    ready_through_block = None if readiness is None else readiness(current_finalized_block)
     task = store.claim_next_scoring(
         worker_id,
         lease_ms=settings.lease_ms,
+        ready_through_block=ready_through_block,
         now_ms=now,
     )
     if task is None:
@@ -557,6 +580,20 @@ def evaluate_next_scoring(
     recorded = store.stage_score(task.challenge_id, task.state)
     if recorded is None:
         try:
+            batch_ready = getattr(evaluator, "batch_ready", None)
+            if batch_ready is not None and not batch_ready(task):
+                store.wait_leased(
+                    task.challenge_id,
+                    task.lease_token,
+                    retry_after_ms=now + settings.retry_base_ms,
+                    reason="EVALUATION_BATCH_PENDING",
+                    occurred_at_ms=now,
+                )
+                return ScoringOutcome(
+                    task.challenge_id,
+                    ChallengeState.SYSTEM_DEFERRED,
+                    "EVALUATION_BATCH_PENDING",
+                )
             archived = None if settings.restore_stage is None else settings.restore_stage(task)
             if archived is None:
                 result = evaluator(task)
@@ -763,6 +800,16 @@ def _defer_or_fail(
     code: str,
     summary: str,
 ) -> ChallengeState:
+    if task.attempts == 1 and task.attempts < settings.max_attempts and settings.alert is not None:
+        settings.alert(
+            "SCORING_RETRY_STARTED",
+            {
+                "challenge_id": task.challenge_id,
+                "attempts": task.attempts,
+                "code": code,
+                "stage": str(task.state),
+            },
+        )
     if task.attempts >= settings.max_attempts:
         store.block_leased(
             task.challenge_id,

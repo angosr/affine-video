@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ import httpx
 
 from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
 from validator.chunks import ChunkManifest, build_chunk_manifest, chunk_object_name, read_part
+from validator.production.batches import BatchDisclosure
 from validator.queue import TERMINAL_STATES
 from validator.s3 import client_config
 from validator.store import ChallengeStore
@@ -61,6 +63,7 @@ class PublicArtifacts:
     files: tuple[PublicFile, ...] = ()
     runtime_manifest: tuple[str, bytes] | None = None
     abort: tuple[str, bytes] | None = None
+    batch_groups: tuple[tuple[str, bytes], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,8 +95,7 @@ def build_public_artifacts(
     chain: WeightChainState,
     *,
     version_key: int,
-    exact_cache_dir: str | Path | None = None,
-    batch_reference_resolver: Callable[[str], tuple[str, ...]] | None = None,
+    batch_disclosure_resolver: Callable[[str], BatchDisclosure] | None = None,
     model_resolver: Callable[[str, int], Path] | None = None,
     runtime_manifest: bytes | None = None,
     track_aborted: bool = False,
@@ -151,6 +153,7 @@ def build_public_artifacts(
         track_aborted=aborted,
     )
     files: dict[str, PublicFile] = {}
+    batch_groups: dict[str, bytes] = {}
     terminal_ids = {
         challenge["challenge_id"]
         for challenge in snapshot["challenges"]
@@ -167,28 +170,29 @@ def build_public_artifacts(
         ]
         if batch is not None:
             stage_batches.append(batch)
-        if exact_cache_dir is not None:
-            for used_batch in stage_batches:
-                plan_digest = used_batch["plan_digest"]
-                if plan_digest not in disclosure:
-                    referenced = (
-                        ()
-                        if batch_reference_resolver is None
-                        else batch_reference_resolver(plan_digest)
-                    )
-                    disclosure[plan_digest] = bool(referenced) and set(referenced).issubset(
-                        terminal_ids
-                    )
-                if not disclosure[plan_digest]:
-                    continue
-                path = (
-                    Path(exact_cache_dir)
-                    / f"{used_batch['generated_block']}-{used_batch['sha256']}.npz"
+        for used_batch in stage_batches:
+            plan_digest = used_batch["plan_digest"]
+            if plan_digest not in disclosure:
+                resolved = (
+                    None
+                    if batch_disclosure_resolver is None
+                    else batch_disclosure_resolver(plan_digest)
                 )
-                files[used_batch["object"]] = PublicFile(
-                    used_batch["object"], path, used_batch["sha256"]
+                disclosure[plan_digest] = bool(resolved) and set(resolved.challenge_ids).issubset(
+                    terminal_ids
                 )
-        if exact_cache_dir is not None and match.outcome.value == "CHALLENGER_WON":
+                if disclosure[plan_digest]:
+                    assert resolved is not None
+                    batch_groups[resolved.record_name] = resolved.record_payload
+                    for item in resolved.files:
+                        files[item.object_name] = PublicFile(
+                            item.object_name,
+                            item.path,
+                            item.sha256,
+                        )
+            if disclosure[plan_digest] and used_batch["object"] not in files:
+                raise PublicArtifactError("batch disclosure omitted its exact evaluation object")
+        if match.outcome.value == "CHALLENGER_WON":
             path_value = store.model_path(match.challenge_id)
             path = None if path_value is None else Path(path_value)
             if path is None or not path.is_file():
@@ -219,6 +223,7 @@ def build_public_artifacts(
         files=tuple(files.values()),
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
         abort=_track_abort_artifact(track) if aborted else None,
+        batch_groups=tuple(sorted(batch_groups.items())),
     )
 
 
@@ -498,65 +503,76 @@ class S3Repository:
         )
         return cls(client, bucket=bucket, prefix=prefix)
 
+    def verify_conditional_writes(self) -> None:
+        """Refuse a public backend that cannot fence concurrent publishers."""
+
+        name = f"capability-probes/{uuid.uuid4().hex}.json"
+        key = f"{self._prefix}/{name}"
+        try:
+            self._client.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=b'{"state":"first"}',
+                IfNoneMatch="*",
+            )
+            first = self._get_stored_optional(name)
+            if first is None:
+                raise PublicArtifactError("conditional create was not durable")
+            try:
+                self._client.put_object(
+                    Bucket=self._bucket,
+                    Key=key,
+                    Body=b'{"state":"overwrite"}',
+                    IfNoneMatch="*",
+                )
+            except Exception as exc:
+                if not _is_precondition_failed(exc):
+                    raise
+            else:
+                raise PublicArtifactError("public object store ignores If-None-Match")
+            try:
+                self._client.put_object(
+                    Bucket=self._bucket,
+                    Key=key,
+                    Body=b'{"state":"stale"}',
+                    IfMatch="invalid-etag",
+                )
+            except Exception as exc:
+                if not _is_precondition_failed(exc):
+                    raise
+            else:
+                raise PublicArtifactError("public object store ignores If-Match")
+            self._client.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=b'{"state":"ready"}',
+                IfMatch=first[1],
+            )
+            stored = self._get_stored_optional(name)
+            if stored is None or stored[0] != b'{"state":"ready"}':
+                raise PublicArtifactError("conditional replacement was not durable")
+        finally:
+            self._client.delete_object(Bucket=self._bucket, Key=key)
+
     async def publish(self, artifacts: PublicArtifacts) -> None:
-        await asyncio.to_thread(self._guard_progress, artifacts)
         if artifacts.runtime_manifest is not None:
             await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
-        await asyncio.to_thread(self._put, "track.json", artifacts.track, False)
+        await asyncio.to_thread(self._put_mutable, "track.json", artifacts.track)
         for artifact in artifacts.files:
             await asyncio.to_thread(self._put_file_immutable, artifact)
         for name, payload in artifacts.system_matches:
             await asyncio.to_thread(self._put_immutable, name, payload)
         for name, payload in artifacts.matches:
             await asyncio.to_thread(self._put_immutable, name, payload)
+        for name, payload in artifacts.batch_groups:
+            await asyncio.to_thread(self._put_immutable, name, payload)
         if artifacts.abort is not None:
             await asyncio.to_thread(self._put_immutable, *artifacts.abort)
-        await asyncio.to_thread(self._put, "summary.json", artifacts.summary, False)
+        await asyncio.to_thread(self._put_mutable, "summary.json", artifacts.summary)
         if artifacts.status is not None:
-            await asyncio.to_thread(self._put, "status.json", artifacts.status, False)
+            await asyncio.to_thread(self._put_mutable, "status.json", artifacts.status)
         if artifacts.weights is not None:
-            await asyncio.to_thread(self._put, "weights.json", artifacts.weights, False)
-
-    def _guard_progress(self, artifacts: PublicArtifacts) -> None:
-        """Reject a sequential rollback of mutable pointers for the active track."""
-
-        current_track_payload = self._get_optional("track.json")
-        current_summary_payload = self._get_optional("summary.json")
-        if current_track_payload is None:
-            if current_summary_payload is not None:
-                raise PublicArtifactError("public summary exists without its track")
-            return
-        if (
-            current_track_payload == artifacts.track
-            and current_summary_payload == artifacts.summary
-        ):
-            return
-        current_track = _decode_canonical_object(current_track_payload, "track")
-        next_track = _decode_canonical_object(artifacts.track, "track")
-        try:
-            current_track_id = current_track["spec"]["track_id"]
-            next_track_id = next_track["spec"]["track_id"]
-        except (KeyError, TypeError) as exc:
-            raise PublicArtifactError("public track pointer is invalid") from exc
-        if current_track_id != next_track_id:
-            return
-        if current_track_payload != artifacts.track:
-            raise PublicArtifactError("an active track ID cannot change its specification")
-        if current_summary_payload is None:
-            return
-        current = _decode_canonical_object(current_summary_payload, "summary")
-        proposed = _decode_canonical_object(artifacts.summary, "summary")
-        try:
-            current_block = _integer(current["source_block"], "source_block")
-            proposed_block = _integer(proposed["source_block"], "source_block")
-            current_count = _integer(current["match_count"], "match_count")
-            proposed_count = _integer(proposed["match_count"], "match_count")
-        except KeyError as exc:
-            raise PublicArtifactError("public summary pointer is invalid") from exc
-        if proposed_block < current_block or proposed_count < current_count:
-            raise PublicArtifactError("public snapshot rollback is forbidden")
-        if proposed_block == current_block and current_summary_payload != artifacts.summary:
-            raise PublicArtifactError("one source block cannot identify two public snapshots")
+            await asyncio.to_thread(self._put_mutable, "weights.json", artifacts.weights)
 
     def _put_file_immutable(self, artifact: PublicFile) -> None:
         if self._confirmed_immutable.get(artifact.object_name) == artifact.sha256:
@@ -602,6 +618,7 @@ class S3Repository:
                 ContentType="application/octet-stream",
                 CacheControl="public, max-age=31536000, immutable",
                 Metadata={"sha256": part.sha256},
+                IfNoneMatch="*",
             )
             uploaded = self._client.head_object(Bucket=self._bucket, Key=key)
             if (
@@ -609,7 +626,7 @@ class S3Repository:
                 or uploaded.get("ContentLength") != part.size
             ):
                 raise PublicArtifactError("public chunk upload verification failed")
-        self._put(artifact.object_name, manifest.encode(), True)
+        self._put(artifact.object_name, manifest.encode(), True, if_none_match="*")
         self._confirmed_immutable[artifact.object_name] = artifact.sha256
 
     def _verify_public_chunks(self, manifest_name: str, manifest: ChunkManifest) -> None:
@@ -784,41 +801,124 @@ class S3Repository:
                 )
             self._confirmed_immutable[name] = digest
             return
-        self._put(name, payload, True)
+        self._put(name, payload, True, if_none_match="*")
         self._confirmed_immutable[name] = digest
 
-    def _put(self, name: str, payload: bytes, immutable: bool) -> None:
+    def _put_mutable(self, name: str, payload: bytes) -> None:
+        stored = self._get_stored_optional(name)
+        if stored is not None:
+            current, etag = stored
+            if current == payload:
+                return
+            self._guard_mutable(name, current, payload)
+            try:
+                self._put(name, payload, False, if_match=etag)
+            except Exception as exc:
+                if _is_precondition_failed(exc):
+                    raise PublicArtifactError(
+                        f"concurrent public pointer update was fenced: {name}"
+                    ) from exc
+                raise
+            return
+        try:
+            self._put(name, payload, False, if_none_match="*")
+        except Exception as exc:
+            if _is_precondition_failed(exc):
+                raise PublicArtifactError(
+                    f"concurrent public pointer creation was fenced: {name}"
+                ) from exc
+            raise
+
+    def _guard_mutable(self, name: str, current: bytes, proposed: bytes) -> None:
+        if name == "track.json":
+            before = _decode_canonical_object(current, "track")
+            after = _decode_canonical_object(proposed, "track")
+            try:
+                before_id = before["spec"]["track_id"]
+                after_id = after["spec"]["track_id"]
+                before_start = _integer(before["spec"]["track_start_block"], "track_start_block")
+                after_start = _integer(after["spec"]["track_start_block"], "track_start_block")
+            except (KeyError, TypeError) as exc:
+                raise PublicArtifactError("public track pointer is invalid") from exc
+            if before_id == after_id or after_start <= before_start:
+                raise PublicArtifactError("public track pointer rollback is forbidden")
+            return
+        if name == "weights.json":
+            before_weight = decode_weight_artifact(current)
+            after_weight = decode_weight_artifact(proposed)
+            if before_weight.track_id != after_weight.track_id:
+                if after_weight.track_id != self._active_track_id():
+                    raise PublicArtifactError("public pointer targets an inactive track")
+                return
+            before_block = before_weight.source_block
+            after_block = after_weight.source_block
+            before_count = after_count = 0
+        else:
+            before = _decode_canonical_object(current, name)
+            after = _decode_canonical_object(proposed, name)
+            try:
+                if before["track_id"] != after["track_id"]:
+                    if after["track_id"] != self._active_track_id():
+                        raise PublicArtifactError("public pointer targets an inactive track")
+                    return
+                before_block = _integer(before["source_block"], "source_block")
+                after_block = _integer(after["source_block"], "source_block")
+                before_count = _integer(before.get("match_count", 0), "match_count")
+                after_count = _integer(after.get("match_count", 0), "match_count")
+            except KeyError as exc:
+                raise PublicArtifactError(f"public pointer is invalid: {name}") from exc
+        if after_block < before_block or after_count < before_count:
+            raise PublicArtifactError("public snapshot rollback is forbidden")
+        if after_block == before_block:
+            raise PublicArtifactError("one source block cannot identify two public snapshots")
+
+    def _active_track_id(self) -> str:
+        payload = self._get_optional("track.json")
+        if payload is None:
+            raise PublicArtifactError("public mutable pointer exists without its track")
+        document = _decode_canonical_object(payload, "track")
+        try:
+            track_id = document["spec"]["track_id"]
+        except (KeyError, TypeError) as exc:
+            raise PublicArtifactError("public track pointer is invalid") from exc
+        if not isinstance(track_id, str) or not track_id:
+            raise PublicArtifactError("public track pointer is invalid")
+        return track_id
+
+    def _put(
+        self,
+        name: str,
+        payload: bytes,
+        immutable: bool,
+        *,
+        if_match: str | None = None,
+        if_none_match: str | None = None,
+    ) -> None:
         if not payload or len(payload) > _MAX_PUBLIC_OBJECT_BYTES:
             raise PublicArtifactError(f"public object size is invalid: {name}")
-        self._client.put_object(
-            Bucket=self._bucket,
-            Key=f"{self._prefix}/{name}",
-            Body=payload,
-            ContentType="application/json; charset=utf-8",
-            CacheControl=(
+        arguments = {
+            "Bucket": self._bucket,
+            "Key": f"{self._prefix}/{name}",
+            "Body": payload,
+            "ContentType": "application/json; charset=utf-8",
+            "CacheControl": (
                 "public, max-age=31536000, immutable" if immutable else "no-store, max-age=0"
             ),
-        )
+        }
+        if if_match is not None:
+            arguments["IfMatch"] = if_match
+        if if_none_match is not None:
+            arguments["IfNoneMatch"] = if_none_match
+        self._client.put_object(**arguments)
 
-    def _get_optional(self, name: str) -> bytes | None:
+    def _get_stored_optional(self, name: str) -> tuple[bytes, str] | None:
         try:
             response = self._client.get_object(
                 Bucket=self._bucket,
                 Key=f"{self._prefix}/{name}",
             )
         except Exception as exc:
-            response_data = getattr(exc, "response", None)
-            code = (
-                response_data.get("Error", {}).get("Code")
-                if isinstance(response_data, dict)
-                else None
-            )
-            status = (
-                response_data.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                if isinstance(response_data, dict)
-                else None
-            )
-            if status == 404 or code in {"NoSuchKey", "404", "NotFound"}:
+            if _is_missing(exc):
                 return None
             raise
         body = response.get("Body")
@@ -829,7 +929,14 @@ class S3Repository:
             raise PublicArtifactError(f"storage returned a non-byte object body: {name}")
         if not payload or len(payload) > _MAX_PUBLIC_OBJECT_BYTES:
             raise PublicArtifactError(f"public object size is invalid: {name}")
-        return payload
+        etag = response.get("ETag")
+        if not isinstance(etag, str) or not etag:
+            raise PublicArtifactError(f"storage omitted object ETag: {name}")
+        return payload, etag.strip('"')
+
+    def _get_optional(self, name: str) -> bytes | None:
+        stored = self._get_stored_optional(name)
+        return None if stored is None else stored[0]
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -1035,3 +1142,21 @@ def _integer(value: Any, name: str, *, maximum: int | None = None) -> int:
     if type(value) is not int or value < 0 or (maximum is not None and value > maximum):
         raise PublicArtifactError(f"{name} is invalid")
     return value
+
+
+def _is_missing(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    code = response.get("Error", {}).get("Code")
+    return status == 404 or str(code) in {"404", "NoSuchKey", "NotFound"}
+
+
+def _is_precondition_failed(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    code = response.get("Error", {}).get("Code")
+    return status == 412 or str(code) in {"412", "PreconditionFailed"}

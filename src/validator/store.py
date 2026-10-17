@@ -596,11 +596,18 @@ class ChallengeStore:
             JOIN submissions s ON s.submission_id = c.submission_id
             JOIN stage_scores score
               ON score.challenge_id = c.challenge_id AND score.stage = ?
-            WHERE c.state = ? AND score.score_block BETWEEN ? AND ?
+            WHERE (
+                    c.state = ?
+                 OR (c.state IN (?, ?) AND c.resume_state = ?)
+                  )
+              AND score.score_block BETWEEN ? AND ?
             ORDER BY s.block_height, s.extrinsic_index, s.event_index
             """,
             (
                 ChallengeState.SCORING,
+                ChallengeState.CONFIRMING,
+                ChallengeState.SYSTEM_DEFERRED,
+                ChallengeState.SYSTEM_BLOCKED,
                 ChallengeState.CONFIRMING,
                 first_decision_block,
                 last_decision_block,
@@ -853,9 +860,13 @@ class ChallengeStore:
         worker_id: str,
         *,
         lease_ms: int,
+        ready_through_block: int | None = None,
         now_ms: int | None = None,
     ) -> LeasedChallenge | None:
         """Claim the oldest authoritative scoring task without bypassing FIFO."""
+
+        if ready_through_block is not None and ready_through_block < 0:
+            return None
 
         return self._claim_next(
             worker_id,
@@ -865,7 +876,57 @@ class ChallengeStore:
             lease_ms=lease_ms,
             now_ms=now_ms,
             ready_through_block=None,
+            scoring_ready_through_block=ready_through_block,
         )
+
+    def wait_leased(
+        self,
+        identifier: str,
+        lease_token: str,
+        *,
+        retry_after_ms: int,
+        reason: str,
+        occurred_at_ms: int | None = None,
+    ) -> None:
+        """Release a normal data-pipeline wait without consuming a failure attempt."""
+
+        timestamp = _timestamp(occurred_at_ms)
+        if retry_after_ms <= timestamp:
+            raise ValueError("retry time must be in the future")
+        if not reason:
+            raise ValueError("wait reason cannot be empty")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._require_lease_locked(identifier, lease_token)
+            if current not in {ChallengeState.SCORING, ChallengeState.CONFIRMING}:
+                raise ValueError("challenge is not waiting for evaluation data")
+            self._transition_locked(
+                identifier,
+                ChallengeState.SYSTEM_DEFERRED,
+                timestamp=timestamp,
+                error_code=None,
+                error_summary=None,
+                details={
+                    "resume_state": current,
+                    "retry_after_ms": retry_after_ms,
+                    "wait_reason": reason,
+                },
+            )
+            self._connection.execute(
+                """
+                UPDATE challenges
+                SET lease_token = NULL, lease_expires_at_ms = NULL,
+                    resume_state = ?, retry_after_ms = ?,
+                    attempts = max(attempts - 1, 0),
+                    total_attempts = max(total_attempts - 1, 0)
+                WHERE challenge_id = ?
+                """,
+                (current, retry_after_ms, identifier),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def earlier_reference_owner(self, identifier: str) -> str | None:
         """Return the earliest still-valid challenge for the same immutable HF reference."""
@@ -1855,6 +1916,7 @@ class ChallengeStore:
         lease_ms: int,
         now_ms: int | None,
         ready_through_block: int | None,
+        scoring_ready_through_block: int | None = None,
     ) -> LeasedChallenge | None:
         if not worker_id:
             raise ValueError("worker id cannot be empty")
@@ -1908,6 +1970,31 @@ class ChallengeStore:
             if row is None:
                 self._connection.commit()
                 return None
+            current = ChallengeState(row["state"])
+            effective_stage = (
+                ChallengeState(row["resume_state"])
+                if current is ChallengeState.SYSTEM_DEFERRED
+                else current
+            )
+            if scoring_ready_through_block is not None:
+                if effective_stage is ChallengeState.SCORING:
+                    decision_block = row["block_height"]
+                elif effective_stage is ChallengeState.CONFIRMING:
+                    exact = self._connection.execute(
+                        """
+                        SELECT score_block FROM stage_scores
+                        WHERE challenge_id = ? AND stage = ?
+                        """,
+                        (row["challenge_id"], ChallengeState.SCORING),
+                    ).fetchone()
+                    if exact is None:
+                        raise RuntimeError("confirmation challenge has no exact-stage decision")
+                    decision_block = exact["score_block"]
+                else:
+                    raise RuntimeError("scoring claim selected a non-scoring stage")
+                if decision_block > scoring_ready_through_block:
+                    self._connection.commit()
+                    return None
             if strict_fifo and not include_queued:
                 terminal_placeholders = ",".join("?" for _ in TERMINAL_STATES)
                 earlier = self._connection.execute(
@@ -1938,7 +2025,6 @@ class ChallengeStore:
                 self._connection.commit()
                 return None
 
-            current = ChallengeState(row["state"])
             if current is ChallengeState.QUEUED:
                 target = ChallengeState.FETCHING
                 self._transition_locked(

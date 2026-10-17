@@ -11,6 +11,7 @@ from scoring.spec import parse_track_spec
 from tests.scoring.test_spec import valid_spec
 from validator import chunks
 from validator import publication as publication_module
+from validator.production.batches import BatchDisclosure, DisclosureFile
 from validator.publication import (
     PublicArtifactError,
     PublicArtifacts,
@@ -34,15 +35,29 @@ class MemoryS3:
         self.objects = {}
         self.metadata = {}
         self.calls = []
+        self.before_put = None
 
     def get_object(self, *, Bucket, Key):
         del Bucket
         if Key not in self.objects:
             raise MissingObject
-        return {"Body": io.BytesIO(self.objects[Key])}
+        return {
+            "Body": io.BytesIO(self.objects[Key]),
+            "ETag": f'"{hashlib.md5(self.objects[Key], usedforsecurity=False).hexdigest()}"',
+        }
 
     def put_object(self, **kwargs) -> None:
         self.calls.append(kwargs)
+        if self.before_put is not None:
+            self.before_put(kwargs)
+        existing = self.objects.get(kwargs["Key"])
+        etag = (
+            None if existing is None else hashlib.md5(existing, usedforsecurity=False).hexdigest()
+        )
+        if kwargs.get("IfNoneMatch") == "*" and existing is not None:
+            raise precondition_failed()
+        if "IfMatch" in kwargs and kwargs["IfMatch"] != etag:
+            raise precondition_failed()
         self.objects[kwargs["Key"]] = kwargs["Body"]
         self.metadata[kwargs["Key"]] = kwargs.get("Metadata", {})
 
@@ -52,8 +67,23 @@ class MemoryS3:
             raise MissingObject
         return {
             "ContentLength": len(self.objects[Key]),
+            "ETag": f'"{hashlib.md5(self.objects[Key], usedforsecurity=False).hexdigest()}"',
             "Metadata": self.metadata.get(Key, {}),
         }
+
+    def delete_object(self, *, Bucket, Key):
+        del Bucket
+        self.objects.pop(Key, None)
+        self.metadata.pop(Key, None)
+
+
+def precondition_failed():
+    error = RuntimeError("precondition failed")
+    error.response = {
+        "Error": {"Code": "PreconditionFailed"},
+        "ResponseMetadata": {"HTTPStatusCode": 412},
+    }
+    return error
 
 
 def weight_artifact() -> WeightArtifact:
@@ -128,7 +158,9 @@ def test_public_repository_rejects_active_track_pointer_rollback() -> None:
     current = PublicArtifacts(
         source_block=10,
         track=track,
-        summary=encoded({"source_block": 10, "match_count": 1, "marker": "current"}),
+        summary=encoded(
+            {"track_id": "track", "source_block": 10, "match_count": 1, "marker": "current"}
+        ),
         weights=b"{}",
         matches=(),
     )
@@ -142,7 +174,14 @@ def test_public_repository_rejects_active_track_pointer_rollback() -> None:
                 PublicArtifacts(
                     source_block=9,
                     track=track,
-                    summary=encoded({"source_block": 9, "match_count": 1, "marker": "older"}),
+                    summary=encoded(
+                        {
+                            "track_id": "track",
+                            "source_block": 9,
+                            "match_count": 1,
+                            "marker": "older",
+                        }
+                    ),
                     weights=b"{}",
                     matches=(),
                 )
@@ -154,12 +193,111 @@ def test_public_repository_rejects_active_track_pointer_rollback() -> None:
                 PublicArtifacts(
                     source_block=10,
                     track=track,
-                    summary=encoded({"source_block": 10, "match_count": 1, "marker": "conflict"}),
+                    summary=encoded(
+                        {
+                            "track_id": "track",
+                            "source_block": 10,
+                            "match_count": 1,
+                            "marker": "conflict",
+                        }
+                    ),
                     weights=b"{}",
                     matches=(),
                 )
             )
         )
+
+
+def test_public_repository_capability_probe_checks_and_cleans_conditions() -> None:
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+
+    repository.verify_conditional_writes()
+
+    assert client.objects == {}
+
+
+def test_public_repository_rejects_backend_that_ignores_conditions() -> None:
+    class UnsafeS3(MemoryS3):
+        def put_object(self, **kwargs):
+            kwargs.pop("IfMatch", None)
+            kwargs.pop("IfNoneMatch", None)
+            return super().put_object(**kwargs)
+
+    repository = S3Repository(UnsafeS3(), bucket="public-data", prefix="tracks/main")
+
+    with pytest.raises(PublicArtifactError, match="ignores If-None-Match"):
+        repository.verify_conditional_writes()
+
+
+def test_concurrent_stale_summary_write_is_fenced() -> None:
+    def encoded(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    track = encoded({"spec": {"track_id": "track"}, "track_spec_digest": "ab" * 32})
+
+    def artifacts(block):
+        return PublicArtifacts(
+            source_block=block,
+            track=track,
+            summary=encoded(
+                {
+                    "track_id": "track",
+                    "source_block": block,
+                    "match_count": 1,
+                }
+            ),
+            weights=b"{}",
+            matches=(),
+        )
+
+    client = MemoryS3()
+    stale = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    current = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    asyncio.run(current.publish(artifacts(10)))
+
+    def interleave(arguments):
+        if arguments["Key"] != "tracks/main/summary.json" or "IfMatch" not in arguments:
+            return
+        client.before_put = None
+        current._put_mutable("summary.json", artifacts(12).summary)
+
+    client.before_put = interleave
+    with pytest.raises(PublicArtifactError, match="fenced"):
+        asyncio.run(stale.publish(artifacts(11)))
+
+    assert json.loads(client.objects["tracks/main/summary.json"])["source_block"] == 12
+
+
+def test_pointer_from_previous_track_cannot_overwrite_active_track() -> None:
+    def encoded(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    old_track = encoded(
+        {
+            "spec": {"track_id": "old", "track_start_block": 10},
+            "track_spec_digest": "ab" * 32,
+        }
+    )
+    new_track = encoded(
+        {
+            "spec": {"track_id": "new", "track_start_block": 20},
+            "track_spec_digest": "cd" * 32,
+        }
+    )
+    old_summary = encoded({"track_id": "old", "source_block": 11, "match_count": 0})
+    new_summary = encoded({"track_id": "new", "source_block": 21, "match_count": 0})
+    stale_summary = encoded({"track_id": "old", "source_block": 22, "match_count": 0})
+
+    repository._put_mutable("track.json", old_track)
+    repository._put_mutable("summary.json", old_summary)
+    repository._put_mutable("track.json", new_track)
+    repository._put_mutable("summary.json", new_summary)
+
+    with pytest.raises(PublicArtifactError, match="inactive track"):
+        repository._put_mutable("summary.json", stale_summary)
 
 
 def test_fetch_weight_artifact_is_https_only_and_size_bounded() -> None:
@@ -229,11 +367,7 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
 
     client.calls.clear()
     asyncio.run(publisher.publish(artifacts))
-    assert [call["Key"] for call in client.calls if "Body" in call] == [
-        "veda/track/track.json",
-        "veda/track/summary.json",
-        "veda/track/weights.json",
-    ]
+    assert [call["Key"] for call in client.calls if "Body" in call] == []
 
     conflicting = PublicArtifacts(
         120,
@@ -302,11 +436,7 @@ def test_storage_publishes_large_files_as_bounded_verified_chunks(tmp_path, monk
     client.calls.clear()
     restarted = S3Repository(client, bucket="public-data", prefix="tracks/main")
     asyncio.run(restarted.publish(artifacts))
-    assert [call["Key"] for call in client.calls if "Body" in call] == [
-        "tracks/main/track.json",
-        "tracks/main/summary.json",
-        "tracks/main/weights.json",
-    ]
+    assert [call["Key"] for call in client.calls if "Body" in call] == []
 
     del client.objects[prefix + "part-00001"]
     with pytest.raises(PublicArtifactError, match="chunk is missing"):
@@ -315,8 +445,11 @@ def test_storage_publishes_large_files_as_bounded_verified_chunks(tmp_path, monk
         )
 
 
-def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
+def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) -> None:
     track = parse_track_spec(valid_spec())
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"model")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
     snapshot = {
         "challenges": [
             two_stage_challenge(
@@ -331,9 +464,9 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
                     "event_index": 0,
                     "state": "SUCCEEDED",
                     "error_code": None,
-                    "file_sha256": "ab" * 32,
+                    "file_sha256": model_sha256,
                     "model_digest": "cd" * 32,
-                    "model_size_bytes": 123,
+                    "model_size_bytes": model.stat().st_size,
                     "final_score": 0.8,
                     "incumbent_score": 0.5,
                     "paired_gain_lower_bound": 0.3,
@@ -353,6 +486,7 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
         active_competitors=lambda _mapping: [],
+        model_path=lambda _challenge_id: str(model),
     )
     chain = WeightChainState(120, {"alice": 4}, 1, 1.0, 10, {"alice": 0})
     artifacts = build_public_artifacts(store, track, chain, version_key=0)
@@ -479,8 +613,11 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
     assert json.loads(recovered.status)["track_phase"] == "TRACK_ABORTED"
 
 
-def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None:
+def test_storage_loader_recovers_match_uploaded_before_mutable_summary(tmp_path) -> None:
     track = parse_track_spec(valid_spec())
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"model")
+    model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
     first = two_stage_challenge(
         {
             "challenge_id": "challenge-1",
@@ -493,9 +630,9 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
             "event_index": 0,
             "state": "SUCCEEDED",
             "error_code": None,
-            "file_sha256": "ab" * 32,
+            "file_sha256": model_sha256,
             "model_digest": "cd" * 32,
-            "model_size_bytes": 123,
+            "model_size_bytes": model.stat().st_size,
             "final_score": 0.8,
             "incumbent_score": 0.5,
             "paired_gain_lower_bound": 0.3,
@@ -514,6 +651,7 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
         active_competitors=lambda _mapping: [],
+        model_path=lambda _challenge_id: str(model),
     )
     chain = WeightChainState(120, {"alice": 4, "bob": 5}, 1, 1.0, 10, {})
     committed = build_public_artifacts(store, track, chain, version_key=0)
@@ -569,6 +707,8 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
 def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     monkeypatch, tmp_path
 ) -> None:
+    model_path = tmp_path / "model.safetensors"
+    model_path.write_bytes(b"model")
     snapshot = {
         "challenges": [
             two_stage_challenge(
@@ -605,7 +745,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
         active_competitors=lambda _mapping: [],
-        model_path=lambda _challenge_id: None,
+        model_path=lambda _challenge_id: str(model_path),
     )
     track = SimpleNamespace(
         track_id="track",
@@ -654,14 +794,36 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     assert public_summary["leaderboard_total"] == 2
     assert public_match["outcome"] == "CHALLENGER_WON"
 
+    def disclosure(plan_digest, challenge_ids):
+        batch = next(
+            stage["evaluation_batch"]
+            for stage in snapshot["challenges"][0]["stages"]
+            if stage["evaluation_batch"]["plan_digest"] == plan_digest
+        )
+        return BatchDisclosure(
+            challenge_ids,
+            f"batch_groups/{plan_digest}.json",
+            b"{}",
+            (
+                DisclosureFile(
+                    f"batches/{batch['sha256']}/manifest.json",
+                    tmp_path / "batch.npz",
+                    batch["sha256"],
+                ),
+                DisclosureFile(
+                    f"batch_assets/{plan_digest}/manifest.json",
+                    tmp_path / "asset",
+                    plan_digest,
+                ),
+            ),
+        )
+
     withheld = build_public_artifacts(
         store,
         track,
         chain,
         version_key=9,
-        exact_cache_dir=tmp_path,
-        batch_reference_resolver=lambda _digest: ("challenge", "pending"),
-        model_resolver=lambda _digest, _size: tmp_path / "model.safetensors",
+        batch_disclosure_resolver=lambda digest: disclosure(digest, ("challenge", "pending")),
     )
     assert withheld is not None
     assert not any(item.object_name.startswith("batches/") for item in withheld.files)
@@ -670,12 +832,12 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         track,
         chain,
         version_key=9,
-        exact_cache_dir=tmp_path,
-        batch_reference_resolver=lambda _digest: ("challenge",),
-        model_resolver=lambda _digest, _size: tmp_path / "model.safetensors",
+        batch_disclosure_resolver=lambda digest: disclosure(digest, ("challenge",)),
     )
     assert disclosed is not None
     assert sum(item.object_name.startswith("batches/") for item in disclosed.files) == 2
+    assert sum(item.object_name.startswith("batch_assets/") for item in disclosed.files) == 2
+    assert len(disclosed.batch_groups) == 2
 
     store.chain_cursor = lambda: (119, "0x" + "11" * 32)
     assert build_public_artifacts(store, track, chain, version_key=9) is None

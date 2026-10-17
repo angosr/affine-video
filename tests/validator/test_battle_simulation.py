@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 from types import SimpleNamespace
@@ -29,9 +30,20 @@ class MemoryS3:
         del Bucket
         if Key not in self.objects:
             raise MissingObject
-        return {"Body": io.BytesIO(self.objects[Key])}
+        return {
+            "Body": io.BytesIO(self.objects[Key]),
+            "ETag": f'"{hashlib.md5(self.objects[Key], usedforsecurity=False).hexdigest()}"',
+        }
 
     def put_object(self, **kwargs) -> None:
+        existing = self.objects.get(kwargs["Key"])
+        etag = (
+            None if existing is None else hashlib.md5(existing, usedforsecurity=False).hexdigest()
+        )
+        if kwargs.get("IfNoneMatch") == "*" and existing is not None:
+            raise precondition_failed()
+        if "IfMatch" in kwargs and kwargs["IfMatch"] != etag:
+            raise precondition_failed()
         self.objects[kwargs["Key"]] = kwargs["Body"]
         self.metadata[kwargs["Key"]] = kwargs.get("Metadata", {})
 
@@ -41,8 +53,22 @@ class MemoryS3:
             raise MissingObject
         return {
             "ContentLength": len(self.objects[Key]),
+            "ETag": f'"{hashlib.md5(self.objects[Key], usedforsecurity=False).hexdigest()}"',
             "Metadata": self.metadata.get(Key, {}),
         }
+
+    def delete_object(self, *, Bucket, Key):
+        del Bucket
+        self.objects.pop(Key, None)
+
+
+def precondition_failed():
+    error = RuntimeError("precondition failed")
+    error.response = {
+        "Error": {"Code": "PreconditionFailed"},
+        "ResponseMetadata": {"HTTPStatusCode": 412},
+    }
+    return error
 
 
 def challenge(
@@ -158,6 +184,13 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch(tmp_path) -
             error_code="REJECTED_DUPLICATE_HOTKEY",
         ),
     ]
+    winning_model = tmp_path / "winning.safetensors"
+    winning_model.write_bytes(b"winning selector")
+    winning_digest = hashlib.sha256(winning_model.read_bytes()).hexdigest()
+    for item in challenges:
+        if item["state"] == "SUCCEEDED":
+            item["file_sha256"] = winning_digest
+            item["model_size_bytes"] = winning_model.stat().st_size
     competitors = [
         {
             "uid": uid,
@@ -175,7 +208,7 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch(tmp_path) -
         chain_cursor=lambda: (300, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": challenges},
         active_competitors=lambda _mapping: competitors,
-        model_path=lambda _challenge_id: None,
+        model_path=lambda _challenge_id: str(winning_model),
     )
     chain = WeightChainState(
         300,
@@ -233,16 +266,16 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch(tmp_path) -
         resolved.append((sha256, size_bytes))
         return restored
 
+    store.model_path = lambda _challenge_id: None
     with_files = build_public_artifacts(
         store,
         track,
         chain,
         version_key=1,
-        exact_cache_dir=tmp_path,
         model_resolver=restore_model,
     )
     assert with_files is not None
-    assert resolved == [("ab" * 32, 550_000_000)] * 2
+    assert resolved == [(winning_digest, winning_model.stat().st_size)] * 2
     assert sum(item.object_name.startswith("models/") for item in with_files.files) == 1
 
     remote = MemoryS3()

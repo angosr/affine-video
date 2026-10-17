@@ -430,11 +430,16 @@ def test_model_is_durably_archived_before_entering_scoring(tmp_path) -> None:
 def test_archive_failure_defers_without_consuming_the_submission(tmp_path) -> None:
     model = tmp_path / "selector.safetensors"
     write_model(model, "hk1")
+    alerts = []
 
     def unavailable(*_args):
         raise RuntimeError("object store unavailable")
 
-    configured = replace(settings(tmp_path), archive=unavailable)
+    configured = replace(
+        settings(tmp_path),
+        archive=unavailable,
+        alert=lambda event, details: alerts.append((event, details)),
+    )
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
         outcome = process_next_admission(
@@ -451,6 +456,16 @@ def test_archive_failure_defers_without_consuming_the_submission(tmp_path) -> No
         assert challenge.state is ChallengeState.SYSTEM_DEFERRED
         assert challenge.error_code == "MODEL_ARCHIVE_UNAVAILABLE"
         assert store.leaderboard() == []
+        assert alerts == [
+            (
+                "ADMISSION_RETRY_STARTED",
+                {
+                    "challenge_id": identifier,
+                    "attempts": 1,
+                    "code": "MODEL_ARCHIVE_UNAVAILABLE",
+                },
+            )
+        ]
 
 
 def test_admission_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:

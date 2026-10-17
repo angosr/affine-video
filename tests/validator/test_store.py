@@ -850,6 +850,29 @@ def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -
         assert store.confirmation_challenge_ids(150, 150) == (identifier,)
         assert store.confirmation_challenge_ids(151, 151) == ()
 
+        confirming = store.claim_next_scoring("confirm", lease_ms=1_000, now_ms=17)
+        assert confirming is not None
+        store.defer_leased(
+            identifier,
+            confirming.lease_token,
+            retry_after_ms=19,
+            error_code="CONFIRMATION_BATCH_UNAVAILABLE",
+            error_summary="batch is still being generated",
+            occurred_at_ms=18,
+        )
+        assert store.confirmation_challenge_ids(150, 150) == (identifier,)
+
+        confirming = store.claim_next_scoring("confirm", lease_ms=1_000, now_ms=20)
+        assert confirming is not None
+        store.block_leased(
+            identifier,
+            confirming.lease_token,
+            error_code="CONFIRMATION_BATCH_UNAVAILABLE",
+            error_summary="generator requires operator repair",
+            occurred_at_ms=21,
+        )
+        assert store.confirmation_challenge_ids(150, 150) == (identifier,)
+
 
 def test_public_challenge_reads_state_and_history_from_one_snapshot(monkeypatch, tmp_path) -> None:
     database = tmp_path / "validator.db"

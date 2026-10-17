@@ -556,6 +556,7 @@ def test_participant_failure_is_terminal_but_temporary_failure_retries(tmp_path)
 
 
 def test_repeated_infrastructure_failure_remains_retryable(tmp_path) -> None:
+    alerts = []
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier = ready_for_scoring(store)
 
@@ -566,13 +567,99 @@ def test_repeated_infrastructure_failure_remains_retryable(tmp_path) -> None:
             store,
             worker_id="worker",
             current_finalized_block=100,
-            settings=ScoringSettings(),
+            settings=ScoringSettings(alert=lambda event, details: alerts.append((event, details))),
             evaluator=unavailable,
             now_ms=20,
         )
 
         assert outcome is not None and outcome.state is ChallengeState.SYSTEM_DEFERRED
         assert store.get_challenge(identifier).score_block is None
+        assert alerts == [
+            (
+                "SCORING_RETRY_STARTED",
+                {
+                    "challenge_id": identifier,
+                    "attempts": 1,
+                    "code": "SCORING_UNAVAILABLE",
+                    "stage": "SCORING",
+                },
+            )
+        ]
+
+
+def test_future_generation_boundary_is_not_claimed_as_a_scoring_attempt(tmp_path) -> None:
+    class FutureBatch:
+        def ready_through_block(self, _head):
+            return 99
+
+        def __call__(self, _task):
+            raise AssertionError("future evaluation data must not be requested")
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_scoring(store)
+
+        outcome = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=100,
+            settings=ScoringSettings(),
+            evaluator=FutureBatch(),
+            now_ms=20,
+        )
+
+        assert outcome is None
+        challenge = store.get_challenge(identifier)
+        assert challenge.state is ChallengeState.SCORING
+        assert challenge.attempts == 0
+
+
+def test_normal_producer_lag_waits_without_attempt_or_alert(tmp_path) -> None:
+    alerts = []
+
+    class ProducerBatch:
+        ready = False
+
+        def ready_through_block(self, _head):
+            return 100
+
+        def batch_ready(self, _task):
+            return self.ready
+
+        def __call__(self, _task):
+            return StageOutcome(0.7, {"stage": "scoring"})
+
+    evaluator = ProducerBatch()
+    settings = ScoringSettings(
+        retry_base_ms=10,
+        retry_max_ms=10,
+        alert=lambda event, details: alerts.append((event, details)),
+    )
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_scoring(store)
+        waiting = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=100,
+            settings=settings,
+            evaluator=evaluator,
+            now_ms=20,
+        )
+        assert waiting is not None
+        assert waiting.code == "EVALUATION_BATCH_PENDING"
+        assert store.get_challenge(identifier).attempts == 0
+        assert store.public_challenge(identifier)["attempts"] == 0
+        assert alerts == []
+
+        evaluator.ready = True
+        completed = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=100,
+            settings=settings,
+            evaluator=evaluator,
+            now_ms=31,
+        )
+        assert completed is not None and completed.state is ChallengeState.SUCCEEDED
 
 
 def test_scoring_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:

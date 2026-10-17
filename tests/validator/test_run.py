@@ -20,7 +20,7 @@ from validator.queue import ChainPosition, ChallengeState
 from validator.run import EvaluationCycleResult, process_cycle, process_weight_cycle
 from validator.scoring import ScoringSettings, StageOutcome
 from validator.store import ChallengeStore
-from validator.tournament import Champion, resolve_tournament
+from validator.tournament import Champion, MatchOutcome, resolve_tournament
 from validator.weights import (
     WeightArtifact,
     WeightChainState,
@@ -374,10 +374,8 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         ChallengeState.SCORING,
         ChallengeState.SUCCEEDED,
     ]
-    assert plan is not None
-    assert plan.hotkeys == (HOTKEY,)
-    assert plan.uids == (4,)
-    assert plan.weights == (1.0,)
+    assert tournament.matches[0].outcome is MatchOutcome.CHAMPION_RETAINED
+    assert plan is None
 
 
 def test_cycle_releases_scoring_lease_when_fresh_finalized_head_is_unavailable(tmp_path) -> None:

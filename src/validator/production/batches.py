@@ -20,7 +20,7 @@ from scoring.cache import (
 )
 from scoring.exact import GLOBAL_SEGMENT, REFERENCE_SEGMENT, TARGET_SEGMENT
 from scoring.spec import TrackSpec
-from validator.production.commitment import verify_source_proof
+from validator.production.commitment import canonical_json, verify_source_proof
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
@@ -42,6 +42,21 @@ class ArchivedStage:
     score: float
     score_block: int
     metrics: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class DisclosureFile:
+    object_name: str
+    path: Path
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class BatchDisclosure:
+    challenge_ids: tuple[str, ...]
+    record_name: str
+    record_payload: bytes
+    files: tuple[DisclosureFile, ...]
 
 
 class ReadyBatchSource:
@@ -212,9 +227,81 @@ class ReadyBatchSource:
             references.append((reference, path))
         return ConfirmationBatch(plan, self._restore_exact(plan), tuple(references))
 
+    def is_ready(self, challenge_id: str, *, confirmation: bool) -> bool:
+        """Return whether the one frozen plan for this stage reached READY."""
+
+        matches = []
+        for name in self.objects.list_names("plans/"):
+            if not name.startswith("plans/") or not name.endswith(".json"):
+                raise RuntimeError("private plan index contains an unexpected object")
+            plan = BatchPlan.decode(self.objects.get(name).body)
+            self._validate_plan(name, plan)
+            identifiers = (
+                plan.confirmation_challenge_ids if confirmation else plan.exact_challenge_ids
+            )
+            if challenge_id in identifiers:
+                matches.append(plan)
+        if len(matches) > 1:
+            raise RuntimeError("challenge is assigned to multiple private plans")
+        return bool(matches and matches[0].state == "READY")
+
     def batch_challenge_ids(self, plan_digest: str) -> tuple[str, ...]:
         """Return every challenge sharing a plan, for delayed public disclosure."""
 
+        plan = self._plan_by_digest(plan_digest)
+        return tuple(dict.fromkeys(plan.exact_challenge_ids + plan.confirmation_challenge_ids))
+
+    def public_disclosure(self, plan_digest: str) -> BatchDisclosure:
+        """Restore every byte needed to independently replay one terminal batch group."""
+
+        plan = self._plan_by_digest(plan_digest)
+        assert plan.exact is not None
+        exact = self._restore_exact(plan)
+        files = [
+            DisclosureFile(
+                f"batches/{plan.exact.sha256}/manifest.json",
+                exact.path,
+                plan.exact.sha256,
+            )
+        ]
+        references = []
+        directory = self.cache_dir / "disclosures" / plan.plan_digest
+        for reference in plan.dense_references:
+            public = {"rollout_id": reference.rollout_id}
+            for kind, item, suffix in (
+                ("video", reference.video, ".mp4"),
+                ("latent", reference.latent, ".safetensors"),
+            ):
+                path = self.objects.download_content(
+                    item.object_key,
+                    directory / f"{item.sha256}{suffix}",
+                    sha256=item.sha256,
+                    size_bytes=item.size_bytes,
+                )
+                object_name = f"batch_assets/{item.sha256}/manifest.json"
+                files.append(DisclosureFile(object_name, path, item.sha256))
+                public[kind] = {
+                    "object": object_name,
+                    "sha256": item.sha256,
+                    "size_bytes": item.size_bytes,
+                }
+            references.append(public)
+        record = canonical_json(
+            {
+                "format": "veda-batch-disclosure-v1",
+                "plan": plan.document(),
+                "public_exact_object": f"batches/{plan.exact.sha256}/manifest.json",
+                "public_dense_references": references,
+            }
+        )
+        return BatchDisclosure(
+            tuple(dict.fromkeys(plan.exact_challenge_ids + plan.confirmation_challenge_ids)),
+            f"batch_groups/{plan.plan_digest}.json",
+            record,
+            tuple(files),
+        )
+
+    def _plan_by_digest(self, plan_digest: str) -> BatchPlan:
         if len(plan_digest) != 64:
             raise ValueError("plan digest must contain 32 bytes")
         try:
@@ -234,7 +321,7 @@ class ReadyBatchSource:
         plan = matches[0]
         if plan.state != "READY":
             raise RuntimeError("evaluation batch plan is not READY")
-        return tuple(dict.fromkeys(plan.exact_challenge_ids + plan.confirmation_challenge_ids))
+        return plan
 
     def prune_disclosed(self, terminal_challenge_ids: set[str]) -> int:
         """Remove only local copies of READY batches whose whole group is terminal."""
@@ -256,6 +343,10 @@ class ReadyBatchSource:
             dense = self.cache_dir / "dense" / plan.plan_digest
             if dense.is_dir():
                 shutil.rmtree(dense)
+                removed += 1
+            disclosure = self.cache_dir / "disclosures" / plan.plan_digest
+            if disclosure.is_dir():
+                shutil.rmtree(disclosure)
                 removed += 1
         return removed
 

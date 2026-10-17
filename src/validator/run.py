@@ -135,6 +135,11 @@ async def run_evaluator(
         webhook_alerter(alert_webhook_url, service="veda-evaluator") if alert_webhook_url else None
     )
     track = load_track_spec(track_spec)
+    if production_config is not None:
+        verify_public_storage = getattr(publisher, "verify_conditional_writes", None)
+        if verify_public_storage is None:
+            raise ValueError("production publisher must verify conditional writes")
+        await asyncio.to_thread(verify_public_storage)
     ledger = await publisher.load(track)
     cache_dir = Path(exact_cache)
     if not cache_dir.is_dir():
@@ -299,11 +304,10 @@ async def run_evaluator(
                                     track,
                                     chain,
                                     version_key=version_key,
-                                    exact_cache_dir=cache_dir,
-                                    batch_reference_resolver=(
+                                    batch_disclosure_resolver=(
                                         None
                                         if batch_source is None
-                                        else batch_source.batch_challenge_ids
+                                        else batch_source.public_disclosure
                                     ),
                                     model_resolver=(
                                         None if batch_source is None else batch_source.restore_model

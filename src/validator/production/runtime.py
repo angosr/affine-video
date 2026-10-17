@@ -152,7 +152,10 @@ class DenseRolloutRuntime:
             for name in sorted(expected):
                 state[name] = tensors.get_tensor(name)
         predictor.load_state_dict(state, strict=True)
-        predictor = predictor.to(self.environment.device, torch.bfloat16).eval()
+        # Miowtion pools BF16 activations into FP32 descriptors and its predictor
+        # explicitly evaluates projections in FP32. Preserve submitted FP16 values
+        # exactly when materializing that FP32 side branch.
+        predictor = predictor.to(self.environment.device, torch.float32).eval()
         parsed_geometry = self.data.parse_geometry(geometry)
         tile_plan = self.plans.select(parsed_geometry)
         ref_budget = (
@@ -463,7 +466,7 @@ def verify_runtime_trace(
     layer_index, head_index = route_indices(case.route)
     with safe_open(selector_path, framework="pt", device="cpu") as tensors, torch.no_grad():
         predictor = veda_predictor.LayerPredictor(architecture.num_heads, architecture.head_dim).to(
-            dtype=torch.float16, device=resolved
+            dtype=torch.float32, device=resolved
         )
         predictor.proj_q.copy_(tensors.get_tensor(f"layers.{layer_index}.proj_q").to(resolved))
         predictor.proj_k.copy_(tensors.get_tensor(f"layers.{layer_index}.proj_k").to(resolved))

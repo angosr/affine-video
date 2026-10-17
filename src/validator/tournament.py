@@ -334,7 +334,10 @@ def _resolve_match(
             or final_stage.get("paired_gain_lower_bound") != score_gain
         ):
             raise ValueError("final score does not match the last completed stage")
-        if score_gain > minimum_gain:
+        cleared_both_stages = (
+            len(stages) == 2 and exact_gain > minimum_exact_gain and score_gain > minimum_gain
+        )
+        if cleared_both_stages:
             outcome = MatchOutcome.CHALLENGER_WON
             incumbent = candidate
         else:

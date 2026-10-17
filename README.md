@@ -91,6 +91,13 @@ tracks/main/
       manifest.json
       part-00000
       ...
+  batch_groups/
+    <plan_digest>.json
+  batch_assets/
+    <sha256>/
+      manifest.json
+      part-00000
+      ...
   models/
     <track_id>/<sha256>/
       manifest.json
@@ -111,9 +118,11 @@ tracks/main/
   every generator byte committed by the track, without exposing future private source samples.
 - `matches/<track_id>/*.json` are immutable terminal match facts in chain order: public model reference,
   content hashes, aggregate result, incumbent, decision, and decision block.
-- `batches/<sha256>/manifest.json` publishes the exact QKV batch only after every challenge linked
-  to that batch is terminal. The canonical manifest verifies every bounded part and the reassembled
-  file digest.
+- `batch_groups/<plan_digest>.json` reveals the finalized-block seed, source proofs, routes, samples,
+  steps and immutable object mapping only after every linked challenge is terminal.
+  `batches/<sha256>/manifest.json` publishes its exact QKV batch, while `batch_assets/` publishes
+  every referenced source video and dense latent. Each manifest verifies every bounded part and the
+  reassembled file digest.
 - `models/<track_id>/<sha256>/manifest.json` is the public durable copy of every winning selector.
   A private copy of every validated selector is stored before scoring, so publication and later
   matches remain recoverable even if the GPU host or original Hugging Face repository disappears.
@@ -130,6 +139,8 @@ summary. On restart the evaluator validates every committed match, follows any c
 matches, and restores them instead of evaluating them again. Conflicting immutable bytes stop
 publication. A chain node behind the recovered public watermark may keep scanning, but evaluation
 and publication wait until its finalized height catches up, so public state cannot move backward.
+Mutable pointers use ETag conditional writes, and production startup probes both conditional create
+and conditional replace. A backend that cannot fence two concurrent publishers is rejected.
 
 Object storage is the durable source for public tournament facts. The local SQLite database and
 downloaded model cache are disposable execution state: after loss, finalized chain submissions plus
@@ -209,7 +220,9 @@ uv run --extra storage veda validator evaluate \
 Set `VEDA_ALERT_WEBHOOK_URL` to an HTTPS push endpoint before continuous operation. Admission has
 five attempts; scoring and full-video confirmation allow nine attempts with bounded exponential
 delays, and scoring and producer workers have a four-hour wall-clock limit. Production retries a
-failed plan at most five times and sends a push alert on the first and final failure. Scoring
+failed plan at most five times and sends a push alert on the first and final failure. Admission and
+scoring do the same; waiting for a finalized batch boundary or a healthy producer does not consume
+an attempt. Scoring
 exhaustion enters visible `SYSTEM_BLOCKED` state without becoming a Miner loss; after repairing the
 cause, resume its original stage with
 `veda validator retry <challenge-id> --database /data/validator.db`.

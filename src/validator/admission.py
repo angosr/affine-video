@@ -361,6 +361,11 @@ def _defer_or_fail(
     *,
     resume_state: ChallengeState | None = None,
 ) -> AdmissionStatus:
+    if attempts == 1 and attempts < settings.max_attempts and settings.alert is not None:
+        settings.alert(
+            "ADMISSION_RETRY_STARTED",
+            {"challenge_id": challenge_id, "attempts": attempts, "code": error.code},
+        )
     if attempts >= settings.max_attempts:
         store.block_leased(
             challenge_id,

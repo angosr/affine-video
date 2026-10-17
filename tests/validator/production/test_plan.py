@@ -423,10 +423,14 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         digest = hashlib.sha256(content).hexdigest()
         ready = ReadyObject(f"latents/{digest}.safetensors", digest, len(content))
         payloads[ready.object_key] = content
+        video_content = f"video-{index}".encode()
+        video_digest = hashlib.sha256(video_content).hexdigest()
+        video = ReadyObject(f"videos/{video_digest}.mp4", video_digest, len(video_content))
+        payloads[video.object_key] = video_content
         references.append(
             DenseReference(
                 rollout.rollout_id,
-                ReadyObject(f"videos/{index}.mp4", f"{index + 1:02x}" * 32, 1),
+                video,
                 ready,
             )
         )
@@ -472,7 +476,9 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         objects=objects,
         cache_dir=tmp_path,
     )
-    source._restore_exact = lambda _plan: SimpleNamespace(sha256="12" * 32)
+    exact_path = tmp_path / "exact-source.npz"
+    exact_path.write_bytes(b"exact")
+    source._restore_exact = lambda _plan: SimpleNamespace(sha256="12" * 32, path=exact_path)
 
     restored = source.confirmation_batch("confirm-a")
 
@@ -483,6 +489,10 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         "exact-a",
         "confirm-a",
     )
+    disclosure = source.public_disclosure(ready_plan.plan_digest)
+    assert disclosure.challenge_ids == ("exact-a", "confirm-a")
+    assert disclosure.record_name == f"batch_groups/{ready_plan.plan_digest}.json"
+    assert len(disclosure.files) == 5
     with pytest.raises(RuntimeError, match="no scheduled"):
         source.confirmation_batch("other")
 
@@ -503,7 +513,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     exact.write_bytes(b"temporary")
     assert (tmp_path / "dense" / ready_plan.plan_digest).is_dir()
     assert source.prune_disclosed({"exact-a"}) == 0
-    assert source.prune_disclosed({"exact-a", "confirm-a"}) == 2
+    assert source.prune_disclosed({"exact-a", "confirm-a"}) == 3
     assert not exact.exists()
     assert not (tmp_path / "dense" / ready_plan.plan_digest).exists()
 
