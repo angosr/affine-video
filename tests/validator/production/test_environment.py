@@ -150,6 +150,33 @@ def test_dependency_tree_hashes_metadata_when_no_file_list_exists(tmp_path) -> N
     assert environment._distribution_content_sha256(distribution) != first
 
 
+def test_import_root_hash_covers_code_missing_from_distribution_file_list(tmp_path) -> None:
+    metadata = tmp_path / "example.egg-info"
+    metadata.mkdir()
+    (metadata / "PKG-INFO").write_text("Version: 1.0\n", encoding="utf-8")
+    package = tmp_path / "example"
+    package.mkdir()
+    module = package / "runtime.py"
+    module.write_text("VALUE = 1\n", encoding="utf-8")
+
+    first = environment._import_root_content_sha256(tmp_path)
+    module.write_text("VALUE = 2\n", encoding="utf-8")
+
+    assert environment._import_root_content_sha256(tmp_path) != first
+
+
+def test_import_root_hash_ignores_generated_python_cache(tmp_path) -> None:
+    package = tmp_path / "example"
+    package.mkdir()
+    (package / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+    first = environment._import_root_content_sha256(tmp_path)
+    cache = package / "__pycache__"
+    cache.mkdir()
+    (cache / "runtime.cpython-312.pyc").write_bytes(b"generated")
+
+    assert environment._import_root_content_sha256(tmp_path) == first
+
+
 def test_dist_info_without_record_uses_metadata_tree(tmp_path) -> None:
     metadata = tmp_path / "example-1.0.dist-info"
     metadata.mkdir()

@@ -143,6 +143,7 @@ def _verify_source_bundle(bundle: Path, active: dict[str, Path]) -> None:
 def _environment_document(*, verify_files: bool) -> dict[str, Any]:
     executable = Path(sys.executable).resolve()
     distributions = []
+    import_roots: set[Path] = set()
     grouped: dict[str, list[importlib.metadata.Distribution]] = {}
     for distribution in importlib.metadata.distributions():
         raw_name = distribution.metadata.get("Name")
@@ -152,6 +153,13 @@ def _environment_document(*, verify_files: bool) -> dict[str, Any]:
         grouped.setdefault(name, []).append(distribution)
     for name, candidates in grouped.items():
         distribution, record = _select_distribution(name, candidates)
+        metadata_path = getattr(distribution, "_path", None)
+        if metadata_path is None:
+            raise ValueError(f"installed distribution has no metadata path: {name}")
+        root = Path(metadata_path).resolve().parent
+        if not root.is_dir():
+            raise ValueError(f"installed distribution root is unavailable: {name}")
+        import_roots.add(root)
         version = distribution.version
         if not isinstance(version, str) or not version:
             raise ValueError(f"installed distribution has no version: {name}")
@@ -169,7 +177,16 @@ def _environment_document(*, verify_files: bool) -> dict[str, Any]:
     distributions.sort(key=lambda item: item["name"])
     return {
         "distributions": distributions,
-        "format": "veda-python-environment-lock-v1",
+        "format": "veda-python-environment-lock-v2",
+        "import_roots": [
+            {
+                "content_sha256": (
+                    _import_root_content_sha256(root) if verify_files else "0" * 64
+                ),
+                "path": str(root),
+            }
+            for root in sorted(import_roots, key=str)
+        ],
         "python_executable_sha256": _file_sha256(executable),
         "python_implementation": platform.python_implementation(),
         "python_version": platform.python_version(),
@@ -263,6 +280,30 @@ def _distribution_content_sha256(distribution: importlib.metadata.Distribution) 
             raise ValueError(f"installed dependency file is unavailable: {name}")
         digest.update(name.encode("utf-8"))
         digest.update(b"\0")
+        digest.update(bytes.fromhex(_file_sha256(path)))
+    return digest.hexdigest()
+
+
+def _import_root_content_sha256(root: Path) -> str:
+    """Hash every importable byte under a distribution root exactly once."""
+
+    if not root.is_dir():
+        raise ValueError(f"installed distribution root is unavailable: {root}")
+    paths = tuple(
+        path
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+        and "__pycache__" not in path.relative_to(root).parts
+        and path.suffix not in {".pyc", ".pyo"}
+    )
+    if not paths:
+        raise ValueError(f"installed distribution root is empty: {root}")
+    digest = hashlib.sha256(b"veda-python-import-root-v1\0")
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update((path.stat().st_mode & 0o777).to_bytes(2, "big"))
         digest.update(bytes.fromhex(_file_sha256(path)))
     return digest.hexdigest()
 
