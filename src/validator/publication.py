@@ -143,6 +143,14 @@ def build_public_artifacts(
             min_allowed_weights=chain.min_allowed_weights,
             max_weight=chain.max_weight,
         )
+        if plan is None and tournament.champion.challenge_id != initial.challenge_id:
+            plan = plan_champion_weight(
+                initial,
+                uid_by_hotkey=chain.uid_by_hotkey,
+                current_block=chain.finalized_block,
+                min_allowed_weights=chain.min_allowed_weights,
+                max_weight=chain.max_weight,
+            )
     artifact = WeightArtifact(
         track_id=track.track_id,
         track_spec_digest=track.digest,

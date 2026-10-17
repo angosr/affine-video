@@ -53,9 +53,10 @@ the rest.
 
 The current champion receives the full subnet weight. Before any successful challenge this is UID
 0; after a valid win it is the winning Miner's hotkey. The evaluator checks the current finalized
-hotkey-to-UID mapping and chain weight constraints before publishing. When the champion is no
-longer registered or a valid vector is impossible, `weights` is `null` and Validators keep their
-last finalized weights.
+hotkey-to-UID mapping and chain weight constraints before publishing. If a winning hotkey is no
+longer registered, weight falls back to the registered VEDA baseline hotkey instead of leaving a
+stale UID allocation behind. When neither hotkey is registered or the chain cannot accept a
+single-recipient vector, `weights` is `null` and Validators keep their last finalized weights.
 
 A selector that produces non-finite logits or sparse latents receives zero quality for the affected
 case. This rule is applied independently to the challenger and incumbent, so a pathological model

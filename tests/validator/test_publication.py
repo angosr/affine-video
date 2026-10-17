@@ -1009,6 +1009,31 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     assert public_summary["leaderboard_total"] == 2
     assert public_match["outcome"] == "CHALLENGER_WON"
 
+    missing_champion = WeightChainState(
+        121,
+        {"genesis-hotkey": 0},
+        1,
+        1.0,
+        10,
+        {"genesis-hotkey": 0},
+    )
+    fallback_store = SimpleNamespace(
+        chain_cursor=lambda: (121, "0x" + "34" * 32),
+        public_snapshot=store.public_snapshot,
+        active_competitors=store.active_competitors,
+        model_path=store.model_path,
+    )
+    fallback = build_public_artifacts(fallback_store, track, missing_champion, version_key=9)
+    assert fallback is not None
+    fallback_weights = decode_weight_artifact(fallback.weights)
+    assert fallback_weights.plan == WeightPlan(
+        121,
+        ("genesis-hotkey",),
+        (0,),
+        (1.0,),
+    )
+    assert json.loads(fallback.summary)["champion"]["hotkey"] == "alice"
+
     def disclosure(plan_digest, challenge_ids):
         batch = next(
             stage["evaluation_batch"]
