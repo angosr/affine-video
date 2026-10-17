@@ -141,6 +141,7 @@ async def run_evaluator(
             raise ValueError("production publisher must verify conditional writes")
         await asyncio.to_thread(verify_public_storage)
     ledger = await publisher.load(track)
+    disclosed_plan_digests = set(getattr(ledger, "disclosed_plan_digests", ()))
     cache_dir = Path(exact_cache)
     if not cache_dir.is_dir():
         raise ValueError("exact cache path must be a batch directory")
@@ -320,6 +321,7 @@ async def run_evaluator(
                                         if batch_source is None
                                         else batch_source.public_disclosure
                                     ),
+                                    disclosed_plan_digests=frozenset(disclosed_plan_digests),
                                     model_resolver=(
                                         None if batch_source is None else batch_source.restore_model
                                     ),
@@ -328,6 +330,10 @@ async def run_evaluator(
                                 )
                                 if artifacts is not None:
                                     await publisher.publish(artifacts)
+                                    disclosed_plan_digests.update(
+                                        name.removeprefix("batch_groups/").removesuffix(".json")
+                                        for name, _ in artifacts.batch_groups
+                                    )
                                     if artifacts.abort is not None:
                                         track_aborted = True
                                     if batch_source is not None:

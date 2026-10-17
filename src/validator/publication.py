@@ -8,7 +8,7 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,7 @@ import httpx
 from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
 from validator.chunks import ChunkManifest, build_chunk_manifest, chunk_object_name, read_part
 from validator.production.batches import BatchDisclosure
+from validator.production.plan import BatchPlan
 from validator.queue import TERMINAL_STATES
 from validator.s3 import client_config
 from validator.store import ChallengeStore
@@ -82,6 +83,7 @@ class PublicLedger:
     source_block: int | None
     matches: tuple[MatchRecord, ...]
     aborted: bool = False
+    disclosed_plan_digests: frozenset[str] = frozenset()
 
     @property
     def required_finalized_block(self) -> int:
@@ -100,6 +102,7 @@ def build_public_artifacts(
     *,
     version_key: int,
     batch_disclosure_resolver: Callable[[str], BatchDisclosure] | None = None,
+    disclosed_plan_digests: frozenset[str] = frozenset(),
     model_resolver: Callable[[str, int], Path] | None = None,
     runtime_manifest: bytes | None = None,
     track_aborted: bool = False,
@@ -180,25 +183,34 @@ def build_public_artifacts(
         for used_batch in stage_batches:
             plan_digest = used_batch["plan_digest"]
             if plan_digest not in disclosure:
-                resolved = (
-                    None
-                    if batch_disclosure_resolver is None
-                    else batch_disclosure_resolver(plan_digest)
+                if plan_digest in disclosed_plan_digests:
+                    disclosure[plan_digest] = True
+                else:
+                    resolved = (
+                        None
+                        if batch_disclosure_resolver is None
+                        else batch_disclosure_resolver(plan_digest)
+                    )
+                    disclosure[plan_digest] = bool(resolved) and set(
+                        resolved.challenge_ids
+                    ).issubset(terminal_ids)
+                    if disclosure[plan_digest]:
+                        assert resolved is not None
+                        batch_groups[resolved.record_name] = resolved.record_payload
+                        for item in resolved.files:
+                            files[item.object_name] = PublicFile(
+                                item.object_name,
+                                item.path,
+                                item.sha256,
+                            )
+            if (
+                disclosure[plan_digest]
+                and plan_digest not in disclosed_plan_digests
+                and used_batch["object"] not in files
+            ):
+                raise PublicArtifactError(
+                    "batch disclosure omitted its exact evaluation object"
                 )
-                disclosure[plan_digest] = bool(resolved) and set(resolved.challenge_ids).issubset(
-                    terminal_ids
-                )
-                if disclosure[plan_digest]:
-                    assert resolved is not None
-                    batch_groups[resolved.record_name] = resolved.record_payload
-                    for item in resolved.files:
-                        files[item.object_name] = PublicFile(
-                            item.object_name,
-                            item.path,
-                            item.sha256,
-                        )
-            if disclosure[plan_digest] and used_batch["object"] not in files:
-                raise PublicArtifactError("batch disclosure omitted its exact evaluation object")
         if match.outcome.value == "CHALLENGER_WON":
             path_value = store.model_path(match.challenge_id)
             path = None if path_value is None else Path(path_value)
@@ -714,10 +726,14 @@ class S3Repository:
         aborted = self._load_track_abort(track)
 
         if summary_payload is None:
+            matches = tuple(
+                self._load_following_matches(track, 1, genesis_champion(track))
+            )
             return PublicLedger(
                 None,
-                tuple(self._load_following_matches(track, 1, genesis_champion(track))),
+                matches,
                 aborted,
+                self._load_batch_disclosures(track, matches),
             )
         summary = _decode_canonical_object(summary_payload, "summary")
         expected_fields = {
@@ -779,7 +795,13 @@ class S3Repository:
             raise PublicArtifactError("public summary does not match its immutable matches")
 
         matches.extend(self._load_following_matches(track, match_count + 1, incumbent))
-        return PublicLedger(source_block, tuple(matches), aborted)
+        complete_matches = tuple(matches)
+        return PublicLedger(
+            source_block,
+            complete_matches,
+            aborted,
+            self._load_batch_disclosures(track, complete_matches),
+        )
 
     def _load_track_abort(self, track: TrackSpec) -> bool:
         name, expected = _track_abort_artifact(track)
@@ -823,6 +845,108 @@ class S3Repository:
             self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
             sequence += 1
         return matches
+
+    def _load_batch_disclosures(
+        self,
+        track: TrackSpec,
+        matches: tuple[MatchRecord, ...],
+    ) -> frozenset[str]:
+        """Verify complete public batch groups once when recovering the ledger."""
+
+        terminal_ids = {match.challenge_id for match in matches}
+        batches: dict[str, list[Mapping[str, Any]]] = {}
+        for match in matches:
+            evaluation = match.document["evaluation"]
+            used = [
+                stage["evaluation_batch"]
+                for stage in evaluation["stages"]
+                if "evaluation_batch" in stage
+            ]
+            if evaluation["evaluation_batch"] is not None:
+                used.append(evaluation["evaluation_batch"])
+            for batch in used:
+                batches.setdefault(batch["plan_digest"], []).append(batch)
+
+        disclosed = set()
+        for plan_digest, used_batches in batches.items():
+            record_name = f"batch_groups/{plan_digest}.json"
+            payload = self._get_optional(record_name)
+            if payload is None:
+                continue
+            document = _decode_canonical_object(payload, record_name)
+            if set(document) != {
+                "format",
+                "plan",
+                "public_dense_references",
+                "public_exact_object",
+            } or document["format"] != "veda-batch-disclosure-v1":
+                raise PublicArtifactError("public batch disclosure fields are invalid")
+            try:
+                plan = BatchPlan.decode(_json_bytes(document["plan"]))
+            except (TypeError, ValueError) as exc:
+                raise PublicArtifactError("public batch disclosure plan is invalid") from exc
+            challenge_ids = set(plan.exact_challenge_ids + plan.confirmation_challenge_ids)
+            if (
+                plan.state != "READY"
+                or plan.plan_digest != plan_digest
+                or plan.track_spec_digest != track.digest
+                or not challenge_ids
+                or not challenge_ids.issubset(terminal_ids)
+            ):
+                raise PublicArtifactError("public batch disclosure conflicts with the ledger")
+            assert plan.exact is not None
+            exact_name = f"batches/{plan.exact.sha256}/manifest.json"
+            if any(
+                batch["sha256"] != plan.exact.sha256
+                or batch["object"] != exact_name
+                or batch["generated_block"] != plan.generation_block
+                or batch["seed_block_hash"] != plan.block_hash
+                for batch in used_batches
+            ):
+                raise PublicArtifactError("public match conflicts with its batch disclosure")
+
+            public_references = []
+            files = [(exact_name, plan.exact.sha256, plan.exact.size_bytes)]
+            for reference in plan.dense_references:
+                public = {"rollout_id": reference.rollout_id}
+                for kind, item in (
+                    ("video", reference.video),
+                    ("latent", reference.latent),
+                ):
+                    object_name = f"batch_assets/{item.sha256}/manifest.json"
+                    public[kind] = {
+                        "object": object_name,
+                        "sha256": item.sha256,
+                        "size_bytes": item.size_bytes,
+                    }
+                    files.append((object_name, item.sha256, item.size_bytes))
+                public_references.append(public)
+            expected = {
+                "format": "veda-batch-disclosure-v1",
+                "plan": plan.document(),
+                "public_exact_object": exact_name,
+                "public_dense_references": public_references,
+            }
+            if document != expected:
+                raise PublicArtifactError("public batch disclosure is not canonical")
+            for object_name, sha256, size_bytes in files:
+                self._verify_disclosed_file(object_name, sha256, size_bytes)
+            self._confirmed_immutable[record_name] = hashlib.sha256(payload).hexdigest()
+            disclosed.add(plan_digest)
+        return frozenset(disclosed)
+
+    def _verify_disclosed_file(self, object_name: str, sha256: str, size_bytes: int) -> None:
+        payload = self._get_optional(object_name)
+        if payload is None:
+            raise PublicArtifactError("public batch disclosure file is missing")
+        try:
+            manifest = ChunkManifest.decode(payload)
+        except ValueError as exc:
+            raise PublicArtifactError("public batch disclosure file manifest is invalid") from exc
+        if manifest.sha256 != sha256 or manifest.size != size_bytes:
+            raise PublicArtifactError("public batch disclosure file identity is invalid")
+        self._verify_public_chunks(object_name, manifest)
+        self._confirmed_immutable[object_name] = sha256
 
     def _put_immutable(self, name: str, payload: bytes) -> None:
         digest = hashlib.sha256(payload).hexdigest()

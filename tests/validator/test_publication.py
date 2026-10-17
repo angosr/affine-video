@@ -12,6 +12,8 @@ from tests.scoring.test_spec import valid_spec
 from validator import chunks
 from validator import publication as publication_module
 from validator.production.batches import BatchDisclosure, DisclosureFile
+from validator.production.commitment import SourceLeaf, SourcePool, canonical_json
+from validator.production.plan import DenseReference, ReadyObject, build_plan
 from validator.publication import (
     PublicArtifactError,
     PublicArtifacts,
@@ -813,6 +815,110 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary(tmp_path)
     ]
 
 
+def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_path) -> None:
+    track = parse_track_spec(valid_spec())
+    leaves = tuple(
+        SourceLeaf(
+            "production",
+            f"family-{index}",
+            f"source-{index}",
+            f"prompt {index}",
+            (),
+            "all",
+            "internal-cleared-v1",
+        )
+        for index in range(track.scoring.rollouts_per_stratum)
+    )
+    pool = SourcePool(leaves)
+    plan = build_plan(
+        track_spec_digest=track.digest,
+        generation_block=200,
+        block_hash="0x" + "12" * 32,
+        track_start_block=track.track_start_block,
+        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
+        generation_interval_blocks=track.cache.generation_interval_blocks,
+        exact_challenge_ids=("challenge",),
+        confirmation_challenge_ids=(),
+        source_proofs=tuple(pool.proof(leaf.source_id) for leaf in leaves),
+        scoring=track.scoring,
+        available_routes=track.model.selector.routes,
+    )
+
+    def ready_file(name, content):
+        path = tmp_path / name
+        path.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        return path, ReadyObject(f"private/{name}", digest, len(content))
+
+    exact_path, exact = ready_file("batch.npz", b"exact-batch")
+    references = []
+    local_files = [(f"batches/{exact.sha256}/manifest.json", exact_path, exact)]
+    for index, rollout in enumerate(plan.rollouts):
+        video_path, video = ready_file(f"video-{index}.mp4", f"video-{index}".encode())
+        latent_path, latent = ready_file(
+            f"latent-{index}.safetensors", f"latent-{index}".encode()
+        )
+        references.append(DenseReference(rollout.rollout_id, video, latent))
+        local_files.extend(
+            (
+                (f"batch_assets/{video.sha256}/manifest.json", video_path, video),
+                (f"batch_assets/{latent.sha256}/manifest.json", latent_path, latent),
+            )
+        )
+    ready = plan.ready(exact=exact, dense_references=tuple(references))
+    public_references = []
+    for reference in ready.dense_references:
+        public = {"rollout_id": reference.rollout_id}
+        for kind, item in (("video", reference.video), ("latent", reference.latent)):
+            public[kind] = {
+                "object": f"batch_assets/{item.sha256}/manifest.json",
+                "sha256": item.sha256,
+                "size_bytes": item.size_bytes,
+            }
+        public_references.append(public)
+    record = canonical_json(
+        {
+            "format": "veda-batch-disclosure-v1",
+            "plan": ready.document(),
+            "public_exact_object": f"batches/{exact.sha256}/manifest.json",
+            "public_dense_references": public_references,
+        }
+    )
+    batch = {
+        "sha256": exact.sha256,
+        "generated_block": ready.generation_block,
+        "plan_digest": ready.plan_digest,
+        "seed_block_hash": ready.block_hash,
+        "object": f"batches/{exact.sha256}/manifest.json",
+    }
+    match = SimpleNamespace(
+        challenge_id="challenge",
+        document={
+            "evaluation": {
+                "stages": [{"evaluation_batch": batch}],
+                "evaluation_batch": batch,
+            }
+        },
+    )
+
+    client = MemoryS3()
+    publisher = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    for object_name, path, item in local_files:
+        publisher._put_file_immutable(PublicFile(object_name, path, item.sha256))
+    publisher._put_immutable(f"batch_groups/{ready.plan_digest}.json", record)
+
+    restarted = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    assert restarted._load_batch_disclosures(track, (match,)) == frozenset(
+        {ready.plan_digest}
+    )
+
+    client.objects.pop(f"tracks/main/batches/{exact.sha256}/part-00000")
+    with pytest.raises(PublicArtifactError, match="chunk is missing"):
+        S3Repository(client, bucket="public-data", prefix="tracks/main")._load_batch_disclosures(
+            track, (match,)
+        )
+
+
 def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     monkeypatch, tmp_path
 ) -> None:
@@ -947,6 +1053,29 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     assert sum(item.object_name.startswith("batches/") for item in disclosed.files) == 2
     assert sum(item.object_name.startswith("batch_assets/") for item in disclosed.files) == 2
     assert len(disclosed.batch_groups) == 2
+
+    resolved_digests = frozenset(
+        name.removeprefix("batch_groups/").removesuffix(".json")
+        for name, _ in disclosed.batch_groups
+    )
+
+    def unexpected_disclosure(_digest):
+        raise AssertionError("an already public batch was restored from private storage")
+
+    repeated = build_public_artifacts(
+        store,
+        track,
+        chain,
+        version_key=9,
+        batch_disclosure_resolver=unexpected_disclosure,
+        disclosed_plan_digests=resolved_digests,
+    )
+    assert repeated is not None
+    assert not any(
+        item.object_name.startswith(("batches/", "batch_assets/"))
+        for item in repeated.files
+    )
+    assert repeated.batch_groups == ()
 
     store.chain_cursor = lambda: (119, "0x" + "11" * 32)
     assert build_public_artifacts(store, track, chain, version_key=9) is None
