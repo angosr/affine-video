@@ -170,6 +170,7 @@ class PlanCoordinator:
             proofs = select_source_proofs(
                 self.source_pool,
                 commitments=self.track.source_commitments,
+                partition="production",
                 strata=tuple(self.track.scoring.stratum_weight_map),
                 sources_per_stratum=self.track.scoring.rollouts_per_stratum,
                 batch_seed=seed,

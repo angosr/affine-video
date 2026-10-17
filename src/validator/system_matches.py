@@ -195,9 +195,5 @@ def _is_release_packaging(logical_name: str) -> bool:
             "runtime/source.zip",
         )
     )
-    parts = logical_name.split("/")
-    launch_evidence = any(
-        parts[index : index + 2] == ["evidence", "system-panel"]
-        for index in range(len(parts) - 1)
-    )
+    launch_evidence = logical_name.startswith("evidence/system-panel/")
     return packaging or launch_evidence

@@ -226,6 +226,7 @@ def test_source_selection_never_reuses_a_family() -> None:
     selected = select_source_proofs(
         pool,
         commitments=source_commitments(pool),
+        partition="production",
         strata=("16:9@37",),
         sources_per_stratum=1,
         batch_seed="12" * 32,
@@ -237,6 +238,7 @@ def test_source_selection_never_reuses_a_family() -> None:
         select_source_proofs(
             pool,
             commitments=source_commitments(pool),
+            partition="production",
             strata=("16:9@37",),
             sources_per_stratum=1,
             batch_seed="12" * 32,
@@ -250,6 +252,7 @@ def test_source_selection_is_reproducible_from_the_public_index() -> None:
     selected = select_source_proofs(
         pool,
         commitments=commitments,
+        partition="production",
         strata=("16:9@37",),
         sources_per_stratum=2,
         batch_seed="34" * 32,
@@ -258,6 +261,7 @@ def test_source_selection_is_reproducible_from_the_public_index() -> None:
 
     expected = select_source_digests(
         commitments,
+        partition="production",
         strata=("16:9@37",),
         sources_per_stratum=2,
         batch_seed="34" * 32,
@@ -268,6 +272,95 @@ def test_source_selection_is_reproducible_from_the_public_index() -> None:
     assert all(verify_source_proof(item, pool.root) for item in selected)
 
 
+def test_source_selection_is_partition_explicit_and_audit_is_deterministic() -> None:
+    leaves = tuple(
+        SourceLeaf(
+            partition,
+            f"{partition}-family-{index}",
+            f"{partition}-source-{index}",
+            f"{partition} prompt {index}",
+            (),
+            "16:9@37",
+            "internal-cleared-v1",
+            hashlib.sha256(f"{partition}-nonce-{index}".encode()).hexdigest(),
+        )
+        for partition in ("production", "audit")
+        for index in range(3)
+    )
+    pool = SourcePool(leaves)
+    commitments = source_commitments(pool)
+    arguments = {
+        "strata": ("16:9@37",),
+        "sources_per_stratum": 2,
+        "batch_seed": "56" * 32,
+        "used_source_digests": frozenset(),
+    }
+
+    selected = select_source_proofs(
+        pool,
+        commitments=commitments,
+        partition="audit",
+        **arguments,
+    )
+    expected = select_source_digests(commitments, partition="audit", **arguments)
+    production = select_source_digests(commitments, partition="production", **arguments)
+
+    assert tuple(proof.leaf.digest for proof in selected) == expected
+    assert all(proof.leaf.partition == "audit" for proof in selected)
+    assert set(expected).isdisjoint(production)
+    assert expected == select_source_digests(commitments, partition="audit", **arguments)
+
+
+@pytest.mark.parametrize("partition", ["", "staging", True, None])
+def test_source_selection_rejects_invalid_partition(partition) -> None:
+    pool = SourcePool((proof(0).leaf,))
+    arguments = {
+        "partition": partition,
+        "strata": ("16:9@37",),
+        "sources_per_stratum": 1,
+        "batch_seed": "78" * 32,
+        "used_source_digests": frozenset(),
+    }
+
+    with pytest.raises(ValueError, match="production or audit"):
+        select_source_digests(source_commitments(pool), **arguments)
+    with pytest.raises(ValueError, match="production or audit"):
+        select_source_proofs(pool, commitments=source_commitments(pool), **arguments)
+
+
+def test_live_batch_plan_rejects_audit_sources() -> None:
+    leaves = tuple(
+        SourceLeaf(
+            "audit",
+            f"audit-family-{index}",
+            f"audit-source-{index}",
+            f"audit prompt {index}",
+            (),
+            "16:9@37",
+            "internal-cleared-v1",
+            hashlib.sha256(f"audit-nonce-{index}".encode()).hexdigest(),
+        )
+        for index in range(2)
+    )
+    pool = SourcePool(leaves)
+    audit_proofs = tuple(pool.proof(leaf.source_id) for leaf in leaves)
+
+    with pytest.raises(ValueError, match="production sources"):
+        build_plan(
+            track_spec_digest="ab" * 32,
+            generation_block=120,
+            block_hash="0x" + "cd" * 32,
+            track_start_block=100,
+            minimum_generation_delay_blocks=1,
+            generation_interval_blocks=20,
+            exact_challenge_ids=("challenge",),
+            confirmation_challenge_ids=(),
+            source_proofs=audit_proofs,
+            scoring=scoring(),
+            available_routes=("route-0", "route-1", "route-2"),
+        )
+
+
 def test_source_selection_sequence_rejects_a_member_chosen_out_of_order() -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
     commitments = source_commitments(pool)
@@ -275,6 +368,7 @@ def test_source_selection_sequence_rejects_a_member_chosen_out_of_order() -> Non
     selected = select_source_proofs(
         pool,
         commitments=commitments,
+        partition="production",
         strata=("16:9@37",),
         sources_per_stratum=2,
         batch_seed=generation_seed("ab" * 32, block_hash),

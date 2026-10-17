@@ -20,6 +20,7 @@ def _runtime_manifest(
     asset_sha256: str = "ab" * 32,
     package_sha256: str = "cd" * 32,
     evidence_sha256: str | None = None,
+    evidence_name: str = "evidence/system-panel/raw.json",
 ) -> bytes:
     artifacts = [
         Artifact("runtime/source.zip", package_sha256, 10, "artifacts/" + package_sha256),
@@ -33,7 +34,7 @@ def _runtime_manifest(
     if evidence_sha256 is not None:
         artifacts.append(
             Artifact(
-                "release/evidence/system-panel/raw.json",
+                evidence_name,
                 evidence_sha256,
                 30,
                 "artifacts/" + evidence_sha256,
@@ -179,6 +180,25 @@ def test_system_evidence_rejects_changed_scoring_assets_but_not_repackaging(monk
     assert system_match_artifacts(track, _runtime_manifest(evidence_sha256="ef" * 32))
     assert system_match_artifacts(track, _runtime_manifest(asset_sha256="ef" * 32)) == ()
     assert system_match_artifacts(track, None) == ()
+
+
+def test_only_the_canonical_panel_namespace_is_excluded_from_runtime_semantics(
+    monkeypatch,
+) -> None:
+    track = load_track_spec(Path(__file__).parents[2] / "track.json")
+    runtime_manifest = _runtime_manifest(evidence_sha256="56" * 32)
+    _bind_evidence(monkeypatch, track, runtime_manifest)
+
+    assert system_match_artifacts(track, _runtime_manifest(evidence_sha256="ef" * 32))
+    for name in (
+        "release/evidence/system-panel/raw.json",
+        "evidence/system-panelish/raw.json",
+        "other/evidence/system-panel/raw.json",
+    ):
+        assert system_match_artifacts(
+            track,
+            _runtime_manifest(evidence_sha256="ef" * 32, evidence_name=name),
+        ) == ()
 
 
 def test_system_matches_are_not_attached_to_another_track(monkeypatch) -> None:

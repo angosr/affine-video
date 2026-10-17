@@ -124,6 +124,34 @@ def test_scanner_advances_persistent_cursor_in_bounded_batches(tmp_path) -> None
         assert challenge["block_height"] == 100
 
 
+def test_scanner_skips_empty_commitment_and_processes_the_next_block(
+    tmp_path, caplog
+) -> None:
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    blocks = {
+        100: chain_block(b"", 100),
+        101: chain_block(payload, 101),
+    }
+    client = FakeClient(blocks)
+
+    with ChallengeStore(tmp_path / "validator.db") as store, caplog.at_level(logging.WARNING):
+        result = asyncio.run(
+            scan_finalized_blocks(client, store, netuid=7, track_start_block=100)
+        )
+
+        assert result.submissions_found == 1
+        assert store.chain_cursor() == (101, blocks[101][0])
+        assert len(store.public_snapshot()["challenges"]) == 1
+    empty = next(
+        record
+        for record in caplog.records
+        if record.message == "skipping empty finalized commitment"
+    )
+    assert empty.block_height == 100
+    assert empty.event_index == 1
+    assert empty.hotkey == HOTKEY
+
+
 def test_scanner_advances_without_recording_commitments_after_track_close(tmp_path) -> None:
     payload = ModelSubmission("owner/model", "12" * 20).encode()
     blocks = {height: chain_block(payload, height) for height in range(100, 103)}

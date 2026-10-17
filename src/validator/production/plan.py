@@ -509,15 +509,17 @@ def select_source_proofs(
     pool: SourcePool,
     *,
     commitments: tuple[SourceCommitmentSpec, ...],
+    partition: str,
     strata: tuple[str, ...],
     sources_per_stratum: int,
     batch_seed: str,
     used_source_digests: frozenset[str],
 ) -> tuple[SourceProof, ...]:
-    """Select independent, unused production families for every stratum."""
+    """Select independent, unused families from one committed partition."""
 
     selected_digests = select_source_digests(
         commitments,
+        partition=partition,
         strata=strata,
         sources_per_stratum=sources_per_stratum,
         batch_seed=batch_seed,
@@ -535,13 +537,16 @@ def select_source_proofs(
 def select_source_digests(
     commitments: tuple[SourceCommitmentSpec, ...],
     *,
+    partition: str,
     strata: tuple[str, ...],
     sources_per_stratum: int,
     batch_seed: str,
     used_source_digests: frozenset[str],
 ) -> tuple[str, ...]:
-    """Select sources from only the salted commitments published before the track."""
+    """Select sources from one salted partition published before the track."""
 
+    if partition not in {"production", "audit"}:
+        raise ValueError("source partition must be production or audit")
     if not strata or len(set(strata)) != len(strata):
         raise ValueError("source strata must be non-empty and unique")
     if type(sources_per_stratum) is not int or sources_per_stratum <= 0:
@@ -555,7 +560,7 @@ def select_source_digests(
         candidates = tuple(
             item.sha256
             for item in commitments
-            if item.partition == "production"
+            if item.partition == partition
             and item.generation_geometry == stratum
             and item.sha256 not in reserved
         )
@@ -583,6 +588,7 @@ def validate_source_selection_sequence(
     for plan in ordered:
         expected = select_source_digests(
             commitments,
+            partition="production",
             strata=tuple(scoring.stratum_weight_map),
             sources_per_stratum=scoring.rollouts_per_stratum,
             batch_seed=plan.batch_seed,

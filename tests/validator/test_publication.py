@@ -1029,6 +1029,7 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
     proofs = select_source_proofs(
         pool,
         commitments=track.source_commitments,
+        partition="production",
         strata=tuple(track.scoring.stratum_weight_map),
         sources_per_stratum=track.scoring.rollouts_per_stratum,
         batch_seed=generation_seed(track.digest, block_hash),

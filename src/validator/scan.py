@@ -124,6 +124,17 @@ def extract_commitments(
             raise RuntimeError("commitment event contains an invalid hotkey")
         if extrinsic.get("address") != hotkey:
             raise RuntimeError("commitment signer does not match its chain event")
+        if not payload:
+            LOGGER.warning(
+                "skipping empty finalized commitment",
+                extra={
+                    "block_height": block_height,
+                    "event_index": event_position,
+                    "hotkey": hotkey,
+                    "netuid": netuid,
+                },
+            )
+            continue
         records.append(
             ChainCommitment(
                 hotkey,
