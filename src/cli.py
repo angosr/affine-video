@@ -19,6 +19,8 @@ from validator.run import (
     DEFAULT_NETUID,
     DEFAULT_PUBLIC_WEIGHTS_URL,
     DEFAULT_TRACK_SPEC_DIGEST,
+    PUBLIC_STORAGE_BUCKET,
+    PUBLIC_STORAGE_PREFIX,
     EvaluationCycleResult,
     WeightCycleResult,
     run_evaluator,
@@ -34,20 +36,23 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="veda")
     modules = parser.add_subparsers(dest="module", required=True)
 
-    miner = modules.add_parser("miner", help="submit a pinned model reference")
+    miner = modules.add_parser("miner", help="commit a pinned model reference")
     miner_commands = miner.add_subparsers(dest="command", required=True)
-    submit = miner_commands.add_parser("submit", help="commit a model reference on-chain")
-    submit.add_argument("--repo-id", required=True)
-    submit.add_argument("--revision", required=True)
-    submit.add_argument("--netuid", required=True, type=int)
-    submit.add_argument("--network", default="finney")
-    submit.add_argument("--wallet-name", default="default")
-    submit.add_argument("--hotkey", default="default")
-    submit.add_argument("--wallet-path")
-    submit.add_argument(
-        "--execute",
+    commit = miner_commands.add_parser(
+        "commit",
+        help="sign and finalize the hotkey's one allowed model commitment",
+    )
+    commit.add_argument("--repo-id", required=True)
+    commit.add_argument("--revision", required=True)
+    commit.add_argument("--netuid", default=DEFAULT_NETUID, type=int)
+    commit.add_argument("--network", default="finney")
+    commit.add_argument("--wallet-name", default="default")
+    commit.add_argument("--hotkey", default="default")
+    commit.add_argument("--wallet-path")
+    commit.add_argument(
+        "--dry-run",
         action="store_true",
-        help="sign and submit; without this flag the command only validates and prints the payload",
+        help="validate and print the payload without opening a chain connection",
     )
 
     validator = modules.add_parser("validator", help="evaluate models or set chain weights")
@@ -88,8 +93,6 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--scoring-timeout-seconds", default=1800.0, type=float)
     evaluate.add_argument("--scoring-max-memory-bytes", type=int)
     evaluate.add_argument("--scoring-max-cpu-seconds", type=int)
-    evaluate.add_argument("--storage-bucket", required=True)
-    evaluate.add_argument("--storage-prefix", required=True)
     evaluate.add_argument("--mechid", default=DEFAULT_MECHID, type=int)
     evaluate.add_argument("--version-key", default=0, type=int)
     evaluate.add_argument("--once", action="store_true")
@@ -99,8 +102,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     initialize.add_argument("--network", default="finney")
     initialize.add_argument("--poll-seconds", default=12.0, type=float)
-    initialize.add_argument("--storage-bucket", default="affine_video")
-    initialize.add_argument("--storage-prefix", default="tracks/main")
     initialize.add_argument("--once", action="store_true")
 
     run = validator_commands.add_parser(
@@ -136,7 +137,7 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
             raise ValueError("network cannot be empty")
         submission = ModelSubmission(arguments.repo_id, arguments.revision)
         payload = submission.encode()
-        if not arguments.execute:
+        if arguments.dry_run:
             output = {
                 "hotkey": arguments.hotkey,
                 "network": arguments.network,
@@ -185,8 +186,8 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
     if arguments.command == "initialize":
         try:
             publisher = S3Repository.from_environment(
-                bucket=arguments.storage_bucket,
-                prefix=arguments.storage_prefix,
+                bucket=PUBLIC_STORAGE_BUCKET,
+                prefix=PUBLIC_STORAGE_PREFIX,
             )
             asyncio.run(
                 run_initial_publisher(
@@ -206,8 +207,8 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
     if arguments.command == "evaluate":
         try:
             publisher = S3Repository.from_environment(
-                bucket=arguments.storage_bucket,
-                prefix=arguments.storage_prefix,
+                bucket=PUBLIC_STORAGE_BUCKET,
+                prefix=PUBLIC_STORAGE_PREFIX,
             )
             asyncio.run(
                 run_evaluator(

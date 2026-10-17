@@ -53,10 +53,10 @@ than a second runtime scoring system.
 
 ## Public object-storage state
 
-Each frozen track uses one prefix:
+The public contract uses one fixed prefix:
 
 ```text
-tracks/<track>/
+tracks/main/
   track.json
   summary.json
   status.json
@@ -109,18 +109,21 @@ uv run ruff check src tests
 uv run pytest
 ```
 
-Preview a Miner payload locally:
+Commit a Miner model reference with the wallet hotkey and wait for finalization:
 
 ```bash
-uv run veda miner submit \
+uv run veda miner commit \
   --repo-id owner/model \
   --revision 0123456789abcdef0123456789abcdef01234567 \
-  --netuid 1
+  --wallet-name default \
+  --hotkey default
 ```
 
-Add `--execute`, wallet options, and the target network to sign, submit, wait for finalization, and
-exit. The model revision may be private at submission time, but it must be public when its grace
-period expires.
+The production netuid defaults to `120` and the network defaults to `finney`; both can be overridden.
+Because only the hotkey's first commitment is eligible, the command sends exactly one transaction
+and never retries it. Add `--dry-run` to validate the fields and inspect the encoded payload without
+opening a chain connection. The model revision may be private at commit time, but it must be public
+when its grace period expires.
 
 Run the evaluator:
 
@@ -136,8 +139,7 @@ uv run --extra storage veda validator evaluate \
   --model-cache /data/models \
   --exact-cache /data/exact.npz \
   --archive-endpoint wss://archive.example \
-  --storage-bucket affine_video \
-  --storage-prefix tracks/main
+  --scoring-timeout-seconds 1800
 ```
 
 Keep the live UID 0 state current before the first evaluation track is published:

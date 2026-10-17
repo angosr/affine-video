@@ -9,24 +9,27 @@ from validator.queue import ChainPosition, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
 
 
-def test_miner_preview_does_not_open_chain(capsys) -> None:
+def test_miner_dry_run_does_not_open_chain(monkeypatch, capsys) -> None:
+    async def unexpected_submit(*_args, **_kwargs):
+        raise AssertionError("dry-run opened the chain")
+
+    monkeypatch.setattr(cli_module, "submit_model", unexpected_submit)
     main(
         [
             "miner",
-            "submit",
+            "commit",
             "--repo-id",
             "owner/model",
             "--revision",
             "12" * 20,
-            "--netuid",
-            "7",
+            "--dry-run",
         ]
     )
 
     output = json.loads(capsys.readouterr().out)
     assert output["repo_id"] == "owner/model"
     assert output["revision"] == "12" * 20
-    assert output["netuid"] == 7
+    assert output["netuid"] == 120
     assert output["network"] == "finney"
     assert output["hotkey"] == "default"
     assert output["payload_bytes"] <= 128
@@ -38,13 +41,14 @@ def test_miner_preview_rejects_invalid_netuid(netuid, capsys) -> None:
         main(
             [
                 "miner",
-                "submit",
+                "commit",
                 "--repo-id",
                 "owner/model",
                 "--revision",
                 "12" * 20,
                 "--netuid",
                 netuid,
+                "--dry-run",
             ]
         )
 
@@ -57,7 +61,7 @@ def test_miner_preview_rejects_empty_network(capsys) -> None:
         main(
             [
                 "miner",
-                "submit",
+                "commit",
                 "--repo-id",
                 "owner/model",
                 "--revision",
@@ -66,6 +70,7 @@ def test_miner_preview_rejects_empty_network(capsys) -> None:
                 "7",
                 "--network",
                 "",
+                "--dry-run",
             ]
         )
 
@@ -73,7 +78,7 @@ def test_miner_preview_rejects_empty_network(capsys) -> None:
     assert "network cannot be empty" in capsys.readouterr().err
 
 
-def test_miner_execute_forwards_chain_arguments(monkeypatch, capsys) -> None:
+def test_miner_commit_forwards_chain_arguments(monkeypatch, capsys) -> None:
     called = {}
 
     async def fake_submit(submission, **kwargs):
@@ -89,7 +94,7 @@ def test_miner_execute_forwards_chain_arguments(monkeypatch, capsys) -> None:
     main(
         [
             "miner",
-            "submit",
+            "commit",
             "--repo-id",
             "owner/model",
             "--revision",
@@ -104,7 +109,6 @@ def test_miner_execute_forwards_chain_arguments(monkeypatch, capsys) -> None:
             "miner",
             "--wallet-path",
             "/wallets",
-            "--execute",
         ]
     )
 
@@ -118,6 +122,14 @@ def test_miner_execute_forwards_chain_arguments(monkeypatch, capsys) -> None:
     assert output["block_hash"] == "0xabc"
     assert output["extrinsic_id"] == "10-2"
     assert output["netuid"] == 7
+
+
+def test_removed_miner_submit_command_is_rejected(capsys) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        main(["miner", "submit"])
+
+    assert stopped.value.code == 2
+    assert "invalid choice: 'submit'" in capsys.readouterr().err
 
 
 def test_validator_challenges_reads_local_database(tmp_path, capsys) -> None:
@@ -187,10 +199,6 @@ def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_p
             "wss://archive-1.example",
             "--archive-endpoint",
             "wss://archive-2.example",
-            "--storage-bucket",
-            "public-data",
-            "--storage-prefix",
-            "veda/track",
             "--once",
         ]
     )
@@ -200,8 +208,8 @@ def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_p
     assert called["exact_cache"] == str(tmp_path / "exact.npz")
     assert called["initial_model"] == str(tmp_path / "veda.safetensors")
     assert called["publisher"] == {
-        "bucket": "public-data",
-        "prefix": "veda/track",
+        "bucket": "affine_video",
+        "prefix": "tracks/main",
     }
     assert called["archive_endpoints"] == [
         "wss://archive-1.example",

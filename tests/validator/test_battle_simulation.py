@@ -157,14 +157,14 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch() -> None:
     assert rows["carol"]["outcome"] == "CHALLENGE_FAILED"
 
     remote = MemoryS3()
-    repository = S3Repository(remote, bucket="public-data", prefix="tracks/sn120")
+    repository = S3Repository(remote, bucket="public-data", prefix="tracks/main")
     asyncio.run(repository.publish(artifacts))
     recovered = asyncio.run(repository.load(track))
     assert len(recovered.matches) == 5
     assert recovered.matches[-1].champion_after.hotkey == "dave"
 
-    tampered = bytearray(remote.objects["tracks/sn120/matches/000000000004.json"])
+    tampered = bytearray(remote.objects["tracks/main/matches/000000000004.json"])
     tampered[-2] ^= 1
-    remote.objects["tracks/sn120/matches/000000000004.json"] = bytes(tampered)
+    remote.objects["tracks/main/matches/000000000004.json"] = bytes(tampered)
     with pytest.raises(PublicArtifactError):
-        asyncio.run(S3Repository(remote, bucket="public-data", prefix="tracks/sn120").load(track))
+        asyncio.run(S3Repository(remote, bucket="public-data", prefix="tracks/main").load(track))

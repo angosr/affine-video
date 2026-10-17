@@ -153,7 +153,7 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
 
 def test_initial_state_publisher_stops_after_competition_track_exists() -> None:
     client = MemoryS3()
-    publisher = S3Repository(client, bucket="public-data", prefix="tracks/sn120")
+    publisher = S3Repository(client, bucket="public-data", prefix="tracks/main")
 
     asyncio.run(
         publisher.publish_initial_state(
@@ -162,11 +162,11 @@ def test_initial_state_publisher_stops_after_competition_track_exists() -> None:
             system_matches=(("system_matches/000000000001.json", b"system-match"),),
         )
     )
-    assert client.objects["tracks/sn120/status.json"] == b"status"
-    assert client.objects["tracks/sn120/weights.json"] == b"weights"
-    assert client.objects["tracks/sn120/system_matches/000000000001.json"] == b"system-match"
+    assert client.objects["tracks/main/status.json"] == b"status"
+    assert client.objects["tracks/main/weights.json"] == b"weights"
+    assert client.objects["tracks/main/system_matches/000000000001.json"] == b"system-match"
 
-    client.objects["tracks/sn120/track.json"] = b"track"
+    client.objects["tracks/main/track.json"] = b"track"
     with pytest.raises(PublicArtifactError, match="taken ownership"):
         asyncio.run(publisher.publish_initial_state(status=b"new", weights=b"new"))
 
