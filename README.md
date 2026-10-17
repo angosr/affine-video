@@ -134,6 +134,16 @@ uv run --extra storage veda validator evaluate \
   --storage-prefix tracks/sn120
 ```
 
+Keep the live UID 0 state current before the first evaluation track is published:
+
+```bash
+uv run --extra storage veda validator initialize
+```
+
+This loop publishes only `status.json` and `weights.json`. It verifies that the pinned hotkey is
+still UID 0 at every finalized snapshot and stops writing as soon as the evaluator publishes the
+immutable `track.json`.
+
 If `--initial-model` is omitted, the evaluator restores the pinned UID 0 VEDA weights from the
 public chunk manifest, verifies every chunk, the complete file SHA-256, the canonical tensor
 digest, and the frozen baseline score before scanning submissions. The cache is disposable.
