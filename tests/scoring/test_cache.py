@@ -63,6 +63,7 @@ def write_batch(tmp_path):
         source_pool_merkle_root="56" * 32,
         source_proofs=({"source_id": "source-0"},),
         dense_references=({"video_sha256": "67" * 32},),
+        selected_inputs={"index_sha256": "78" * 32},
     )
 
 
@@ -161,6 +162,7 @@ def test_rollout_shards_assemble_without_loading_the_complete_batch(tmp_path) ->
         "source_pool_merkle_root": "56" * 32,
         "source_proofs": (),
         "dense_references": (),
+        "selected_inputs": {"index_sha256": "78" * 32},
     }
     first = write_exact_cache_batch(tmp_path / "first", cases[:4], generated_block=120, **common)
     second = write_exact_cache_batch(tmp_path / "second", cases[4:], generated_block=120, **common)

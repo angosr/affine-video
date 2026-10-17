@@ -747,6 +747,7 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkey
         source_pool_merkle_root=pool.root,
         source_proofs=tuple(item.document() for item in plan.source_proofs),
         dense_references=(),
+        selected_inputs={},
     )
     video = tmp_path / f"{rollout.rollout_id}.mp4"
     latent = tmp_path / f"{rollout.rollout_id}.safetensors"
@@ -864,6 +865,7 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
             source_pool_merkle_root=pool.root,
             source_proofs=tuple(item.document() for item in planned.source_proofs),
             dense_references=tuple(item.document() for item in references),
+            selected_inputs=ready_sample_cache().document(),
         )
 
     track = SimpleNamespace(cache=SimpleNamespace(exact_max_bytes=10_000_000), scoring=scoring())
@@ -874,6 +876,16 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
         sample_cache=ready_sample_cache(),
     )
     _validate_plan_case_binding(batch.path, ready, track)
+
+    substituted_inputs = replace(
+        ready,
+        sample_cache=ReadySampleCache(
+            ReadyObject("inputs/substitute.json", "90" * 32, 10),
+            ready_sample_cache().text,
+        ),
+    )
+    with pytest.raises(CacheLoadError, match="selected inputs"):
+        _validate_plan_case_binding(batch.path, substituted_inputs, track)
 
     changed = (replace(cases[0], source_id="wrong-source"), *cases[1:])
     invalid = write(tmp_path / "invalid", changed)
