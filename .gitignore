@@ -15,5 +15,5 @@ models/
 wallets/
 deploy/
 docs/
-experiments/CPU可行性实验报告.md
+experiments/*.md
 

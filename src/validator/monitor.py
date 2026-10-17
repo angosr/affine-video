@@ -95,7 +95,7 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
             for row, plain in zip(rows, plain_rows, strict=True)
         )
     else:
-        lines.append("尚无新比赛参赛者")
+        lines.append("No participants yet")
     return "\n".join(lines)
 
 
