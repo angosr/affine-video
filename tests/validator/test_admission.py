@@ -265,6 +265,7 @@ def test_deferred_earlier_submission_blocks_fifo_without_consuming_a_slot(tmp_pa
 
         assert first is not None and first.status is AdmissionStatus.DEFERRED
         assert not store.has_season_slot(first_id)
+        assert not store.admission_interval_complete(100, 100)
         assert blocked_by_fifo is None
 
         retried = process_next_admission(
@@ -277,6 +278,7 @@ def test_deferred_earlier_submission_blocks_fifo_without_consuming_a_slot(tmp_pa
         )
         assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
         assert store.has_season_slot(first_id)
+        assert store.admission_interval_complete(100, 100)
 
         second = process_next_admission(
             store,

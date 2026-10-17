@@ -731,6 +731,11 @@ def test_plan_coordinator_skips_empty_intervals_without_losing_later_work() -> N
     )
 
     class Store:
+        admission_complete = False
+
+        def admission_interval_complete(self, _first, _last):
+            return self.admission_complete
+
         def chain_cursor(self):
             return (140, "0x" + "ef" * 32)
 
@@ -754,14 +759,19 @@ def test_plan_coordinator_skips_empty_intervals_without_losing_later_work() -> N
             self.payload = (name, payload)
             return StoredObject(payload, "etag")
 
+    store = Store()
     objects = Objects()
     coordinator = PlanCoordinator(
         track=track,
-        store=Store(),
+        store=store,
         objects=objects,
         source_pool=pool,
     )
 
+    assert coordinator.create_next() is None
+    assert objects.payload is None
+
+    store.admission_complete = True
     plan = coordinator.create_next()
 
     assert plan is not None
@@ -787,6 +797,9 @@ def test_plan_coordinator_maps_confirmation_from_its_exact_decision_block() -> N
     )
 
     class Store:
+        def admission_interval_complete(self, _first, _last):
+            return True
+
         def chain_cursor(self):
             return (140, "0x" + "ef" * 32)
 
@@ -860,6 +873,9 @@ def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
     class Store:
         score_recovered = False
         transition_applied = False
+
+        def admission_interval_complete(self, _first, _last):
+            return True
 
         def stage_score(self, identifier, stage):
             assert identifier == challenge_id

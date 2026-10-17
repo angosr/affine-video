@@ -555,6 +555,41 @@ class ChallengeStore:
         ).fetchall()
         return tuple(row["challenge_id"] for row in rows)
 
+    def admission_interval_complete(self, first_block: int, last_block: int) -> bool:
+        """Return whether every eligible submission in an interval has left admission."""
+
+        if not 0 <= first_block <= last_block:
+            raise ValueError("challenge block interval is invalid")
+        row = self._connection.execute(
+            """
+            SELECT 1
+            FROM challenges c
+            JOIN submissions s ON s.submission_id = c.submission_id
+            WHERE s.admitted = 1
+              AND s.block_height BETWEEN ? AND ?
+              AND (
+                    c.state IN (?, ?, ?)
+                 OR (
+                        c.state IN (?, ?)
+                    AND c.resume_state IN (?, ?)
+                    )
+                  )
+            LIMIT 1
+            """,
+            (
+                first_block,
+                last_block,
+                ChallengeState.QUEUED,
+                ChallengeState.FETCHING,
+                ChallengeState.VALIDATING,
+                ChallengeState.SYSTEM_DEFERRED,
+                ChallengeState.SYSTEM_BLOCKED,
+                ChallengeState.FETCHING,
+                ChallengeState.VALIDATING,
+            ),
+        ).fetchone()
+        return row is None
+
     def confirmation_challenge_ids(
         self, first_decision_block: int, last_decision_block: int
     ) -> tuple[str, ...]:

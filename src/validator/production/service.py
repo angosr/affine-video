@@ -120,6 +120,8 @@ class PlanCoordinator:
                 minimum_generation_delay_blocks=(self.track.cache.minimum_generation_delay_blocks),
                 generation_interval_blocks=interval,
             )
+            if not self.store.admission_interval_complete(first, last):
+                return None
             exact_ids = self.store.admitted_challenge_ids(first, last)
             confirmation_ids = self.store.confirmation_challenge_ids(first, last)
             if not exact_ids and not confirmation_ids:
