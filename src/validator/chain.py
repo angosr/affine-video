@@ -132,6 +132,12 @@ async def scan_finalized_blocks(
                             extra=context,
                         )
                         continue
+                    if not payload:
+                        LOGGER.warning(
+                            "skipping empty finalized commitment reveal",
+                            extra=context,
+                        )
+                        continue
                     matching.append(payload)
                 if len(matching) != 1:
                     LOGGER.warning(

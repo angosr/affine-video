@@ -154,6 +154,8 @@ match, follows any contiguous orphaned matches, and restores them instead of eva
 Conflicting immutable bytes stop publication. A chain node behind the recovered public watermark
 may keep scanning, but evaluation and publication wait until its finalized height catches up, so
 public state cannot move backward.
+The weight pointer binds the terminal match sequence and payload SHA-256, so a higher-block
+publisher with a shorter or conflicting match prefix is fenced before it can change champion weights.
 Mutable pointers use ETag conditional writes, and production startup probes both conditional create
 and conditional replace. A backend that cannot fence two concurrent publishers is rejected.
 

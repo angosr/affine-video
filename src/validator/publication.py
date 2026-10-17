@@ -149,6 +149,7 @@ def build_public_artifacts(
     )
     if any(match.document["decided_block"] > chain.finalized_block for match in tournament.matches):
         raise PublicArtifactError("a terminal decision is newer than the finalized chain snapshot")
+    match_sequence, terminal_match_sha256 = _terminal_match_fence(tournament)
     plan = None
     if not aborted:
         plan = plan_champion_weight(
@@ -175,6 +176,8 @@ def build_public_artifacts(
         source_block=chain.finalized_block,
         plan=plan,
         track_aborted=aborted,
+        match_sequence=match_sequence,
+        terminal_match_sha256=terminal_match_sha256,
     )
     summary = _summary_document(track, chain.finalized_block, tournament)
     system_matches = system_match_artifacts(track, runtime_manifest)
@@ -307,6 +310,8 @@ def build_genesis_artifacts(
         version_key=version_key,
         source_block=chain.finalized_block,
         plan=plan,
+        match_sequence=0,
+        terminal_match_sha256=None,
     )
     system_matches = system_match_artifacts(track, runtime_manifest)
     return PublicArtifacts(
@@ -359,6 +364,8 @@ def encode_weight_artifact(artifact: WeightArtifact) -> bytes:
             "version_key": artifact.version_key,
             "source_block": artifact.source_block,
             "track_aborted": artifact.track_aborted,
+            "match_sequence": artifact.match_sequence,
+            "terminal_match_sha256": artifact.terminal_match_sha256,
             "weights": weights,
         }
     )
@@ -373,10 +380,12 @@ def decode_weight_artifact(payload: bytes) -> WeightArtifact:
         raw = json.loads(payload, object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PublicArtifactError("weight artifact is not valid JSON") from exc
-    if isinstance(raw, dict) and "track_aborted" not in raw and (
+    if isinstance(raw, dict) and (
         raw.get("track_id"), raw.get("track_spec_digest")
     ) == _LEGACY_UNFENCED_WEIGHT_TRACK:
-        raw["track_aborted"] = False
+        raw.setdefault("track_aborted", False)
+        raw.setdefault("match_sequence", 0)
+        raw.setdefault("terminal_match_sha256", None)
     root = _object(
         raw,
         {
@@ -387,6 +396,8 @@ def decode_weight_artifact(payload: bytes) -> WeightArtifact:
             "version_key",
             "source_block",
             "track_aborted",
+            "match_sequence",
+            "terminal_match_sha256",
             "weights",
         },
         "weight artifact",
@@ -402,6 +413,13 @@ def decode_weight_artifact(payload: bytes) -> WeightArtifact:
     track_aborted = root["track_aborted"]
     if not isinstance(track_aborted, bool):
         raise PublicArtifactError("track_aborted must be boolean")
+    match_sequence = _integer(root["match_sequence"], "match_sequence")
+    terminal_match_sha256 = root["terminal_match_sha256"]
+    if terminal_match_sha256 is not None:
+        terminal_match_sha256 = _string(
+            terminal_match_sha256,
+            "terminal_match_sha256",
+        )
     items = root["weights"]
     plan = None
     if items is not None:
@@ -432,6 +450,8 @@ def decode_weight_artifact(payload: bytes) -> WeightArtifact:
             source_block,
             plan,
             track_aborted,
+            match_sequence,
+            terminal_match_sha256,
         )
     except ValueError as exc:
         raise PublicArtifactError(str(exc)) from exc
@@ -1220,7 +1240,14 @@ class S3Repository:
                 raise PublicArtifactError("public track abort is irreversible")
             before_block = before_weight.source_block
             after_block = after_weight.source_block
-            before_count = after_count = 0
+            before_count = before_weight.match_sequence
+            after_count = after_weight.match_sequence
+            if (
+                after_count == before_count
+                and after_weight.terminal_match_sha256
+                != before_weight.terminal_match_sha256
+            ):
+                raise PublicArtifactError("one match sequence cannot identify two histories")
         else:
             before = _decode_canonical_object(current, name)
             after = _decode_canonical_object(proposed, name)
@@ -1334,6 +1361,17 @@ def _summary_document(
         "leaderboard": list(tournament.leaderboard[:_SUMMARY_LEADERBOARD_LIMIT]),
         "leaderboard_total": len(tournament.leaderboard),
     }
+
+
+def _terminal_match_fence(tournament: Tournament) -> tuple[int, str | None]:
+    """Bind mutable weights to the immutable terminal match in their snapshot."""
+
+    if not tournament.matches:
+        return 0, None
+    terminal = tournament.matches[-1]
+    if terminal.sequence != len(tournament.matches):
+        raise PublicArtifactError("tournament match sequence is not contiguous")
+    return terminal.sequence, hashlib.sha256(_json_bytes(terminal.document)).hexdigest()
 
 
 def _status_document(

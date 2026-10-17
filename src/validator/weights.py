@@ -63,6 +63,8 @@ class WeightArtifact:
     source_block: int
     plan: WeightPlan | None
     track_aborted: bool = False
+    match_sequence: int = 0
+    terminal_match_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not self.track_id:
@@ -75,6 +77,16 @@ class WeightArtifact:
             raise ValueError("weight artifact chain values must be non-negative")
         if not isinstance(self.track_aborted, bool):
             raise ValueError("track-aborted marker must be boolean")
+        if type(self.match_sequence) is not int or self.match_sequence < 0:
+            raise ValueError("weight artifact match sequence must be non-negative")
+        if self.match_sequence == 0:
+            if self.terminal_match_sha256 is not None:
+                raise ValueError("empty match history cannot have a terminal match hash")
+        elif (
+            not isinstance(self.terminal_match_sha256, str)
+            or not _HEX_32.fullmatch(self.terminal_match_sha256)
+        ):
+            raise ValueError("weight artifact terminal match hash is invalid")
         if self.plan is not None and self.plan.source_block != self.source_block:
             raise ValueError("weight plan source block does not match its artifact")
         if self.track_aborted and self.plan is not None:

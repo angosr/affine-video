@@ -105,6 +105,8 @@ def weight_artifact() -> WeightArtifact:
         version_key=9,
         source_block=120,
         plan=WeightPlan(120, ("alice", "bob"), (1, 4), (0.6, 0.4)),
+        match_sequence=2,
+        terminal_match_sha256="cd" * 32,
     )
 
 
@@ -122,6 +124,8 @@ def test_only_pinned_legacy_weights_may_omit_abort_fence() -> None:
     }
     decoded = decode_weight_artifact(json.dumps(legacy).encode())
     assert decoded.track_aborted is False
+    assert decoded.match_sequence == 0
+    assert decoded.terminal_match_sha256 is None
 
     legacy["track_id"] = "another-track"
     with pytest.raises(PublicArtifactError, match="fields"):
@@ -136,7 +140,13 @@ def pointer_track(track_id: str = "track") -> bytes:
     ).encode()
 
 
-def pointer_weights(block: int, track_id: str = "track") -> bytes:
+def pointer_weights(
+    block: int,
+    track_id: str = "track",
+    *,
+    match_sequence: int = 0,
+    terminal_match_sha256: str | None = None,
+) -> bytes:
     return encode_weight_artifact(
         WeightArtifact(
             track_id,
@@ -146,6 +156,8 @@ def pointer_weights(block: int, track_id: str = "track") -> bytes:
             0,
             block,
             WeightPlan(block, ("hk",), (1,), (1.0,)),
+            match_sequence=match_sequence,
+            terminal_match_sha256=terminal_match_sha256,
         )
     )
 
@@ -258,6 +270,61 @@ def test_public_repository_rejects_active_track_pointer_rollback() -> None:
                 )
             )
         )
+
+
+def test_weights_reject_a_higher_block_with_a_stale_match_prefix_before_mutation() -> None:
+    def encoded(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    track = encoded({"spec": {"track_id": "track"}, "track_spec_digest": "ab" * 32})
+    current = PublicArtifacts(
+        source_block=10,
+        track=track,
+        summary=encoded({"track_id": "track", "source_block": 10, "match_count": 2}),
+        weights=pointer_weights(
+            10,
+            match_sequence=2,
+            terminal_match_sha256="22" * 32,
+        ),
+        matches=(),
+    )
+    stale = PublicArtifacts(
+        source_block=11,
+        track=track,
+        summary=encoded({"track_id": "track", "source_block": 11, "match_count": 1}),
+        weights=pointer_weights(
+            11,
+            match_sequence=1,
+            terminal_match_sha256="11" * 32,
+        ),
+        matches=(),
+    )
+    conflicting = PublicArtifacts(
+        source_block=12,
+        track=track,
+        summary=encoded({"track_id": "track", "source_block": 12, "match_count": 2}),
+        weights=pointer_weights(
+            12,
+            match_sequence=2,
+            terminal_match_sha256="33" * 32,
+        ),
+        matches=(),
+    )
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    asyncio.run(repository.publish(current))
+    weights_before = client.objects["tracks/main/weights.json"]
+    summary_before = client.objects["tracks/main/summary.json"]
+
+    with pytest.raises(PublicArtifactError, match="rollback"):
+        asyncio.run(repository.publish(stale))
+    assert client.objects["tracks/main/weights.json"] == weights_before
+    assert client.objects["tracks/main/summary.json"] == summary_before
+
+    with pytest.raises(PublicArtifactError, match="two histories"):
+        asyncio.run(repository.publish(conflicting))
+    assert client.objects["tracks/main/weights.json"] == weights_before
+    assert client.objects["tracks/main/summary.json"] == summary_before
 
 
 def test_public_repository_capability_probe_checks_and_cleans_conditions() -> None:
@@ -1290,6 +1357,10 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     public_summary = json.loads(artifacts.summary)
     public_match = json.loads(artifacts.matches[0][1])
     assert public_weights.source_block == public_summary["source_block"] == 120
+    assert public_weights.match_sequence == 1
+    assert public_weights.terminal_match_sha256 == hashlib.sha256(
+        artifacts.matches[0][1]
+    ).hexdigest()
     assert public_weights.plan is not None
     assert public_weights.plan.hotkeys == ("alice",)
     assert public_summary["champion"]["hotkey"] == "alice"

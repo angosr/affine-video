@@ -287,6 +287,57 @@ def test_scanner_skips_bad_timelock_reveals_and_advances_cursor(tmp_path, caplog
     assert "skipping unmatched finalized commitment reveal" in caplog.text
 
 
+@pytest.mark.parametrize("stored", ["0x", "", b""])
+def test_scanner_skips_empty_reveal_and_processes_the_next_block(
+    tmp_path, caplog, stored
+) -> None:
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+
+    def reveal_block(height: int):
+        block_hash = "0x" + f"{height:064x}"
+        return (
+            block_hash,
+            {"extrinsics": []},
+            [
+                {
+                    "extrinsic_idx": None,
+                    "module_id": "Commitments",
+                    "event_id": "CommitmentRevealed",
+                    "attributes": {"netuid": 7, "who": HOTKEY},
+                }
+            ],
+        )
+
+    blocks = {height: reveal_block(height) for height in (100, 101)}
+    client = FakeClient(blocks)
+    client.revealed = {
+        100: [SimpleNamespace(hotkey=HOTKEY, revealed=[(100, stored)])],
+        101: [
+            SimpleNamespace(
+                hotkey=HOTKEY,
+                revealed=[(101, "0x" + payload.hex())],
+            )
+        ],
+    }
+
+    with ChallengeStore(tmp_path / "validator.db") as store, caplog.at_level(logging.WARNING):
+        result = asyncio.run(
+            scan_finalized_blocks(client, store, netuid=7, track_start_block=100)
+        )
+
+        assert result.submissions_found == 1
+        assert store.chain_cursor() == (101, blocks[101][0])
+        assert len(store.public_snapshot()["challenges"]) == 1
+    empty = next(
+        record
+        for record in caplog.records
+        if record.message == "skipping empty finalized commitment reveal"
+    )
+    assert empty.block_height == 100
+    assert empty.event_index == 0
+    assert empty.hotkey == HOTKEY
+
+
 def test_scanner_skips_malformed_reveal_entries_without_losing_following_work(
     tmp_path, caplog
 ) -> None:
