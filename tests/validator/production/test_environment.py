@@ -128,6 +128,11 @@ def test_dependency_selection_uses_active_python_path_precedence(
     with pytest.raises(ValueError, match="ambiguous"):
         environment._select_distribution("example", [legacy, installed])
 
+    dist_info = SimpleNamespace(version="1.0", _path=tmp_path / "example.dist-info")
+    egg_info = SimpleNamespace(version="1.0", _path=tmp_path / "example.egg-info")
+    monkeypatch.setattr(environment, "_distribution_record", lambda _distribution: None)
+    assert environment._select_distribution("example", [egg_info, dist_info])[0] is dist_info
+
 
 def test_dependency_tree_hashes_metadata_when_no_file_list_exists(tmp_path) -> None:
     metadata = tmp_path / "example.egg-info"

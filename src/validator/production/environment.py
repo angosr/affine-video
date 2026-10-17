@@ -186,9 +186,19 @@ def _select_distribution(
     )
     if not ranked or ranked[0][0] >= len(sys.path):
         raise ValueError(f"installed distribution is outside the active Python path: {name}")
-    if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
-        raise ValueError(f"installed distribution identity is ambiguous: {name}")
-    selected = ranked[0][1]
+    tied = [distribution for priority, distribution in ranked if priority == ranked[0][0]]
+    if len(tied) == 1:
+        selected = tied[0]
+    else:
+        versions = {distribution.version for distribution in tied}
+        standard = [
+            distribution
+            for distribution in tied
+            if Path(getattr(distribution, "_path", "")).name.endswith(".dist-info")
+        ]
+        if len(versions) != 1 or len(standard) != 1:
+            raise ValueError(f"installed distribution identity is ambiguous: {name}")
+        selected = standard[0]
     return selected, _distribution_record(selected)
 
 
