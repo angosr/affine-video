@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -12,7 +13,7 @@ from scoring.model import TensorSpec
 from validator import run as run_module
 from validator.admission import AdmissionSettings, AdmissionStatus
 from validator.download import DownloadedModel
-from validator.publication import encode_weight_artifact
+from validator.publication import decode_weight_artifact, encode_weight_artifact
 from validator.queue import ChainPosition, ChallengeState
 from validator.run import process_cycle, process_weight_cycle
 from validator.scoring import ScoringSettings, StageOutcome
@@ -29,22 +30,52 @@ from validator.weights import (
 from .test_chain import HOTKEY, FakeClient, chain_block
 
 
-def test_unreleased_default_track_fails_before_wallet_or_network_access() -> None:
-    with pytest.raises(ValueError, match="not been released"):
-        asyncio.run(
-            run_module.run_validator(
-                public_weights_url=run_module.DEFAULT_PUBLIC_WEIGHTS_URL,
-                netuid=run_module.DEFAULT_NETUID,
-                track_spec_digest=run_module.DEFAULT_TRACK_SPEC_DIGEST,
-                network="finney",
-                wallet_name="default",
-                hotkey_name="default",
-                once=True,
-            )
-        )
-
+def test_release_defaults_target_sn120_initial_state() -> None:
     assert run_module.DEFAULT_NETUID == 120
     assert "/tracks/sn120/weights.json" in run_module.DEFAULT_PUBLIC_WEIGHTS_URL
+    assert run_module.DEFAULT_TRACK_SPEC_DIGEST != "0" * 64
+
+
+def test_initial_publisher_emits_current_uid_zero_weight(monkeypatch) -> None:
+    chain = WeightChainState(
+        321,
+        {run_module.INITIAL_CHAMPION_HOTKEY: 0},
+        1,
+        1.0,
+        100,
+        {},
+    )
+    published = {}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Publisher:
+        async def publish_initial_state(self, **kwargs):
+            published.update(kwargs)
+
+    async def read_state(_client, *, netuid):
+        assert netuid == 120
+        return chain
+
+    monkeypatch.setattr(run_module.bt, "Client", lambda _network: Client())
+    monkeypatch.setattr(run_module, "read_weight_chain_state", read_state)
+    asyncio.run(run_module.run_initial_publisher(publisher=Publisher(), once=True))
+
+    weights = decode_weight_artifact(published["weights"])
+    status = json.loads(published["status"])
+    assert weights.source_block == 321
+    assert weights.plan == WeightPlan(
+        321,
+        (run_module.INITIAL_CHAMPION_HOTKEY,),
+        (0,),
+        (1.0,),
+    )
+    assert status["participants"][0]["champion"] is True
 
 
 def empty_chain_block(block_height: int) -> tuple[str, dict, list[dict]]:

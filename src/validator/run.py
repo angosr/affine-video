@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ import httpx
 
 from scoring.cache import validate_exact_cache
 from scoring.model import ValidatedModel, validate_model
-from scoring.spec import TrackSpec, load_track_spec
+from scoring.spec import VEDA_REPO_ID, VEDA_REVISION, TrackSpec, load_track_spec
 from validator.admission import (
     AdmissionOutcome,
     AdmissionSettings,
@@ -27,6 +28,7 @@ from validator.publication import (
     PublicArtifacts,
     PublicLedger,
     build_public_artifacts,
+    encode_weight_artifact,
     fetch_weight_artifact,
     validate_public_weights_url,
 )
@@ -42,7 +44,9 @@ from validator.scoring import (
 from validator.store import ChallengeStore, LeasedChallenge
 from validator.tournament import MatchRecord
 from validator.weights import (
+    WeightArtifact,
     WeightReceipt,
+    plan_champion_weight,
     read_weight_chain_state,
     submit_weights,
     validate_weight_artifact,
@@ -58,13 +62,17 @@ DEFAULT_BASELINE_MANIFEST_URL = (
     "affine_video/tracks/sn120/assets/veda_baseline_f16/manifest.json"
 )
 DEFAULT_NETUID = 120
-DEFAULT_TRACK_SPEC_DIGEST = "0" * 64
+DEFAULT_TRACK_SPEC_DIGEST = "e853e8635ee229c2c7e37610d2ca852981cd3b32e963926e939e8f92545d7744"
+INITIAL_TRACK_ID = "veda-sn120-v1"
+INITIAL_CHAMPION_HOTKEY = "5HmYnmUYT6qe3yFMg1Ad8WLLqDvnwtjYakXBpDvoRW1Qqzb8"
 
 
 class ArtifactRepository(Protocol):
     async def publish(self, artifacts: PublicArtifacts) -> None: ...
 
     async def load(self, track: TrackSpec) -> PublicLedger: ...
+
+    async def publish_initial_state(self, *, status: bytes, weights: bytes) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +93,12 @@ class WeightCycleResult:
     status: str
     receipt: WeightReceipt | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _InitialChampion:
+    hotkey: str = INITIAL_CHAMPION_HOTKEY
+    uid: int = 0
 
 
 async def run_evaluator(
@@ -251,8 +265,6 @@ async def run_validator(
     normalized_track_digest = track_spec_digest.lower()
     if re.fullmatch(r"[0-9a-f]{64}", normalized_track_digest) is None:
         raise ValueError("track specification digest must be 32-byte hexadecimal")
-    if normalized_track_digest == "0" * 64:
-        raise ValueError("production track has not been released")
     validate_public_weights_url(public_weights_url)
     if poll_seconds <= 0:
         raise ValueError("poll interval must be positive")
@@ -296,6 +308,111 @@ async def run_validator(
                     raise RuntimeError(result.error)
                 return
             await asyncio.sleep(poll_seconds)
+
+
+async def run_initial_publisher(
+    *,
+    publisher: ArtifactRepository,
+    network: str = "finney",
+    poll_seconds: float = 12.0,
+    once: bool = False,
+    report: Callable[[WeightCycleResult], None] | None = None,
+) -> None:
+    """Keep the public SN120 state current while UID0 is the only champion."""
+
+    if not network:
+        raise ValueError("network cannot be empty")
+    if poll_seconds <= 0:
+        raise ValueError("poll interval must be positive")
+    async with bt.Client(network) as client:
+        while True:
+            try:
+                chain = await read_weight_chain_state(client, netuid=DEFAULT_NETUID)
+                plan = plan_champion_weight(
+                    _InitialChampion(),
+                    uid_by_hotkey=chain.uid_by_hotkey,
+                    current_block=chain.finalized_block,
+                    min_allowed_weights=chain.min_allowed_weights,
+                    max_weight=chain.max_weight,
+                )
+                if plan is None:
+                    raise RuntimeError("UID0 cannot receive the complete chain weight")
+                artifact = WeightArtifact(
+                    INITIAL_TRACK_ID,
+                    DEFAULT_TRACK_SPEC_DIGEST,
+                    DEFAULT_NETUID,
+                    0,
+                    0,
+                    chain.finalized_block,
+                    plan,
+                )
+                status = _initial_status(chain.finalized_block)
+                await publisher.publish_initial_state(
+                    status=status,
+                    weights=encode_weight_artifact(artifact),
+                )
+                result = WeightCycleResult(
+                    chain.finalized_block,
+                    chain.finalized_block,
+                    "PUBLISHED",
+                )
+            except Exception as exc:
+                result = WeightCycleResult(
+                    None,
+                    None,
+                    "ERROR",
+                    error=str(exc) or type(exc).__name__,
+                )
+            if report is not None:
+                report(result)
+            if once:
+                if result.error is not None:
+                    raise RuntimeError(result.error)
+                return
+            await asyncio.sleep(poll_seconds)
+
+
+def _initial_status(source_block: int) -> bytes:
+    champion = {
+        "challenge_id": "genesis",
+        "hotkey": INITIAL_CHAMPION_HOTKEY,
+        "repo_id": VEDA_REPO_ID,
+        "revision": VEDA_REVISION,
+        "score": None,
+        "uid": 0,
+        "source": "VEDA_BASELINE",
+        "block_height": 0,
+        "extrinsic_index": 0,
+        "event_index": 0,
+    }
+    document = {
+        "track_id": INITIAL_TRACK_ID,
+        "track_spec_digest": DEFAULT_TRACK_SPEC_DIGEST,
+        "netuid": DEFAULT_NETUID,
+        "source_block": source_block,
+        "champion": champion,
+        "participants": [
+            {
+                "uid": 0,
+                "hotkey": INITIAL_CHAMPION_HOTKEY,
+                "challenge_id": "genesis",
+                "submission_block": 0,
+                "state": "CHAMPION",
+                "queue_position": None,
+                "match_sequence": 0,
+                "score": None,
+                "outcome": "GENESIS",
+                "champion": True,
+            }
+        ],
+    }
+    return json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode()
 
 
 async def process_weight_cycle(

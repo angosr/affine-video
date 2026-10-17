@@ -332,6 +332,19 @@ class S3Repository:
             await asyncio.to_thread(self._put, "status.json", artifacts.status, False)
         await asyncio.to_thread(self._put, "weights.json", artifacts.weights, False)
 
+    async def publish_initial_state(self, *, status: bytes, weights: bytes) -> None:
+        """Publish UID0 state until the immutable competition track exists."""
+
+        await asyncio.to_thread(self._publish_initial_state, status, weights)
+
+    def _publish_initial_state(self, status: bytes, weights: bytes) -> None:
+        if self._get_optional("track.json") is not None:
+            raise PublicArtifactError("the competition evaluator has already taken ownership")
+        self._put("status.json", status, False)
+        if self._get_optional("track.json") is not None:
+            raise PublicArtifactError("the competition evaluator started during publication")
+        self._put("weights.json", weights, False)
+
     async def load(self, track: TrackSpec) -> PublicLedger:
         """Load and verify the committed public tournament ledger from object storage."""
 

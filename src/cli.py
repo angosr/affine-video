@@ -21,6 +21,7 @@ from validator.run import (
     EvaluationCycleResult,
     WeightCycleResult,
     run_evaluator,
+    run_initial_publisher,
     run_validator,
 )
 from validator.store import ChallengeStore
@@ -91,6 +92,15 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--mechid", default=0, type=int)
     evaluate.add_argument("--version-key", default=0, type=int)
     evaluate.add_argument("--once", action="store_true")
+
+    initialize = validator_commands.add_parser(
+        "initialize", help="publish the live UID0 state before the first challenge"
+    )
+    initialize.add_argument("--network", default="finney")
+    initialize.add_argument("--poll-seconds", default=12.0, type=float)
+    initialize.add_argument("--storage-bucket", default="affine_video")
+    initialize.add_argument("--storage-prefix", default="tracks/sn120")
+    initialize.add_argument("--once", action="store_true")
 
     run = validator_commands.add_parser(
         "run", help="fetch public weights and submit them on-chain"
@@ -168,6 +178,27 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
         except KeyboardInterrupt:
             return
         except (RuntimeError, ValueError) as exc:
+            parser.exit(1, f"error: {exc}\n")
+        return
+
+    if arguments.command == "initialize":
+        try:
+            publisher = S3Repository.from_environment(
+                bucket=arguments.storage_bucket,
+                prefix=arguments.storage_prefix,
+            )
+            asyncio.run(
+                run_initial_publisher(
+                    publisher=publisher,
+                    network=arguments.network,
+                    poll_seconds=arguments.poll_seconds,
+                    once=arguments.once,
+                    report=_print_weight_cycle,
+                )
+            )
+        except KeyboardInterrupt:
+            return
+        except (RuntimeError, OSError, ValueError) as exc:
             parser.exit(1, f"error: {exc}\n")
         return
 
