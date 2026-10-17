@@ -1995,8 +1995,11 @@ class ChallengeStore:
                 if decision_block > scoring_ready_through_block:
                     self._connection.commit()
                     return None
-            if strict_fifo and not include_queued:
+            if strict_fifo:
                 terminal_placeholders = ",".join("?" for _ in TERMINAL_STATES)
+                ownership_filter = (
+                    "AND earlier_challenge.model_digest IS NULL" if include_queued else ""
+                )
                 earlier = self._connection.execute(
                     f"""
                     SELECT 1
@@ -2004,6 +2007,7 @@ class ChallengeStore:
                     JOIN submissions earlier_submission
                       ON earlier_submission.submission_id = earlier_challenge.submission_id
                     WHERE earlier_challenge.state NOT IN ({terminal_placeholders})
+                      {ownership_filter}
                       AND (
                         earlier_submission.block_height,
                         earlier_submission.extrinsic_index,

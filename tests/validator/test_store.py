@@ -637,7 +637,7 @@ def test_expired_admission_lease_is_recovered(tmp_path) -> None:
         )
 
 
-def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> None:
+def test_deferred_admission_blocks_later_model_ownership_until_retry(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         second_id, _ = store.add_submission(submission_at(101, hotkey="hk2"), occurred_at_ms=20)
@@ -657,22 +657,7 @@ def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> No
         second = store.claim_next_admission(
             "worker", lease_ms=100, ready_through_block=10_000, now_ms=150
         )
-        assert second is not None
-        assert second.challenge_id == second_id
-        store.advance_leased(
-            second_id,
-            second.lease_token,
-            ChallengeState.VALIDATING,
-            release=False,
-            occurred_at_ms=151,
-        )
-        store.advance_leased(
-            second_id,
-            second.lease_token,
-            ChallengeState.SCORING,
-            release=True,
-            occurred_at_ms=152,
-        )
+        assert second is None
 
         retry = store.claim_next_admission(
             "worker", lease_ms=100, ready_through_block=10_000, now_ms=200
@@ -680,6 +665,26 @@ def test_deferred_admission_does_not_block_fifo_until_retry_time(tmp_path) -> No
         assert retry is not None
         assert retry.challenge_id == first_id
         assert retry.state is ChallengeState.FETCHING
+
+        store.advance_leased(
+            first_id,
+            retry.lease_token,
+            ChallengeState.VALIDATING,
+            release=False,
+            occurred_at_ms=201,
+        )
+        registration = store.register_validated_model(
+            first_id,
+            retry.lease_token,
+            model_digest="ab" * 32,
+            occurred_at_ms=202,
+        )
+        assert registration.accepted
+
+        second = store.claim_next_admission(
+            "worker", lease_ms=100, ready_through_block=10_000, now_ms=203
+        )
+        assert second is not None and second.challenge_id == second_id
 
 
 def test_scoring_claims_are_fifo_and_reject_stale_completion(tmp_path) -> None:

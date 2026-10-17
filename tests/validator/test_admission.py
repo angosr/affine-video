@@ -214,12 +214,18 @@ def test_frozen_effective_challenge_limit_is_enforced(tmp_path) -> None:
 
 def test_deferred_earlier_submission_keeps_its_non_refundable_season_slot(tmp_path) -> None:
     configured = replace(settings(tmp_path), maximum_effective_challenges=1)
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
     downloads = 0
 
-    def unavailable(*_args, **_kwargs):
+    def initially_unavailable(*args, **kwargs):
         nonlocal downloads
         downloads += 1
-        raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "temporary outage", temporary=True)
+        if downloads == 1:
+            raise ModelDownloadError(
+                "DOWNLOAD_TEMPORARY_FAILURE", "temporary outage", temporary=True
+            )
+        return model_downloader(model)(*args, **kwargs)
 
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
@@ -232,22 +238,42 @@ def test_deferred_earlier_submission_keeps_its_non_refundable_season_slot(tmp_pa
             settings=configured,
             current_finalized_block=10_000,
             now_ms=100,
-            downloader=unavailable,
+            downloader=initially_unavailable,
         )
-        second = process_next_admission(
+        blocked_by_fifo = process_next_admission(
             store,
             worker_id="admission",
             settings=configured,
             current_finalized_block=10_000,
             now_ms=200,
-            downloader=unavailable,
+            downloader=initially_unavailable,
         )
 
         assert first is not None and first.status is AdmissionStatus.DEFERRED
         assert store.has_season_slot(first_id)
+        assert blocked_by_fifo is None
+
+        retried = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=30_100,
+            downloader=initially_unavailable,
+        )
+        assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
+
+        second = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=30_101,
+            downloader=initially_unavailable,
+        )
         assert second is not None and second.code == "TRACK_CAPACITY_REACHED"
         assert store.get_challenge(second_id).state is ChallengeState.REJECTED_TRACK_CAPACITY
-        assert downloads == 1
+        assert downloads == 2
 
 
 def test_same_repository_revision_is_rejected_before_redownload(tmp_path) -> None:
@@ -377,6 +403,80 @@ def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:
             "other", lease_ms=1_000, ready_through_block=10_000, now_ms=30_100
         )
         assert retry is not None and retry.state is ChallengeState.FETCHING
+
+
+def test_temporary_failure_cannot_invert_identical_model_ownership(tmp_path) -> None:
+    early_model = tmp_path / "early.safetensors"
+    later_model = tmp_path / "later.safetensors"
+    write_model(early_model, "early")
+    write_model(later_model, "later")
+    downloads = {
+        "early/model": model_downloader(early_model),
+        "later/model": model_downloader(later_model),
+    }
+    early_attempts = 0
+
+    def temporarily_unavailable(repo_id, *args, **kwargs):
+        nonlocal early_attempts
+        if repo_id == "early/model" and early_attempts == 0:
+            early_attempts += 1
+            raise ModelDownloadError(
+                "DOWNLOAD_TEMPORARY_FAILURE", "temporary outage", temporary=True
+            )
+        return downloads[repo_id](repo_id, *args, **kwargs)
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        early_id, _ = store.add_submission(
+            submission_at(100, "early", "early/model"), occurred_at_ms=1
+        )
+        later_id, _ = store.add_submission(
+            submission_at(101, "later", "later/model"), occurred_at_ms=2
+        )
+
+        deferred = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=settings(tmp_path),
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=temporarily_unavailable,
+        )
+        assert deferred is not None and deferred.status is AdmissionStatus.DEFERRED
+
+        assert (
+            process_next_admission(
+                store,
+                worker_id="admission",
+                settings=settings(tmp_path),
+                current_finalized_block=10_000,
+                now_ms=101,
+                downloader=temporarily_unavailable,
+            )
+            is None
+        )
+
+        accepted = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=settings(tmp_path),
+            current_finalized_block=10_000,
+            now_ms=30_100,
+            downloader=temporarily_unavailable,
+        )
+        assert accepted is not None and accepted.status is AdmissionStatus.ACCEPTED
+        assert accepted.challenge_id == early_id
+
+        duplicate = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=settings(tmp_path),
+            current_finalized_block=10_000,
+            now_ms=30_101,
+            downloader=temporarily_unavailable,
+        )
+        assert duplicate is not None and duplicate.code == "EXACT_DUPLICATE"
+        assert duplicate.challenge_id == later_id
+        assert duplicate.duplicate_of == early_id
 
 
 def test_repeated_download_infrastructure_failure_remains_retryable(tmp_path) -> None:
