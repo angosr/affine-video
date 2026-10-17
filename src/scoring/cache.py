@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 from numpy.lib.format import read_array_header_1_0, read_array_header_2_0, read_magic
 
-from scoring.exact import ExactCase
+from scoring.exact import ExactCase, validate_dense_reference
 from scoring.spec import EXACT_CACHE_FORMAT
 from validator.production.plan import scheduled_generation_block
 
@@ -366,8 +366,9 @@ def validate_exact_cache(
     rollouts_per_stratum: int,
     sampled_step_count: int,
     query_tiles_per_case: int,
+    dense_device: str | None = None,
 ) -> None:
-    """Validate central directory, metadata and array headers only."""
+    """Validate the complete cross design and every stored dense reference."""
 
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
     metadata = _read_metadata(cache_path)
@@ -415,6 +416,22 @@ def validate_exact_cache(
             )
         if set(archive.namelist()) != expected_names:
             raise CacheLoadError("cache archive members do not match its metadata")
+    _validate_dense_references(cache_path, cases, device=dense_device)
+
+
+def validate_exact_cache_references(
+    path: str | Path,
+    *,
+    expected_sha256: str,
+    max_bytes: int,
+    device: str | None = None,
+) -> None:
+    """Stream and verify Q/K/V→dense consistency for a cache or rollout shard."""
+
+    cache_path = _verify_archive(path, expected_sha256, max_bytes)
+    metadata = _read_metadata(cache_path)
+    cases = [_case_metadata(item) for item in metadata["cases"]]
+    _validate_dense_references(cache_path, cases, device=device)
 
 
 class ExactCacheReader:
@@ -439,24 +456,44 @@ class ExactCacheReader:
         if self._archive is None:
             raise RuntimeError("exact cache reader must be used as a context manager")
         for index, case in enumerate(self._cases):
-            prefix = f"case_{index:06d}"
-            arrays = {
-                field: np.asarray(self._archive[f"{prefix}_{field}"]) for field in _ARRAY_FIELDS
-            }
-            yield ExactCase(
-                route=case["route"],
-                stratum=case["stratum"],
-                rollout_id=case["rollout_id"],
-                source_id=case["source_id"],
-                step_index=case["step_index"],
-                step_window=case["step_window"],
-                scheduler_timestep=float(case["scheduler_timestep"]),
-                sigma=float(case["sigma"]),
-                tile_plan_hash=case["tile_plan_hash"],
-                query_tile_ids=tuple(case["query_tile_ids"]),
-                epsilon=float(case["epsilon"]),
-                **arrays,
-            )
+            yield _load_case(self._archive, index, case)
+
+
+def _validate_dense_references(
+    path: Path,
+    cases: list[dict[str, Any]],
+    *,
+    device: str | None,
+) -> None:
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            for index, metadata in enumerate(cases):
+                case = _load_case(archive, index, metadata)
+                validate_dense_reference(case, device=device)
+                del case
+    except CacheLoadError:
+        raise
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise CacheLoadError("cache dense reference is inconsistent with its Q/K/V") from exc
+
+
+def _load_case(archive: Any, index: int, case: Mapping[str, Any]) -> ExactCase:
+    prefix = f"case_{index:06d}"
+    arrays = {field: np.asarray(archive[f"{prefix}_{field}"]) for field in _ARRAY_FIELDS}
+    return ExactCase(
+        route=case["route"],
+        stratum=case["stratum"],
+        rollout_id=case["rollout_id"],
+        source_id=case["source_id"],
+        step_index=case["step_index"],
+        step_window=case["step_window"],
+        scheduler_timestep=float(case["scheduler_timestep"]),
+        sigma=float(case["sigma"]),
+        tile_plan_hash=case["tile_plan_hash"],
+        query_tile_ids=tuple(case["query_tile_ids"]),
+        epsilon=float(case["epsilon"]),
+        **arrays,
+    )
 
 
 def _case_document(case: ExactCase) -> dict[str, Any]:

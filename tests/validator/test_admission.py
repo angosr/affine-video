@@ -1,10 +1,13 @@
+import errno
 import hashlib
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 from safetensors.numpy import save_file
 
 from scoring.model import TensorSpec
+from validator import download as download_module
 from validator.admission import (
     AdmissionSettings,
     AdmissionStatus,
@@ -820,6 +823,73 @@ def test_admission_retry_ceiling_survives_total_local_state_loss(tmp_path) -> No
         AdmissionStatus.BLOCKED,
     ]
     assert calls == 2
+
+
+def test_disk_full_during_download_preparation_uses_durable_retry_ceiling(
+    monkeypatch, tmp_path
+) -> None:
+    retries = PrivateRetryStore(
+        PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc"),
+        track_spec_digest="ab" * 32,
+    )
+    calls = 0
+    alerts = []
+
+    class MetadataApi:
+        def model_info(self, *_args, **_kwargs):
+            sibling = SimpleNamespace(
+                rfilename="selector.safetensors",
+                size=6,
+                lfs=None,
+            )
+            return SimpleNamespace(siblings=[sibling], sha="12" * 20)
+
+    def disk_full(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    monkeypatch.setattr(download_module, "HfApi", lambda **_kwargs: MetadataApi())
+    monkeypatch.setattr(download_module.tempfile, "mkstemp", disk_full)
+    configured = replace(
+        settings(tmp_path),
+        max_attempts=2,
+        alert=lambda event, details: alerts.append((event, details)),
+        restore_retry=retries.restore,
+        record_retry=retries.record_failure,
+    )
+    submission = submission_at(100, "hk1")
+    outcomes = []
+    states = []
+    for index, now in enumerate((100, 30_100, 1_000_000), start=1):
+        with ChallengeStore(tmp_path / f"disk-full-{index}.db") as store:
+            identifier, _ = store.add_submission(submission, occurred_at_ms=1)
+            outcome = process_next_admission(
+                store,
+                worker_id="admission",
+                settings=configured,
+                current_finalized_block=10_000,
+                now_ms=now,
+            )
+            assert outcome is not None
+            outcomes.append(outcome.status)
+            states.append(store.get_challenge(identifier).state)
+
+    assert outcomes == [
+        AdmissionStatus.DEFERRED,
+        AdmissionStatus.BLOCKED,
+        AdmissionStatus.BLOCKED,
+    ]
+    assert states == [
+        ChallengeState.SYSTEM_DEFERRED,
+        ChallengeState.SYSTEM_BLOCKED,
+        ChallengeState.SYSTEM_BLOCKED,
+    ]
+    assert calls == 2
+    assert [event for event, _details in alerts] == [
+        "ADMISSION_RETRY_STARTED",
+        "ADMISSION_RETRY_EXHAUSTED",
+    ]
 
 
 def test_permanent_download_failure_records_no_authoritative_score(tmp_path) -> None:

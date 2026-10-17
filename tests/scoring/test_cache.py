@@ -1,4 +1,5 @@
 import hashlib
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -18,9 +19,9 @@ from scoring.exact import ExactCase
 
 def exact_case(route: str, rollout: str, step: int) -> ExactCase:
     generator = np.random.default_rng(step + int(rollout[-1]))
-    q = generator.normal(size=(2, 2, 2)).astype(np.float32)
-    k = generator.normal(size=(3, 2, 2)).astype(np.float32)
-    v = generator.normal(size=(3, 2, 2)).astype(np.float32)
+    q = generator.normal(size=(2, 2, 2)).astype(np.float16)
+    k = generator.normal(size=(3, 2, 2)).astype(np.float16)
+    v = generator.normal(size=(3, 2, 2)).astype(np.float16)
     dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
     return ExactCase(
         route=route,
@@ -114,6 +115,32 @@ def test_cache_rejects_wrong_digest_track_or_decoded_limit(tmp_path) -> None:
         ExactCacheReader(batch.path, expected_sha256="00" * 32, max_bytes=1_000_000)
     with pytest.raises(CacheLoadError, match="decoded size"):
         ExactCacheReader(batch.path, expected_sha256=batch.sha256, max_bytes=1)
+
+
+def test_cache_rejects_rehashed_dense_values_that_do_not_match_qkv(tmp_path) -> None:
+    cases = tuple(
+        exact_case(route, rollout, step)
+        for route in ("route-0", "route-1")
+        for rollout in ("rollout-0", "rollout-1")
+        for step in (0, 1)
+    )
+    cases = tuple(replace(case, dense=case.dense + 100) for case in cases)
+    batch = write_exact_cache_batch(
+        tmp_path,
+        cases,
+        generated_block=120,
+        seed_block_hash="0x" + "ab" * 32,
+        plan_digest="23" * 32,
+        track_spec_digest="34" * 32,
+        artifact_manifest_sha256="45" * 32,
+        source_pool_merkle_root="56" * 32,
+        source_proofs=({"source_id": "source-0"},),
+        dense_references=({"video_sha256": "67" * 32},),
+        selected_inputs={"index_sha256": "78" * 32},
+    )
+
+    with pytest.raises(CacheLoadError, match="dense reference"):
+        validate_exact_cache(batch.path, **validation_arguments(batch))
 
 
 def test_selects_only_the_scheduled_generation_batch(tmp_path) -> None:

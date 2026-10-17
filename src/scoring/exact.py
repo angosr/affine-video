@@ -24,6 +24,9 @@ from scoring.spec import BudgetSpec
 TARGET_SEGMENT = 0
 REFERENCE_SEGMENT = 1
 GLOBAL_SEGMENT = 2
+DENSE_REFERENCE_MAX_ABS_TOLERANCE = 1.0
+DENSE_REFERENCE_MEAN_ABS_TOLERANCE = 5e-2
+DENSE_REFERENCE_RELATIVE_SQUARED_ERROR_TOLERANCE = 1e-5
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +363,70 @@ def _validate_independent_videos(
 def _validate_case(case: ExactCase, selector: FixedSelector) -> None:
     if case.route not in selector.architecture.routes:
         raise ValueError("exact case references an unknown selector route")
+    _validate_case_data(case)
+
+
+def validate_dense_reference(
+    case: ExactCase,
+    *,
+    device: str | None = None,
+    max_abs_tolerance: float = DENSE_REFERENCE_MAX_ABS_TOLERANCE,
+    mean_abs_tolerance: float = DENSE_REFERENCE_MEAN_ABS_TOLERANCE,
+    relative_squared_error_tolerance: float = (
+        DENSE_REFERENCE_RELATIVE_SQUARED_ERROR_TOLERANCE
+    ),
+) -> tuple[float, float, float]:
+    """Verify that stored dense output is the frozen float32 attention of Q/K/V."""
+
+    if min(
+        max_abs_tolerance,
+        mean_abs_tolerance,
+        relative_squared_error_tolerance,
+    ) <= 0:
+        raise ValueError("dense reference tolerances must be positive")
+    _validate_case_data(case)
+    if device is None:
+        expected = reference_attention(
+            case.q,
+            case.k,
+            case.v,
+            np.ones((case.q.shape[0], case.k.shape[0]), dtype=np.bool_),
+            query_valid_counts=case.query_valid_counts,
+            key_valid_counts=case.key_valid_counts,
+        )
+    else:
+        from scoring.torch_backend import dense_reference_attention
+
+        expected = dense_reference_attention(case, device=device)
+    # Both runtime captures and cache files freeze outputs as float16. Compare
+    # after that same storage conversion so this gate tests protocol semantics,
+    # not uncommitted higher-precision values.
+    expected = np.asarray(expected, dtype=np.float16).astype(np.float32)
+    observed = np.asarray(case.dense, dtype=np.float32)
+    valid = np.arange(observed.shape[1])[None, :] < np.asarray(
+        case.query_valid_counts
+    )[:, None]
+    delta = np.abs(observed[valid] - expected[valid])
+    maximum = float(delta.max())
+    mean = float(delta.mean(dtype=np.float64))
+    relative = relative_squared_error(
+        observed[valid].reshape(-1),
+        expected[valid].reshape(-1),
+        epsilon=case.epsilon,
+    )
+    if (
+        maximum > max_abs_tolerance
+        or mean > mean_abs_tolerance
+        or relative > relative_squared_error_tolerance
+    ):
+        raise ValueError(
+            "exact dense reference diverges from its Q/K/V: "
+            f"max_abs={maximum:.9g}, mean_abs={mean:.9g}, relative={relative:.9g}"
+        )
+    return maximum, mean, relative
+
+
+def _validate_case_data(case: ExactCase) -> None:
     for value, name in (
         (case.stratum, "stratum"),
         (case.rollout_id, "rollout"),

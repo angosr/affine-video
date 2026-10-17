@@ -21,7 +21,12 @@ from typing import Any
 
 from safetensors import SafetensorError, safe_open
 
-from scoring.cache import ExactCacheReader, assemble_exact_cache_batch, write_exact_cache_batch
+from scoring.cache import (
+    ExactCacheReader,
+    assemble_exact_cache_batch,
+    validate_exact_cache_references,
+    write_exact_cache_batch,
+)
 from scoring.spec import TrackSpec, load_track_spec
 from validator.alerts import webhook_alerter
 from validator.production.commitment import (
@@ -627,7 +632,7 @@ def _produce_unit(
     runtime.verify_trajectory_schedule(track.scoring.trajectory_schedule.sigmas)
     root = config.work_dir / plan.plan_digest / "units" / rollout.rollout_id
     root.mkdir(parents=True, exist_ok=True)
-    existing = _find_valid_shard(root, plan, rollout, track)
+    existing = _find_valid_shard(root, plan, rollout, track, dense_device="cuda:0")
     video = root / f"{rollout.rollout_id}.mp4"
     latent = root / f"{rollout.rollout_id}.safetensors"
     if existing is not None:
@@ -664,7 +669,7 @@ def _produce_unit(
         selected_inputs={},
     )
     _write_unit_completion(root, plan, rollout, shard.path, output.video_path, output.latent_path)
-    validated = _find_valid_shard(root, plan, rollout, track)
+    validated = _find_valid_shard(root, plan, rollout, track, dense_device="cuda:0")
     if validated != shard.path:
         raise RuntimeError("producer unit failed its completion validation")
     return UnitResult(
@@ -678,7 +683,12 @@ def _produce_unit(
 
 
 def _find_valid_shard(
-    root: Path, plan: BatchPlan, rollout: RolloutPlan, track: TrackSpec
+    root: Path,
+    plan: BatchPlan,
+    rollout: RolloutPlan,
+    track: TrackSpec,
+    *,
+    dense_device: str | None = None,
 ) -> Path | None:
     completion = root / "unit-complete.json"
     if not completion.is_file():
@@ -724,6 +734,12 @@ def _find_valid_shard(
             or not _video_decodes(video)
         ):
             return None
+        validate_exact_cache_references(
+            exact,
+            expected_sha256=document["files"]["exact"]["sha256"],
+            max_bytes=track.cache.exact_max_bytes,
+            device=dense_device,
+        )
         return exact
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return None

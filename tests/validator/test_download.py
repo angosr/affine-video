@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 from types import SimpleNamespace
@@ -221,6 +222,25 @@ def test_download_persists_an_absolute_cache_path(monkeypatch, tmp_path) -> None
 
     assert downloaded.path.is_absolute()
     assert downloaded.path.parent == (tmp_path / "relative-cache").resolve()
+
+
+def test_local_download_preparation_failure_is_temporary(monkeypatch, tmp_path) -> None:
+    def disk_full(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    monkeypatch.setattr("validator.download.tempfile.mkstemp", disk_full)
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model",
+            "12" * 20,
+            cache_dir=tmp_path,
+            max_bytes=10,
+            api=FakeApi([sibling(size=6)]),
+            http_client=FakeClient(),
+        )
+
+    assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
+    assert caught.value.temporary is True
 
 
 def test_metadata_size_rejects_before_download(tmp_path) -> None:

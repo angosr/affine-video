@@ -773,6 +773,23 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkey
 
     assert _find_valid_shard(tmp_path, plan, rollout, track) == shard.path
 
+    inconsistent = write_exact_cache_batch(
+        tmp_path,
+        (replace(case, dense=case.dense + 100),),
+        generated_block=plan.generation_block,
+        seed_block_hash=plan.block_hash,
+        plan_digest=plan.plan_digest,
+        track_spec_digest=plan.track_spec_digest,
+        artifact_manifest_sha256="67" * 32,
+        source_pool_merkle_root=pool.root,
+        source_proofs=tuple(item.document() for item in plan.source_proofs),
+        dense_references=(),
+        selected_inputs={},
+    )
+    _write_unit_completion(tmp_path, plan, rollout, inconsistent.path, video, latent)
+    assert _find_valid_shard(tmp_path, plan, rollout, track) is None
+    _write_unit_completion(tmp_path, plan, rollout, shard.path, video, latent)
+
     video.write_bytes(b"broken encoded video")
     assert _find_valid_shard(tmp_path, plan, rollout, track) is None
 

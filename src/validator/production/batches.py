@@ -72,10 +72,13 @@ class ReadyBatchSource:
         track: TrackSpec,
         objects: PrivateObjectStore,
         cache_dir: str | Path,
+        validation_device: str | None = None,
     ) -> None:
         self.track = track
         self.objects = objects
         self.cache_dir = Path(cache_dir)
+        self.validation_device = validation_device
+        self._validated_exact: set[str] = set()
 
     def archive_model(
         self,
@@ -251,20 +254,22 @@ class ReadyBatchSource:
         )
         try:
             batch = inspect_exact_cache_batch(path, max_bytes=self.track.cache.exact_max_bytes)
-            validate_exact_cache(
-                path,
-                expected_sha256=batch.sha256,
-                expected_track_spec_digest=self.track.digest,
-                max_bytes=self.track.cache.exact_max_bytes,
-                head_dim=self.track.model.selector.head_dim,
-                tile_size=128,
-                routes=plan.selected_routes,
-                strata=self.track.scoring.stratum_weight_map,
-                sampled_route_count=self.track.scoring.sampled_route_count,
-                rollouts_per_stratum=self.track.scoring.rollouts_per_stratum,
-                sampled_step_count=self.track.scoring.sampled_step_count,
-                query_tiles_per_case=self.track.scoring.query_tiles_per_case,
-            )
+            if batch.sha256 not in self._validated_exact:
+                validate_exact_cache(
+                    path,
+                    expected_sha256=batch.sha256,
+                    expected_track_spec_digest=self.track.digest,
+                    max_bytes=self.track.cache.exact_max_bytes,
+                    head_dim=self.track.model.selector.head_dim,
+                    tile_size=128,
+                    routes=plan.selected_routes,
+                    strata=self.track.scoring.stratum_weight_map,
+                    sampled_route_count=self.track.scoring.sampled_route_count,
+                    rollouts_per_stratum=self.track.scoring.rollouts_per_stratum,
+                    sampled_step_count=self.track.scoring.sampled_step_count,
+                    query_tiles_per_case=self.track.scoring.query_tiles_per_case,
+                    dense_device=self.validation_device,
+                )
             _validate_plan_case_binding(path, plan, self.track)
         except (OSError, CacheLoadError, ValueError) as exc:
             raise RuntimeError("restored exact batch is invalid") from exc
@@ -283,6 +288,7 @@ class ReadyBatchSource:
             or batch.selected_inputs != plan.sample_cache.document()
         ):
             raise RuntimeError("restored exact batch conflicts with its READY plan")
+        self._validated_exact.add(batch.sha256)
         return batch
 
     def confirmation_batch(self, challenge_id: str) -> ConfirmationBatch:

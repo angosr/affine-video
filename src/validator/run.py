@@ -191,7 +191,12 @@ async def run_evaluator(
             logical_names=evaluator_artifacts,
         )
         data_config.verify_evaluator_manifest(manifest)
-        batch_source = ReadyBatchSource(track=track, objects=objects, cache_dir=cache_dir)
+        batch_source = ReadyBatchSource(
+            track=track,
+            objects=objects,
+            cache_dir=cache_dir,
+            validation_device=scoring_device,
+        )
         retry_store = PrivateRetryStore(objects, track_spec_digest=track.digest)
         confirmation_pool = ConfirmationWorkerPool(
             data_config,

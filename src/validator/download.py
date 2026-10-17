@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -373,19 +374,24 @@ def download_public_model(
     if declared_size is not None and declared_size > max_bytes:
         raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
 
-    cache = Path(cache_dir).resolve()
-    cache.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".partial-", dir=cache)
-    temporary = Path(temporary_name)
     owned_client = http_client is None
-    client = http_client or httpx.Client(follow_redirects=True, timeout=timeout_seconds)
+    client: httpx.Client | None = http_client
+    descriptor: int | None = None
+    temporary: Path | None = None
     digest = hashlib.sha256()
     received = 0
     etag: str | None = None
     host: str | None = None
 
     try:
-        with os.fdopen(descriptor, "wb") as output:
+        cache = Path(cache_dir).resolve()
+        cache.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".partial-", dir=cache)
+        temporary = Path(temporary_name)
+        client = client or httpx.Client(follow_redirects=True, timeout=timeout_seconds)
+        raw_descriptor = descriptor
+        descriptor = None
+        with os.fdopen(raw_descriptor, "wb") as output:
             url = hf_hub_url(repo_id, MODEL_FILENAME, revision=revision)
             with client.stream("GET", url) as response:
                 if response.status_code >= 400:
@@ -416,18 +422,24 @@ def download_public_model(
             temporary.unlink()
         else:
             os.replace(temporary, target)
+        temporary = None
         return DownloadedModel(target, file_sha256, received, etag, host)
     except ModelDownloadError:
-        temporary.unlink(missing_ok=True)
         raise
     except (httpx.HTTPError, OSError, ValueError) as exc:
-        temporary.unlink(missing_ok=True)
         raise ModelDownloadError(
             "DOWNLOAD_TEMPORARY_FAILURE", "model download did not complete", temporary=True
         ) from exc
     finally:
-        if owned_client:
-            client.close()
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        if owned_client and client is not None:
+            with suppress(OSError):
+                client.close()
 
 
 def _http_failure(status_code: int) -> ModelDownloadError:
