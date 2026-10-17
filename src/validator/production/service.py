@@ -17,7 +17,12 @@ from typing import Any
 from scoring.cache import ExactCacheReader, assemble_exact_cache_batch, write_exact_cache_batch
 from scoring.spec import TrackSpec, load_track_spec
 from validator.alerts import webhook_alerter
-from validator.production.commitment import ArtifactManifest, SourcePool, verify_source_proof
+from validator.production.commitment import (
+    ArtifactManifest,
+    SourceCacheBinding,
+    SourcePool,
+    verify_source_proof,
+)
 from validator.production.config import ProducerConfig, load_producer_config
 from validator.production.plan import (
     BatchPlan,
@@ -256,6 +261,13 @@ class ProducerService:
             raise ValueError("artifact manifest does not match the track commitment")
         self.objects.ensure_artifacts(self.manifest, config.artifact_root)
         config.verify_manifest(self.manifest)
+        self.source_binding = SourceCacheBinding.decode(
+            config.artifact_path(config.runtime.source_binding).read_bytes()
+        )
+        self.source_binding.verify_local(
+            self.pool,
+            config.artifact_path(config.runtime.sample_cache),
+        )
         config.work_dir.mkdir(parents=True, exist_ok=True)
         self.alert = alert
 

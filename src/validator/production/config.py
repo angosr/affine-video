@@ -16,6 +16,10 @@ class RuntimeConfig:
     predictor: str
     sample_cache: str
     feature_model: str
+    source_binding: str
+    source_bundle: str
+    dependency_lock: str
+    oci_image: str
     offload_blocks: int
     prefetch: int
     mlp_chunk_rows: int
@@ -53,6 +57,10 @@ class ProducerConfig:
                 self.runtime.adapter,
                 self.runtime.predictor,
                 self.runtime.feature_model,
+                self.runtime.source_binding,
+                self.runtime.source_bundle,
+                self.runtime.dependency_lock,
+                self.runtime.oci_image,
             ),
             directories=(self.runtime.model_root, self.runtime.sample_cache),
         )
@@ -100,6 +108,10 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
             "prefetch",
             "sample_cache",
             "feature_model",
+            "source_binding",
+            "source_bundle",
+            "dependency_lock",
+            "oci_image",
         },
         "producer runtime",
     )
@@ -143,6 +155,10 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
             predictor=_relative(runtime["predictor"], "predictor"),
             sample_cache=_relative(runtime["sample_cache"], "sample_cache"),
             feature_model=_relative(runtime["feature_model"], "feature_model"),
+            source_binding=_relative(runtime["source_binding"], "source_binding"),
+            source_bundle=_relative(runtime["source_bundle"], "source_bundle"),
+            dependency_lock=_relative(runtime["dependency_lock"], "dependency_lock"),
+            oci_image=_relative(runtime["oci_image"], "oci_image"),
             offload_blocks=_integer(runtime["offload_blocks"], "offload_blocks", 0),
             prefetch=_integer(runtime["prefetch"], "prefetch", 1),
             mlp_chunk_rows=_integer(runtime["mlp_chunk_rows"], "mlp_chunk_rows", 1),
@@ -156,6 +172,10 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
         config.runtime.predictor,
         config.runtime.sample_cache,
         config.runtime.feature_model,
+        config.runtime.source_binding,
+        config.runtime.source_bundle,
+        config.runtime.dependency_lock,
+        config.runtime.oci_image,
     ):
         config.artifact_path(name)
     return config

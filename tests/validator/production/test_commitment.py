@@ -1,10 +1,12 @@
 import hashlib
+import json
 
 import pytest
 
 from validator.production.commitment import (
     Artifact,
     ArtifactManifest,
+    SourceCacheBinding,
     SourceLeaf,
     SourcePool,
     canonical_json,
@@ -47,6 +49,63 @@ def test_source_family_cannot_cross_private_partitions() -> None:
                 source(1, family="related", partition="audit"),
             )
         )
+
+
+def test_source_cache_binding_rejects_id_preserving_encoded_input_change(tmp_path) -> None:
+    leaves = tuple(
+        SourceLeaf(
+            partition="production",
+            source_family_id=f"family-{index}",
+            source_id=f"source-{index}",
+            prompt=f"prompt {index}",
+            condition_asset_sha256=(),
+            generation_geometry="16:9@37",
+            redistribution_license_id="generated-original-v1",
+        )
+        for index in range(2)
+    )
+    pool = SourcePool(leaves)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    index = cache / "index.json"
+    text = cache / "text.safetensors"
+    index.write_text(
+        json.dumps({"samples": [{"id": leaf.source_id} for leaf in leaves]}),
+        encoding="utf-8",
+    )
+    text.write_bytes(b"encoded prompt tensors")
+    binding = SourceCacheBinding(
+        source_pool_merkle_root=pool.root,
+        index_sha256=hashlib.sha256(index.read_bytes()).hexdigest(),
+        text_sha256=hashlib.sha256(text.read_bytes()).hexdigest(),
+        condition_sha256=None,
+    )
+
+    decoded = SourceCacheBinding.decode(binding.encode())
+    decoded.verify_local(pool, cache)
+
+    text.write_bytes(b"different tensors under the same source IDs")
+    with pytest.raises(ValueError, match="sample text differs"):
+        decoded.verify_local(pool, cache)
+
+
+def test_source_cache_binding_requires_exact_leaf_and_sample_coverage(tmp_path) -> None:
+    pool = SourcePool((source(0), source(1)))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    index = cache / "index.json"
+    text = cache / "text.safetensors"
+    index.write_text(json.dumps({"samples": [{"id": "source-0"}]}), encoding="utf-8")
+    text.write_bytes(b"encoded")
+    binding = SourceCacheBinding(
+        pool.root,
+        hashlib.sha256(index.read_bytes()).hexdigest(),
+        hashlib.sha256(text.read_bytes()).hexdigest(),
+        None,
+    )
+
+    with pytest.raises(ValueError, match="sample IDs differ"):
+        binding.verify_local(pool, cache)
 
 
 def test_artifact_manifest_is_canonical_and_verifies_local_bytes(tmp_path) -> None:

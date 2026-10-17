@@ -217,6 +217,104 @@ class SourcePool:
         return SourceProof(self.leaves[index], index, tuple(siblings))
 
 
+@dataclass(frozen=True, slots=True)
+class SourceCacheBinding:
+    """Commit one source pool to the exact encoded SampleCache bytes it uses."""
+
+    source_pool_merkle_root: str
+    index_sha256: str
+    text_sha256: str
+    condition_sha256: str | None
+
+    def __post_init__(self) -> None:
+        _require_digest(self.source_pool_merkle_root, "source pool Merkle root")
+        _require_digest(self.index_sha256, "sample index SHA-256")
+        _require_digest(self.text_sha256, "sample text SHA-256")
+        if self.condition_sha256 is not None:
+            _require_digest(self.condition_sha256, "sample condition SHA-256")
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "condition_sha256": self.condition_sha256,
+            "format": "veda-source-cache-binding-v1",
+            "index_sha256": self.index_sha256,
+            "source_pool_merkle_root": self.source_pool_merkle_root,
+            "text_sha256": self.text_sha256,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_json(self.document())
+
+    @classmethod
+    def decode(cls, payload: bytes) -> SourceCacheBinding:
+        root = _object(
+            decode_canonical_json(payload),
+            {
+                "condition_sha256",
+                "format",
+                "index_sha256",
+                "source_pool_merkle_root",
+                "text_sha256",
+            },
+            "source cache binding",
+        )
+        if root["format"] != "veda-source-cache-binding-v1":
+            raise ValueError("source cache binding format is unsupported")
+        condition = root["condition_sha256"]
+        if condition is not None and not isinstance(condition, str):
+            raise ValueError("source condition cache digest must be a string or null")
+        return cls(
+            root["source_pool_merkle_root"],
+            root["index_sha256"],
+            root["text_sha256"],
+            condition,
+        )
+
+    def verify_local(self, pool: SourcePool, sample_cache: str | Path) -> None:
+        """Reject an ID-preserving substitution of any encoded source input."""
+
+        if pool.root != self.source_pool_merkle_root:
+            raise ValueError("source cache binding targets another source pool")
+        root = Path(sample_cache)
+        index = root / "index.json"
+        text = root / "text.safetensors"
+        condition = root / "cond.safetensors"
+        if _file_sha256(index) != self.index_sha256:
+            raise ValueError("encoded sample index differs from its source binding")
+        if _file_sha256(text) != self.text_sha256:
+            raise ValueError("encoded sample text differs from its source binding")
+        if self.condition_sha256 is None:
+            if condition.exists():
+                raise ValueError("unexpected encoded sample conditions are present")
+        elif _file_sha256(condition) != self.condition_sha256:
+            raise ValueError("encoded sample conditions differ from their source binding")
+
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"duplicate encoded sample index field: {key}")
+                result[key] = value
+            return result
+
+        try:
+            document = json.loads(index.read_text(encoding="utf-8"), object_pairs_hook=unique)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("encoded sample index is invalid") from exc
+        if not isinstance(document, dict) or set(document) != {"samples"}:
+            raise ValueError("encoded sample index fields are invalid")
+        samples = document["samples"]
+        if not isinstance(samples, list) or any(not isinstance(row, dict) for row in samples):
+            raise ValueError("encoded sample index rows are invalid")
+        identifiers = [row.get("id") for row in samples]
+        if (
+            any(not isinstance(source_id, str) or not source_id for source_id in identifiers)
+            or len(set(identifiers)) != len(identifiers)
+            or set(identifiers) != {leaf.source_id for leaf in pool.leaves}
+        ):
+            raise ValueError("encoded sample IDs differ from the committed source pool")
+
+
 def verify_source_proof(proof: SourceProof, expected_root: str) -> bool:
     """Verify one disclosed source without revealing the remaining pool."""
 

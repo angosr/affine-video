@@ -154,6 +154,12 @@ Both production services verify conditional-write support before starting, seed 
 objects from a complete local runtime, and restore missing local bytes by committed size and SHA-256.
 The GPU host therefore contains no unique tournament state.
 
+The manifest must cover a restorable OCI image, the exact producer/scorer source bundle and its
+dependency lock. A canonical source-cache binding joins the source-pool Merkle root to the complete
+encoded SampleCache index, text tensors and optional condition tensors. Producer startup verifies
+that binding and exact source-ID coverage, so changing encoded input under an existing source ID is
+a hard failure rather than a new hidden dataset with the old commitment.
+
 Before a batch's complete challenge group becomes terminal, public artifacts exclude its hidden
 arrays, per-sample metrics, local paths, worker and lease data, retry timing, error text, stack
 traces, and credentials. Only stable error codes and retry counts are public. Use a public HTTPS
