@@ -30,6 +30,7 @@ def _runtime_manifest(*, asset_sha256: str = "ab" * 32, package_sha256: str = "c
 
 
 def _bind_evidence(monkeypatch, track, runtime_manifest: bytes) -> None:
+    system_matches_module._evidence_runtime_digest.cache_clear()
     monkeypatch.setattr(system_matches_module, "evaluation_source_digest", lambda: "12" * 32)
     monkeypatch.setattr(
         system_matches_module,
@@ -46,6 +47,32 @@ def _bind_evidence(monkeypatch, track, runtime_manifest: bytes) -> None:
         "PRODUCTION_EVIDENCE_RUNTIME_DIGEST",
         system_matches_module._evidence_runtime_digest(runtime_manifest),
     )
+
+
+def test_runtime_evidence_contract_is_computed_once(monkeypatch) -> None:
+    runtime_manifest = _runtime_manifest()
+    calls = {"environment": 0, "source": 0}
+
+    def environment_digest() -> str:
+        calls["environment"] += 1
+        return "12" * 32
+
+    def source_digest() -> str:
+        calls["source"] += 1
+        return "34" * 32
+
+    system_matches_module._evidence_runtime_digest.cache_clear()
+    monkeypatch.setattr(
+        system_matches_module,
+        "evaluation_environment_digest",
+        environment_digest,
+    )
+    monkeypatch.setattr(system_matches_module, "evaluation_source_digest", source_digest)
+
+    first = system_matches_module._evidence_runtime_digest(runtime_manifest)
+    assert system_matches_module._evidence_runtime_digest(runtime_manifest) == first
+    assert calls == {"environment": 1, "source": 1}
+    system_matches_module._evidence_runtime_digest.cache_clear()
 
 
 def test_production_system_matches_are_complete_and_separate_from_rewards(monkeypatch) -> None:

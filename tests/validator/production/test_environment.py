@@ -51,14 +51,16 @@ def test_source_bundle_builder_is_deterministic(tmp_path, monkeypatch) -> None:
         environment.build_source_bundle(first)
 
 
-def test_evaluation_source_digest_excludes_only_non_scoring_inputs(
+def test_evaluation_source_digest_excludes_only_benchmark_data(
     tmp_path, monkeypatch
 ) -> None:
     scoring = tmp_path / "scoring.py"
     system_matches = tmp_path / "system_matches.py"
+    system_match_data = tmp_path / "system_match_data.py"
     miner = tmp_path / "miner.py"
     scoring.write_text("VALUE = 1\n", encoding="utf-8")
-    system_matches.write_text("RESULTS = 1\n", encoding="utf-8")
+    system_matches.write_text("def runtime_digest(): return 1\n", encoding="utf-8")
+    system_match_data.write_text("RESULTS = 1\n", encoding="utf-8")
     miner.write_text("VALUE = 1\n", encoding="utf-8")
     monkeypatch.setattr(
         environment,
@@ -66,17 +68,18 @@ def test_evaluation_source_digest_excludes_only_non_scoring_inputs(
         lambda: {
             "miner/submit.py": miner,
             "scoring/exact.py": scoring,
+            "validator/system_match_data.py": system_match_data,
             "validator/system_matches.py": system_matches,
         },
     )
 
     environment.evaluation_source_digest.cache_clear()
     first = environment.evaluation_source_digest()
-    system_matches.write_text("RESULTS = 2\n", encoding="utf-8")
+    system_match_data.write_text("RESULTS = 2\n", encoding="utf-8")
     miner.write_text("VALUE = 2\n", encoding="utf-8")
     environment.evaluation_source_digest.cache_clear()
     assert environment.evaluation_source_digest() == first
-    scoring.write_text("VALUE = 2\n", encoding="utf-8")
+    system_matches.write_text("def runtime_digest(): return 2\n", encoding="utf-8")
     environment.evaluation_source_digest.cache_clear()
     assert environment.evaluation_source_digest() != first
     environment.evaluation_source_digest.cache_clear()

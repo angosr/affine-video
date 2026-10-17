@@ -76,7 +76,7 @@ def evaluation_source_digest() -> str:
     for name, path in sorted(_active_source_files().items()):
         if not name.startswith(("scoring/", "validator/", "miowtion/")):
             continue
-        if name == "validator/system_matches.py":
+        if name == "validator/system_match_data.py":
             continue
         rows.append({"name": name, "sha256": _file_sha256(path)})
     if not rows:
