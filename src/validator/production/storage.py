@@ -12,12 +12,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 from validator.chunks import (
+    CHUNK_BYTES,
     ChunkManifest,
     build_chunk_manifest,
     chunk_object_name,
     read_part,
 )
-from validator.production.commitment import ArtifactManifest
+from validator.production.commitment import Artifact, ArtifactManifest
 from validator.s3 import client_config
 
 
@@ -84,12 +85,23 @@ class PrivateObjectStore:
             credential_role="evaluator",
         )
 
-    def verify_evaluator_boundary(self, hidden_object_names: tuple[str, ...]) -> None:
-        """Fail unless evaluator IAM denies both hidden bootstrap and content objects."""
+    def verify_evaluator_boundary(self, hidden_artifacts: tuple[Artifact, ...]) -> None:
+        """Fail unless evaluator IAM denies hidden manifests, chunks, and listings."""
 
-        if self._credential_role != "evaluator" or not hidden_object_names:
+        if self._credential_role != "evaluator" or not hidden_artifacts:
             raise ValueError("evaluator boundary requires hidden objects and evaluator credentials")
-        denied_objects = ("bootstrap/source_pool.json", *hidden_object_names)
+        denied_objects = ["bootstrap/source_pool.json"]
+        denied_prefixes = ["source-pool/"]
+        for artifact in hidden_artifacts:
+            name = artifact.object_key
+            part_count = (artifact.size_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
+            denied_objects.append(name)
+            denied_objects.extend(
+                chunk_object_name(name, f"part-{index:05d}") for index in range(part_count)
+            )
+            denied_prefixes.append(
+                chunk_object_name(name, "part-00000").rsplit("/", 1)[0] + "/"
+            )
         for name in denied_objects:
             try:
                 self.get(name)
@@ -100,13 +112,16 @@ class PrivateObjectStore:
                     f"evaluator hidden-object denial could not be verified: {name}"
                 ) from exc
             raise StorageError(f"evaluator credentials can read a hidden object: {name}")
-        try:
-            self.list_names("source-pool/")
-        except Exception as exc:
-            if not _is_access_denied(exc):
-                raise StorageError("evaluator hidden-prefix denial could not be verified") from exc
-        else:
-            raise StorageError("evaluator credentials can list the hidden source prefix")
+        for prefix in denied_prefixes:
+            try:
+                self.list_names(prefix)
+            except Exception as exc:
+                if not _is_access_denied(exc):
+                    raise StorageError(
+                        f"evaluator hidden-prefix denial could not be verified: {prefix}"
+                    ) from exc
+            else:
+                raise StorageError(f"evaluator credentials can list a hidden prefix: {prefix}")
 
     def __getstate__(self) -> dict[str, Any]:
         if not self._reconnect_from_environment:

@@ -151,9 +151,60 @@ def test_evaluator_credentials_are_separate_and_do_not_fallback(monkeypatch) -> 
 
 
 def test_evaluator_boundary_requires_real_access_denials() -> None:
+    hidden = Artifact("hidden.bin", "0" * 64, 1, "source-pool/assets/hidden")
+
     class DeniedS3(MemoryS3):
         def get_object(self, *, Bucket, Key):
             if "/source-pool/" in Key or Key.endswith("bootstrap/source_pool.json"):
+                error = RuntimeError("denied")
+                error.response = {
+                    "Error": {"Code": "AccessDenied"},
+                    "ResponseMetadata": {"HTTPStatusCode": 403},
+                }
+                raise error
+            return super().get_object(Bucket=Bucket, Key=Key)
+
+        def list_objects_v2(self, *, Bucket, Prefix, **_kwargs):
+            if "/source-pool" in Prefix:
+                error = RuntimeError("denied")
+                error.response = {
+                    "Error": {"Code": "AccessDenied"},
+                    "ResponseMetadata": {"HTTPStatusCode": 403},
+                }
+                raise error
+            return {"Contents": [], "IsTruncated": False}
+
+    client = DeniedS3()
+    store = PrivateObjectStore(
+        client,
+        bucket="private",
+        prefix="tracks/abc",
+        credential_role="evaluator",
+    )
+
+    store.verify_evaluator_boundary((hidden,))
+
+    permissive = PrivateObjectStore(
+        MemoryS3(),
+        bucket="private",
+        prefix="tracks/abc",
+        credential_role="evaluator",
+    )
+    with pytest.raises(StorageError, match="denial could not be verified"):
+        permissive.verify_evaluator_boundary((hidden,))
+
+
+def test_evaluator_boundary_rejects_readable_noninitial_hidden_chunk() -> None:
+    hidden = "source-pool/assets/hidden"
+    artifact = Artifact("hidden.bin", "0" * 64, chunks.CHUNK_BYTES + 1, hidden)
+
+    class IncompleteChunkDenialS3(MemoryS3):
+        def get_object(self, *, Bucket, Key):
+            if (
+                Key.endswith("bootstrap/source_pool.json")
+                or Key.endswith(hidden)
+                or Key.endswith(f"{hidden}.parts/part-00000")
+            ):
                 error = RuntimeError("denied")
                 error.response = {
                     "Error": {"Code": "AccessDenied"},
@@ -172,7 +223,9 @@ def test_evaluator_boundary_requires_real_access_denials() -> None:
                 raise error
             return {"Contents": [], "IsTruncated": False}
 
-    client = DeniedS3()
+    client = IncompleteChunkDenialS3()
+    part_key = "tracks/abc/source-pool/assets/hidden.parts/part-00001"
+    client.objects[("private", part_key)] = (b"hidden", "etag", {})
     store = PrivateObjectStore(
         client,
         bucket="private",
@@ -180,16 +233,8 @@ def test_evaluator_boundary_requires_real_access_denials() -> None:
         credential_role="evaluator",
     )
 
-    store.verify_evaluator_boundary(("source-pool/assets/hidden",))
-
-    permissive = PrivateObjectStore(
-        MemoryS3(),
-        bucket="private",
-        prefix="tracks/abc",
-        credential_role="evaluator",
-    )
-    with pytest.raises(StorageError, match="denial could not be verified"):
-        permissive.verify_evaluator_boundary(("source-pool/assets/hidden",))
+    with pytest.raises(StorageError, match="can read a hidden object"):
+        store.verify_evaluator_boundary((artifact,))
 
 
 def test_injected_store_client_cannot_be_serialized() -> None:

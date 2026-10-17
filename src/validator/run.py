@@ -184,7 +184,7 @@ async def run_evaluator(
             raise ValueError("artifact manifest does not match the track commitment")
         evaluator_artifacts = data_config.evaluator_artifact_names(manifest)
         hidden_artifacts = tuple(
-            artifact.object_key
+            artifact
             for artifact in manifest.artifacts
             if artifact.logical_name == data_config.runtime.source_binding
             or artifact.logical_name.startswith(

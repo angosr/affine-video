@@ -259,7 +259,8 @@ uv run --extra storage veda validator evaluate \
 The evaluator variables must identify a separate least-privilege R2 role. Startup proves that the
 role can use plan/stage CAS and read READY-selected objects, while reads of
 `bootstrap/source_pool.json`, the `source-pool/` prefix, and the committed full source cache are
-denied. Evaluator credentials never fall back to the producer credentials.
+denied, including every `<manifest>.parts/part-*` object and its list prefix. Evaluator credentials
+never fall back to the producer credentials.
 The production configuration also uses a separate `evaluator_artifact_root`; it must be mounted
 without the producer artifact root, source-pool file, complete production/audit SampleCache, or
 producer work directory.
