@@ -62,13 +62,14 @@ from validator.weights import (
 
 DEFAULT_PUBLIC_WEIGHTS_URL = (
     "https://iblosevwkuiootbbgnsy.supabase.co/storage/v1/object/public/"
-    "affine_video/tracks/sn120/weights.json"
+    "affine_video/tracks/main/weights.json"
 )
 DEFAULT_BASELINE_MANIFEST_URL = (
     "https://iblosevwkuiootbbgnsy.supabase.co/storage/v1/object/public/"
     "affine_video/tracks/sn120/assets/veda_baseline_f16/manifest.json"
 )
 DEFAULT_NETUID = PRODUCTION_NETUID
+DEFAULT_MECHID = 1
 DEFAULT_TRACK_SPEC_DIGEST = PRODUCTION_TRACK_SPEC_DIGEST
 INITIAL_TRACK_ID = PRODUCTION_TRACK_ID
 INITIAL_CHAMPION_HOTKEY = "5HmYnmUYT6qe3yFMg1Ad8WLLqDvnwtjYakXBpDvoRW1Qqzb8"
@@ -354,7 +355,7 @@ async def run_initial_publisher(
                     INITIAL_TRACK_ID,
                     DEFAULT_TRACK_SPEC_DIGEST,
                     DEFAULT_NETUID,
-                    0,
+                    DEFAULT_MECHID,
                     0,
                     chain.finalized_block,
                     plan,

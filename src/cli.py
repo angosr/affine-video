@@ -15,6 +15,7 @@ from validator.monitor import fetch_status, render_status
 from validator.publication import S3Repository
 from validator.run import (
     DEFAULT_BASELINE_MANIFEST_URL,
+    DEFAULT_MECHID,
     DEFAULT_NETUID,
     DEFAULT_PUBLIC_WEIGHTS_URL,
     DEFAULT_TRACK_SPEC_DIGEST,
@@ -89,7 +90,7 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--scoring-max-cpu-seconds", type=int)
     evaluate.add_argument("--storage-bucket", required=True)
     evaluate.add_argument("--storage-prefix", required=True)
-    evaluate.add_argument("--mechid", default=0, type=int)
+    evaluate.add_argument("--mechid", default=DEFAULT_MECHID, type=int)
     evaluate.add_argument("--version-key", default=0, type=int)
     evaluate.add_argument("--once", action="store_true")
 
@@ -99,7 +100,7 @@ def _parser() -> argparse.ArgumentParser:
     initialize.add_argument("--network", default="finney")
     initialize.add_argument("--poll-seconds", default=12.0, type=float)
     initialize.add_argument("--storage-bucket", default="affine_video")
-    initialize.add_argument("--storage-prefix", default="tracks/sn120")
+    initialize.add_argument("--storage-prefix", default="tracks/main")
     initialize.add_argument("--once", action="store_true")
 
     run = validator_commands.add_parser(

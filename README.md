@@ -137,7 +137,7 @@ uv run --extra storage veda validator evaluate \
   --exact-cache /data/exact.npz \
   --archive-endpoint wss://archive.example \
   --storage-bucket affine_video \
-  --storage-prefix tracks/sn120
+  --storage-prefix tracks/main
 ```
 
 Keep the live UID 0 state current before the first evaluation track is published:

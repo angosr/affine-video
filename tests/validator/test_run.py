@@ -35,7 +35,8 @@ def test_release_defaults_target_sn120_initial_state() -> None:
     assert run_module.DEFAULT_PUBLIC_WEIGHTS_URL.startswith(
         "https://iblosevwkuiootbbgnsy.supabase.co/"
     )
-    assert "/tracks/sn120/weights.json" in run_module.DEFAULT_PUBLIC_WEIGHTS_URL
+    assert "/tracks/main/weights.json" in run_module.DEFAULT_PUBLIC_WEIGHTS_URL
+    assert run_module.DEFAULT_MECHID == 1
     assert run_module.DEFAULT_TRACK_SPEC_DIGEST != "0" * 64
 
 
@@ -72,6 +73,8 @@ def test_initial_publisher_emits_current_uid_zero_weight(monkeypatch) -> None:
     weights = decode_weight_artifact(published["weights"])
     status = json.loads(published["status"])
     assert weights.source_block == 321
+    assert weights.netuid == 120
+    assert weights.mechid == 1
     assert weights.plan == WeightPlan(
         321,
         (run_module.INITIAL_CHAMPION_HOTKEY,),
