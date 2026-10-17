@@ -208,16 +208,13 @@ def _distribution_priority(distribution: importlib.metadata.Distribution) -> int
 
 
 def _distribution_record(distribution: importlib.metadata.Distribution) -> Path | None:
-    matches = [
-        item
-        for item in distribution.files or ()
-        if item.name == "RECORD" and item.parent.name.endswith(".dist-info")
-    ]
-    if not matches:
+    metadata_path = getattr(distribution, "_path", None)
+    if metadata_path is None:
         return None
-    if len(matches) != 1:
-        raise ValueError("installed distribution has multiple RECORD files")
-    path = Path(distribution.locate_file(matches[0])).resolve()
+    root = Path(metadata_path).resolve()
+    if not root.name.endswith(".dist-info"):
+        return None
+    path = root / "RECORD"
     if not path.is_file():
         raise ValueError("installed distribution RECORD is unavailable")
     return path
