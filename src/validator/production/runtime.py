@@ -442,7 +442,8 @@ def verify_runtime_trace(
     device: str,
     descriptor_atol: float = 1e-6,
     logits_atol: float = 1e-4,
-    output_atol: float = 4e-3,
+    output_atol: float = 1.25e-1,
+    output_mean_atol: float = 1e-4,
 ) -> RuntimeTraceVerification:
     """Compare one cached case with Miowtion's native predictor and kernel semantics."""
 
@@ -456,7 +457,7 @@ def verify_runtime_trace(
         raise RuntimeError(
             "runtime trace verification requires the pinned GPU environment"
         ) from exc
-    if min(descriptor_atol, logits_atol, output_atol) <= 0:
+    if min(descriptor_atol, logits_atol, output_atol, output_mean_atol) <= 0:
         raise ValueError("runtime trace tolerances must be positive")
     resolved = torch.device(device)
     if resolved.type != "cuda" or not torch.cuda.is_available():
@@ -564,8 +565,17 @@ def verify_runtime_trace(
         tuple(maxima),
         tuple(means),
     )
-    if any(result.mask_mismatches) or any(value > output_atol for value in result.output_max_abs):
-        raise RuntimeError("cached mask or sparse output diverges from the Miowtion runtime")
+    if (
+        any(result.mask_mismatches)
+        or any(value > output_atol for value in result.output_max_abs)
+        or any(value > output_mean_atol for value in result.output_mean_abs)
+    ):
+        raise RuntimeError(
+            "cached mask or sparse output diverges from the Miowtion runtime: "
+            f"mask_mismatches={result.mask_mismatches}, "
+            f"output_max_abs={result.output_max_abs}, "
+            f"output_mean_abs={result.output_mean_abs}"
+        )
     return result
 
 

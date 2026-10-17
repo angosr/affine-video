@@ -10,6 +10,7 @@ PRODUCTION_TRACK_ID = "veda-sn120-v2"
 PRODUCTION_TRACK_SPEC_DIGEST = "c44359ffb68c098ad780124aed8de3e0260fa39e7b162cbbba244c6614c45846"
 PRODUCTION_NETUID = 120
 _EVIDENCE_SHA256 = "87ba4871c29df4f5113b4051c4f2d1e6905be834ef9a54dfcb780a675fc357db"
+_RUNTIME_TRACE_EVIDENCE_SHA256 = "c6e873d8d9acbcb02814eae888fb30fa73e620d73fca03f99a7f8f30f10b3fa5"
 _MINIMUM_GAIN = 0.005
 _BASELINE_SCORES = (
     0.965935974938656,
@@ -219,6 +220,16 @@ def _match_document(sequence: int, control: dict[str, Any]) -> dict[str, Any]:
             "minimum_gain": _MINIMUM_GAIN,
             "cluster_unit": "source_video",
             "evidence_sha256": _EVIDENCE_SHA256,
+            "runtime_trace": {
+                "evidence_sha256": _RUNTIME_TRACE_EVIDENCE_SHA256,
+                "cases": 16,
+                "sampled_routes": 8,
+                "descriptor_max_abs": 2.384185791015625e-07,
+                "logits_max_abs": 6.198883056640625e-06,
+                "mask_mismatches": 0,
+                "output_max_abs": 0.0625,
+                "output_mean_abs": 3.039836883544922e-06,
+            },
             "batches": batches,
         },
         "scores": {
