@@ -123,7 +123,9 @@ tracks/main/
   the VEDA baseline with fixed control models, but never enter the Miner queue, tournament rank, or
   chain weights. A panel is attached only when its track contract, score-affecting source bytes,
   third-party environment and committed model/source assets match; rebuilding the same release
-  packaging does not invalidate it.
+  packaging does not invalidate it. Panel-only selectors, runner bytes and raw results live under
+  the manifest's `evidence/system-panel/` namespace. They remain content-addressed and recoverable
+  but are excluded from the non-circular runtime digest because production scoring never reads them.
 - `events/<track_id>/track-aborted.json` is the immutable stop fact created when system work remains
   unfinished after the close grace block. It survives loss of local state and prevents that track
   from resuming evaluation or weight refresh.

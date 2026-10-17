@@ -15,18 +15,31 @@ from validator.system_matches import (
 )
 
 
-def _runtime_manifest(*, asset_sha256: str = "ab" * 32, package_sha256: str = "cd" * 32) -> bytes:
-    return ArtifactManifest(
-        (
-            Artifact("runtime/source.zip", package_sha256, 10, "artifacts/" + package_sha256),
+def _runtime_manifest(
+    *,
+    asset_sha256: str = "ab" * 32,
+    package_sha256: str = "cd" * 32,
+    evidence_sha256: str | None = None,
+) -> bytes:
+    artifacts = [
+        Artifact("runtime/source.zip", package_sha256, 10, "artifacts/" + package_sha256),
+        Artifact(
+            "weights/predictor.safetensors",
+            asset_sha256,
+            20,
+            "artifacts/" + asset_sha256,
+        ),
+    ]
+    if evidence_sha256 is not None:
+        artifacts.append(
             Artifact(
-                "weights/predictor.safetensors",
-                asset_sha256,
-                20,
-                "artifacts/" + asset_sha256,
-            ),
+                "release/evidence/system-panel/raw.json",
+                evidence_sha256,
+                30,
+                "artifacts/" + evidence_sha256,
+            )
         )
-    ).encode()
+    return ArtifactManifest(tuple(sorted(artifacts, key=lambda item: item.logical_name))).encode()
 
 
 def _bind_evidence(monkeypatch, track, runtime_manifest: bytes) -> None:
@@ -163,6 +176,7 @@ def test_system_evidence_rejects_changed_scoring_assets_but_not_repackaging(monk
     _bind_evidence(monkeypatch, track, runtime_manifest)
 
     assert system_match_artifacts(track, _runtime_manifest(package_sha256="ef" * 32))
+    assert system_match_artifacts(track, _runtime_manifest(evidence_sha256="ef" * 32))
     assert system_match_artifacts(track, _runtime_manifest(asset_sha256="ef" * 32)) == ()
     assert system_match_artifacts(track, None) == ()
 
