@@ -18,6 +18,9 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
 1. A Miner commits a Hugging Face `repo_id` and a complete 40-character commit SHA on-chain.
    Only that hotkey's first submission on the track is eligible; every later submission is
    terminally rejected, even when the first submission is malformed or fails evaluation.
+   The evaluator verifies the signed old-contest activation history before the track starts.
+   A hotkey already in the old contest is rejected, while a hotkey's first recognized choice for
+   the new contest remains fixed even if it later writes unrelated commitments.
 2. After the fixed publication grace period, the evaluator processes submissions by finalized
    `(block, extrinsic, event)` order. The pinned revision must then be anonymously downloadable.
 3. The evaluator accepts exactly one `selector.safetensors` file. It rejects executable code,

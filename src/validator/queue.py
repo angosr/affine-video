@@ -71,6 +71,7 @@ class ChallengeState(StrEnum):
     PARTICIPANT_FAILED = "PARTICIPANT_FAILED"
     MALFORMED_SUBMISSION = "MALFORMED_SUBMISSION"
     REJECTED_DUPLICATE_HOTKEY = "REJECTED_DUPLICATE_HOTKEY"
+    REJECTED_OTHER_COMPETITION = "REJECTED_OTHER_COMPETITION"
 
 
 TERMINAL_STATES = frozenset(
@@ -80,6 +81,7 @@ TERMINAL_STATES = frozenset(
         ChallengeState.SYSTEM_FAILED,
         ChallengeState.MALFORMED_SUBMISSION,
         ChallengeState.REJECTED_DUPLICATE_HOTKEY,
+        ChallengeState.REJECTED_OTHER_COMPETITION,
     }
 )
 
@@ -97,6 +99,7 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
             ChallengeState.FETCHING,
             ChallengeState.MALFORMED_SUBMISSION,
             ChallengeState.REJECTED_DUPLICATE_HOTKEY,
+            ChallengeState.REJECTED_OTHER_COMPETITION,
         }
     ),
     ChallengeState.FETCHING: frozenset(

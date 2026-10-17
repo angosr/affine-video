@@ -21,7 +21,7 @@ from validator.admission import (
     AdmissionSettings,
     process_next_admission,
 )
-from validator.chain import ScanResult, scan_finalized_blocks
+from validator.chain import ScanResult, scan_finalized_blocks, seed_legacy_exclusions
 from validator.download import DownloadedModel, download_chunked_asset, download_public_model
 from validator.publication import (
     PublicArtifacts,
@@ -161,6 +161,12 @@ async def run_evaluator(
 
     with ChallengeStore(database, track_spec_digest=track.digest) as store:
         async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
+            await seed_legacy_exclusions(
+                client,
+                store,
+                netuid=track.netuid,
+                before_block=track.track_start_block - 1,
+            )
             recovery_index = 0
             while True:
                 result = await process_cycle(

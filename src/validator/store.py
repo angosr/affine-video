@@ -275,12 +275,14 @@ class ChallengeStore:
         submission_id: str | None,
         legacy_excluded: bool,
     ) -> None:
-        """Record the current contest choice while pinning VDA to its first submission."""
+        """Record a hotkey's first recognized contest choice permanently."""
 
         if not hotkey or not payload:
             raise ValueError("commitment hotkey and payload cannot be empty")
         if not 0 <= netuid <= 0xFFFF:
             raise ValueError("netuid must fit in an unsigned 16-bit integer")
+        if submission_id is None and not legacy_excluded:
+            return
         normalized_hash = _block_hash(block_hash)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
@@ -324,32 +326,12 @@ class ChallengeStore:
                 )
                 if incoming < existing:
                     raise ValueError("commitment choice cannot move backward")
-                if incoming == existing:
-                    if (
-                        current["block_hash"] != normalized_hash
-                        or bytes(current["payload"]) != payload
-                        or current["submission_id"] != selected_submission_id
-                    ):
-                        raise RuntimeError("replayed commitment choice contains different data")
-                else:
-                    self._connection.execute(
-                        """
-                        UPDATE commitment_choices
-                        SET netuid = ?, block_hash = ?, block_height = ?,
-                            extrinsic_index = ?, event_index = ?, payload = ?, submission_id = ?
-                        WHERE hotkey = ?
-                        """,
-                        (
-                            netuid,
-                            normalized_hash,
-                            position.block,
-                            position.extrinsic_index,
-                            position.event_index,
-                            payload,
-                            selected_submission_id,
-                            hotkey,
-                        ),
-                    )
+                if incoming == existing and (
+                    current["block_hash"] != normalized_hash
+                    or bytes(current["payload"]) != payload
+                    or current["submission_id"] != selected_submission_id
+                ):
+                    raise RuntimeError("replayed commitment choice contains different data")
             else:
                 self._connection.execute(
                     """
@@ -369,7 +351,7 @@ class ChallengeStore:
                         selected_submission_id,
                     ),
                 )
-            if legacy_excluded:
+            if current is None and legacy_excluded:
                 self._connection.execute(
                     """
                     INSERT INTO competition_exclusions (hotkey, first_block, reason)
@@ -377,6 +359,34 @@ class ChallengeStore:
                     ON CONFLICT(hotkey) DO NOTHING
                     """,
                     (hotkey, position.block),
+                )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def seed_legacy_exclusions(
+        self,
+        exclusions: Mapping[str, int],
+    ) -> None:
+        """Persist old-contest choices observed before this track opened."""
+
+        if any(
+            not hotkey or type(block) is not int or block < 0
+            for hotkey, block in exclusions.items()
+        ):
+            raise ValueError("legacy exclusion snapshot is invalid")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            for hotkey, block in sorted(exclusions.items()):
+                self._connection.execute(
+                    """
+                    INSERT INTO competition_exclusions (hotkey, first_block, reason)
+                    VALUES (?, ?, 'LEGACY_CONTEST_ACTIVATED')
+                    ON CONFLICT(hotkey) DO UPDATE SET
+                        first_block = MIN(first_block, excluded.first_block)
+                    """,
+                    (hotkey, block),
                 )
             self._connection.commit()
         except Exception:
@@ -555,6 +565,10 @@ class ChallengeStore:
                 raise RuntimeError("submissions must be inserted in finalized chain order")
 
             malformed = submission.repo_id is None or submission.revision is None
+            excluded = self._connection.execute(
+                "SELECT 1 FROM competition_exclusions WHERE hotkey = ?",
+                (submission.hotkey,),
+            ).fetchone() is not None
             previous_hotkey_submission = self._connection.execute(
                 """
                 SELECT submission_id FROM submissions
@@ -564,7 +578,7 @@ class ChallengeStore:
                 (submission.hotkey,),
             ).fetchone()
             first_for_hotkey = previous_hotkey_submission is None
-            admitted = not malformed and first_for_hotkey
+            admitted = not excluded and not malformed and first_for_hotkey
 
             self._connection.execute(
                 """
@@ -602,7 +616,9 @@ class ChallengeStore:
                 (identifier, ChallengeState.QUEUED, timestamp),
             )
             terminal = (
-                ChallengeState.REJECTED_DUPLICATE_HOTKEY
+                ChallengeState.REJECTED_OTHER_COMPETITION
+                if excluded
+                else ChallengeState.REJECTED_DUPLICATE_HOTKEY
                 if not first_for_hotkey
                 else ChallengeState.MALFORMED_SUBMISSION
                 if malformed

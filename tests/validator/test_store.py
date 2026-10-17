@@ -262,6 +262,56 @@ def test_malformed_first_submission_consumes_hotkey_slot(tmp_path) -> None:
         )
 
 
+def test_old_contest_choice_rejects_new_contest_submission(tmp_path) -> None:
+    submission = submission_at(100)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        store.seed_legacy_exclusions({submission.hotkey: 99})
+        identifier, _ = store.add_submission(submission, occurred_at_ms=10)
+
+        assert (
+            store.get_challenge(identifier).state
+            is ChallengeState.REJECTED_OTHER_COMPETITION
+        )
+        assert store.active_competitors({submission.hotkey: 4}) == []
+
+
+def test_first_new_contest_choice_survives_later_commitments(tmp_path) -> None:
+    first = submission_at(100)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        store.add_submission(first, occurred_at_ms=10)
+        store.observe_commitment(
+            hotkey=first.hotkey,
+            netuid=first.netuid,
+            block_hash=first.block_hash,
+            position=first.position,
+            payload=first.payload,
+            submission_id=first.submission_id,
+            legacy_excluded=False,
+        )
+        store.observe_commitment(
+            hotkey=first.hotkey,
+            netuid=first.netuid,
+            block_hash="0x" + "cd" * 32,
+            position=ChainPosition(101, 0, 0),
+            payload=b"unrelated commitment",
+            submission_id=None,
+            legacy_excluded=False,
+        )
+        store.observe_commitment(
+            hotkey=first.hotkey,
+            netuid=first.netuid,
+            block_hash="0x" + "ef" * 32,
+            position=ChainPosition(102, 0, 0),
+            payload=b"affine2|activate|later",
+            submission_id=None,
+            legacy_excluded=True,
+        )
+
+        assert [item["submission_id"] for item in store.active_competitors({first.hotkey: 4})] == [
+            first.submission_id
+        ]
+
+
 def test_current_vda_choice_always_points_to_hotkeys_first_submission(tmp_path) -> None:
     first = submission_at(100)
     later = submission_at(101)

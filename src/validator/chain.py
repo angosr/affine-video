@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from validator.competition import is_valid_legacy_activation
+from validator.competition import LEGACY_ACTIVATION_PREFIX, is_valid_legacy_activation
 from validator.scan import extract_commitments, extract_submissions
 from validator.store import ChallengeStore
 
@@ -64,19 +64,20 @@ async def scan_finalized_blocks(
             events=events,
             netuid=netuid,
         )
-        for submission in submissions:
-            store.add_submission(submission)
         submissions_by_position = {
-            submission.position: submission.submission_id for submission in submissions
+            submission.position: submission for submission in submissions
         }
         for commitment in commitments:
+            submission = submissions_by_position.get(commitment.position)
+            if submission is not None:
+                store.add_submission(submission)
             store.observe_commitment(
                 hotkey=commitment.hotkey,
                 netuid=commitment.netuid,
                 block_hash=commitment.block_hash,
                 position=commitment.position,
                 payload=commitment.payload,
-                submission_id=submissions_by_position.get(commitment.position),
+                submission_id=None if submission is None else submission.submission_id,
                 legacy_excluded=is_valid_legacy_activation(
                     commitment.payload,
                     hotkey=commitment.hotkey,
@@ -96,3 +97,45 @@ async def scan_finalized_blocks(
         submissions_found += len(submissions)
 
     return ScanResult(first, last, last - first + 1, submissions_found)
+
+
+async def seed_legacy_exclusions(
+    client: Any,
+    store: ChallengeStore,
+    *,
+    netuid: int,
+    before_block: int,
+) -> int:
+    """Snapshot signed old-contest activations that predate this track."""
+
+    if before_block < 0:
+        return 0
+    snapshot = await client.at(before_block)
+    graph = await snapshot.subnets.metagraph(netuid, commitments=True)
+    if graph is None:
+        raise RuntimeError(f"subnet {netuid} does not exist at block {before_block}")
+    exclusions: dict[str, int] = {}
+    for neuron in graph.neurons:
+        hotkey = getattr(neuron, "hotkey", None)
+        commitment = getattr(neuron, "commitment", None)
+        revealed = getattr(commitment, "revealed", ()) if commitment is not None else ()
+        if not isinstance(hotkey, str) or not hotkey:
+            continue
+        for item in revealed or ():
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                continue
+            block, value = item
+            if type(block) is not int or block < 0 or block > before_block:
+                continue
+            if isinstance(value, str):
+                payload = value.encode("utf-8")
+            elif isinstance(value, (bytes, bytearray)):
+                payload = bytes(value)
+            else:
+                continue
+            if not payload.startswith(LEGACY_ACTIVATION_PREFIX):
+                continue
+            if is_valid_legacy_activation(payload, hotkey=hotkey, netuid=netuid):
+                exclusions[hotkey] = min(block, exclusions.get(hotkey, block))
+    store.seed_legacy_exclusions(exclusions)
+    return len(exclusions)
