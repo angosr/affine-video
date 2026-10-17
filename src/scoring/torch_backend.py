@@ -22,7 +22,15 @@ if TYPE_CHECKING:
     from scoring.spec import BudgetSpec
 
 
-def dense_reference_attention(case: ExactCase, *, device: str) -> np.ndarray:
+def dense_reference_attention(
+    q_tiles: np.ndarray,
+    k_tiles: np.ndarray,
+    v_tiles: np.ndarray,
+    query_valid_counts: np.ndarray,
+    key_valid_counts: np.ndarray,
+    *,
+    device: str,
+) -> np.ndarray:
     """Compute one all-key float32 reference on the authoritative CUDA backend."""
 
     try:
@@ -34,11 +42,11 @@ def dense_reference_attention(case: ExactCase, *, device: str) -> np.ndarray:
         raise RuntimeError("the authoritative torch backend requires CUDA")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    q = torch.as_tensor(case.q, device=resolved, dtype=torch.float32)
-    k = torch.as_tensor(case.k, device=resolved, dtype=torch.float32)
-    v = torch.as_tensor(case.v, device=resolved, dtype=torch.float32)
-    q_counts = torch.as_tensor(case.query_valid_counts, device=resolved)
-    k_counts = torch.as_tensor(case.key_valid_counts, device=resolved)
+    q = torch.as_tensor(q_tiles, device=resolved, dtype=torch.float32)
+    k = torch.as_tensor(k_tiles, device=resolved, dtype=torch.float32)
+    v = torch.as_tensor(v_tiles, device=resolved, dtype=torch.float32)
+    q_counts = torch.as_tensor(query_valid_counts, device=resolved)
+    k_counts = torch.as_tensor(key_valid_counts, device=resolved)
     mask = torch.ones((q.shape[0], k.shape[0]), dtype=torch.bool, device=resolved)
     return _attention(torch, q, k, v, q_counts, k_counts, mask).cpu().numpy()
 

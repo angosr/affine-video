@@ -7,8 +7,7 @@ import pytest
 from safetensors.numpy import save_file
 
 from scoring.cache import write_exact_cache_batch
-from scoring.evaluate import reference_attention
-from scoring.exact import ExactCase
+from scoring.exact import ExactCase, canonical_dense_reference
 from scoring.model import validate_model
 from scoring.selector import SelectorArchitecture
 from scoring.spec import (
@@ -150,10 +149,18 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
     cache_dir = tmp_path / "batches"
     cache_dir.mkdir()
     generator = np.random.default_rng(1)
-    q = generator.normal(size=(2, 128, 2)).astype(np.float32)
-    k = generator.normal(size=(3, 128, 2)).astype(np.float32)
-    v = generator.normal(size=(3, 128, 2)).astype(np.float32)
-    dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
+    q = generator.normal(size=(2, 128, 2)).astype(np.float16)
+    k = generator.normal(size=(3, 128, 2)).astype(np.float16)
+    v = generator.normal(size=(3, 128, 2)).astype(np.float16)
+    query_valid_counts = np.full(2, 128, dtype=np.int16)
+    key_valid_counts = np.full(3, 128, dtype=np.int16)
+    dense = canonical_dense_reference(
+        q,
+        k,
+        v,
+        query_valid_counts,
+        key_valid_counts,
+    )
     case = ExactCase(
         route="layer_0_head_0",
         stratum="all",
@@ -169,8 +176,8 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
         k=k,
         v=v,
         dense=dense,
-        query_valid_counts=np.full(2, 128, dtype=np.int16),
-        key_valid_counts=np.full(3, 128, dtype=np.int16),
+        query_valid_counts=query_valid_counts,
+        key_valid_counts=key_valid_counts,
         key_segments=np.zeros(3, dtype=np.int8),
         required_keys=np.array([[True, False, False], [False, True, False]], dtype=np.bool_),
         epsilon=1e-6,

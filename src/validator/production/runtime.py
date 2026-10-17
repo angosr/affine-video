@@ -15,7 +15,13 @@ from typing import Any
 import numpy as np
 
 from scoring.evaluate import reference_attention, segmented_top_k, trip_pool
-from scoring.exact import GLOBAL_SEGMENT, REFERENCE_SEGMENT, TARGET_SEGMENT, ExactCase
+from scoring.exact import (
+    GLOBAL_SEGMENT,
+    REFERENCE_SEGMENT,
+    TARGET_SEGMENT,
+    ExactCase,
+    canonical_dense_reference,
+)
 from scoring.selector import SelectorArchitecture, load_selector, route_indices, route_name
 from scoring.spec import BudgetSpec
 from validator.production.plan import select_query_tiles
@@ -332,14 +338,14 @@ class DenseRolloutRuntime:
                         int(head) for head in group.heads.tolist() if int(head) in selected_by_head
                     ]
                     if heads:
-                        self._capture_group(q, k, v, output, layer_index, group, heads)
+                        self._capture_group(q, k, v, layer_index, group, heads)
                 return output
 
-            def _capture_group(self, q, k, v, output, layer_index, group, heads):
+            def _capture_group(self, q, k, v, layer_index, group, heads):
                 head_tensor = torch.tensor(heads, dtype=torch.long, device=clip.device)
                 layout = clip.get(group.shape)
                 gather = runtime.veda_attention._gather  # pylint: disable=protected-access
-                rows = [gather(value, layout, head_tensor) for value in (q, k, v, output)]
+                rows = [gather(value, layout, head_tensor) for value in (q, k, v)]
                 shaped = [
                     value.view(layout.n_tiles, 128, len(heads), -1).permute(2, 0, 1, 3)
                     for value in rows
@@ -362,8 +368,18 @@ class DenseRolloutRuntime:
                     required = np.zeros((len(query_ids), layout.n_tiles), dtype=np.bool_)
                     for row, query_id in enumerate(query_ids):
                         required[row, query_id] = True
-                    q_value, k_value, v_value, dense_value = (
+                    q_value, k_value, v_value = (
                         _to_float16(value[local_head]) for value in shaped
+                    )
+                    q_value = q_value[list(query_ids)]
+                    query_valid_counts = valid_counts[list(query_ids)].copy()
+                    dense_value = canonical_dense_reference(
+                        q_value,
+                        k_value,
+                        v_value,
+                        query_valid_counts,
+                        valid_counts,
+                        device=str(clip.device),
                     )
                     self.cases.append(
                         ExactCase(
@@ -377,11 +393,11 @@ class DenseRolloutRuntime:
                             sigma=float(runtime.teacher.schedule.video[self.step]),
                             tile_plan_hash=plan_hash,
                             query_tile_ids=query_ids,
-                            q=q_value[list(query_ids)],
+                            q=q_value,
                             k=k_value,
                             v=v_value,
-                            dense=dense_value[list(query_ids)],
-                            query_valid_counts=valid_counts[list(query_ids)].copy(),
+                            dense=dense_value,
+                            query_valid_counts=query_valid_counts,
                             key_valid_counts=valid_counts.copy(),
                             key_segments=segments.copy(),
                             required_keys=required,

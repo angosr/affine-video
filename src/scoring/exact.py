@@ -24,9 +24,6 @@ from scoring.spec import BudgetSpec
 TARGET_SEGMENT = 0
 REFERENCE_SEGMENT = 1
 GLOBAL_SEGMENT = 2
-DENSE_REFERENCE_MAX_ABS_TOLERANCE = 1.0
-DENSE_REFERENCE_MEAN_ABS_TOLERANCE = 5e-2
-DENSE_REFERENCE_RELATIVE_SQUARED_ERROR_TOLERANCE = 1e-5
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,60 +367,81 @@ def validate_dense_reference(
     case: ExactCase,
     *,
     device: str | None = None,
-    max_abs_tolerance: float = DENSE_REFERENCE_MAX_ABS_TOLERANCE,
-    mean_abs_tolerance: float = DENSE_REFERENCE_MEAN_ABS_TOLERANCE,
-    relative_squared_error_tolerance: float = (
-        DENSE_REFERENCE_RELATIVE_SQUARED_ERROR_TOLERANCE
-    ),
 ) -> tuple[float, float, float]:
-    """Verify that stored dense output is the frozen float32 attention of Q/K/V."""
+    """Require stored dense bytes to be the canonical result for frozen Q/K/V."""
 
-    if min(
-        max_abs_tolerance,
-        mean_abs_tolerance,
-        relative_squared_error_tolerance,
-    ) <= 0:
-        raise ValueError("dense reference tolerances must be positive")
     _validate_case_data(case)
-    if device is None:
-        expected = reference_attention(
-            case.q,
-            case.k,
-            case.v,
-            np.ones((case.q.shape[0], case.k.shape[0]), dtype=np.bool_),
-            query_valid_counts=case.query_valid_counts,
-            key_valid_counts=case.key_valid_counts,
-        )
-    else:
-        from scoring.torch_backend import dense_reference_attention
-
-        expected = dense_reference_attention(case, device=device)
-    # Both runtime captures and cache files freeze outputs as float16. Compare
-    # after that same storage conversion so this gate tests protocol semantics,
-    # not uncommitted higher-precision values.
-    expected = np.asarray(expected, dtype=np.float16).astype(np.float32)
-    observed = np.asarray(case.dense, dtype=np.float32)
+    expected = canonical_dense_reference(
+        case.q,
+        case.k,
+        case.v,
+        case.query_valid_counts,
+        case.key_valid_counts,
+        device=device,
+    )
+    observed_storage = np.asarray(case.dense)
+    if observed_storage.dtype != np.float16:
+        raise ValueError("exact dense reference must use canonical float16 storage")
+    observed = observed_storage.astype(np.float32)
+    expected_float = expected.astype(np.float32)
     valid = np.arange(observed.shape[1])[None, :] < np.asarray(
         case.query_valid_counts
     )[:, None]
-    delta = np.abs(observed[valid] - expected[valid])
+    delta = np.abs(observed[valid] - expected_float[valid])
     maximum = float(delta.max())
     mean = float(delta.mean(dtype=np.float64))
     relative = relative_squared_error(
         observed[valid].reshape(-1),
-        expected[valid].reshape(-1),
+        expected_float[valid].reshape(-1),
         epsilon=case.epsilon,
     )
-    if (
-        maximum > max_abs_tolerance
-        or mean > mean_abs_tolerance
-        or relative > relative_squared_error_tolerance
-    ):
+    if not np.array_equal(observed_storage, expected):
         raise ValueError(
             "exact dense reference diverges from its Q/K/V: "
             f"max_abs={maximum:.9g}, mean_abs={mean:.9g}, relative={relative:.9g}"
         )
     return maximum, mean, relative
+
+
+def canonical_dense_reference(
+    q_tiles: np.ndarray,
+    k_tiles: np.ndarray,
+    v_tiles: np.ndarray,
+    query_valid_counts: np.ndarray,
+    key_valid_counts: np.ndarray,
+    *,
+    device: str | None = None,
+) -> np.ndarray:
+    """Compute the single float16 dense representation stored by exact-cache v2."""
+
+    q = np.asarray(q_tiles)
+    k = np.asarray(k_tiles)
+    v = np.asarray(v_tiles)
+    q_counts = np.asarray(query_valid_counts)
+    k_counts = np.asarray(key_valid_counts)
+    if any(value.dtype != np.float16 for value in (q, k, v)):
+        raise ValueError("canonical dense input Q/K/V must use float16 storage")
+    if device is None:
+        dense = reference_attention(
+            q,
+            k,
+            v,
+            np.ones((q.shape[0], k.shape[0]), dtype=np.bool_),
+            query_valid_counts=q_counts,
+            key_valid_counts=k_counts,
+        )
+    else:
+        from scoring.torch_backend import dense_reference_attention
+
+        dense = dense_reference_attention(
+            q,
+            k,
+            v,
+            q_counts,
+            k_counts,
+            device=device,
+        )
+    return np.asarray(dense, dtype=np.float16)
 
 
 def _validate_case_data(case: ExactCase) -> None:

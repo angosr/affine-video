@@ -885,7 +885,14 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
             selected_inputs=ready_sample_cache().document(),
         )
 
-    track = SimpleNamespace(cache=SimpleNamespace(exact_max_bytes=10_000_000), scoring=scoring())
+    track = SimpleNamespace(
+        digest=planned.track_spec_digest,
+        artifact_manifest_sha256="34" * 32,
+        source_pool_merkle_root=pool.root,
+        cache=SimpleNamespace(exact_max_bytes=10_000_000),
+        scoring=scoring(),
+        model=SimpleNamespace(selector=SimpleNamespace(head_dim=2)),
+    )
     batch = write(tmp_path / "valid", cases)
     ready = planned.ready(
         exact=ReadyObject("exact/valid.npz", batch.sha256, batch.path.stat().st_size),
@@ -913,6 +920,39 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
     )
     with pytest.raises(CacheLoadError, match="metadata conflicts"):
         _validate_plan_case_binding(invalid.path, invalid_ready, track)
+
+    inconsistent = write(
+        tmp_path / "inconsistent",
+        (replace(cases[0], dense=cases[0].dense + 100), *cases[1:]),
+    )
+    inconsistent_ready = planned.ready(
+        exact=ReadyObject(
+            "exact/inconsistent.npz",
+            inconsistent.sha256,
+            inconsistent.path.stat().st_size,
+        ),
+        dense_references=references,
+        sample_cache=ready_sample_cache(),
+    )
+
+    class Objects:
+        @staticmethod
+        def download_content(_object_name, destination, *, sha256, size_bytes):
+            payload = inconsistent.path.read_bytes()
+            assert hashlib.sha256(payload).hexdigest() == sha256
+            assert len(payload) == size_bytes
+            target = Path(destination)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+            return target
+
+    source = ReadyBatchSource(
+        track=track,
+        objects=Objects(),
+        cache_dir=tmp_path / "restored-inconsistent",
+    )
+    with pytest.raises(RuntimeError, match="restored exact batch is invalid"):
+        source._restore_exact(inconsistent_ready)
 
 
 def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_path) -> None:

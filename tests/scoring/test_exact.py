@@ -4,7 +4,13 @@ import numpy as np
 import pytest
 
 from scoring.evaluate import reference_attention
-from scoring.exact import ExactCase, paired_score_gain_bound, score_selector_pair
+from scoring.exact import (
+    ExactCase,
+    canonical_dense_reference,
+    paired_score_gain_bound,
+    score_selector_pair,
+    validate_dense_reference,
+)
 from scoring.selector import FixedSelector, SelectorArchitecture
 from scoring.spec import BudgetSpec
 
@@ -36,6 +42,26 @@ def exact_case(seed: int, *, stratum: str = "all") -> ExactCase:
         required_keys=np.array([[True, False, False], [False, True, False]], dtype=np.bool_),
         epsilon=1e-6,
     )
+
+
+def test_canonical_dense_reference_is_an_exact_float16_binding() -> None:
+    case = exact_case(1)
+    q = case.q.astype(np.float16)
+    k = case.k.astype(np.float16)
+    v = case.v.astype(np.float16)
+    dense = canonical_dense_reference(
+        q,
+        k,
+        v,
+        case.query_valid_counts,
+        case.key_valid_counts,
+    )
+    canonical = replace(case, q=q, k=k, v=v, dense=dense)
+
+    assert dense.dtype == np.float16
+    assert validate_dense_reference(canonical) == (0.0, 0.0, 0.0)
+    with pytest.raises(ValueError, match="diverges"):
+        validate_dense_reference(replace(canonical, dense=dense + np.float16(100)))
 
 
 def test_paired_gain_bound_supports_losses_and_is_deterministic() -> None:
