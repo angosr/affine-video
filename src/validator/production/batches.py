@@ -19,7 +19,9 @@ from scoring.cache import (
     validate_exact_cache,
 )
 from scoring.exact import GLOBAL_SEGMENT, REFERENCE_SEGMENT, TARGET_SEGMENT
+from scoring.model import ValidatedModel
 from scoring.spec import TrackSpec
+from validator.download import DownloadedModel
 from validator.production.commitment import canonical_json, verify_source_proof
 from validator.production.plan import (
     BatchPlan,
@@ -73,15 +75,78 @@ class ReadyBatchSource:
         self.objects = objects
         self.cache_dir = Path(cache_dir)
 
-    def archive_model(self, path: str | Path, sha256: str, size_bytes: int) -> None:
-        """Persist a validated selector before it can affect tournament state."""
+    def archive_model(
+        self,
+        task: object,
+        path: str | Path,
+        validated: ValidatedModel,
+    ) -> None:
+        """Persist a validated selector and its challenge binding before scoring."""
 
-        if Path(path).stat().st_size != size_bytes:
+        if Path(path).stat().st_size != validated.size_bytes:
             raise RuntimeError("validated selector size changed before archival")
         self.objects.put_content(
             path,
-            sha256=sha256,
-            object_name=f"models/{sha256}.safetensors",
+            sha256=validated.file_sha256,
+            object_name=f"models/{validated.file_sha256}.safetensors",
+        )
+        document = {
+            "format": "veda-admission-model-v1",
+            "track_spec_digest": self.track.digest,
+            "challenge_id": task.challenge_id,
+            "submission_id": task.submission_id,
+            "hotkey": task.hotkey,
+            "repo_id": task.repo_id,
+            "revision": task.revision,
+            "file_sha256": validated.file_sha256,
+            "model_digest": validated.model_digest,
+            "size_bytes": validated.size_bytes,
+        }
+        self.objects.create_plan(
+            self._admission_name(task.challenge_id),
+            _json(document),
+        )
+
+    def restore_admission(self, task: object) -> DownloadedModel | None:
+        """Restore a previously accepted admission without contacting its repository."""
+
+        stored = self.objects.get_optional(self._admission_name(task.challenge_id))
+        if stored is None:
+            return None
+        try:
+            document = json.loads(stored.body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("archived admission model is invalid") from exc
+        identity = {
+            "format": "veda-admission-model-v1",
+            "track_spec_digest": self.track.digest,
+            "challenge_id": task.challenge_id,
+            "submission_id": task.submission_id,
+            "hotkey": task.hotkey,
+            "repo_id": task.repo_id,
+            "revision": task.revision,
+        }
+        file_sha256 = document.get("file_sha256") if isinstance(document, dict) else None
+        model_digest = document.get("model_digest") if isinstance(document, dict) else None
+        size_bytes = document.get("size_bytes") if isinstance(document, dict) else None
+        if (
+            not isinstance(document, dict)
+            or _json(document) != stored.body
+            or any(document.get(key) != value for key, value in identity.items())
+            or set(document) != set(identity) | {"file_sha256", "model_digest", "size_bytes"}
+            or not _digest(file_sha256)
+            or not _digest(model_digest)
+            or type(size_bytes) is not int
+            or size_bytes <= 0
+        ):
+            raise RuntimeError("archived admission model conflicts with its challenge")
+        path = self.restore_model(file_sha256, size_bytes)
+        return DownloadedModel(
+            path=path,
+            file_sha256=file_sha256,
+            size_bytes=size_bytes,
+            etag=None,
+            download_host="private-archive",
         )
 
     def restore_model(self, sha256: str, size_bytes: int) -> Path:
@@ -163,6 +228,10 @@ class ReadyBatchSource:
     @staticmethod
     def _stage_name(challenge_id: str, stage: str) -> str:
         return f"stages/{challenge_id}/{stage}.json"
+
+    @staticmethod
+    def _admission_name(challenge_id: str) -> str:
+        return f"admissions/{challenge_id}.json"
 
     def exact_batch(self, challenge_id: str) -> ExactCacheBatch:
         plan = self._plan_for(challenge_id, confirmation=False)
@@ -407,6 +476,16 @@ def _json(value: object) -> bytes:
         ensure_ascii=True,
         allow_nan=False,
     ).encode()
+
+
+def _digest(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _validate_plan_case_binding(path: Path, plan: BatchPlan, track: TrackSpec) -> None:

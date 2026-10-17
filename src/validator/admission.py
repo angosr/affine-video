@@ -38,7 +38,8 @@ class AdmissionSettings:
     retry_max_ms: int = 30 * 60 * 1000
     max_attempts: int = 5
     alert: Callable[[str, Mapping[str, object]], None] | None = None
-    archive: Callable[[str | Path, str, int], None] | None = None
+    archive: Callable[[object, str | Path, ValidatedModel], None] | None = None
+    restore: Callable[[object], DownloadedModel | None] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -141,13 +142,34 @@ def process_next_admission(
     model_path = Path(task.model_path) if task.model_path is not None else None
     expected_file_sha256 = task.file_sha256
     if task.state is ChallengeState.FETCHING:
+        downloaded = None
+        if settings.restore is not None:
+            try:
+                downloaded = settings.restore(task)
+            except Exception:
+                error = ModelDownloadError(
+                    "MODEL_ARCHIVE_UNAVAILABLE",
+                    "archived admission model could not be restored",
+                    temporary=True,
+                )
+                status = _defer_or_fail(
+                    store,
+                    task.challenge_id,
+                    task.lease_token,
+                    task.attempts,
+                    settings,
+                    now,
+                    error,
+                )
+                return AdmissionOutcome(task.challenge_id, status, error.code)
         try:
-            downloaded = downloader(
-                task.repo_id,
-                task.revision,
-                cache_dir=settings.cache_dir,
-                max_bytes=settings.max_model_bytes,
-            )
+            if downloaded is None:
+                downloaded = downloader(
+                    task.repo_id,
+                    task.revision,
+                    cache_dir=settings.cache_dir,
+                    max_bytes=settings.max_model_bytes,
+                )
         except ModelDownloadError as exc:
             if exc.temporary:
                 status = _defer_or_fail(
@@ -170,7 +192,6 @@ def process_next_admission(
                 score_block=current_finalized_block,
             )
             return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, exc.code)
-
         store.record_downloaded_model(
             task.challenge_id,
             task.lease_token,
@@ -262,7 +283,7 @@ def process_next_admission(
 
     if settings.archive is not None:
         try:
-            settings.archive(model_path, validated.file_sha256, validated.size_bytes)
+            settings.archive(task, model_path, validated)
         except Exception:
             error = ModelDownloadError(
                 "MODEL_ARCHIVE_UNAVAILABLE",

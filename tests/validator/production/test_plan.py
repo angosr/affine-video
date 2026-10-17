@@ -9,6 +9,7 @@ import pytest
 
 from scoring.cache import CacheLoadError, write_exact_cache_batch
 from scoring.exact import ExactCase
+from scoring.model import ValidatedModel
 from scoring.spec import BudgetSpec, ScoringSpec, StepWindowSpec, TrajectoryScheduleSpec
 from validator.production.batches import ReadyBatchSource, _validate_plan_case_binding
 from validator.production.commitment import SourceLeaf, SourcePool
@@ -534,6 +535,64 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     assert archived.score == 0.8
     assert archived.score_block == 121
     assert archived.metrics == {"requires_confirmation": True}
+
+
+def test_admission_archive_restores_model_by_challenge_identity(tmp_path) -> None:
+    class Objects:
+        def __init__(self):
+            self.small = {}
+            self.content = {}
+
+        def put_content(self, path, *, sha256, object_name):
+            payload = Path(path).read_bytes()
+            assert hashlib.sha256(payload).hexdigest() == sha256
+            self.content.setdefault(object_name, payload)
+
+        def create_plan(self, name, payload):
+            stored = StoredObject(payload, hashlib.sha256(payload).hexdigest())
+            existing = self.small.setdefault(name, stored)
+            if existing.body != payload:
+                raise RuntimeError("conflicting archive")
+            return existing
+
+        def get_optional(self, name):
+            return self.small.get(name)
+
+        def download_content(self, object_name, destination, *, sha256, size_bytes):
+            payload = self.content[object_name]
+            assert len(payload) == size_bytes
+            assert hashlib.sha256(payload).hexdigest() == sha256
+            path = Path(destination)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+            return path
+
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(b"validated selector")
+    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    validated = ValidatedModel(file_sha256, "cd" * 32, path.stat().st_size, 1)
+    task = SimpleNamespace(
+        challenge_id="challenge-a",
+        submission_id="submission-a",
+        hotkey="hotkey-a",
+        repo_id="owner/model",
+        revision="12" * 20,
+    )
+    objects = Objects()
+    source = ReadyBatchSource(
+        track=SimpleNamespace(digest="ab" * 32),
+        objects=objects,
+        cache_dir=tmp_path / "restored",
+    )
+
+    source.archive_model(task, path, validated)
+    path.unlink()
+    restored = source.restore_admission(task)
+
+    assert restored is not None
+    assert restored.path.read_bytes() == b"validated selector"
+    assert restored.file_sha256 == file_sha256
+    assert restored.download_host == "private-archive"
 
 
 def test_plan_coordinator_skips_empty_intervals_without_losing_later_work() -> None:

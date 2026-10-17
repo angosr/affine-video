@@ -137,7 +137,14 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
     archived = []
     configured = replace(
         settings(tmp_path),
-        archive=lambda path, digest, size: archived.append((path, digest, size)),
+        archive=lambda task, path, validated: archived.append(
+            (
+                task.challenge_id,
+                path,
+                validated.file_sha256,
+                validated.size_bytes,
+            )
+        ),
     )
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
@@ -171,7 +178,7 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
         duplicate = store.get_challenge(second_id)
         assert duplicate.state is ChallengeState.PARTICIPANT_FAILED
         assert duplicate.error_code == "EXACT_DUPLICATE"
-        assert [item[0] for item in archived] == [first_model]
+        assert [(item[0], item[1]) for item in archived] == [(first_id, first_model)]
 
 
 def test_frozen_effective_challenge_limit_is_enforced(tmp_path) -> None:
@@ -507,7 +514,14 @@ def test_model_is_durably_archived_before_entering_scoring(tmp_path) -> None:
     archived = []
     configured = replace(
         settings(tmp_path),
-        archive=lambda path, digest, size: archived.append((path, digest, size)),
+        archive=lambda task, path, validated: archived.append(
+            (
+                task.challenge_id,
+                path,
+                validated.file_sha256,
+                validated.size_bytes,
+            )
+        ),
     )
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
@@ -523,8 +537,42 @@ def test_model_is_durably_archived_before_entering_scoring(tmp_path) -> None:
         assert outcome is not None and outcome.status is AdmissionStatus.ACCEPTED
         assert store.get_challenge(identifier).state is ChallengeState.SCORING
         assert archived == [
-            (model, hashlib.sha256(model.read_bytes()).hexdigest(), model.stat().st_size)
+            (
+                identifier,
+                model,
+                hashlib.sha256(model.read_bytes()).hexdigest(),
+                model.stat().st_size,
+            )
         ]
+
+
+def test_archived_admission_is_restored_without_repository_access(tmp_path) -> None:
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
+    restored = model_downloader(model)()
+    restore_calls = []
+
+    def restore(task):
+        restore_calls.append(task.challenge_id)
+        return restored
+
+    def repository_must_not_be_used(*_args, **_kwargs):
+        raise AssertionError("repository access is not allowed during archive recovery")
+
+    configured = replace(settings(tmp_path), restore=restore)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=repository_must_not_be_used,
+        )
+
+        assert outcome is not None and outcome.status is AdmissionStatus.ACCEPTED
+        assert restore_calls == [identifier]
 
 
 def test_archive_failure_defers_without_consuming_the_submission(tmp_path) -> None:

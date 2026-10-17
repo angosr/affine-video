@@ -203,6 +203,7 @@ async def run_evaluator(
         last_submission_block=track.last_submission_block,
         alert=alert,
         archive=None if batch_source is None else batch_source.archive_model,
+        restore=None if batch_source is None else batch_source.restore_admission,
     )
 
     with ExitStack() as resources:
