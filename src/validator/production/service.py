@@ -8,11 +8,14 @@ import multiprocessing
 import os
 import queue
 import shutil
+import subprocess
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from safetensors import SafetensorError, safe_open
 
 from scoring.cache import ExactCacheReader, assemble_exact_cache_batch, write_exact_cache_batch
 from scoring.spec import TrackSpec, load_track_spec
@@ -497,7 +500,7 @@ def _produce_unit(
     existing = _find_valid_shard(root, plan, rollout, track)
     video = root / f"{rollout.rollout_id}.mp4"
     latent = root / f"{rollout.rollout_id}.safetensors"
-    if existing is not None and video.stat().st_size > 0 and latent.stat().st_size > 0:
+    if existing is not None:
         return UnitResult(rollout.rollout_id, str(existing), str(video), str(latent), 0.0, 0.0)
     capture = runtime.capture(
         sample_id=rollout.source_id,
@@ -529,9 +532,13 @@ def _produce_unit(
         source_proofs=tuple(proof.document() for proof in plan.source_proofs),
         dense_references=(),
     )
+    _write_unit_completion(root, plan, rollout, shard.path, output.video_path, output.latent_path)
+    validated = _find_valid_shard(root, plan, rollout, track)
+    if validated != shard.path:
+        raise RuntimeError("producer unit failed its completion validation")
     return UnitResult(
         rollout.rollout_id,
-        str(shard.path),
+        str(validated),
         str(output.video_path),
         str(output.latent_path),
         capture.elapsed_seconds + output.decode_seconds,
@@ -542,28 +549,180 @@ def _produce_unit(
 def _find_valid_shard(
     root: Path, plan: BatchPlan, rollout: RolloutPlan, track: TrackSpec
 ) -> Path | None:
-    candidates = sorted(root.glob(f"{plan.generation_block}-*.npz"))
-    if (
-        not candidates
-        or not (root / f"{rollout.rollout_id}.mp4").is_file()
-        or not (root / f"{rollout.rollout_id}.safetensors").is_file()
-    ):
+    completion = root / "unit-complete.json"
+    if not completion.is_file():
         return None
-    for path in candidates:
-        digest = _file_sha256(path)
-        try:
-            reader = ExactCacheReader(
-                path,
-                expected_sha256=digest,
-                max_bytes=track.cache.exact_max_bytes,
+    try:
+        payload = completion.read_bytes()
+        document = json.loads(payload)
+        identity = {
+            "format": "veda-production-unit-v1",
+            "track_spec_digest": track.digest,
+            "plan_digest": plan.plan_digest,
+            "rollout_id": rollout.rollout_id,
+        }
+        if (
+            not isinstance(document, dict)
+            or payload != _canonical_json(document)
+            or set(document) != set(identity) | {"files"}
+            or any(document.get(key) != value for key, value in identity.items())
+            or not isinstance(document.get("files"), dict)
+            or set(document["files"]) != {"exact", "video", "latent"}
+        ):
+            return None
+        exact = _completed_file(root, document["files"]["exact"], ".npz")
+        video = _completed_file(root, document["files"]["video"], ".mp4")
+        latent = _completed_file(root, document["files"]["latent"], ".safetensors")
+        if video.name != f"{rollout.rollout_id}.mp4" or latent.name != (
+            f"{rollout.rollout_id}.safetensors"
+        ):
+            return None
+        reader = ExactCacheReader(
+            exact,
+            expected_sha256=document["files"]["exact"]["sha256"],
+            max_bytes=track.cache.exact_max_bytes,
+        )
+        if (
+            reader.metadata["track_spec_digest"] != track.digest
+            or reader.metadata["plan_digest"] != plan.plan_digest
+            or reader.metadata["generated_block"] != plan.generation_block
+            or reader.metadata["seed_block_hash"].lower() != plan.block_hash.lower()
+            or {row["rollout_id"] for row in reader.metadata["cases"]}
+            != {rollout.rollout_id}
+            or not _valid_dense_latent(latent, rollout)
+            or not _video_decodes(video)
+        ):
+            return None
+        return exact
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _write_unit_completion(
+    root: Path,
+    plan: BatchPlan,
+    rollout: RolloutPlan,
+    exact: Path,
+    video: Path,
+    latent: Path,
+) -> None:
+    document = {
+        "format": "veda-production-unit-v1",
+        "track_spec_digest": plan.track_spec_digest,
+        "plan_digest": plan.plan_digest,
+        "rollout_id": rollout.rollout_id,
+        "files": {
+            "exact": _completed_file_document(exact),
+            "video": _completed_file_document(video),
+            "latent": _completed_file_document(latent),
+        },
+    }
+    destination = root / "unit-complete.json"
+    temporary = root / ".unit-complete.tmp"
+    payload = _canonical_json(document)
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _completed_file_document(path: Path) -> dict[str, object]:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise RuntimeError("producer unit output is missing or empty")
+    return {
+        "name": path.name,
+        "sha256": _file_sha256(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def _completed_file(root: Path, value: object, suffix: str) -> Path:
+    if not isinstance(value, dict) or set(value) != {"name", "sha256", "size_bytes"}:
+        raise ValueError("unit completion file record is invalid")
+    name = value["name"]
+    digest = value["sha256"]
+    size = value["size_bytes"]
+    if (
+        not isinstance(name, str)
+        or Path(name).name != name
+        or not name.endswith(suffix)
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or type(size) is not int
+        or size <= 0
+    ):
+        raise ValueError("unit completion file record is invalid")
+    bytes.fromhex(digest)
+    path = root / name
+    if not path.is_file() or path.stat().st_size != size or _file_sha256(path) != digest:
+        raise ValueError("unit completion file does not match its recorded content")
+    return path
+
+
+def _valid_dense_latent(path: Path, rollout: RolloutPlan) -> bool:
+    try:
+        with safe_open(path, framework="numpy") as tensors:
+            if set(tensors.keys()) != {"audio_rows", "video_rows"} or tensors.metadata() != {
+                "geometry": rollout.stratum,
+                "rollout_id": rollout.rollout_id,
+            }:
+                return False
+            audio = tensors.get_slice("audio_rows")
+            video = tensors.get_slice("video_rows")
+            return (
+                audio.get_dtype() == "F32"
+                and video.get_dtype() == "F32"
+                and len(audio.get_shape()) == 2
+                and len(video.get_shape()) == 2
+                and audio.get_shape()[0] > 0
+                and video.get_shape()[0] > 0
+                and audio.get_shape()[1] == 32
+                and video.get_shape()[1] == 96
             )
-            if reader.metadata["plan_digest"] == plan.plan_digest and {
-                row["rollout_id"] for row in reader.metadata["cases"]
-            } == {rollout.rollout_id}:
-                return path
-        except (OSError, ValueError):
-            continue
-    return None
+    except (OSError, ValueError, SafetensorError):
+        return False
+
+
+def _video_decodes(path: Path) -> bool:
+    try:
+        subprocess.run(
+            (
+                "ffmpeg",
+                "-v",
+                "error",
+                "-xerror",
+                "-i",
+                str(path),
+                "-map",
+                "0:v:0",
+                "-f",
+                "null",
+                "-",
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=120,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode()
 
 
 def _ready_file(path: Path, directory: str, suffix: str) -> ReadyObject:

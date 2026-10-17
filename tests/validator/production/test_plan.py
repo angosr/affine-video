@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from safetensors.numpy import save_file
 
+import validator.production.service as production_service
 from scoring.cache import CacheLoadError, write_exact_cache_batch
 from scoring.exact import ExactCase
 from scoring.model import ValidatedModel
@@ -27,8 +29,10 @@ from validator.production.plan import (
 from validator.production.service import (
     PlanCoordinator,
     WorkerPool,
+    _find_valid_shard,
     _prune_local_work,
     _validate_source_capacity,
+    _write_unit_completion,
 )
 from validator.production.storage import StoredObject
 from validator.queue import ChainPosition, ChallengeState
@@ -294,6 +298,102 @@ def test_worker_pool_has_a_plan_wall_clock_ceiling() -> None:
 
     with pytest.raises(RuntimeError, match="wall-clock limit"):
         worker.run(plan)
+
+
+def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkeypatch) -> None:
+    pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
+    plan = build_plan(
+        track_spec_digest="ab" * 32,
+        generation_block=120,
+        block_hash="0x" + "cd" * 32,
+        track_start_block=100,
+        minimum_generation_delay_blocks=1,
+        generation_interval_blocks=20,
+        exact_challenge_ids=("challenge",),
+        confirmation_challenge_ids=(),
+        source_proofs=tuple(pool.proof(f"source-{index}") for index in range(2)),
+        scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+    rollout = plan.rollouts[0]
+    step = plan.selected_steps[0]
+    route = plan.selected_routes[0]
+    segments = np.array([1, 0, 0, 0, 0, 2], dtype=np.int8)
+    selected = select_query_tiles(
+        query_selection_seed=plan.query_selection_seed,
+        case_id=f"{rollout.rollout_id}:{step.index}:{route}",
+        target_tiles=(1, 2, 3, 4),
+        reference_tiles=(0,),
+        count=4,
+    )
+    required = np.zeros((4, 6), dtype=np.bool_)
+    for row, query_id in enumerate(selected):
+        required[row, query_id] = True
+    valid = np.full(6, 2, dtype=np.int16)
+    case = ExactCase(
+        route=route,
+        stratum=rollout.stratum,
+        rollout_id=rollout.rollout_id,
+        source_id=rollout.source_id,
+        step_index=step.index,
+        step_window=step.window,
+        scheduler_timestep=step.sigma,
+        sigma=step.sigma,
+        tile_plan_hash="45" * 32,
+        query_tile_ids=selected,
+        q=np.zeros((4, 2, 2), dtype=np.float32),
+        k=np.zeros((6, 2, 2), dtype=np.float32),
+        v=np.zeros((6, 2, 2), dtype=np.float32),
+        dense=np.zeros((4, 2, 2), dtype=np.float32),
+        query_valid_counts=valid[list(selected)],
+        key_valid_counts=valid,
+        key_segments=segments,
+        required_keys=required,
+        epsilon=1e-6,
+    )
+    shard = write_exact_cache_batch(
+        tmp_path,
+        (case,),
+        generated_block=plan.generation_block,
+        seed_block_hash=plan.block_hash,
+        plan_digest=plan.plan_digest,
+        track_spec_digest=plan.track_spec_digest,
+        artifact_manifest_sha256="67" * 32,
+        source_pool_merkle_root=pool.root,
+        source_proofs=tuple(item.document() for item in plan.source_proofs),
+        dense_references=(),
+    )
+    video = tmp_path / f"{rollout.rollout_id}.mp4"
+    latent = tmp_path / f"{rollout.rollout_id}.safetensors"
+    video.write_bytes(b"valid encoded video")
+    save_file(
+        {
+            "audio_rows": np.zeros((2, 32), dtype=np.float32),
+            "video_rows": np.zeros((2, 96), dtype=np.float32),
+        },
+        latent,
+        metadata={"geometry": rollout.stratum, "rollout_id": rollout.rollout_id},
+    )
+    _write_unit_completion(tmp_path, plan, rollout, shard.path, video, latent)
+    monkeypatch.setattr(production_service, "_video_decodes", lambda _path: True)
+    track = SimpleNamespace(
+        digest=plan.track_spec_digest,
+        cache=SimpleNamespace(exact_max_bytes=10**7),
+    )
+
+    assert _find_valid_shard(tmp_path, plan, rollout, track) == shard.path
+
+    video.write_bytes(b"broken encoded video")
+    assert _find_valid_shard(tmp_path, plan, rollout, track) is None
+
+    video.write_bytes(b"valid encoded video")
+    save_file(
+        {"wrong_rows": np.zeros((2, 96), dtype=np.float32)},
+        latent,
+        metadata={"geometry": rollout.stratum, "rollout_id": rollout.rollout_id},
+    )
+    _write_unit_completion(tmp_path, plan, rollout, shard.path, video, latent)
+    assert _find_valid_shard(tmp_path, plan, rollout, track) is None
 
 
 def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> None:
