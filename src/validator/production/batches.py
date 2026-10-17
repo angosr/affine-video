@@ -28,6 +28,7 @@ from validator.production.plan import (
     DenseReference,
     build_plan,
     select_query_tiles,
+    validate_source_selection_sequence,
 )
 from validator.production.storage import PrivateObjectStore
 
@@ -300,11 +301,7 @@ class ReadyBatchSource:
         """Return whether the one frozen plan for this stage reached READY."""
 
         matches = []
-        for name in self.objects.list_names("plans/"):
-            if not name.startswith("plans/") or not name.endswith(".json"):
-                raise RuntimeError("private plan index contains an unexpected object")
-            plan = BatchPlan.decode(self.objects.get(name).body)
-            self._validate_plan(name, plan)
+        for _name, plan in self._plans():
             identifiers = (
                 plan.confirmation_challenge_ids if confirmation else plan.exact_challenge_ids
             )
@@ -378,11 +375,7 @@ class ReadyBatchSource:
         except ValueError as exc:
             raise ValueError("plan digest must be hexadecimal") from exc
         matches = []
-        for name in self.objects.list_names("plans/"):
-            if not name.startswith("plans/") or not name.endswith(".json"):
-                raise RuntimeError("private plan index contains an unexpected object")
-            plan = BatchPlan.decode(self.objects.get(name).body)
-            self._validate_plan(name, plan)
+        for _name, plan in self._plans():
             if plan.plan_digest == plan_digest:
                 matches.append(plan)
         if len(matches) != 1:
@@ -396,11 +389,7 @@ class ReadyBatchSource:
         """Remove only local copies of READY batches whose whole group is terminal."""
 
         removed = 0
-        for name in self.objects.list_names("plans/"):
-            if not name.startswith("plans/") or not name.endswith(".json"):
-                raise RuntimeError("private plan index contains an unexpected object")
-            plan = BatchPlan.decode(self.objects.get(name).body)
-            self._validate_plan(name, plan)
+        for _name, plan in self._plans():
             references = set(plan.exact_challenge_ids + plan.confirmation_challenge_ids)
             if plan.state != "READY" or not references or not references <= terminal_challenge_ids:
                 continue
@@ -423,11 +412,7 @@ class ReadyBatchSource:
         if not challenge_id:
             raise ValueError("challenge ID cannot be empty")
         matches = []
-        for name in self.objects.list_names("plans/"):
-            if not name.startswith("plans/") or not name.endswith(".json"):
-                raise RuntimeError("private plan index contains an unexpected object")
-            plan = BatchPlan.decode(self.objects.get(name).body)
-            self._validate_plan(name, plan)
+        for _name, plan in self._plans():
             identifiers = (
                 plan.confirmation_challenge_ids if confirmation else plan.exact_challenge_ids
             )
@@ -440,6 +425,25 @@ class ReadyBatchSource:
         if matches:
             raise RuntimeError("challenge batch is not READY")
         raise RuntimeError("challenge has no scheduled private batch")
+
+    def _plans(self) -> tuple[tuple[str, BatchPlan], ...]:
+        rows = []
+        for name in self.objects.list_names("plans/"):
+            if not name.startswith("plans/") or not name.endswith(".json"):
+                raise RuntimeError("private plan index contains an unexpected object")
+            plan = BatchPlan.decode(self.objects.get(name).body)
+            self._validate_plan(name, plan)
+            rows.append((name, plan))
+        rows.sort(key=lambda row: row[1].generation_block)
+        try:
+            validate_source_selection_sequence(
+                tuple(plan for _name, plan in rows),
+                commitments=self.track.source_commitments,
+                scoring=self.track.scoring,
+            )
+        except ValueError as exc:
+            raise RuntimeError("private plan source selection is invalid") from exc
+        return tuple(rows)
 
     def _validate_plan(self, name: str, plan: BatchPlan) -> None:
         if name != f"plans/{plan.generation_block}.json":

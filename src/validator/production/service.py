@@ -39,6 +39,7 @@ from validator.production.plan import (
     build_plan,
     select_source_proofs,
     submission_interval,
+    validate_source_selection_sequence,
 )
 from validator.production.runtime import trajectory_tensor_key
 from validator.production.storage import PreconditionFailed, PrivateObjectStore, StoredObject
@@ -79,6 +80,16 @@ class PlanCoordinator:
     ) -> None:
         if source_pool.root != track.source_pool_merkle_root:
             raise ValueError("source pool does not match the track commitment")
+        expected_commitments = tuple(
+            {
+                "generation_geometry": item.generation_geometry,
+                "partition": item.partition,
+                "sha256": item.sha256,
+            }
+            for item in track.source_commitments
+        )
+        if source_pool.public_commitments() != expected_commitments:
+            raise ValueError("source pool differs from the public selection index")
         self.track = track
         self.store = store
         self.objects = objects
@@ -96,6 +107,14 @@ class PlanCoordinator:
         rows.sort(key=lambda row: row[2].generation_block)
         if len({row[2].generation_block for row in rows}) != len(rows):
             raise RuntimeError("private plan index contains duplicate generation blocks")
+        try:
+            validate_source_selection_sequence(
+                tuple(row[2] for row in rows),
+                commitments=self.track.source_commitments,
+                scoring=self.track.scoring,
+            )
+        except ValueError as exc:
+            raise RuntimeError("private plan source selection is invalid") from exc
         return tuple(rows)
 
     def create_next(self) -> BatchPlan | None:
@@ -103,8 +122,8 @@ class PlanCoordinator:
             return None
         existing = self.plans()
         by_block = {plan.generation_block: plan for _, _, plan in existing}
-        used_families = {
-            proof.leaf.source_family_id for _, _, plan in existing for proof in plan.source_proofs
+        used_source_digests = {
+            proof.leaf.digest for _, _, plan in existing for proof in plan.source_proofs
         }
         cursor = self.store.chain_cursor()
         if cursor is None:
@@ -138,10 +157,11 @@ class PlanCoordinator:
             ).hexdigest()
             proofs = select_source_proofs(
                 self.source_pool,
+                commitments=self.track.source_commitments,
                 strata=tuple(self.track.scoring.stratum_weight_map),
                 sources_per_stratum=self.track.scoring.rollouts_per_stratum,
                 batch_seed=seed,
-                used_families=frozenset(used_families),
+                used_source_digests=frozenset(used_source_digests),
             )
             plan = build_plan(
                 track_spec_digest=self.track.digest,
@@ -159,9 +179,13 @@ class PlanCoordinator:
             name = _plan_name(block)
             try:
                 self.objects.create_plan(name, plan.encode())
-            except PreconditionFailed:
+            except PreconditionFailed as exc:
                 winner = BatchPlan.decode(self.objects.get(name).body)
                 self._validate_plan(name, winner)
+                if winner.planned_document() != plan.planned_document():
+                    raise RuntimeError(
+                        "private plan conflicts with the deterministic schedule"
+                    ) from exc
                 return winner
             return plan
         return None
@@ -362,6 +386,7 @@ class ProducerService:
             source_pool_payload,
             config.artifact_path(config.runtime.source_binding).read_bytes(),
             expected_root=self.track.source_pool_merkle_root,
+            expected_commitments=self.track.source_commitment_documents,
             sample_cache=config.artifact_path(config.runtime.sample_cache),
         )
         _validate_source_capacity(self.pool, self.track)

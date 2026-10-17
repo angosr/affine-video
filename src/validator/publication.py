@@ -19,7 +19,12 @@ import httpx
 from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
 from validator.chunks import ChunkManifest, build_chunk_manifest, chunk_object_name, read_part
 from validator.production.batches import BatchDisclosure
-from validator.production.plan import BatchPlan
+from validator.production.commitment import verify_source_proof
+from validator.production.plan import (
+    BatchPlan,
+    build_plan,
+    validate_source_selection_sequence,
+)
 from validator.queue import TERMINAL_STATES
 from validator.s3 import client_config
 from validator.store import ChallengeStore
@@ -877,7 +882,16 @@ class S3Repository:
             for batch in used:
                 batches.setdefault(batch["plan_digest"], []).append(batch)
 
-        disclosed = set()
+        generation_blocks = {}
+        for plan_digest, used_batches in batches.items():
+            blocks = {batch["generated_block"] for batch in used_batches}
+            if len(blocks) != 1:
+                raise PublicArtifactError("public matches disagree on a batch generation block")
+            generation_blocks[plan_digest] = blocks.pop()
+        if len(set(generation_blocks.values())) != len(generation_blocks):
+            raise PublicArtifactError("public matches identify multiple plans for one block")
+
+        verified = {}
         for plan_digest, used_batches in batches.items():
             record_name = f"batch_groups/{plan_digest}.json"
             payload = self._get_optional(record_name)
@@ -904,6 +918,28 @@ class S3Repository:
                 or not challenge_ids.issubset(terminal_ids)
             ):
                 raise PublicArtifactError("public batch disclosure conflicts with the ledger")
+            if any(
+                not verify_source_proof(proof, track.source_pool_merkle_root)
+                for proof in plan.source_proofs
+            ):
+                raise PublicArtifactError("public batch disclosure has an invalid source proof")
+            rebuilt = build_plan(
+                track_spec_digest=track.digest,
+                generation_block=plan.generation_block,
+                block_hash=plan.block_hash,
+                track_start_block=track.track_start_block,
+                minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
+                generation_interval_blocks=track.cache.generation_interval_blocks,
+                exact_challenge_ids=plan.exact_challenge_ids,
+                confirmation_challenge_ids=plan.confirmation_challenge_ids,
+                source_proofs=plan.source_proofs,
+                scoring=track.scoring,
+                available_routes=track.model.selector.routes,
+            )
+            if rebuilt.planned_document() != plan.planned_document():
+                raise PublicArtifactError(
+                    "public batch disclosure conflicts with the deterministic schedule"
+                )
             assert plan.exact is not None
             exact_name = f"batches/{plan.exact.sha256}/manifest.json"
             if any(
@@ -941,9 +977,27 @@ class S3Repository:
                 raise PublicArtifactError("public batch disclosure is not canonical")
             for object_name, sha256, size_bytes in files:
                 self._verify_public_file(object_name, sha256, size_bytes)
+            verified[plan_digest] = (plan, record_name, payload)
+
+        prefix = []
+        for plan_digest in sorted(generation_blocks, key=generation_blocks.__getitem__):
+            row = verified.get(plan_digest)
+            if row is None:
+                break
+            prefix.append((plan_digest, *row))
+        try:
+            validate_source_selection_sequence(
+                tuple(plan for _digest, plan, _name, _payload in prefix),
+                commitments=track.source_commitments,
+                scoring=track.scoring,
+            )
+        except ValueError as exc:
+            raise PublicArtifactError(
+                "public batch disclosure source selection is invalid"
+            ) from exc
+        for _digest, _plan, record_name, payload in prefix:
             self._confirmed_immutable[record_name] = hashlib.sha256(payload).hexdigest()
-            disclosed.add(plan_digest)
-        return frozenset(disclosed)
+        return frozenset(digest for digest, _plan, _name, _payload in prefix)
 
     def _verify_model_archives(self, matches: tuple[MatchRecord, ...]) -> None:
         for match in matches:

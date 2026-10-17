@@ -28,6 +28,7 @@ EXACT_CACHE_FORMAT = "veda-exact-cache-v2"
 PRIVATE_GENERATOR = "veda-private-rollout-v1"
 STEP_SELECTION_ALGORITHM = "sha256-window-without-replacement-v1"
 QUERY_SELECTION_ALGORITHM = "sha256-segment-quota-v1"
+SOURCE_PARTITIONS = ("production", "audit")
 
 
 class TrackSpecError(ValueError):
@@ -110,6 +111,13 @@ class FullVideoSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceCommitmentSpec:
+    sha256: str
+    partition: str
+    generation_geometry: str
+
+
+@dataclass(frozen=True, slots=True)
 class ScoringSpec:
     budgets: tuple[BudgetSpec, ...]
     sampled_route_count: int
@@ -155,6 +163,7 @@ class TrackSpec:
     maximum_effective_challenges: int
     track_close_grace_blocks: int
     source_pool_merkle_root: str
+    source_commitments: tuple[SourceCommitmentSpec, ...]
     artifact_manifest_sha256: str
     initial_champion: InitialChampionSpec
     model: ModelSpec
@@ -195,6 +204,10 @@ class TrackSpec:
     def track_close_block(self) -> int:
         return self.last_generation_block + self.track_close_grace_blocks
 
+    @property
+    def source_commitment_documents(self) -> tuple[dict[str, str], ...]:
+        return tuple(asdict(item) for item in self.source_commitments)
+
 
 def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
     """Return the canonical public document whose SHA-256 is ``spec.digest``."""
@@ -215,6 +228,17 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
         {"indices": list(window.indices), "name": window.name, "weight": window.weight}
         for window in spec.scoring.trajectory_schedule.step_windows
     ]
+    document["source_commitments"] = {
+        partition: {
+            geometry: [
+                item.sha256
+                for item in spec.source_commitments
+                if item.partition == partition and item.generation_geometry == geometry
+            ]
+            for geometry in sorted(spec.scoring.stratum_weight_map)
+        }
+        for partition in SOURCE_PARTITIONS
+    }
     return document
 
 
@@ -249,6 +273,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "netuid",
             "publication_grace_blocks",
             "scoring",
+            "source_commitments",
             "source_pool_merkle_root",
             "track_close_grace_blocks",
             "track_id",
@@ -302,6 +327,11 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "confirmation boundary per effective challenge"
         )
     values["scoring"] = _parse_scoring(root["scoring"], values["model"].selector, maximum_effective)
+    values["source_commitments"] = _parse_source_commitments(
+        root["source_commitments"],
+        expected_root=values["source_pool_merkle_root"],
+        strata=frozenset(values["scoring"].stratum_weight_map),
+    )
     if values["full_video"].minimum_gain < values["scoring"].minimum_frontier_gain:
         raise TrackSpecError("full-video minimum gain cannot be lower than the exact-stage gate")
     canonical = _spec_document(values)
@@ -588,6 +618,51 @@ def _parse_full_video(value: Any) -> FullVideoSpec:
         _unit(raw["black_frame_threshold"], "black frame threshold"),
         _number(raw["flicker_threshold"], "flicker threshold", minimum_exclusive=0),
     )
+
+
+def _parse_source_commitments(
+    value: Any,
+    *,
+    expected_root: str,
+    strata: frozenset[str],
+) -> tuple[SourceCommitmentSpec, ...]:
+    if not isinstance(value, dict) or set(value) != set(SOURCE_PARTITIONS):
+        raise TrackSpecError("source commitments must contain production and audit")
+    result = []
+    for partition in SOURCE_PARTITIONS:
+        groups = value[partition]
+        if not isinstance(groups, dict) or set(groups) != strata:
+            raise TrackSpecError(
+                f"{partition} source commitments must cover every stratum"
+            )
+        for geometry in sorted(strata):
+            digests = groups[geometry]
+            if not isinstance(digests, list) or not digests:
+                raise TrackSpecError("source commitment group must be a non-empty list")
+            result.extend(
+                SourceCommitmentSpec(
+                    _digest(digest, "source commitment sha256"),
+                    partition,
+                    geometry,
+                )
+                for digest in digests
+            )
+    digests = tuple(item.sha256 for item in result)
+    if len(set(digests)) != len(digests):
+        raise TrackSpecError("source commitment digests must be unique")
+    if _source_merkle_root(digests) != expected_root:
+        raise TrackSpecError("source commitments do not reconstruct the source pool root")
+    return tuple(result)
+
+
+def _source_merkle_root(digests: tuple[str, ...]) -> str:
+    level = tuple(bytes.fromhex(value) for value in digests)
+    while len(level) > 1:
+        level = tuple(
+            hashlib.sha256(b"\x01" + level[index] + level[min(index + 1, len(level) - 1)]).digest()
+            for index in range(0, len(level), 2)
+        )
+    return level[0].hex()
 
 
 def _spec_document(values: dict[str, Any]) -> dict[str, Any]:

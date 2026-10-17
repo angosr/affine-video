@@ -13,7 +13,13 @@ from validator import chunks
 from validator import publication as publication_module
 from validator.production.batches import BatchDisclosure, DisclosureFile
 from validator.production.commitment import SourceLeaf, SourcePool, canonical_json
-from validator.production.plan import DenseReference, ReadyObject, build_plan
+from validator.production.plan import (
+    DenseReference,
+    ReadyObject,
+    build_plan,
+    generation_seed,
+    select_source_proofs,
+)
 from validator.publication import (
     PublicArtifactError,
     PublicArtifacts,
@@ -890,7 +896,6 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary(tmp_path)
 
 
 def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_path) -> None:
-    track = parse_track_spec(valid_spec())
     leaves = tuple(
         SourceLeaf(
             "production",
@@ -900,20 +905,51 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
             (),
             "all",
             "internal-cleared-v1",
+            hashlib.sha256(f"nonce-{index}".encode()).hexdigest(),
         )
-        for index in range(track.scoring.rollouts_per_stratum)
+        for index in range(4)
     )
-    pool = SourcePool(leaves)
+    audit = SourceLeaf(
+        "audit",
+        "audit-family",
+        "audit-source",
+        "audit prompt",
+        (),
+        "all",
+        "internal-cleared-v1",
+        hashlib.sha256(b"audit-nonce").hexdigest(),
+    )
+    pool = SourcePool((*leaves, audit))
+    raw_track = valid_spec()
+    raw_track["source_pool_merkle_root"] = pool.root
+    raw_track["source_commitments"] = {
+        "production": {
+            "all": [
+                leaf.digest for leaf in pool.leaves if leaf.partition == "production"
+            ]
+        },
+        "audit": {"all": [leaf.digest for leaf in pool.leaves if leaf.partition == "audit"]},
+    }
+    track = parse_track_spec(raw_track)
+    block_hash = "0x" + "12" * 32
+    proofs = select_source_proofs(
+        pool,
+        commitments=track.source_commitments,
+        strata=tuple(track.scoring.stratum_weight_map),
+        sources_per_stratum=track.scoring.rollouts_per_stratum,
+        batch_seed=generation_seed(track.digest, block_hash),
+        used_source_digests=frozenset(),
+    )
     plan = build_plan(
         track_spec_digest=track.digest,
         generation_block=200,
-        block_hash="0x" + "12" * 32,
+        block_hash=block_hash,
         track_start_block=track.track_start_block,
         minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
         generation_interval_blocks=track.cache.generation_interval_blocks,
         exact_challenge_ids=("challenge",),
         confirmation_challenge_ids=(),
-        source_proofs=tuple(pool.proof(leaf.source_id) for leaf in leaves),
+        source_proofs=proofs,
         scoring=track.scoring,
         available_routes=track.model.selector.routes,
     )
@@ -984,6 +1020,29 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
     restarted = S3Repository(client, bucket="public-data", prefix="tracks/main")
     assert restarted._load_batch_disclosures(track, (match,)) == frozenset(
         {ready.plan_digest}
+    )
+
+    earlier_batch = {
+        **batch,
+        "generated_block": ready.generation_block - 20,
+        "plan_digest": "00" * 32,
+    }
+    gap_match = SimpleNamespace(
+        challenge_id="challenge",
+        document={
+            "evaluation": {
+                "stages": [
+                    {"evaluation_batch": earlier_batch},
+                    {"evaluation_batch": batch},
+                ],
+                "evaluation_batch": batch,
+            }
+        },
+    )
+    assert (
+        S3Repository(client, bucket="public-data", prefix="tracks/main")
+        ._load_batch_disclosures(track, (gap_match,))
+        == frozenset()
     )
 
     client.objects.pop(f"tracks/main/batches/{exact.sha256}/part-00000")

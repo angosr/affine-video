@@ -172,7 +172,11 @@ packages. Release assembly calls `build_source_bundle()` and `write_dependency_l
 format. A canonical source-cache binding joins the source-pool Merkle root to the complete encoded
 SampleCache index, text tensors and optional condition tensors. Producer startup verifies that
 binding and exact source-ID coverage, so changing encoded input under an existing source ID is a
-hard failure rather than a new hidden dataset with the old commitment.
+hard failure rather than a new hidden dataset with the old commitment. Each private source leaf
+also contains an independent 256-bit nonce. The track publishes only its salted leaf digest,
+partition and geometry. Batch selection ranks those public digests with the finalized-block seed;
+after disclosure, the nonce, leaf and Merkle path prove both pool membership and that the selected
+source was the deterministic unused candidate, without exposing future prompts or assets.
 
 Before a batch's complete challenge group becomes terminal, public artifacts exclude its hidden
 arrays, per-sample metrics, local paths, worker and lease data, retry timing, error text, stack

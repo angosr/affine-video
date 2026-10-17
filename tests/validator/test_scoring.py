@@ -25,6 +25,7 @@ from scoring.spec import (
     InitialChampionSpec,
     ModelSpec,
     ScoringSpec,
+    SourceCommitmentSpec,
     StepWindowSpec,
     TrackSpec,
     TrajectoryScheduleSpec,
@@ -123,6 +124,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
         maximum_effective_challenges=1,
         track_close_grace_blocks=10,
         source_pool_merkle_root="cd" * 32,
+        source_commitments=(SourceCommitmentSpec("cd" * 32, "production", "all"),),
         artifact_manifest_sha256="ef" * 32,
         initial_champion=InitialChampionSpec(
             0,

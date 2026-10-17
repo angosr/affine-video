@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Any
 
-from scoring.spec import ScoringSpec
+from scoring.spec import ScoringSpec, SourceCommitmentSpec
 from validator.production.commitment import (
     SourcePool,
     SourceProof,
@@ -475,40 +475,90 @@ def select_query_tiles(
 def select_source_proofs(
     pool: SourcePool,
     *,
+    commitments: tuple[SourceCommitmentSpec, ...],
     strata: tuple[str, ...],
     sources_per_stratum: int,
     batch_seed: str,
-    used_families: frozenset[str],
+    used_source_digests: frozenset[str],
 ) -> tuple[SourceProof, ...]:
     """Select independent, unused production families for every stratum."""
+
+    selected_digests = select_source_digests(
+        commitments,
+        strata=strata,
+        sources_per_stratum=sources_per_stratum,
+        batch_seed=batch_seed,
+        used_source_digests=used_source_digests,
+    )
+    leaves = {leaf.digest: leaf for leaf in pool.leaves}
+    if set(leaves) != {item.sha256 for item in commitments}:
+        raise ValueError("private source pool differs from the public selection index")
+    try:
+        return tuple(pool.proof(leaves[digest].source_id) for digest in selected_digests)
+    except KeyError as exc:
+        raise ValueError("public source selection is absent from the private pool") from exc
+
+
+def select_source_digests(
+    commitments: tuple[SourceCommitmentSpec, ...],
+    *,
+    strata: tuple[str, ...],
+    sources_per_stratum: int,
+    batch_seed: str,
+    used_source_digests: frozenset[str],
+) -> tuple[str, ...]:
+    """Select sources from only the salted commitments published before the track."""
 
     if not strata or len(set(strata)) != len(strata):
         raise ValueError("source strata must be non-empty and unique")
     if type(sources_per_stratum) is not int or sources_per_stratum <= 0:
         raise ValueError("sources per stratum must be positive")
-    selected: list[SourceProof] = []
-    reserved = set(used_families)
+    known = {item.sha256 for item in commitments}
+    if len(known) != len(commitments) or not used_source_digests <= known:
+        raise ValueError("source commitment index or used set is invalid")
+    selected: list[str] = []
+    reserved = set(used_source_digests)
     for stratum in sorted(strata):
         candidates = tuple(
-            leaf
-            for leaf in pool.leaves
-            if leaf.partition == "production"
-            and leaf.generation_geometry == stratum
-            and leaf.source_family_id not in reserved
+            item.sha256
+            for item in commitments
+            if item.partition == "production"
+            and item.generation_geometry == stratum
+            and item.sha256 not in reserved
         )
         ranked = _ranked(candidates, batch_seed, f"source:{stratum}")
-        chosen_for_stratum = []
-        for chosen in ranked:
-            if chosen.source_family_id in reserved:
-                continue
-            reserved.add(chosen.source_family_id)
-            chosen_for_stratum.append(pool.proof(chosen.source_id))
-            if len(chosen_for_stratum) == sources_per_stratum:
-                break
+        chosen_for_stratum = ranked[:sources_per_stratum]
         if len(chosen_for_stratum) != sources_per_stratum:
             raise ValueError(f"source pool is exhausted for stratum {stratum}")
+        reserved.update(chosen_for_stratum)
         selected.extend(chosen_for_stratum)
     return tuple(selected)
+
+
+def validate_source_selection_sequence(
+    plans: tuple[BatchPlan, ...],
+    *,
+    commitments: tuple[SourceCommitmentSpec, ...],
+    scoring: ScoringSpec,
+) -> None:
+    """Verify every disclosed plan against the public index and prior selections."""
+
+    ordered = tuple(sorted(plans, key=lambda plan: plan.generation_block))
+    if len({plan.generation_block for plan in ordered}) != len(ordered):
+        raise ValueError("source selection plans repeat a generation block")
+    used: set[str] = set()
+    for plan in ordered:
+        expected = select_source_digests(
+            commitments,
+            strata=tuple(scoring.stratum_weight_map),
+            sources_per_stratum=scoring.rollouts_per_stratum,
+            batch_seed=plan.batch_seed,
+            used_source_digests=frozenset(used),
+        )
+        actual = tuple(proof.leaf.digest for proof in plan.source_proofs)
+        if actual != expected:
+            raise ValueError("plan source selection differs from the public commitment index")
+        used.update(actual)
 
 
 def _rollouts(

@@ -11,6 +11,7 @@ from typing import Any
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PARTITIONS = frozenset({"production", "audit"})
+_PARTITION_ORDER = {"production": 0, "audit": 1}
 
 
 def canonical_json(value: Any) -> bytes:
@@ -57,6 +58,7 @@ class SourceLeaf:
     condition_asset_sha256: tuple[str, ...]
     generation_geometry: str
     redistribution_license_id: str
+    commitment_nonce: str
 
     def __post_init__(self) -> None:
         if self.partition not in _PARTITIONS:
@@ -74,10 +76,12 @@ class SourceLeaf:
             raise ValueError("source condition assets must be unique")
         for digest in self.condition_asset_sha256:
             _require_digest(digest, "condition asset SHA-256")
+        _require_digest(self.commitment_nonce, "source commitment nonce")
 
     def document(self) -> dict[str, Any]:
         return {
             "condition_asset_sha256": list(self.condition_asset_sha256),
+            "commitment_nonce": self.commitment_nonce,
             "generation_geometry": self.generation_geometry,
             "partition": self.partition,
             "prompt": self.prompt,
@@ -92,6 +96,7 @@ class SourceLeaf:
             value,
             {
                 "condition_asset_sha256",
+                "commitment_nonce",
                 "generation_geometry",
                 "partition",
                 "prompt",
@@ -112,6 +117,7 @@ class SourceLeaf:
             tuple(assets),
             row["generation_geometry"],
             row["redistribution_license_id"],
+            row["commitment_nonce"],
         )
 
     @property
@@ -166,16 +172,25 @@ class SourcePool:
     """Sorted Merkle tree over the frozen source identities."""
 
     def __init__(self, leaves: tuple[SourceLeaf, ...]) -> None:
-        ordered = tuple(sorted(leaves, key=lambda leaf: leaf.source_id))
+        ordered = tuple(
+            sorted(
+                leaves,
+                key=lambda leaf: (
+                    _PARTITION_ORDER[leaf.partition],
+                    leaf.generation_geometry,
+                    leaf.source_id,
+                ),
+            )
+        )
         if not ordered:
             raise ValueError("source pool cannot be empty")
         if len({leaf.source_id for leaf in ordered}) != len(ordered):
             raise ValueError("source IDs must be unique")
-        family_partitions: dict[str, str] = {}
+        families: set[str] = set()
         for leaf in ordered:
-            previous = family_partitions.setdefault(leaf.source_family_id, leaf.partition)
-            if previous != leaf.partition:
-                raise ValueError("a source family cannot cross production and audit partitions")
+            if leaf.source_family_id in families:
+                raise ValueError("source families must be unique across the committed pool")
+            families.add(leaf.source_family_id)
         self.leaves = ordered
         self._levels = _merkle_levels(tuple(bytes.fromhex(leaf.digest) for leaf in ordered))
 
@@ -189,6 +204,18 @@ class SourcePool:
                 "format": "veda-source-pool-v1",
                 "leaves": [leaf.document() for leaf in self.leaves],
             }
+        )
+
+    def public_commitments(self) -> tuple[dict[str, str], ...]:
+        """Return the salted, prompt-hiding index used for public source selection."""
+
+        return tuple(
+            {
+                "generation_geometry": leaf.generation_geometry,
+                "partition": leaf.partition,
+                "sha256": leaf.digest,
+            }
+            for leaf in self.leaves
         )
 
     @classmethod
@@ -320,6 +347,7 @@ def load_bound_source_pool(
     source_binding: bytes,
     *,
     expected_root: str,
+    expected_commitments: tuple[dict[str, str], ...] | None = None,
     sample_cache: str | Path,
 ) -> SourcePool:
     """Load the only source pool whose committed inputs may enter runtime."""
@@ -327,6 +355,8 @@ def load_bound_source_pool(
     pool = SourcePool.decode(source_pool)
     if pool.root != expected_root:
         raise ValueError("source pool does not match the track commitment")
+    if expected_commitments is not None and pool.public_commitments() != expected_commitments:
+        raise ValueError("source pool differs from the public selection index")
     binding = SourceCacheBinding.decode(source_binding)
     binding.verify_local(pool, sample_cache)
     return pool

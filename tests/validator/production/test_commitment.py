@@ -24,6 +24,7 @@ def source(index: int, *, family: str | None = None, partition: str = "productio
         condition_asset_sha256=(hashlib.sha256(f"asset-{index}".encode()).hexdigest(),),
         generation_geometry="16:9@37",
         redistribution_license_id="internal-cleared-v1",
+        commitment_nonce=hashlib.sha256(f"nonce-{index}".encode()).hexdigest(),
     )
 
 
@@ -42,8 +43,33 @@ def test_source_pool_proves_each_sorted_leaf_without_revealing_others() -> None:
     assert not verify_source_proof(proof, "00" * 32)
 
 
-def test_source_family_cannot_cross_private_partitions() -> None:
-    with pytest.raises(ValueError, match="cannot cross"):
+def test_public_source_commitments_hide_inputs_but_reconstruct_the_root() -> None:
+    first = source(0)
+    same_input_new_nonce = SourceLeaf(
+        partition=first.partition,
+        source_family_id=first.source_family_id,
+        source_id=first.source_id,
+        prompt=first.prompt,
+        condition_asset_sha256=first.condition_asset_sha256,
+        generation_geometry=first.generation_geometry,
+        redistribution_license_id=first.redistribution_license_id,
+        commitment_nonce="ff" * 32,
+    )
+    pool = SourcePool((first, source(1, partition="audit")))
+    public = pool.public_commitments()
+
+    assert first.digest != same_input_new_nonce.digest
+    assert tuple(item["sha256"] for item in public) == tuple(
+        leaf.digest for leaf in pool.leaves
+    )
+    assert all(set(item) == {"generation_geometry", "partition", "sha256"} for item in public)
+    assert first.prompt not in json.dumps(public)
+    assert first.source_id not in json.dumps(public)
+    assert first.commitment_nonce not in json.dumps(public)
+
+
+def test_source_family_must_be_unique_across_private_pool() -> None:
+    with pytest.raises(ValueError, match="must be unique"):
         SourcePool(
             (
                 source(0, family="related", partition="production"),
@@ -62,6 +88,7 @@ def test_source_cache_binding_rejects_id_preserving_encoded_input_change(tmp_pat
             condition_asset_sha256=(),
             generation_geometry="16:9@37",
             redistribution_license_id="generated-original-v1",
+            commitment_nonce=hashlib.sha256(f"nonce-{index}".encode()).hexdigest(),
         )
         for index in range(2)
     )

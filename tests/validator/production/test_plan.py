@@ -13,18 +13,27 @@ import validator.production.service as production_service
 from scoring.cache import CacheLoadError, write_exact_cache_batch
 from scoring.exact import ExactCase
 from scoring.model import ValidatedModel
-from scoring.spec import BudgetSpec, ScoringSpec, StepWindowSpec, TrajectoryScheduleSpec
+from scoring.spec import (
+    BudgetSpec,
+    ScoringSpec,
+    SourceCommitmentSpec,
+    StepWindowSpec,
+    TrajectoryScheduleSpec,
+)
 from validator.production.batches import ReadyBatchSource, _validate_plan_case_binding
-from validator.production.commitment import SourceLeaf, SourcePool
+from validator.production.commitment import SourceLeaf, SourcePool, verify_source_proof
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
     ReadyObject,
     build_plan,
+    generation_seed,
     scheduled_generation_block,
     select_query_tiles,
+    select_source_digests,
     select_source_proofs,
     submission_interval,
+    validate_source_selection_sequence,
 )
 from validator.production.runtime import DenseRolloutRuntime, trajectory_tensor_key
 from validator.production.service import (
@@ -95,8 +104,13 @@ def proof(index: int = 0):
         (),
         "16:9@37",
         "internal-cleared-v1",
+        hashlib.sha256(f"nonce-{index}".encode()).hexdigest(),
     )
     return SourcePool((leaf,)).proof(f"source-{index}")
+
+
+def source_commitments(pool: SourcePool) -> tuple[SourceCommitmentSpec, ...]:
+    return tuple(SourceCommitmentSpec(**item) for item in pool.public_commitments())
 
 
 def test_batch_schedule_has_one_exact_submission_interval() -> None:
@@ -194,29 +208,92 @@ def test_source_selection_never_reuses_a_family() -> None:
         (),
         "16:9@37",
         "internal-cleared-v1",
+        hashlib.sha256(b"nonce-1").hexdigest(),
     )
     pool = SourcePool((first, second))
 
     selected = select_source_proofs(
         pool,
+        commitments=source_commitments(pool),
         strata=("16:9@37",),
         sources_per_stratum=1,
         batch_seed="12" * 32,
-        used_families=frozenset({"family-0"}),
+        used_source_digests=frozenset({first.digest}),
     )
 
     assert selected[0].leaf.source_family_id == "family-1"
     with pytest.raises(ValueError, match="exhausted"):
         select_source_proofs(
             pool,
+            commitments=source_commitments(pool),
             strata=("16:9@37",),
             sources_per_stratum=1,
             batch_seed="12" * 32,
-            used_families=frozenset({"family-0", "family-1"}),
+            used_source_digests=frozenset({first.digest, second.digest}),
         )
 
 
-def test_source_selection_skips_duplicate_families_without_losing_quota() -> None:
+def test_source_selection_is_reproducible_from_the_public_index() -> None:
+    pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
+    commitments = source_commitments(pool)
+    selected = select_source_proofs(
+        pool,
+        commitments=commitments,
+        strata=("16:9@37",),
+        sources_per_stratum=2,
+        batch_seed="34" * 32,
+        used_source_digests=frozenset(),
+    )
+
+    expected = select_source_digests(
+        commitments,
+        strata=("16:9@37",),
+        sources_per_stratum=2,
+        batch_seed="34" * 32,
+        used_source_digests=frozenset(),
+    )
+
+    assert tuple(item.leaf.digest for item in selected) == expected
+    assert all(verify_source_proof(item, pool.root) for item in selected)
+
+
+def test_source_selection_sequence_rejects_a_member_chosen_out_of_order() -> None:
+    pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
+    commitments = source_commitments(pool)
+    block_hash = "0x" + "cd" * 32
+    selected = select_source_proofs(
+        pool,
+        commitments=commitments,
+        strata=("16:9@37",),
+        sources_per_stratum=2,
+        batch_seed=generation_seed("ab" * 32, block_hash),
+        used_source_digests=frozenset(),
+    )
+    arguments = {
+        "track_spec_digest": "ab" * 32,
+        "generation_block": 120,
+        "block_hash": block_hash,
+        "track_start_block": 100,
+        "minimum_generation_delay_blocks": 1,
+        "generation_interval_blocks": 20,
+        "exact_challenge_ids": ("challenge",),
+        "confirmation_challenge_ids": (),
+        "scoring": scoring(),
+        "available_routes": ("route-0", "route-1", "route-2"),
+    }
+    plan = build_plan(source_proofs=selected, **arguments)
+
+    validate_source_selection_sequence(
+        (plan,), commitments=commitments, scoring=scoring()
+    )
+    wrong_order = build_plan(source_proofs=tuple(reversed(selected)), **arguments)
+    with pytest.raises(ValueError, match="public commitment index"):
+        validate_source_selection_sequence(
+            (wrong_order,), commitments=commitments, scoring=scoring()
+        )
+
+
+def test_source_pool_rejects_duplicate_families_before_selection() -> None:
     leaves = (
         SourceLeaf(
             "production",
@@ -226,6 +303,7 @@ def test_source_selection_skips_duplicate_families_without_losing_quota() -> Non
             (),
             "16:9@37",
             "internal-cleared-v1",
+            hashlib.sha256(b"nonce-a1").hexdigest(),
         ),
         SourceLeaf(
             "production",
@@ -235,6 +313,7 @@ def test_source_selection_skips_duplicate_families_without_losing_quota() -> Non
             (),
             "16:9@37",
             "internal-cleared-v1",
+            hashlib.sha256(b"nonce-a2").hexdigest(),
         ),
         SourceLeaf(
             "production",
@@ -244,17 +323,11 @@ def test_source_selection_skips_duplicate_families_without_losing_quota() -> Non
             (),
             "16:9@37",
             "internal-cleared-v1",
+            hashlib.sha256(b"nonce-b").hexdigest(),
         ),
     )
-    selected = select_source_proofs(
-        SourcePool(leaves),
-        strata=("16:9@37",),
-        sources_per_stratum=2,
-        batch_seed="34" * 32,
-        used_families=frozenset(),
-    )
-
-    assert {item.leaf.source_family_id for item in selected} == {"family-a", "family-b"}
+    with pytest.raises(ValueError, match="must be unique"):
+        SourcePool(leaves)
 
 
 def test_every_rollout_uses_a_distinct_source_family() -> None:
@@ -728,6 +801,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     track = SimpleNamespace(
         digest="ab" * 32,
         source_pool_merkle_root=pool.root,
+        source_commitments=source_commitments(pool),
         track_start_block=100,
         cache=SimpleNamespace(generation_interval_blocks=20, minimum_generation_delay_blocks=1),
         scoring=scoring(),
@@ -924,11 +998,12 @@ def test_admission_archive_restores_model_by_challenge_identity(tmp_path) -> Non
     assert restored.download_host == "private-archive"
 
 
-def test_plan_coordinator_skips_empty_intervals_without_losing_later_work() -> None:
+def test_plan_coordinator_skips_empty_intervals_and_rejects_a_conflicting_winner() -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
     track = SimpleNamespace(
         digest="ab" * 32,
         source_pool_merkle_root=pool.root,
+        source_commitments=source_commitments(pool),
         track_start_block=100,
         maximum_generation_batches=2,
         maximum_effective_challenges=2,
@@ -989,12 +1064,68 @@ def test_plan_coordinator_skips_empty_intervals_without_losing_later_work() -> N
     assert plan.exact_challenge_ids == ("exact-a",)
     assert objects.payload is not None and objects.payload[0] == "plans/140.json"
 
+    conflicting = build_plan(
+        track_spec_digest=track.digest,
+        generation_block=plan.generation_block,
+        block_hash=plan.block_hash,
+        track_start_block=track.track_start_block,
+        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
+        generation_interval_blocks=track.cache.generation_interval_blocks,
+        exact_challenge_ids=("different-challenge",),
+        confirmation_challenge_ids=(),
+        source_proofs=plan.source_proofs,
+        scoring=track.scoring,
+        available_routes=track.model.selector.routes,
+    )
+
+    class ConflictObjects(Objects):
+        def create_plan(self, _name, _payload):
+            raise PreconditionFailed("lost conditional create")
+
+        def get(self, _name):
+            return StoredObject(conflicting.encode(), "winner-etag")
+
+    with pytest.raises(RuntimeError, match="deterministic schedule"):
+        PlanCoordinator(
+            track=track,
+            store=store,
+            objects=ConflictObjects(),
+            source_pool=pool,
+        ).create_next()
+
+    recovered = plan.ready(
+        exact=ReadyObject("exact/batch.npz", "12" * 32, 100),
+        dense_references=tuple(
+            DenseReference(
+                rollout.rollout_id,
+                ReadyObject(f"videos/{index}.mp4", f"{index + 1:064x}", 100),
+                ReadyObject(f"latents/{index}.safetensors", f"{index + 3:064x}", 200),
+            )
+            for index, rollout in enumerate(plan.rollouts)
+        ),
+    )
+
+    class RecoveryObjects(ConflictObjects):
+        def get(self, _name):
+            return StoredObject(recovered.encode(), "winner-etag")
+
+    assert (
+        PlanCoordinator(
+            track=track,
+            store=store,
+            objects=RecoveryObjects(),
+            source_pool=pool,
+        ).create_next()
+        == recovered
+    )
+
 
 def test_plan_coordinator_maps_confirmation_from_its_exact_decision_block() -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
     track = SimpleNamespace(
         digest="ab" * 32,
         source_pool_merkle_root=pool.root,
+        source_commitments=source_commitments(pool),
         track_start_block=100,
         maximum_generation_batches=2,
         maximum_effective_challenges=2,
@@ -1069,6 +1200,7 @@ def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
     track = SimpleNamespace(
         digest="ab" * 32,
         source_pool_merkle_root=pool.root,
+        source_commitments=source_commitments(pool),
         track_start_block=100,
         maximum_generation_batches=2,
         maximum_effective_challenges=2,
@@ -1199,6 +1331,7 @@ def test_terminal_public_stage_projection_matches_private_archive() -> None:
     track = SimpleNamespace(
         digest="ab" * 32,
         source_pool_merkle_root=pool.root,
+        source_commitments=source_commitments(pool),
     )
 
     class Store:

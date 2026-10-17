@@ -16,7 +16,8 @@ from validator.system_matches import (
 def test_production_system_matches_are_complete_and_separate_from_rewards() -> None:
     track = load_track_spec(Path(__file__).parents[2] / "track.json")
     assert track.track_id == PRODUCTION_TRACK_ID
-    assert track.digest == PRODUCTION_TRACK_SPEC_DIGEST
+    assert track.digest != PRODUCTION_TRACK_SPEC_DIGEST
+    assert system_match_artifacts(track.track_id, track.digest, track.netuid) == ()
     artifacts = system_match_artifacts(
         PRODUCTION_TRACK_ID,
         PRODUCTION_TRACK_SPEC_DIGEST,

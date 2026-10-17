@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -17,6 +18,11 @@ from scoring.spec import (
 
 
 def valid_spec() -> dict:
+    production = "aa" * 32
+    audit = "bb" * 32
+    source_root = hashlib.sha256(
+        b"\x01" + bytes.fromhex(production) + bytes.fromhex(audit)
+    ).hexdigest()
     return {
         "track_id": "veda-test-v1",
         "netuid": 7,
@@ -26,7 +32,11 @@ def valid_spec() -> dict:
         "maximum_generation_batches": 10,
         "maximum_effective_challenges": 2,
         "track_close_grace_blocks": 50,
-        "source_pool_merkle_root": "ab" * 32,
+        "source_pool_merkle_root": source_root,
+        "source_commitments": {
+            "production": {"all": [production]},
+            "audit": {"all": [audit]},
+        },
         "artifact_manifest_sha256": "cd" * 32,
         "initial_champion": {
             "uid": 0,
@@ -178,6 +188,32 @@ def test_score_affecting_change_changes_digest() -> None:
     second["scoring"]["budgets"][1]["calibrated_cost"] = 2.5
 
     assert parse_track_spec(first).digest != parse_track_spec(second).digest
+
+
+def test_source_selection_index_is_bound_to_the_merkle_root_and_track_digest() -> None:
+    valid = valid_spec()
+    parsed = parse_track_spec(valid)
+    assert track_spec_dict(parsed)["source_commitments"] == valid["source_commitments"]
+
+    changed = valid_spec()
+    changed["source_commitments"]["production"] = {"unknown": ["aa" * 32]}
+    with pytest.raises(TrackSpecError, match="cover every stratum"):
+        parse_track_spec(changed)
+
+    wrong_root = valid_spec()
+    wrong_root["source_pool_merkle_root"] = "00" * 32
+    with pytest.raises(TrackSpecError, match="reconstruct"):
+        parse_track_spec(wrong_root)
+
+    reordered = valid_spec()
+    reordered["source_commitments"]["production"]["all"], reordered[
+        "source_commitments"
+    ]["audit"]["all"] = (
+        reordered["source_commitments"]["audit"]["all"],
+        reordered["source_commitments"]["production"]["all"],
+    )
+    with pytest.raises(TrackSpecError, match="reconstruct"):
+        parse_track_spec(reordered)
 
 
 def test_production_shape_uses_bounded_hidden_route_sample() -> None:

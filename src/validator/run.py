@@ -191,6 +191,7 @@ async def run_evaluator(
             source_pool_payload,
             data_config.artifact_path(data_config.runtime.source_binding).read_bytes(),
             expected_root=track.source_pool_merkle_root,
+            expected_commitments=track.source_commitment_documents,
             sample_cache=data_config.artifact_path(data_config.runtime.sample_cache),
         )
         batch_source = ReadyBatchSource(track=track, objects=objects, cache_dir=cache_dir)
