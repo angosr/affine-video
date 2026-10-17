@@ -282,13 +282,15 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
     )
     file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     payload = ModelSubmission("owner/model", "12" * 20).encode()
-    client = FakeClient({100: chain_block(payload, 100), 101: empty_chain_block(101)})
+    blocks = {height: empty_chain_block(height) for height in range(101, 301)}
+    blocks[100] = chain_block(payload, 100)
+    client = FakeClient(blocks)
     finalized_reads = 0
 
     async def advancing_finalized_block():
         nonlocal finalized_reads
         finalized_reads += 1
-        return 350 if finalized_reads >= 3 else 101
+        return (101, 101, 150, 250, 250, 300)[min(finalized_reads - 1, 5)]
 
     client.finalized_block = advancing_finalized_block
     database = tmp_path / "validator.db"
@@ -299,17 +301,32 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         downloads += 1
         return DownloadedModel(model_path, file_digest, model_path.stat().st_size, None, None)
 
-    def evaluate(_task):
+    def evaluate(task):
+        if task.state is ChallengeState.SCORING:
+            return StageOutcome(
+                0.9,
+                {
+                    "stage": "scoring",
+                    "incumbent_score": 0.5,
+                    "paired_gain_lower_bound": 0.4,
+                    "cache_sha256": "de" * 32,
+                    "cache_generated_block": 101,
+                    "cache_plan_digest": "ef" * 32,
+                    "cache_seed_block_hash": "0x" + "ab" * 32,
+                    "requires_confirmation": True,
+                },
+            )
+        assert task.state is ChallengeState.CONFIRMING
         return StageOutcome(
-            0.9,
+            0.8,
             {
-                "stage": "scoring",
+                "stage": "confirming",
                 "incumbent_score": 0.5,
-                "paired_gain_lower_bound": 0.4,
-                "cache_sha256": "de" * 32,
-                "cache_generated_block": 101,
-                "cache_plan_digest": "ef" * 32,
-                "cache_seed_block_hash": "0x" + "ab" * 32,
+                "paired_gain_lower_bound": 0.3,
+                "cache_sha256": "12" * 32,
+                "cache_generated_block": 200,
+                "cache_plan_digest": "34" * 32,
+                "cache_seed_block_hash": "0x" + "cd" * 32,
             },
         )
 
@@ -326,12 +343,16 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         "evaluator": evaluate,
         "worker_id": "validator-a",
         "downloader": download,
+        "max_scan_blocks": 300,
     }
     with ChallengeStore(database, track_spec_digest="ab" * 32) as store:
-        cycle = asyncio.run(process_cycle(client, store, **arguments))
-        assert cycle.scoring is not None
+        exact_cycle = asyncio.run(process_cycle(client, store, **arguments))
+        assert exact_cycle.scoring is not None
+        assert exact_cycle.scoring.state is ChallengeState.CONFIRMING
 
     with ChallengeStore(database, track_spec_digest="ab" * 32) as store:
+        confirmation_cycle = asyncio.run(process_cycle(client, store, **arguments))
+        assert confirmation_cycle.scoring is not None
         snapshot = store.public_snapshot()
         challenge = snapshot["challenges"][0]
         tournament = resolve_tournament(
@@ -339,8 +360,8 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
             track_id="track",
             track_spec_digest="ab" * 32,
             netuid=7,
-            minimum_gain=0.001,
-            minimum_exact_gain=0.5,
+            minimum_gain=0.1,
+            minimum_exact_gain=0.1,
             initial_champion=Champion(
                 "genesis",
                 "genesis-hotkey",
@@ -361,21 +382,29 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         )
 
     assert downloads == 1
-    assert cycle.scoring.state is ChallengeState.SUCCEEDED
+    assert confirmation_cycle.scoring.state is ChallengeState.SUCCEEDED
     assert challenge["state"] == ChallengeState.SUCCEEDED
-    assert challenge["final_score"] == pytest.approx(0.9)
-    assert challenge["score_block"] == 350
-    assert cycle.finalized_block == 350
-    assert [stage["stage"] for stage in challenge["stages"]] == [ChallengeState.SCORING]
+    assert challenge["final_score"] == pytest.approx(0.8)
+    assert challenge["score_block"] == 300
+    assert confirmation_cycle.finalized_block == 300
+    assert [stage["stage"] for stage in challenge["stages"]] == [
+        ChallengeState.SCORING,
+        ChallengeState.CONFIRMING,
+    ]
     assert [event["state"] for event in challenge["events"]] == [
         ChallengeState.QUEUED,
         ChallengeState.FETCHING,
         ChallengeState.VALIDATING,
         ChallengeState.SCORING,
+        ChallengeState.CONFIRMING,
         ChallengeState.SUCCEEDED,
     ]
-    assert tournament.matches[0].outcome is MatchOutcome.CHAMPION_RETAINED
-    assert plan is None
+    assert tournament.matches[0].outcome is MatchOutcome.CHALLENGER_WON
+    assert tournament.champion.hotkey == HOTKEY
+    assert plan is not None
+    assert plan.hotkeys == (HOTKEY,)
+    assert plan.uids == (4,)
+    assert plan.weights == (1.0,)
 
 
 def test_cycle_releases_scoring_lease_when_fresh_finalized_head_is_unavailable(tmp_path) -> None:
