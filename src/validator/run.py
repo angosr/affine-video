@@ -289,7 +289,8 @@ async def run_evaluator(
                         recovery_index += result.restored_matches
                         cursor = store.chain_cursor()
                         if (
-                            cursor is not None
+                            not track_aborted
+                            and cursor is not None
                             and cursor[0] == result.finalized_block
                             and result.finalized_block >= ledger.required_finalized_block
                         ):
@@ -496,7 +497,8 @@ async def process_weight_cycle(
         max_staleness_blocks=max_staleness_blocks,
     )
     if plan is None:
-        return WeightCycleResult(chain.finalized_block, artifact.source_block, "NO_WEIGHTS")
+        status = "TRACK_ABORTED" if artifact.track_aborted else "NO_WEIGHTS"
+        return WeightCycleResult(chain.finalized_block, artifact.source_block, status)
     due, reason = weight_update_due(
         artifact,
         chain,

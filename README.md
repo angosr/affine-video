@@ -133,12 +133,13 @@ tracks/main/
 - `weights.json` is the small mutable artifact consumed by Validators.
 
 Publication writes the immutable runtime manifest, current track, immutable batch/model files and
-matches first, then `summary.json`, then `weights.json`.
-A crash can therefore leave an extra immutable match but cannot expose weights for an uncommitted
-summary. On restart the evaluator validates every committed match, follows any contiguous orphaned
-matches, and restores them instead of evaluating them again. Conflicting immutable bytes stop
-publication. A chain node behind the recovered public watermark may keep scanning, but evaluation
-and publication wait until its finalized height catches up, so public state cannot move backward.
+matches first, then the self-contained `weights.json` pointer, followed by `summary.json` and
+`status.json`. A crash may leave display pointers behind a valid weight pointer, but cannot expose
+weights before their immutable match facts. On restart the evaluator validates every committed
+match, follows any contiguous orphaned matches, and restores them instead of evaluating them again.
+Conflicting immutable bytes stop publication. A chain node behind the recovered public watermark
+may keep scanning, but evaluation and publication wait until its finalized height catches up, so
+public state cannot move backward.
 Mutable pointers use ETag conditional writes, and production startup probes both conditional create
 and conditional replace. A backend that cannot fence two concurrent publishers is rejected.
 
@@ -227,9 +228,11 @@ exhaustion enters visible `SYSTEM_BLOCKED` state without becoming a Miner loss; 
 cause, resume its original stage with
 `veda validator retry <challenge-id> --database /data/validator.db`.
 
-After the track close grace block, any unfinished system work changes `status.json` to
-`TRACK_ABORTED` and stops refreshing `weights.json`; the affected Miner is not marked as losing.
-Recovery then requires a new track ID.
+After the track close grace block, unfinished system work first publishes an irreversible
+`weights.json` fence with `track_aborted=true` and no weight plan, then the immutable
+`TRACK_ABORTED` event. Validators stop submitting, and the evaluator stops evaluation and every
+later pointer refresh for that track; the affected Miner is not marked as losing. Recovery requires
+a new track ID.
 
 `--exact-cache` contains immutable NPZ batches named `<generation-block>-<sha256>.npz`. Every batch
 binds its finalized block hash, source proofs, runtime artifacts and each case's planned

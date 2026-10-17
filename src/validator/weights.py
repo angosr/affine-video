@@ -62,6 +62,7 @@ class WeightArtifact:
     version_key: int
     source_block: int
     plan: WeightPlan | None
+    track_aborted: bool = False
 
     def __post_init__(self) -> None:
         if not self.track_id:
@@ -72,8 +73,12 @@ class WeightArtifact:
             raise ValueError("netuid must fit in an unsigned 16-bit integer")
         if min(self.mechid, self.version_key, self.source_block) < 0:
             raise ValueError("weight artifact chain values must be non-negative")
+        if not isinstance(self.track_aborted, bool):
+            raise ValueError("track-aborted marker must be boolean")
         if self.plan is not None and self.plan.source_block != self.source_block:
             raise ValueError("weight plan source block does not match its artifact")
+        if self.track_aborted and self.plan is not None:
+            raise ValueError("an aborted track cannot publish a weight plan")
 
 
 @dataclass(frozen=True, slots=True)

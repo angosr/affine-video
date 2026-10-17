@@ -56,7 +56,7 @@ class PublicArtifacts:
     source_block: int
     track: bytes
     summary: bytes
-    weights: bytes | None
+    weights: bytes
     matches: tuple[tuple[str, bytes], ...]
     status: bytes | None = None
     system_matches: tuple[tuple[str, bytes], ...] = ()
@@ -127,13 +127,15 @@ def build_public_artifacts(
     )
     if any(match.document["decided_block"] > chain.finalized_block for match in tournament.matches):
         raise PublicArtifactError("a terminal decision is newer than the finalized chain snapshot")
-    plan = plan_champion_weight(
-        tournament.champion,
-        uid_by_hotkey=chain.uid_by_hotkey,
-        current_block=chain.finalized_block,
-        min_allowed_weights=chain.min_allowed_weights,
-        max_weight=chain.max_weight,
-    )
+    plan = None
+    if not aborted:
+        plan = plan_champion_weight(
+            tournament.champion,
+            uid_by_hotkey=chain.uid_by_hotkey,
+            current_block=chain.finalized_block,
+            min_allowed_weights=chain.min_allowed_weights,
+            max_weight=chain.max_weight,
+        )
     artifact = WeightArtifact(
         track_id=track.track_id,
         track_spec_digest=track.digest,
@@ -142,6 +144,7 @@ def build_public_artifacts(
         version_key=version_key,
         source_block=chain.finalized_block,
         plan=plan,
+        track_aborted=aborted,
     )
     summary = _summary_document(track, chain.finalized_block, tournament)
     status = _status_document(
@@ -214,7 +217,7 @@ def build_public_artifacts(
             }
         ),
         summary=_json_bytes(summary),
-        weights=None if aborted else encode_weight_artifact(artifact),
+        weights=encode_weight_artifact(artifact),
         matches=tuple(
             (match.object_name, _json_bytes(match.document)) for match in tournament.matches
         ),
@@ -304,6 +307,7 @@ def encode_weight_artifact(artifact: WeightArtifact) -> bytes:
             "mechid": artifact.mechid,
             "version_key": artifact.version_key,
             "source_block": artifact.source_block,
+            "track_aborted": artifact.track_aborted,
             "weights": weights,
         }
     )
@@ -327,6 +331,7 @@ def decode_weight_artifact(payload: bytes) -> WeightArtifact:
             "mechid",
             "version_key",
             "source_block",
+            "track_aborted",
             "weights",
         },
         "weight artifact",
@@ -339,6 +344,9 @@ def decode_weight_artifact(payload: bytes) -> WeightArtifact:
     mechid = _integer(root["mechid"], "mechid")
     version_key = _integer(root["version_key"], "version_key")
     source_block = _integer(root["source_block"], "source_block")
+    track_aborted = root["track_aborted"]
+    if not isinstance(track_aborted, bool):
+        raise PublicArtifactError("track_aborted must be boolean")
     items = root["weights"]
     plan = None
     if items is not None:
@@ -368,6 +376,7 @@ def decode_weight_artifact(payload: bytes) -> WeightArtifact:
             version_key,
             source_block,
             plan,
+            track_aborted,
         )
     except ValueError as exc:
         raise PublicArtifactError(str(exc)) from exc
@@ -555,6 +564,25 @@ class S3Repository:
             self._client.delete_object(Bucket=self._bucket, Key=key)
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
+        track_document = _decode_canonical_object(artifacts.track, "track")
+        try:
+            track_id = track_document["spec"]["track_id"]
+        except (KeyError, TypeError) as exc:
+            raise PublicArtifactError("public track pointer is invalid") from exc
+        if not isinstance(track_id, str) or not track_id:
+            raise PublicArtifactError("public track pointer is invalid")
+        weight_fence = decode_weight_artifact(artifacts.weights)
+        if weight_fence.track_id != track_id:
+            raise PublicArtifactError("public weights target a different track")
+        abort_name = f"events/{track_id}/track-aborted.json"
+        if artifacts.abort is None:
+            if weight_fence.track_aborted:
+                raise PublicArtifactError("track-aborted weights require the immutable event")
+            existing_abort = await asyncio.to_thread(self._get_optional, abort_name)
+            if existing_abort is not None:
+                raise PublicArtifactError("an aborted public track cannot resume")
+        elif artifacts.abort[0] != abort_name or not weight_fence.track_aborted:
+            raise PublicArtifactError("track abort requires its null weight fence")
         if artifacts.runtime_manifest is not None:
             await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
         await asyncio.to_thread(self._put_mutable, "track.json", artifacts.track)
@@ -566,13 +594,12 @@ class S3Repository:
             await asyncio.to_thread(self._put_immutable, name, payload)
         for name, payload in artifacts.batch_groups:
             await asyncio.to_thread(self._put_immutable, name, payload)
+        await asyncio.to_thread(self._put_mutable, "weights.json", artifacts.weights)
         if artifacts.abort is not None:
             await asyncio.to_thread(self._put_immutable, *artifacts.abort)
         await asyncio.to_thread(self._put_mutable, "summary.json", artifacts.summary)
         if artifacts.status is not None:
             await asyncio.to_thread(self._put_mutable, "status.json", artifacts.status)
-        if artifacts.weights is not None:
-            await asyncio.to_thread(self._put_mutable, "weights.json", artifacts.weights)
 
     def _put_file_immutable(self, artifact: PublicFile) -> None:
         if self._confirmed_immutable.get(artifact.object_name) == artifact.sha256:
@@ -850,6 +877,8 @@ class S3Repository:
                 if after_weight.track_id != self._active_track_id():
                     raise PublicArtifactError("public pointer targets an inactive track")
                 return
+            if before_weight.track_aborted and not after_weight.track_aborted:
+                raise PublicArtifactError("public track abort is irreversible")
             before_block = before_weight.source_block
             after_block = after_weight.source_block
             before_count = after_count = 0

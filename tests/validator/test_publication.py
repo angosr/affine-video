@@ -98,6 +98,28 @@ def weight_artifact() -> WeightArtifact:
     )
 
 
+def pointer_track(track_id: str = "track") -> bytes:
+    return json.dumps(
+        {"spec": {"track_id": track_id}, "track_spec_digest": "ab" * 32},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+def pointer_weights(block: int, track_id: str = "track") -> bytes:
+    return encode_weight_artifact(
+        WeightArtifact(
+            track_id,
+            "ab" * 32,
+            7,
+            0,
+            0,
+            block,
+            WeightPlan(block, ("hk",), (1,), (1.0,)),
+        )
+    )
+
+
 def two_stage_challenge(value: dict) -> dict:
     result = dict(value)
     if result.get("state") != "SUCCEEDED":
@@ -161,7 +183,7 @@ def test_public_repository_rejects_active_track_pointer_rollback() -> None:
         summary=encoded(
             {"track_id": "track", "source_block": 10, "match_count": 1, "marker": "current"}
         ),
-        weights=b"{}",
+        weights=pointer_weights(10),
         matches=(),
     )
     client = MemoryS3()
@@ -182,7 +204,7 @@ def test_public_repository_rejects_active_track_pointer_rollback() -> None:
                             "marker": "older",
                         }
                     ),
-                    weights=b"{}",
+                    weights=pointer_weights(9),
                     matches=(),
                 )
             )
@@ -201,7 +223,7 @@ def test_public_repository_rejects_active_track_pointer_rollback() -> None:
                             "marker": "conflict",
                         }
                     ),
-                    weights=b"{}",
+                    weights=pointer_weights(10),
                     matches=(),
                 )
             )
@@ -247,7 +269,7 @@ def test_concurrent_stale_summary_write_is_fenced() -> None:
                     "match_count": 1,
                 }
             ),
-            weights=b"{}",
+            weights=pointer_weights(block),
             matches=(),
         )
 
@@ -267,6 +289,55 @@ def test_concurrent_stale_summary_write_is_fenced() -> None:
         asyncio.run(stale.publish(artifacts(11)))
 
     assert json.loads(client.objects["tracks/main/summary.json"])["source_block"] == 12
+
+
+def test_track_abort_fences_concurrent_stale_weight_refresh() -> None:
+    def encoded(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    track = encoded({"spec": {"track_id": "track"}, "track_spec_digest": "ab" * 32})
+
+    def artifacts(block, *, aborted=False):
+        plan = None if aborted else WeightPlan(block, ("hk",), (1,), (1.0,))
+        weights = encode_weight_artifact(
+            WeightArtifact("track", "ab" * 32, 7, 0, 0, block, plan, aborted)
+        )
+        return PublicArtifacts(
+            source_block=block,
+            track=track,
+            summary=encoded({"track_id": "track", "source_block": block, "match_count": 0}),
+            weights=weights,
+            matches=(),
+            abort=("events/track/track-aborted.json", encoded({"event": "TRACK_ABORTED"}))
+            if aborted
+            else None,
+        )
+
+    client = MemoryS3()
+    stale = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    current = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    asyncio.run(current.publish(artifacts(9)))
+
+    def interleave(arguments):
+        if arguments["Key"] != "tracks/main/weights.json" or "IfMatch" not in arguments:
+            return
+        client.before_put = None
+        asyncio.run(current.publish(artifacts(11, aborted=True)))
+
+    client.before_put = interleave
+    with pytest.raises(PublicArtifactError, match="fenced"):
+        asyncio.run(stale.publish(artifacts(10)))
+
+    published = decode_weight_artifact(client.objects["tracks/main/weights.json"])
+    assert published.source_block == 11
+    assert published.plan is None
+    assert published.track_aborted is True
+    assert "tracks/main/events/track/track-aborted.json" in client.objects
+
+    summary = client.objects["tracks/main/summary.json"]
+    with pytest.raises(PublicArtifactError, match="cannot resume"):
+        asyncio.run(current.publish(artifacts(12)))
+    assert client.objects["tracks/main/summary.json"] == summary
 
 
 def test_pointer_from_previous_track_cannot_overwrite_active_track() -> None:
@@ -347,9 +418,9 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
     publisher = S3Repository(client, bucket="public-data", prefix="veda/track")
     artifacts = PublicArtifacts(
         120,
-        b"track",
+        pointer_track(),
         b"summary",
-        b"weights",
+        pointer_weights(120),
         (("matches/track/000000000001.json", b"match"),),
     )
     asyncio.run(publisher.publish(artifacts))
@@ -358,8 +429,8 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
     assert [call["Key"] for call in writes] == [
         "veda/track/track.json",
         "veda/track/matches/track/000000000001.json",
-        "veda/track/summary.json",
         "veda/track/weights.json",
+        "veda/track/summary.json",
     ]
     assert writes[0]["CacheControl"] == "no-store, max-age=0"
     assert writes[1]["CacheControl"].endswith("immutable")
@@ -371,9 +442,9 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
 
     conflicting = PublicArtifacts(
         120,
-        b"track",
+        pointer_track(),
         b"summary",
-        b"weights",
+        pointer_weights(120),
         (("matches/track/000000000001.json", b"different"),),
     )
     with pytest.raises(PublicArtifactError, match="conflicts"):
@@ -387,9 +458,9 @@ def test_runtime_manifest_is_content_addressed_and_published_before_track() -> N
     publisher = S3Repository(client, bucket="public-data", prefix="tracks/main")
     artifacts = PublicArtifacts(
         120,
-        b"track",
+        pointer_track(),
         b"summary",
-        b"weights",
+        pointer_weights(120),
         (),
         runtime_manifest=(
             f"runtime/{digest}/manifest.json",
@@ -415,9 +486,9 @@ def test_storage_publishes_large_files_as_bounded_verified_chunks(tmp_path, monk
     publisher = S3Repository(client, bucket="public-data", prefix="tracks/main")
     artifacts = PublicArtifacts(
         120,
-        b"track",
+        pointer_track(),
         b"summary",
-        b"weights",
+        pointer_weights(120),
         (),
         files=(PublicFile(f"batches/{digest}/manifest.json", source, digest),),
     )
@@ -579,7 +650,7 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
     artifacts = build_public_artifacts(store, track, chain, version_key=0)
 
     assert artifacts is not None
-    assert artifacts.weights is None
+    assert decode_weight_artifact(artifacts.weights).plan is None
     status = json.loads(artifacts.status)
     assert status["track_phase"] == "TRACK_ABORTED"
     assert status["abort"] == {
@@ -589,11 +660,29 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
     assert artifacts.abort is not None
 
     client = MemoryS3()
-    existing = b"existing-weights"
+    existing = encode_weight_artifact(
+        WeightArtifact(
+            track.track_id,
+            track.digest,
+            track.netuid,
+            track.mechid,
+            0,
+            block - 1,
+            WeightPlan(
+                block - 1,
+                (track.initial_champion.hotkey,),
+                (0,),
+                (1.0,),
+            ),
+        )
+    )
     client.objects["tracks/main/weights.json"] = existing
     repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
     asyncio.run(repository.publish(artifacts))
-    assert client.objects["tracks/main/weights.json"] == existing
+    stopped = decode_weight_artifact(client.objects["tracks/main/weights.json"])
+    assert stopped.source_block == block
+    assert stopped.plan is None
+    assert stopped.track_aborted is True
 
     ledger = asyncio.run(repository.load(track))
     assert ledger.aborted is True
@@ -609,7 +698,7 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
         version_key=0,
         track_aborted=ledger.aborted,
     )
-    assert recovered is not None and recovered.weights is None
+    assert recovered is not None and decode_weight_artifact(recovered.weights).plan is None
     assert json.loads(recovered.status)["track_phase"] == "TRACK_ABORTED"
 
 
