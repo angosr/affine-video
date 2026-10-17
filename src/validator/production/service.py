@@ -34,6 +34,7 @@ from validator.production.plan import (
     submission_interval,
 )
 from validator.production.storage import PreconditionFailed, PrivateObjectStore, StoredObject
+from validator.queue import ChallengeState
 from validator.store import ChallengeStore
 
 
@@ -88,6 +89,8 @@ class PlanCoordinator:
 
     def create_next(self) -> BatchPlan | None:
         self.store.reserve_season_slots(self.track.maximum_effective_challenges)
+        if not self._stage_recovery_complete():
+            return None
         existing = self.plans()
         by_block = {plan.generation_block: plan for _, _, plan in existing}
         used_families = {
@@ -150,6 +153,59 @@ class PlanCoordinator:
                 return winner
             return plan
         return None
+
+    def _stage_recovery_complete(self) -> bool:
+        """Fence planning until every private stage fact is present in SQLite."""
+
+        for name in self.objects.list_names("stages/"):
+            parts = name.split("/")
+            if len(parts) != 3 or parts[0] != "stages" or not parts[2].endswith(".json"):
+                raise RuntimeError("private stage index contains an unexpected object")
+            challenge_id = parts[1]
+            stage_name = parts[2][:-5]
+            try:
+                challenge_bytes = bytes.fromhex(challenge_id)
+                stage = ChallengeState(stage_name)
+            except ValueError as exc:
+                raise RuntimeError("private stage index contains an invalid object") from exc
+            if len(challenge_bytes) != 32 or stage not in {
+                ChallengeState.SCORING,
+                ChallengeState.CONFIRMING,
+            }:
+                raise RuntimeError("private stage index contains an invalid object")
+
+            stored = self.objects.get(name)
+            try:
+                document = json.loads(stored.body)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("private stage archive is invalid") from exc
+            if (
+                not isinstance(document, dict)
+                or document.get("format") != "veda-stage-result-v1"
+                or document.get("track_spec_digest") != self.track.digest
+                or document.get("challenge_id") != challenge_id
+                or document.get("stage") != stage.value
+            ):
+                raise RuntimeError("private stage archive conflicts with its object key")
+
+            recovered = self.store.stage_score(challenge_id, stage)
+            if recovered is None:
+                return False
+            if (
+                recovered.score != document.get("score")
+                or recovered.score_block != document.get("score_block")
+                or recovered.metrics != document.get("metrics")
+            ):
+                raise RuntimeError("local stage fact conflicts with its private archive")
+            state = self.store.get_challenge(challenge_id).state
+            applied_states = (
+                {ChallengeState.CONFIRMING, ChallengeState.SUCCEEDED}
+                if stage is ChallengeState.SCORING
+                else {ChallengeState.SUCCEEDED}
+            )
+            if state not in applied_states:
+                return False
+        return True
 
     def _validate_plan(self, name: str, plan: BatchPlan) -> None:
         if name != _plan_name(plan.generation_block):

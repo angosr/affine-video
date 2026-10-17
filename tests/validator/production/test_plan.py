@@ -1,4 +1,5 @@
 import hashlib
+import json
 import queue
 from dataclasses import replace
 from pathlib import Path
@@ -711,6 +712,119 @@ def test_plan_coordinator_maps_confirmation_from_its_exact_decision_block() -> N
     assert plan.generation_block == 140
     assert plan.exact_challenge_ids == ()
     assert plan.confirmation_challenge_ids == ("confirm-a",)
+
+
+def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
+    pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
+    challenge_id = "12" * 32
+    archived = {
+        "format": "veda-stage-result-v1",
+        "track_spec_digest": "ab" * 32,
+        "challenge_id": challenge_id,
+        "submission_id": "submission-a",
+        "hotkey": "hotkey-a",
+        "repo_id": "owner/repo",
+        "revision": "34" * 20,
+        "file_sha256": "56" * 32,
+        "stage": ChallengeState.SCORING.value,
+        "score": 0.8,
+        "score_block": 125,
+        "metrics": {"cache_generated_block": 120, "requires_confirmation": True},
+    }
+    track = SimpleNamespace(
+        digest="ab" * 32,
+        source_pool_merkle_root=pool.root,
+        track_start_block=100,
+        maximum_generation_batches=2,
+        maximum_effective_challenges=2,
+        cache=SimpleNamespace(
+            generation_interval_blocks=20,
+            minimum_generation_delay_blocks=1,
+        ),
+        scoring=scoring(),
+        model=SimpleNamespace(selector=SimpleNamespace(routes=("route-0", "route-1"))),
+    )
+
+    class Store:
+        score_recovered = False
+        transition_applied = False
+
+        def reserve_season_slots(self, maximum):
+            assert maximum == 2
+
+        def stage_score(self, identifier, stage):
+            assert identifier == challenge_id
+            assert stage is ChallengeState.SCORING
+            if not self.score_recovered:
+                return None
+            return SimpleNamespace(
+                score=archived["score"],
+                score_block=archived["score_block"],
+                metrics=archived["metrics"],
+            )
+
+        def get_challenge(self, identifier):
+            assert identifier == challenge_id
+            return SimpleNamespace(
+                state=(
+                    ChallengeState.CONFIRMING
+                    if self.transition_applied
+                    else ChallengeState.SCORING
+                )
+            )
+
+        def chain_cursor(self):
+            return (140, "0x" + "ef" * 32)
+
+        def finalized_block_hash(self, block):
+            return "0x" + f"{block:064x}"
+
+        def admitted_challenge_ids(self, _first, _last):
+            return ()
+
+        def confirmation_challenge_ids(self, first, last):
+            if self.transition_applied and (first, last) == (120, 139):
+                return (challenge_id,)
+            return ()
+
+    class Objects:
+        plan = None
+
+        def list_names(self, prefix):
+            if prefix == "stages/":
+                return (f"stages/{challenge_id}/SCORING.json",)
+            return ()
+
+        def get(self, name):
+            assert name == f"stages/{challenge_id}/SCORING.json"
+            return StoredObject(json.dumps(archived).encode(), "stage-etag")
+
+        def create_plan(self, name, payload):
+            self.plan = (name, payload)
+            return StoredObject(payload, "plan-etag")
+
+    store = Store()
+    objects = Objects()
+    coordinator = PlanCoordinator(
+        track=track,
+        store=store,
+        objects=objects,
+        source_pool=pool,
+    )
+
+    assert coordinator.create_next() is None
+    assert objects.plan is None
+
+    store.score_recovered = True
+    assert coordinator.create_next() is None
+    assert objects.plan is None
+
+    store.transition_applied = True
+    plan = coordinator.create_next()
+
+    assert plan is not None
+    assert plan.generation_block == 140
+    assert plan.confirmation_challenge_ids == (challenge_id,)
 
 
 def test_source_pool_capacity_is_proved_before_production_starts() -> None:
