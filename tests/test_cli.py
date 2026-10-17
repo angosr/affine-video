@@ -132,6 +132,27 @@ def test_removed_miner_submit_command_is_rejected(capsys) -> None:
     assert "invalid choice: 'submit'" in capsys.readouterr().err
 
 
+def test_formal_evaluator_defaults_to_cuda_zero() -> None:
+    arguments = cli_module._parser().parse_args(
+        [
+            "validator",
+            "evaluate",
+            "--track-spec",
+            "track.json",
+            "--database",
+            "validator.db",
+            "--model-cache",
+            "models",
+            "--exact-cache",
+            "exact",
+            "--production-config",
+            "producer.json",
+        ]
+    )
+
+    assert arguments.scoring_device == "cuda:0"
+
+
 def test_validator_challenges_reads_local_database(tmp_path, capsys) -> None:
     database = tmp_path / "validator.db"
     position = ChainPosition(100, 0, 0)

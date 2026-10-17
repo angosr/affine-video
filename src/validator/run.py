@@ -170,6 +170,7 @@ async def run_evaluator(
             raise ValueError("production configuration uses a different track specification")
         if data_config.validator_database.resolve() != Path(database).resolve():
             raise ValueError("production configuration uses a different validator database")
+        scoring_device = data_config.validate_evaluation_device(scoring_device)
         objects = PrivateObjectStore.from_environment(
             bucket=data_config.storage_bucket,
             prefix=f"{data_config.storage_prefix}/tracks/{track.digest}",

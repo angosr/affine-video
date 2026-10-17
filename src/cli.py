@@ -109,6 +109,8 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--scoring-max-cpu-seconds", type=int)
     evaluate.add_argument(
         "--scoring-device",
+        choices=("cuda:0", "cuda:1"),
+        default="cuda:0",
         help="authoritative CUDA device, for example cuda:0",
     )
     evaluate.add_argument("--version-key", default=0, type=int)

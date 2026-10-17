@@ -63,3 +63,29 @@ def test_config_rejects_gpu_or_path_escape(tmp_path) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
     with pytest.raises(ValueError, match="normalized relative"):
         load_producer_config(path)
+
+
+def test_config_resolves_only_formal_physical_evaluation_gpus(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "producer.json"
+    path.write_text(json.dumps(document(tmp_path)), encoding="utf-8")
+    config = load_producer_config(path)
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert config.validate_evaluation_device("cuda:0") == "cuda:0"
+    assert config.validate_evaluation_device("cuda:1") == "cuda:1"
+    with pytest.raises(ValueError, match="physical GPU 0 or 1"):
+        config.validate_evaluation_device("cuda:6")
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,0,1")
+    with pytest.raises(ValueError, match="physical GPU 0 or 1"):
+        config.validate_evaluation_device("cuda:0")
+    assert config.validate_evaluation_device("cuda:1") == "cuda:1"
+    assert config.validate_evaluation_device("cuda:2") == "cuda:2"
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-opaque")
+    with pytest.raises(ValueError, match="verifiable physical"):
+        config.validate_evaluation_device("cuda:0")
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    with pytest.raises(ValueError, match="verifiable physical"):
+        config.validate_evaluation_device("cuda:0")

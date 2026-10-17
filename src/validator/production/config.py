@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -64,6 +66,36 @@ class ProducerConfig:
             ),
             directories=(self.runtime.model_root, self.runtime.sample_cache),
         )
+        from validator.production.environment import verify_runtime_environment
+
+        verify_runtime_environment(
+            self.artifact_path(self.runtime.source_bundle),
+            self.artifact_path(self.runtime.dependency_lock),
+        )
+
+    def validate_evaluation_device(self, device: str | None) -> str:
+        """Resolve a CUDA ordinal to an allowed physical evaluation GPU."""
+
+        if not isinstance(device, str) or re.fullmatch(r"cuda:[0-9]+", device) is None:
+            raise ValueError("formal scoring_device must be an explicit CUDA ordinal")
+        ordinal = int(device.removeprefix("cuda:"))
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible is None:
+            physical = ordinal
+        else:
+            entries = [item.strip() for item in visible.split(",")]
+            if (
+                not entries
+                or any(not item.isdecimal() for item in entries)
+                or ordinal >= len(entries)
+            ):
+                raise ValueError(
+                    "CUDA_VISIBLE_DEVICES does not expose a verifiable physical scoring GPU"
+                )
+            physical = int(entries[ordinal])
+        if physical not in self.evaluation_gpu_ids:
+            raise ValueError("formal scoring_device must resolve to physical GPU 0 or 1")
+        return device
 
 
 def load_producer_config(path: str | Path) -> ProducerConfig:
