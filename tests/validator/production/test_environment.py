@@ -129,6 +129,22 @@ def test_dependency_selection_uses_active_python_path_precedence(
         environment._select_distribution("example", [legacy, installed])
 
 
+def test_dependency_tree_hashes_metadata_when_no_file_list_exists(tmp_path) -> None:
+    metadata = tmp_path / "example.egg-info"
+    metadata.mkdir()
+    (metadata / "PKG-INFO").write_text("Version: 1.0\n", encoding="utf-8")
+    distribution = SimpleNamespace(
+        files=None,
+        metadata={"Name": "example"},
+        _path=metadata,
+    )
+
+    first = environment._distribution_content_sha256(distribution)
+    (metadata / "PKG-INFO").write_text("Version: 2.0\n", encoding="utf-8")
+
+    assert environment._distribution_content_sha256(distribution) != first
+
+
 def test_dependency_lock_must_be_canonical(tmp_path, monkeypatch) -> None:
     source = tmp_path / "example.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")

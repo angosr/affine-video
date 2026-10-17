@@ -225,21 +225,35 @@ def _distribution_content_sha256(distribution: importlib.metadata.Distribution) 
 
     files = sorted(distribution.files or (), key=str)
     if not files:
-        name = distribution.metadata.get("Name", "unknown")
-        raise ValueError(f"installed distribution has no recorded files: {name}")
+        metadata_path = getattr(distribution, "_path", None)
+        if metadata_path is None:
+            name = distribution.metadata.get("Name", "unknown")
+            raise ValueError(f"installed distribution has no verifiable metadata: {name}")
+        root = Path(metadata_path).resolve()
+        if root.is_file():
+            paths = ((root.name, root),)
+        elif root.is_dir():
+            paths = tuple(
+                (path.relative_to(root).as_posix(), path)
+                for path in sorted(root.rglob("*"))
+                if path.is_file() and "__pycache__" not in path.parts
+            )
+        else:
+            paths = ()
+        if not paths:
+            name = distribution.metadata.get("Name", "unknown")
+            raise ValueError(f"installed distribution metadata is unavailable: {name}")
+    else:
+        paths = tuple(
+            (str(item), Path(distribution.locate_file(item)).resolve()) for item in files
+        )
     digest = hashlib.sha256(b"veda-installed-distribution-v1\0")
-    checked = 0
-    for item in files:
-        path = Path(distribution.locate_file(item)).resolve()
+    for name, path in paths:
         if not path.is_file():
-            raise ValueError(f"installed dependency file is unavailable: {item}")
-        digest.update(str(item).encode("utf-8"))
+            raise ValueError(f"installed dependency file is unavailable: {name}")
+        digest.update(name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(bytes.fromhex(_file_sha256(path)))
-        checked += 1
-    if checked == 0:
-        name = distribution.metadata.get("Name", "unknown")
-        raise ValueError(f"installed distribution has no files: {name}")
     return digest.hexdigest()
 
 
