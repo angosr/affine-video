@@ -362,15 +362,48 @@ def load_bound_source_pool(
     return pool
 
 
-def verify_source_proof(proof: SourceProof, expected_root: str) -> bool:
-    """Verify one disclosed source without revealing the remaining pool."""
+def verify_source_proof(
+    proof: SourceProof,
+    expected_root: str,
+    *,
+    commitment_digests: tuple[str, ...] | None = None,
+) -> bool:
+    """Verify one disclosed source and its canonical position in the public tree."""
 
     _require_digest(expected_root, "source pool Merkle root")
+    position = proof.index
+    width = None
+    if commitment_digests is not None:
+        if not commitment_digests or len(set(commitment_digests)) != len(commitment_digests):
+            raise ValueError("source commitment index must be non-empty and unique")
+        try:
+            expected_index = commitment_digests.index(proof.leaf.digest)
+        except ValueError:
+            return False
+        if position != expected_index:
+            return False
+        width = len(commitment_digests)
+        depth = 0
+        remaining = width
+        while remaining > 1:
+            depth += 1
+            remaining = (remaining + 1) // 2
+        if len(proof.siblings) != depth:
+            return False
+
     value = bytes.fromhex(proof.leaf.digest)
     for sibling in proof.siblings:
+        expected_side = "left" if position % 2 else "right"
+        if sibling.side != expected_side:
+            return False
         other = bytes.fromhex(sibling.sha256)
+        if width is not None and position % 2 == 0 and position + 1 >= width and other != value:
+            return False
         value = _node_hash(other, value) if sibling.side == "left" else _node_hash(value, other)
-    return value.hex() == expected_root
+        position //= 2
+        if width is not None:
+            width = (width + 1) // 2
+    return position == 0 and (width is None or width == 1) and value.hex() == expected_root
 
 
 @dataclass(frozen=True, slots=True)

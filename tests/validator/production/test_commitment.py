@@ -1,5 +1,6 @@
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -30,17 +31,48 @@ def source(index: int, *, family: str | None = None, partition: str = "productio
 
 def test_source_pool_proves_each_sorted_leaf_without_revealing_others() -> None:
     pool = SourcePool((source(2), source(0), source(1)))
+    commitments = tuple(leaf.digest for leaf in pool.leaves)
 
     assert SourcePool.decode(pool.encode()).root == pool.root
     assert [leaf.source_id for leaf in pool.leaves] == ["source-0", "source-1", "source-2"]
     assert len(pool.root) == 64
     for leaf in pool.leaves:
         proof = pool.proof(leaf.source_id)
-        assert verify_source_proof(proof, pool.root)
+        assert verify_source_proof(
+            proof,
+            pool.root,
+            commitment_digests=commitments,
+        )
         assert proof.leaf == leaf
 
     proof = pool.proof("source-1")
     assert not verify_source_proof(proof, "00" * 32)
+
+
+def test_source_proof_is_bound_to_its_public_index_and_canonical_path() -> None:
+    pool = SourcePool((source(0), source(1), source(2)))
+    commitments = tuple(leaf.digest for leaf in pool.leaves)
+    proof = pool.proof("source-2")
+
+    assert not verify_source_proof(
+        replace(proof, index=3),
+        pool.root,
+        commitment_digests=commitments,
+    )
+    assert not verify_source_proof(
+        replace(proof, siblings=proof.siblings[:-1]),
+        pool.root,
+        commitment_digests=commitments,
+    )
+    wrong_side = replace(
+        proof.siblings[0],
+        side="left" if proof.siblings[0].side == "right" else "right",
+    )
+    assert not verify_source_proof(
+        replace(proof, siblings=(wrong_side, *proof.siblings[1:])),
+        pool.root,
+        commitment_digests=commitments,
+    )
 
 
 def test_public_source_commitments_hide_inputs_but_reconstruct_the_root() -> None:

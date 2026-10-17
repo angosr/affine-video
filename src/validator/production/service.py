@@ -257,8 +257,13 @@ class PlanCoordinator:
         expected_hash = self.store.finalized_block_hash(plan.generation_block)
         if expected_hash is not None and expected_hash.lower() != plan.block_hash.lower():
             raise RuntimeError("private plan block hash conflicts with finalized chain history")
+        commitment_digests = tuple(item.sha256 for item in self.track.source_commitments)
         if any(
-            not verify_source_proof(proof, self.track.source_pool_merkle_root)
+            not verify_source_proof(
+                proof,
+                self.track.source_pool_merkle_root,
+                commitment_digests=commitment_digests,
+            )
             for proof in plan.source_proofs
         ):
             raise RuntimeError("private plan contains an invalid source proof")

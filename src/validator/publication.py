@@ -961,8 +961,13 @@ class S3Repository:
                     raise PublicArtifactError(
                         "public batch disclosure uses the wrong generation boundary"
                     )
+            commitment_digests = tuple(item.sha256 for item in track.source_commitments)
             if any(
-                not verify_source_proof(proof, track.source_pool_merkle_root)
+                not verify_source_proof(
+                    proof,
+                    track.source_pool_merkle_root,
+                    commitment_digests=commitment_digests,
+                )
                 for proof in plan.source_proofs
             ):
                 raise PublicArtifactError("public batch disclosure has an invalid source proof")

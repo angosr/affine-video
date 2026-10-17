@@ -450,8 +450,13 @@ class ReadyBatchSource:
             raise RuntimeError("private plan key disagrees with its generation block")
         if plan.track_spec_digest != self.track.digest:
             raise RuntimeError("private plan belongs to another track")
+        commitment_digests = tuple(item.sha256 for item in self.track.source_commitments)
         if any(
-            not verify_source_proof(proof, self.track.source_pool_merkle_root)
+            not verify_source_proof(
+                proof,
+                self.track.source_pool_merkle_root,
+                commitment_digests=commitment_digests,
+            )
             for proof in plan.source_proofs
         ):
             raise RuntimeError("private plan source proof is invalid")
