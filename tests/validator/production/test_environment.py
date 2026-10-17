@@ -1,5 +1,6 @@
 import json
 import zipfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -98,6 +99,30 @@ def test_dependency_lock_writer_refuses_overwrite(tmp_path, monkeypatch) -> None
     assert target.read_bytes() == canonical_json(document)
     with pytest.raises(FileExistsError):
         environment.write_dependency_lock(target)
+
+
+def test_dependency_selection_prefers_one_record_over_editable_metadata(
+    tmp_path, monkeypatch
+) -> None:
+    record = tmp_path / "RECORD"
+    record.write_text("committed", encoding="utf-8")
+    legacy = SimpleNamespace(version="1.0")
+    installed = SimpleNamespace(version="1.0")
+    monkeypatch.setattr(
+        environment,
+        "_distribution_record",
+        lambda distribution: record if distribution is installed else None,
+    )
+
+    assert environment._select_distribution("example", [legacy, installed]) == (
+        installed,
+        record,
+    )
+
+    with pytest.raises(ValueError, match="conflicting versions"):
+        environment._select_distribution(
+            "example", [legacy, SimpleNamespace(version="2.0")]
+        )
 
 
 def test_dependency_lock_must_be_canonical(tmp_path, monkeypatch) -> None:

@@ -41,10 +41,11 @@ def build_dependency_lock() -> bytes:
 def write_dependency_lock(destination: str | Path) -> Path:
     """Write the canonical lock without replacing an existing commitment."""
 
+    payload = build_dependency_lock()
     target = Path(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("xb") as stream:
-        stream.write(build_dependency_lock())
+        stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
     return target
@@ -142,19 +143,18 @@ def _verify_source_bundle(bundle: Path, active: dict[str, Path]) -> None:
 def _environment_document(*, verify_files: bool) -> dict[str, Any]:
     executable = Path(sys.executable).resolve()
     distributions = []
-    seen: set[str] = set()
+    grouped: dict[str, list[importlib.metadata.Distribution]] = {}
     for distribution in importlib.metadata.distributions():
         raw_name = distribution.metadata.get("Name")
         if not isinstance(raw_name, str) or not raw_name:
             raise ValueError("installed distribution has no canonical name")
         name = _normalize_distribution_name(raw_name)
-        if name in seen:
-            raise ValueError(f"installed distribution is duplicated: {name}")
-        seen.add(name)
+        grouped.setdefault(name, []).append(distribution)
+    for name, candidates in grouped.items():
+        distribution, record = _select_distribution(name, candidates)
         version = distribution.version
         if not isinstance(version, str) or not version:
             raise ValueError(f"installed distribution has no version: {name}")
-        record = _distribution_record(distribution)
         content_sha256 = (
             _distribution_content_sha256(distribution) if verify_files else "0" * 64
         )
@@ -162,7 +162,7 @@ def _environment_document(*, verify_files: bool) -> dict[str, Any]:
             {
                 "content_sha256": content_sha256,
                 "name": name,
-                "record_sha256": _file_sha256(record),
+                "record_sha256": None if record is None else _file_sha256(record),
                 "version": version,
             }
         )
@@ -176,15 +176,35 @@ def _environment_document(*, verify_files: bool) -> dict[str, Any]:
     }
 
 
-def _distribution_record(distribution: importlib.metadata.Distribution) -> Path:
+def _select_distribution(
+    name: str,
+    candidates: list[importlib.metadata.Distribution],
+) -> tuple[importlib.metadata.Distribution, Path | None]:
+    versions = {distribution.version for distribution in candidates}
+    if len(versions) != 1:
+        raise ValueError(f"installed distribution has conflicting versions: {name}")
+    with_records = [
+        (distribution, record)
+        for distribution in candidates
+        if (record := _distribution_record(distribution)) is not None
+    ]
+    if len(with_records) == 1:
+        return with_records[0]
+    if not with_records and len(candidates) == 1:
+        return candidates[0], None
+    raise ValueError(f"installed distribution identity is ambiguous: {name}")
+
+
+def _distribution_record(distribution: importlib.metadata.Distribution) -> Path | None:
     matches = [
         item
         for item in distribution.files or ()
         if item.name == "RECORD" and item.parent.name.endswith(".dist-info")
     ]
+    if not matches:
+        return None
     if len(matches) != 1:
-        name = distribution.metadata.get("Name", "unknown")
-        raise ValueError(f"installed distribution has no unique RECORD: {name}")
+        raise ValueError("installed distribution has multiple RECORD files")
     path = Path(distribution.locate_file(matches[0])).resolve()
     if not path.is_file():
         raise ValueError("installed distribution RECORD is unavailable")
