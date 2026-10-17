@@ -45,6 +45,10 @@ _STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MAX_WEIGHT_ARTIFACT_BYTES = 1024 * 1024
 _MAX_PUBLIC_OBJECT_BYTES = 1024 * 1024
 _SUMMARY_LEADERBOARD_LIMIT = 100
+_LEGACY_UNFENCED_WEIGHT_TRACK = (
+    "veda-sn120-v1",
+    "0fcae991aef29f87b97fbb07cf79c49e5eb9cc2a5d9aecdd2a566443e2b81dd5",
+)
 
 
 class PublicArtifactError(RuntimeError):
@@ -322,6 +326,10 @@ def decode_weight_artifact(payload: bytes) -> WeightArtifact:
         raw = json.loads(payload, object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PublicArtifactError("weight artifact is not valid JSON") from exc
+    if isinstance(raw, dict) and "track_aborted" not in raw and (
+        raw.get("track_id"), raw.get("track_spec_digest")
+    ) == _LEGACY_UNFENCED_WEIGHT_TRACK:
+        raw["track_aborted"] = False
     root = _object(
         raw,
         {

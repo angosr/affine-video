@@ -98,6 +98,26 @@ def weight_artifact() -> WeightArtifact:
     )
 
 
+def test_only_pinned_legacy_weights_may_omit_abort_fence() -> None:
+    legacy = {
+        "track_id": "veda-sn120-v1",
+        "track_spec_digest": (
+            "0fcae991aef29f87b97fbb07cf79c49e5eb9cc2a5d9aecdd2a566443e2b81dd5"
+        ),
+        "netuid": 120,
+        "mechid": 1,
+        "version_key": 0,
+        "source_block": 9305106,
+        "weights": [{"hotkey": "hotkey", "uid": 0, "weight": 1.0}],
+    }
+    decoded = decode_weight_artifact(json.dumps(legacy).encode())
+    assert decoded.track_aborted is False
+
+    legacy["track_id"] = "another-track"
+    with pytest.raises(PublicArtifactError, match="fields"):
+        decode_weight_artifact(json.dumps(legacy).encode())
+
+
 def pointer_track(track_id: str = "track") -> bytes:
     return json.dumps(
         {"spec": {"track_id": track_id}, "track_spec_digest": "ab" * 32},
