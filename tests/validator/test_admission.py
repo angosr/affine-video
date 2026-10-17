@@ -48,6 +48,14 @@ def model_downloader(path):
     return download
 
 
+def write_model(path, hotkey: str) -> None:
+    save_file(
+        {"selector.weight": np.ones((2, 2), dtype=np.float32)},
+        path,
+        metadata={"hotkey": hotkey},
+    )
+
+
 def settings(tmp_path) -> AdmissionSettings:
     return AdmissionSettings(
         cache_dir=tmp_path / "cache",
@@ -62,7 +70,7 @@ def settings(tmp_path) -> AdmissionSettings:
 
 def test_model_can_be_published_during_frozen_block_grace(tmp_path) -> None:
     model = tmp_path / "selector.safetensors"
-    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, model)
+    write_model(model, "hk1")
     downloads = 0
 
     def download_after_publication(*args, **kwargs):
@@ -100,8 +108,10 @@ def test_model_can_be_published_during_frozen_block_grace(tmp_path) -> None:
 
 
 def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) -> None:
-    model = tmp_path / "selector.safetensors"
-    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, model)
+    first_model = tmp_path / "first.safetensors"
+    second_model = tmp_path / "second.safetensors"
+    write_model(first_model, "hk1")
+    write_model(second_model, "hk2")
 
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
@@ -111,7 +121,7 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
             settings=settings(tmp_path),
             current_finalized_block=10_000,
             now_ms=100,
-            downloader=model_downloader(model),
+            downloader=model_downloader(first_model),
         )
         assert first is not None and first.status is AdmissionStatus.ACCEPTED
         assert store.get_challenge(first_id).state is ChallengeState.SCORING
@@ -125,7 +135,7 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
             settings=settings(tmp_path),
             current_finalized_block=10_000,
             now_ms=200,
-            downloader=model_downloader(model),
+            downloader=model_downloader(second_model),
         )
 
         assert second is not None
@@ -139,7 +149,7 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
 
 def test_same_repository_revision_is_rejected_before_redownload(tmp_path) -> None:
     model = tmp_path / "selector.safetensors"
-    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, model)
+    write_model(model, "hk1")
     downloads = 0
 
     def counted_download(*args, **kwargs):
@@ -177,7 +187,7 @@ def test_same_repository_revision_is_rejected_before_redownload(tmp_path) -> Non
 
 def test_same_reference_can_retry_after_earlier_participant_failure(tmp_path) -> None:
     model = tmp_path / "selector.safetensors"
-    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, model)
+    write_model(model, "hk2")
 
     def missing(*_args, **_kwargs):
         raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "repository is private")
@@ -207,13 +217,15 @@ def test_same_reference_can_retry_after_earlier_participant_failure(tmp_path) ->
         assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
 
 
-def test_same_model_can_retry_after_earlier_system_failure(tmp_path) -> None:
+def test_copied_reference_cannot_front_run_model_owner(tmp_path) -> None:
     model = tmp_path / "selector.safetensors"
-    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, model)
+    write_model(model, "victim")
 
     with ChallengeStore(tmp_path / "validator.db") as store:
-        first_id, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
-        first = process_next_admission(
+        attacker_id, _ = store.add_submission(
+            submission_at(100, "attacker"), occurred_at_ms=1
+        )
+        attacker = process_next_admission(
             store,
             worker_id="admission",
             settings=settings(tmp_path),
@@ -221,21 +233,13 @@ def test_same_model_can_retry_after_earlier_system_failure(tmp_path) -> None:
             now_ms=100,
             downloader=model_downloader(model),
         )
-        assert first is not None and first.status is AdmissionStatus.ACCEPTED
+        assert attacker is not None and attacker.code == "MODEL_OWNER_MISMATCH"
+        assert store.get_challenge(attacker_id).state is ChallengeState.PARTICIPANT_FAILED
 
-        scoring = store.claim_next_scoring("scoring", lease_ms=100, now_ms=101)
-        assert scoring is not None
-        store.fail_leased_system(
-            first_id,
-            scoring.lease_token,
-            score_block=10_000,
-            error_code="SCORING_WORKER_FAILURE",
-            error_summary="worker unavailable",
-            occurred_at_ms=102,
+        victim_id, _ = store.add_submission(
+            submission_at(101, "victim"), occurred_at_ms=2
         )
-
-        second_id, _ = store.add_submission(submission_at(101, "hk2"), occurred_at_ms=2)
-        retried = process_next_admission(
+        victim = process_next_admission(
             store,
             worker_id="admission",
             settings=settings(tmp_path),
@@ -243,9 +247,8 @@ def test_same_model_can_retry_after_earlier_system_failure(tmp_path) -> None:
             now_ms=200,
             downloader=model_downloader(model),
         )
-
-        assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
-        assert store.get_challenge(second_id).state is ChallengeState.SCORING
+        assert victim is not None and victim.status is AdmissionStatus.ACCEPTED
+        assert store.get_challenge(victim_id).state is ChallengeState.SCORING
 
 
 def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:
@@ -277,26 +280,25 @@ def test_temporary_download_failure_is_deferred_with_backoff(tmp_path) -> None:
         assert retry is not None and retry.state is ChallengeState.FETCHING
 
 
-def test_repeated_download_infrastructure_failure_becomes_system_failed(tmp_path) -> None:
+def test_repeated_download_infrastructure_failure_remains_retryable(tmp_path) -> None:
     def unavailable(*_args, **_kwargs):
         raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "temporary outage", temporary=True)
 
-    configured = replace(settings(tmp_path), max_attempts=1)
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
         outcome = process_next_admission(
             store,
             worker_id="admission",
-            settings=configured,
+            settings=settings(tmp_path),
             current_finalized_block=10_000,
             now_ms=100,
             downloader=unavailable,
         )
 
-        assert outcome is not None and outcome.status is AdmissionStatus.SYSTEM_FAILED
+        assert outcome is not None and outcome.status is AdmissionStatus.DEFERRED
         challenge = store.get_challenge(identifier)
-        assert challenge.state is ChallengeState.SYSTEM_FAILED
-        assert challenge.score_block == 10_000
+        assert challenge.state is ChallengeState.SYSTEM_DEFERRED
+        assert challenge.score_block is None
         assert store.leaderboard() == []
 
 

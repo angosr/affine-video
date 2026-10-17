@@ -74,6 +74,28 @@ def test_rejects_custom_safetensors_metadata(tmp_path) -> None:
     assert caught.value.code == "MODEL_METADATA_INVALID"
 
 
+def test_requires_exact_submitting_hotkey_metadata(tmp_path) -> None:
+    path = tmp_path / "model.safetensors"
+    write_model(path, metadata={"hotkey": "victim"})
+
+    accepted = validate_model(
+        path,
+        schema=SCHEMA,
+        max_bytes=10_000,
+        expected_hotkey="victim",
+    )
+    assert accepted.tensor_count == 2
+
+    with pytest.raises(ModelValidationError) as caught:
+        validate_model(
+            path,
+            schema=SCHEMA,
+            max_bytes=10_000,
+            expected_hotkey="attacker",
+        )
+    assert caught.value.code == "MODEL_OWNER_MISMATCH"
+
+
 def test_rejects_non_finite_weights(tmp_path) -> None:
     path = tmp_path / "model.safetensors"
     write_model(path, non_finite=True)

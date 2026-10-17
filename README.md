@@ -23,8 +23,9 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
    the new contest remains fixed even if it later writes unrelated commitments.
 2. After the fixed publication grace period, the evaluator processes submissions by finalized
    `(block, extrinsic, event)` order. The pinned revision must then be anonymously downloadable.
-3. The evaluator accepts exactly one `selector.safetensors` file. It rejects executable code,
-   metadata, unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.
+3. The evaluator accepts exactly one `selector.safetensors` file. Its only metadata entry must be
+   `hotkey`, set to the complete submitting hotkey. It rejects executable code, other metadata,
+   unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.
 4. Every valid model is scored once on the same hash-pinned hidden exact-attention cache. The score
    is the conservative lower bound of its multi-budget quality-cost curve.
 5. UID 0 is the genesis champion without making a commit. Its identity is pinned to the official

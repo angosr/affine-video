@@ -257,7 +257,7 @@ def test_participant_failure_is_terminal_but_temporary_failure_retries(tmp_path)
         assert store.get_challenge(identifier).attempts == 2
 
 
-def test_repeated_infrastructure_failure_becomes_terminal(tmp_path) -> None:
+def test_repeated_infrastructure_failure_remains_retryable(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier = ready_for_scoring(store)
 
@@ -268,13 +268,13 @@ def test_repeated_infrastructure_failure_becomes_terminal(tmp_path) -> None:
             store,
             worker_id="worker",
             current_finalized_block=100,
-            settings=ScoringSettings(max_attempts=1),
+            settings=ScoringSettings(),
             evaluator=unavailable,
             now_ms=20,
         )
 
-        assert outcome is not None and outcome.state is ChallengeState.SYSTEM_FAILED
-        assert store.get_challenge(identifier).score_block == 100
+        assert outcome is not None and outcome.state is ChallengeState.SYSTEM_DEFERRED
+        assert store.get_challenge(identifier).score_block is None
 
 
 def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) -> None:

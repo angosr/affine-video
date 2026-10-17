@@ -66,7 +66,6 @@ class ChallengeState(StrEnum):
     VALIDATING = "VALIDATING"
     SCORING = "SCORING"
     SYSTEM_DEFERRED = "SYSTEM_DEFERRED"
-    SYSTEM_FAILED = "SYSTEM_FAILED"
     SUCCEEDED = "SUCCEEDED"
     PARTICIPANT_FAILED = "PARTICIPANT_FAILED"
     MALFORMED_SUBMISSION = "MALFORMED_SUBMISSION"
@@ -78,7 +77,6 @@ TERMINAL_STATES = frozenset(
     {
         ChallengeState.SUCCEEDED,
         ChallengeState.PARTICIPANT_FAILED,
-        ChallengeState.SYSTEM_FAILED,
         ChallengeState.MALFORMED_SUBMISSION,
         ChallengeState.REJECTED_DUPLICATE_HOTKEY,
         ChallengeState.REJECTED_OTHER_COMPETITION,
@@ -107,7 +105,6 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
             ChallengeState.VALIDATING,
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
-            ChallengeState.SYSTEM_FAILED,
         }
     ),
     ChallengeState.VALIDATING: frozenset(
@@ -115,7 +112,6 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
             ChallengeState.SCORING,
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
-            ChallengeState.SYSTEM_FAILED,
         }
     ),
     ChallengeState.SCORING: frozenset(
@@ -123,7 +119,6 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
             ChallengeState.SUCCEEDED,
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
-            ChallengeState.SYSTEM_FAILED,
         }
     ),
     ChallengeState.SYSTEM_DEFERRED: _ACTIVE_STAGES,

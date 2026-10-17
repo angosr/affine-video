@@ -67,15 +67,12 @@ class ScoringSettings:
     lease_ms: int = 30 * 60 * 1000
     retry_base_ms: int = 60 * 1000
     retry_max_ms: int = 60 * 60 * 1000
-    max_attempts: int = 3
 
     def __post_init__(self) -> None:
         if min(self.lease_ms, self.retry_base_ms, self.retry_max_ms) <= 0:
             raise ValueError("scoring timing limits must be positive")
         if self.retry_base_ms > self.retry_max_ms:
             raise ValueError("retry base cannot exceed retry maximum")
-        if self.max_attempts <= 0:
-            raise ValueError("maximum attempts must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,7 +378,6 @@ def process_next_scoring(
                 task,
                 settings,
                 now,
-                current_finalized_block,
                 code=exc.code,
                 summary=str(exc),
             )
@@ -392,7 +388,6 @@ def process_next_scoring(
                 task,
                 settings,
                 now,
-                current_finalized_block,
                 code="SCORING_WORKER_FAILURE",
                 summary=str(exc) or type(exc).__name__,
             )
@@ -433,21 +428,10 @@ def _defer_or_fail(
     task: LeasedChallenge,
     settings: ScoringSettings,
     now_ms: int,
-    current_finalized_block: int,
     *,
     code: str,
     summary: str,
 ) -> ChallengeState:
-    if task.attempts >= settings.max_attempts:
-        store.fail_leased_system(
-            task.challenge_id,
-            task.lease_token,
-            score_block=current_finalized_block,
-            error_code=code,
-            error_summary=summary,
-            occurred_at_ms=now_ms,
-        )
-        return ChallengeState.SYSTEM_FAILED
     multiplier = 1 << min(max(task.attempts - 1, 0), 20)
     delay = min(settings.retry_max_ms, settings.retry_base_ms * multiplier)
     store.defer_leased(

@@ -22,7 +22,6 @@ class AdmissionStatus(StrEnum):
     ACCEPTED = "ACCEPTED"
     FAILED = "FAILED"
     DEFERRED = "DEFERRED"
-    SYSTEM_FAILED = "SYSTEM_FAILED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +33,6 @@ class AdmissionSettings:
     lease_ms: int = 5 * 60 * 1000
     retry_base_ms: int = 30 * 1000
     retry_max_ms: int = 30 * 60 * 1000
-    max_attempts: int = 5
 
     def __post_init__(self) -> None:
         if (
@@ -49,8 +47,6 @@ class AdmissionSettings:
             raise ValueError("admission limits must be positive")
         if self.retry_base_ms > self.retry_max_ms:
             raise ValueError("retry base cannot exceed retry maximum")
-        if self.max_attempts <= 0:
-            raise ValueError("maximum attempts must be positive")
         if self.publication_grace_blocks <= 0:
             raise ValueError("publication grace blocks must be positive")
 
@@ -125,7 +121,6 @@ def process_next_admission(
                     settings,
                     now,
                     exc,
-                    current_finalized_block,
                 )
                 return AdmissionOutcome(task.challenge_id, status, exc.code)
             store.complete_challenge(
@@ -163,7 +158,6 @@ def process_next_admission(
             settings,
             now,
             error,
-            current_finalized_block,
             resume_state=ChallengeState.FETCHING,
         )
         return AdmissionOutcome(task.challenge_id, status, error.code)
@@ -173,6 +167,7 @@ def process_next_admission(
             model_path,
             schema=dict(settings.tensor_schema),
             max_bytes=settings.max_model_bytes,
+            expected_hotkey=task.hotkey,
         )
     except OSError:
         error = ModelDownloadError(
@@ -186,7 +181,6 @@ def process_next_admission(
             settings,
             now,
             error,
-            current_finalized_block,
             resume_state=ChallengeState.FETCHING,
         )
         return AdmissionOutcome(task.challenge_id, status, error.code)
@@ -214,7 +208,6 @@ def process_next_admission(
             settings,
             now,
             error,
-            current_finalized_block,
             resume_state=ChallengeState.FETCHING,
         )
         return AdmissionOutcome(task.challenge_id, status, error.code)
@@ -252,20 +245,9 @@ def _defer_or_fail(
     settings: AdmissionSettings,
     now_ms: int,
     error: ModelDownloadError,
-    current_finalized_block: int,
     *,
     resume_state: ChallengeState | None = None,
 ) -> AdmissionStatus:
-    if attempts >= settings.max_attempts:
-        store.fail_leased_system(
-            challenge_id,
-            lease_token,
-            score_block=current_finalized_block,
-            error_code=error.code,
-            error_summary=str(error),
-            occurred_at_ms=now_ms,
-        )
-        return AdmissionStatus.SYSTEM_FAILED
     multiplier = 1 << min(max(attempts - 1, 0), 20)
     delay = min(settings.retry_max_ms, settings.retry_base_ms * multiplier)
     store.defer_leased(

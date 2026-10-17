@@ -31,7 +31,11 @@ class ValidatedModel:
 
 
 def validate_model(
-    path: str | Path, *, schema: dict[str, TensorSpec], max_bytes: int
+    path: str | Path,
+    *,
+    schema: dict[str, TensorSpec],
+    max_bytes: int,
+    expected_hotkey: str | None = None,
 ) -> ValidatedModel:
     """Validate exact tensor keys, shapes, dtypes, and finite values on CPU."""
 
@@ -44,10 +48,19 @@ def validate_model(
     digest.update(b"veda-model-digest-v1\0")
     try:
         with safe_open(model_path, framework="numpy") as tensors:
-            if tensors.metadata():
+            metadata = tensors.metadata() or {}
+            expected_metadata = {} if expected_hotkey is None else {"hotkey": expected_hotkey}
+            if metadata != expected_metadata:
+                code = (
+                    "MODEL_OWNER_MISMATCH"
+                    if expected_hotkey is not None and set(metadata) == {"hotkey"}
+                    else "MODEL_METADATA_INVALID"
+                )
                 raise ModelValidationError(
-                    "MODEL_METADATA_INVALID",
-                    "safetensors metadata must be empty",
+                    code,
+                    "safetensors metadata must contain only the submitting hotkey"
+                    if expected_hotkey is not None
+                    else "safetensors metadata must be empty",
                 )
             keys = sorted(tensors.keys())
             if keys != sorted(schema):

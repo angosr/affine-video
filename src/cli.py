@@ -297,12 +297,16 @@ async def _run_monitor(url: str, interval: float | None) -> None:
 def _print_evaluation_cycle(result: EvaluationCycleResult) -> None:
     output = {
         "finalized_block": result.finalized_block,
-        "scan": {
-            "first_block": result.scan.first_block,
-            "last_block": result.scan.last_block,
-            "blocks_scanned": result.scan.blocks_scanned,
-            "submissions_found": result.scan.submissions_found,
-        },
+        "scan": (
+            {
+                "first_block": result.scan.first_block,
+                "last_block": result.scan.last_block,
+                "blocks_scanned": result.scan.blocks_scanned,
+                "submissions_found": result.scan.submissions_found,
+            }
+            if result.scan is not None
+            else None
+        ),
         "admission": (
             {
                 "challenge_id": result.admission.challenge_id,
@@ -325,6 +329,7 @@ def _print_evaluation_cycle(result: EvaluationCycleResult) -> None:
         "restored_matches": result.restored_matches,
         "published_block": result.published_block,
         "publication_error": result.publication_error,
+        "cycle_error": result.cycle_error,
     }
     print(json.dumps(output, sort_keys=True), flush=True)
 

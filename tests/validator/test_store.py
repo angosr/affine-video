@@ -275,6 +275,24 @@ def test_old_contest_choice_rejects_new_contest_submission(tmp_path) -> None:
         assert store.active_competitors({submission.hotkey: 4}) == []
 
 
+def test_second_submission_from_legacy_excluded_hotkey_is_duplicate(tmp_path) -> None:
+    first = submission_at(100)
+    second = submission_at(101)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        store.seed_legacy_exclusions({first.hotkey: 99})
+        first_id, _ = store.add_submission(first, occurred_at_ms=10)
+        second_id, _ = store.add_submission(second, occurred_at_ms=20)
+
+        assert (
+            store.get_challenge(first_id).state
+            is ChallengeState.REJECTED_OTHER_COMPETITION
+        )
+        assert (
+            store.get_challenge(second_id).state
+            is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+        )
+
+
 def test_first_new_contest_choice_survives_later_commitments(tmp_path) -> None:
     first = submission_at(100)
     with ChallengeStore(tmp_path / "validator.db") as store:
@@ -417,35 +435,6 @@ def test_later_participant_failure_preserves_previous_authoritative_score(tmp_pa
 
         assert store.leaderboard()[0].challenge_id == older
         assert store.leaderboard()[0].final_score == 0.9
-
-
-def test_system_failure_preserves_previous_success(tmp_path) -> None:
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
-        newer, _ = store.add_submission(
-            submission_at(120, hotkey="hk2"), occurred_at_ms=20
-        )
-        advance_to_scoring(store, older, 30)
-        store.complete_challenge(
-            older,
-            ChallengeState.SUCCEEDED,
-            final_score=0.8,
-            occurred_at_ms=40,
-        )
-        advance_to_scoring(store, newer, 50)
-        scoring = store.claim_next_scoring("scoring", lease_ms=100, now_ms=60)
-        assert scoring is not None and scoring.challenge_id == newer
-        store.fail_leased_system(
-            newer,
-            scoring.lease_token,
-            score_block=121,
-            error_code="SCORING_WORKER_FAILURE",
-            error_summary="scoring worker unavailable",
-            occurred_at_ms=63,
-        )
-
-        assert store.get_challenge(newer).state is ChallengeState.SYSTEM_FAILED
-        assert store.leaderboard()[0].challenge_id == older
 
 
 def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None:
@@ -708,17 +697,17 @@ def test_scoring_waits_for_an_earlier_deferred_challenge(tmp_path) -> None:
             "admit-b", lease_ms=100, ready_through_block=10_000, now_ms=200
         )
         assert retry is not None and retry.challenge_id == first_id
-        store.fail_leased_system(
+        store.defer_leased(
             first_id,
             retry.lease_token,
-            score_block=101,
+            retry_after_ms=300,
             error_code="DOWNLOAD_TEMPORARY_FAILURE",
-            error_summary="retry limit reached",
+            error_summary="temporary outage",
             occurred_at_ms=201,
         )
 
         second = store.claim_next_scoring("score", lease_ms=50, now_ms=202)
-        assert second is not None and second.challenge_id == second_id
+        assert second is None
 
 
 def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:

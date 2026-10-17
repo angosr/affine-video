@@ -93,13 +93,14 @@ class ArtifactRepository(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class EvaluationCycleResult:
-    finalized_block: int
-    scan: ScanResult
+    finalized_block: int | None
+    scan: ScanResult | None
     admission: AdmissionOutcome | None
     scoring: ScoringOutcome | None
     restored_matches: int = 0
     published_block: int | None = None
     publication_error: str | None = None
+    cycle_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,71 +191,87 @@ async def run_evaluator(
     scoring_settings = ScoringSettings(lease_ms=ceil(evaluator.timeout_seconds * 1000) + 60_000)
 
     with ChallengeStore(database, track_spec_digest=track.digest) as store:
-        async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
-            await seed_legacy_exclusions(
-                client,
-                store,
-                netuid=track.netuid,
-                before_block=track.track_start_block - 1,
-            )
-            recovery_index = 0
-            while True:
-                result = await process_cycle(
-                    client,
-                    store,
-                    netuid=track.netuid,
-                    track_start_block=track.track_start_block,
-                    admission_settings=admission_settings,
-                    scoring_settings=scoring_settings,
-                    evaluator=evaluator,
-                    worker_id=worker_id,
-                    max_scan_blocks=max_scan_blocks,
-                    recovery_matches=ledger.matches[recovery_index:],
-                    minimum_finalized_block=ledger.required_finalized_block,
-                )
-                recovery_index += result.restored_matches
-                cursor = store.chain_cursor()
-                if (
-                    cursor is not None
-                    and cursor[0] == result.finalized_block
-                    and result.finalized_block >= ledger.required_finalized_block
-                ):
-                    try:
-                        chain = await read_weight_chain_state(
+        recovery_index = 0
+        while True:
+            try:
+                async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
+                    await seed_legacy_exclusions(
+                        client,
+                        store,
+                        netuid=track.netuid,
+                        before_block=track.track_start_block - 1,
+                    )
+                    while True:
+                        result = await process_cycle(
                             client,
-                            netuid=track.netuid,
-                            finalized_block=result.finalized_block,
-                        )
-                        artifacts = build_public_artifacts(
                             store,
-                            track,
-                            chain,
-                            mechid=mechid,
-                            version_key=version_key,
+                            netuid=track.netuid,
+                            track_start_block=track.track_start_block,
+                            admission_settings=admission_settings,
+                            scoring_settings=scoring_settings,
+                            evaluator=evaluator,
+                            worker_id=worker_id,
+                            max_scan_blocks=max_scan_blocks,
+                            recovery_matches=ledger.matches[recovery_index:],
+                            minimum_finalized_block=ledger.required_finalized_block,
                         )
-                        if artifacts is not None:
-                            await publisher.publish(artifacts)
-                            result = EvaluationCycleResult(
-                                result.finalized_block,
-                                result.scan,
-                                result.admission,
-                                result.scoring,
-                                restored_matches=result.restored_matches,
-                                published_block=artifacts.source_block,
-                            )
-                    except Exception as exc:
-                        result = EvaluationCycleResult(
-                            result.finalized_block,
-                            result.scan,
-                            result.admission,
-                            result.scoring,
-                            restored_matches=result.restored_matches,
-                            publication_error=str(exc) or type(exc).__name__,
-                        )
-                if report is not None:
-                    report(result)
+                        recovery_index += result.restored_matches
+                        cursor = store.chain_cursor()
+                        if (
+                            cursor is not None
+                            and cursor[0] == result.finalized_block
+                            and result.finalized_block >= ledger.required_finalized_block
+                        ):
+                            try:
+                                chain = await read_weight_chain_state(
+                                    client,
+                                    netuid=track.netuid,
+                                    finalized_block=result.finalized_block,
+                                )
+                                artifacts = build_public_artifacts(
+                                    store,
+                                    track,
+                                    chain,
+                                    mechid=mechid,
+                                    version_key=version_key,
+                                )
+                                if artifacts is not None:
+                                    await publisher.publish(artifacts)
+                                    result = EvaluationCycleResult(
+                                        result.finalized_block,
+                                        result.scan,
+                                        result.admission,
+                                        result.scoring,
+                                        restored_matches=result.restored_matches,
+                                        published_block=artifacts.source_block,
+                                    )
+                            except Exception as exc:
+                                result = EvaluationCycleResult(
+                                    result.finalized_block,
+                                    result.scan,
+                                    result.admission,
+                                    result.scoring,
+                                    restored_matches=result.restored_matches,
+                                    publication_error=str(exc) or type(exc).__name__,
+                                )
+                        if report is not None:
+                            report(result)
+                        if once:
+                            return
+                        await asyncio.sleep(poll_seconds)
+            except Exception as exc:
                 if once:
-                    return
+                    raise
+                if report is not None:
+                    report(
+                        EvaluationCycleResult(
+                            None,
+                            None,
+                            None,
+                            None,
+                            cycle_error=str(exc) or type(exc).__name__,
+                        )
+                    )
                 await asyncio.sleep(poll_seconds)
 
 

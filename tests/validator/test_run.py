@@ -12,10 +12,11 @@ from miner.submit import ModelSubmission
 from scoring.model import TensorSpec
 from validator import run as run_module
 from validator.admission import AdmissionSettings, AdmissionStatus
+from validator.chain import ScanResult
 from validator.download import DownloadedModel
 from validator.publication import decode_weight_artifact, encode_weight_artifact
 from validator.queue import ChainPosition, ChallengeState
-from validator.run import process_cycle, process_weight_cycle
+from validator.run import EvaluationCycleResult, process_cycle, process_weight_cycle
 from validator.scoring import ScoringSettings, StageOutcome
 from validator.store import ChallengeStore
 from validator.tournament import Champion, resolve_tournament
@@ -90,6 +91,95 @@ def test_initial_publisher_emits_current_uid_zero_weight(monkeypatch) -> None:
     assert len(published["system_matches"]) == 2
 
 
+def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_path) -> None:
+    class StopLoop(BaseException):
+        pass
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Publisher:
+        async def load(self, _track):
+            return SimpleNamespace(matches=(), required_finalized_block=0)
+
+    track = SimpleNamespace(
+        digest="ab" * 32,
+        netuid=120,
+        track_start_block=100,
+        publication_grace_blocks=1,
+        model=SimpleNamespace(
+            max_bytes=1_000,
+            tensor_schema={},
+            selector=SimpleNamespace(head_dim=1, routes=("route",)),
+        ),
+        cache=SimpleNamespace(exact_sha256="cd" * 32, exact_max_bytes=1_000),
+        scoring=SimpleNamespace(
+            budgets=[SimpleNamespace(blocks=1)],
+            stratum_weight_map={"stratum": 1.0},
+            sample_count=1,
+        ),
+        initial_champion=SimpleNamespace(),
+    )
+    attempts = 0
+    clients = 0
+    reports = []
+
+    def client_factory(*_args, **_kwargs):
+        nonlocal clients
+        clients += 1
+        return Client()
+
+    async def process(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("chain disconnected")
+        return EvaluationCycleResult(100, ScanResult(None, None, 0, 0), None, None)
+
+    async def seed(*_args, **_kwargs):
+        return None
+
+    async def no_sleep(_seconds):
+        return None
+
+    def report(result):
+        reports.append(result)
+        if result.cycle_error is None:
+            raise StopLoop
+
+    monkeypatch.setattr(run_module, "load_track_spec", lambda _path: track)
+    monkeypatch.setattr(run_module, "validate_exact_cache", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run_module.bt, "Client", client_factory)
+    monkeypatch.setattr(run_module, "seed_legacy_exclusions", seed)
+    monkeypatch.setattr(run_module, "process_cycle", process)
+    monkeypatch.setattr(run_module.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(StopLoop):
+        asyncio.run(
+            run_module.run_evaluator(
+                track_spec="track.json",
+                database=tmp_path / "validator.db",
+                model_cache=tmp_path / "models",
+                exact_cache=tmp_path / "exact.npz",
+                initial_model=tmp_path / "baseline.safetensors",
+                network="finney",
+                archive_endpoints=None,
+                worker_id="worker",
+                publisher=Publisher(),
+                report=report,
+            )
+        )
+
+    assert clients == 2
+    assert reports[0].cycle_error == "chain disconnected"
+    assert reports[1].cycle_error is None
+
+
 def empty_chain_block(block_height: int) -> tuple[str, dict, list[dict]]:
     return "0x" + f"{block_height:064x}", {"extrinsics": []}, []
 
@@ -152,7 +242,11 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
 
 def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
     model_path = tmp_path / "selector.safetensors"
-    save_file({"selector.weight": np.ones((2, 3), dtype=np.float32)}, model_path)
+    save_file(
+        {"selector.weight": np.ones((2, 3), dtype=np.float32)},
+        model_path,
+        metadata={"hotkey": HOTKEY},
+    )
     file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     payload = ModelSubmission("owner/model", "12" * 20).encode()
     client = FakeClient({100: chain_block(payload, 100), 101: empty_chain_block(101)})
@@ -193,7 +287,11 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
 
 def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_path) -> None:
     model_path = tmp_path / "selector.safetensors"
-    save_file({"selector.weight": np.ones((2, 3), dtype=np.float32)}, model_path)
+    save_file(
+        {"selector.weight": np.ones((2, 3), dtype=np.float32)},
+        model_path,
+        metadata={"hotkey": HOTKEY},
+    )
     file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     payload = ModelSubmission("owner/model", "12" * 20).encode()
     client = FakeClient({100: chain_block(payload, 100), 101: empty_chain_block(101)})

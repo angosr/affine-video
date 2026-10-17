@@ -616,10 +616,10 @@ class ChallengeStore:
                 (identifier, ChallengeState.QUEUED, timestamp),
             )
             terminal = (
-                ChallengeState.REJECTED_OTHER_COMPETITION
-                if excluded
-                else ChallengeState.REJECTED_DUPLICATE_HOTKEY
+                ChallengeState.REJECTED_DUPLICATE_HOTKEY
                 if not first_for_hotkey
+                else ChallengeState.REJECTED_OTHER_COMPETITION
+                if excluded
                 else ChallengeState.MALFORMED_SUBMISSION
                 if malformed
                 else None
@@ -716,7 +716,7 @@ class ChallengeStore:
             JOIN challenges earlier_challenge
               ON earlier_challenge.submission_id = earlier_submission.submission_id
             WHERE current_challenge.challenge_id = ?
-              AND earlier_challenge.state NOT IN (?, ?)
+              AND earlier_challenge.state != ?
             ORDER BY earlier_submission.block_height,
                      earlier_submission.extrinsic_index,
                      earlier_submission.event_index
@@ -725,7 +725,6 @@ class ChallengeStore:
             (
                 identifier,
                 ChallengeState.PARTICIPANT_FAILED,
-                ChallengeState.SYSTEM_FAILED,
             ),
         ).fetchone()
         return None if row is None else row["challenge_id"]
@@ -834,26 +833,14 @@ class ChallengeStore:
                 "UPDATE challenges SET model_digest = ? WHERE challenge_id = ?",
                 (model_digest, identifier),
             )
-            if (
-                owner is not None
-                and ChallengeState(owner["state"]) is not ChallengeState.SYSTEM_FAILED
-            ):
+            if owner is not None:
                 self._connection.commit()
                 return ModelRegistration(False, owner["challenge_id"])
 
-            if owner is None:
-                self._connection.execute(
-                    "INSERT INTO model_owners (model_digest, challenge_id) VALUES (?, ?)",
-                    (model_digest, identifier),
-                )
-            else:
-                self._connection.execute(
-                    """
-                    UPDATE model_owners SET challenge_id = ?
-                    WHERE model_digest = ? AND challenge_id = ?
-                    """,
-                    (identifier, model_digest, owner["challenge_id"]),
-                )
+            self._connection.execute(
+                "INSERT INTO model_owners (model_digest, challenge_id) VALUES (?, ?)",
+                (model_digest, identifier),
+            )
             self._transition_locked(
                 identifier,
                 ChallengeState.SCORING,
@@ -915,57 +902,6 @@ class ChallengeStore:
                 """,
                 (resume, retry_after_ms, identifier),
             )
-            self._connection.commit()
-        except Exception:
-            self._connection.rollback()
-            raise
-
-    def fail_leased_system(
-        self,
-        identifier: str,
-        lease_token: str,
-        *,
-        score_block: int,
-        error_code: str,
-        error_summary: str,
-        occurred_at_ms: int | None = None,
-    ) -> None:
-        """End repeatedly failing infrastructure work without changing ranking."""
-
-        timestamp = _timestamp(occurred_at_ms)
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            current = self._require_lease_locked(identifier, lease_token)
-            if current not in {
-                ChallengeState.FETCHING,
-                ChallengeState.VALIDATING,
-                ChallengeState.SCORING,
-            }:
-                raise ValueError("challenge is not in an active stage")
-            submission = self._connection.execute(
-                """
-                SELECT s.block_height
-                FROM challenges c
-                JOIN submissions s ON s.submission_id = c.submission_id
-                WHERE c.challenge_id = ?
-                """,
-                (identifier,),
-            ).fetchone()
-            if type(score_block) is not int or score_block < submission["block_height"]:
-                raise ValueError("score block cannot precede the submission block")
-            self._transition_locked(
-                identifier,
-                ChallengeState.SYSTEM_FAILED,
-                timestamp=timestamp,
-                error_code=error_code,
-                error_summary=error_summary,
-                details={},
-            )
-            self._connection.execute(
-                "UPDATE challenges SET score_block = ? WHERE challenge_id = ?",
-                (score_block, identifier),
-            )
-            self._clear_lease_locked(identifier)
             self._connection.commit()
         except Exception:
             self._connection.rollback()
@@ -1373,20 +1309,7 @@ class ChallengeStore:
                             (model_digest, match.challenge_id),
                         )
                     elif owner["challenge_id"] != match.challenge_id:
-                        owner_state = self._connection.execute(
-                            "SELECT state FROM challenges WHERE challenge_id = ?",
-                            (owner["challenge_id"],),
-                        ).fetchone()
-                        if (
-                            owner_state is None
-                            or ChallengeState(owner_state["state"])
-                            is not ChallengeState.SYSTEM_FAILED
-                        ):
-                            raise RuntimeError("public model ownership conflicts with local state")
-                        self._connection.execute(
-                            "UPDATE model_owners SET challenge_id = ? WHERE model_digest = ?",
-                            (match.challenge_id, model_digest),
-                        )
+                        raise RuntimeError("public model ownership conflicts with local state")
                 restored += 1
             self._connection.commit()
         except Exception:
