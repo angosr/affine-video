@@ -17,6 +17,7 @@ from scoring.evaluate import (
     trip_pool,
 )
 from scoring.metrics import log_cost_auc, relative_squared_error
+from scoring.model import ModelValidationError
 from scoring.selector import FixedSelector
 from scoring.spec import BudgetSpec
 
@@ -90,15 +91,26 @@ def score_selector_pair(
     incumbent_cells: list[float] = []
     costs = [budget.calibrated_cost for budget in budgets]
     for case in cases:
+        if challenger.architecture != incumbent.architecture:
+            raise ValueError("paired selectors must use the same architecture")
         if device is None:
-            challenger_quality, _ = _score_case(challenger, case, budgets, tail_mean_weight)
-            incumbent_quality, _ = _score_case(incumbent, case, budgets, tail_mean_weight)
+            challenger_quality, _ = _score_case_or_zero(
+                challenger, case, budgets, tail_mean_weight
+            )
+            incumbent_quality, _ = _score_case_or_zero(
+                incumbent, case, budgets, tail_mean_weight
+            )
         else:
             from scoring.torch_backend import TorchCaseScorer
 
+            _validate_case(case, challenger)
             gpu_case = TorchCaseScorer(case, device=device)
-            challenger_quality, _ = gpu_case.score(challenger, list(budgets), tail_mean_weight)
-            incumbent_quality, _ = gpu_case.score(incumbent, list(budgets), tail_mean_weight)
+            challenger_quality, _ = _score_gpu_case_or_zero(
+                gpu_case, challenger, budgets, tail_mean_weight
+            )
+            incumbent_quality, _ = _score_gpu_case_or_zero(
+                gpu_case, incumbent, budgets, tail_mean_weight
+            )
         challenger_cells.append(log_cost_auc(costs, challenger_quality))
         incumbent_cells.append(log_cost_auc(costs, incumbent_quality))
         design.append(
@@ -243,6 +255,38 @@ def _score_case(
         all_errors.append(errors)
         qualities.append(1 / (1 + tail_error(errors, mean_weight=tail_mean_weight)))
     return qualities, all_errors
+
+
+def _score_case_or_zero(
+    selector: FixedSelector,
+    case: ExactCase,
+    budgets: Sequence[BudgetSpec],
+    tail_mean_weight: float,
+) -> tuple[list[float], list[list[float]]]:
+    try:
+        return _score_case(selector, case, budgets, tail_mean_weight)
+    except ModelValidationError as exc:
+        if exc.code != "MODEL_RUNTIME_INVALID":
+            raise
+        return _zero_case(budgets)
+
+
+def _score_gpu_case_or_zero(
+    scorer: object,
+    selector: FixedSelector,
+    budgets: Sequence[BudgetSpec],
+    tail_mean_weight: float,
+) -> tuple[list[float], list[list[float]]]:
+    try:
+        return scorer.score(selector, list(budgets), tail_mean_weight)
+    except ModelValidationError as exc:
+        if exc.code != "MODEL_RUNTIME_INVALID":
+            raise
+        return _zero_case(budgets)
+
+
+def _zero_case(budgets: Sequence[BudgetSpec]) -> tuple[list[float], list[list[float]]]:
+    return [0.0 for _ in budgets], [[] for _ in budgets]
 
 
 def _weighted_cell_mean(

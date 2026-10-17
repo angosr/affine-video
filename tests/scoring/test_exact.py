@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from scoring.evaluate import reference_attention
-from scoring.exact import ExactCase, paired_score_gain_bound
+from scoring.exact import ExactCase, paired_score_gain_bound, score_selector_pair
+from scoring.selector import FixedSelector, SelectorArchitecture
+from scoring.spec import BudgetSpec
 
 
 def exact_case(seed: int, *, stratum: str = "all") -> ExactCase:
@@ -86,3 +88,64 @@ def test_paired_bound_rejects_multiple_rollouts_from_one_source_video() -> None:
             resamples=100,
             seed=7,
         )
+
+
+def test_runtime_invalid_selector_scores_zero_without_poisoning_its_opponent() -> None:
+    architecture = SelectorArchitecture(1, 1, 2, "float32")
+    shape = (architecture.descriptor_dim, architecture.head_dim)
+    good = FixedSelector(
+        architecture,
+        {
+            "layer_0_head_0.proj_q": np.zeros(shape, dtype=np.float32),
+            "layer_0_head_0.proj_k": np.zeros(shape, dtype=np.float32),
+        },
+    )
+    bad = FixedSelector(
+        architecture,
+        {
+            "layer_0_head_0.proj_q": np.full(
+                shape, np.finfo(np.float32).max, dtype=np.float32
+            ),
+            "layer_0_head_0.proj_k": np.full(
+                shape, np.finfo(np.float32).max, dtype=np.float32
+            ),
+        },
+    )
+    cases = []
+    for seed in range(4):
+        case = exact_case(seed)
+        q = np.ones_like(case.q)
+        k = np.ones_like(case.k)
+        cases.append(
+            replace(
+                case,
+                q=q,
+                k=k,
+                dense=reference_attention(
+                    q,
+                    k,
+                    case.v,
+                    np.ones((q.shape[0], k.shape[0]), dtype=np.bool_),
+                ),
+            )
+        )
+    arguments = {
+        "cases": cases,
+        "budgets": (BudgetSpec(1, 0, 1.0), BudgetSpec(2, 0, 2.0)),
+        "stratum_weights": {"all": 1.0},
+        "step_window_weights": {"all": 1.0},
+        "tail_mean_weight": 0.5,
+        "confidence": 0.95,
+        "resamples": 100,
+        "seed": 7,
+    }
+
+    invalid_challenger = score_selector_pair(bad, good, **arguments)
+    invalid_incumbent = score_selector_pair(good, bad, **arguments)
+
+    assert invalid_challenger.challenger_score == 0.0
+    assert invalid_challenger.incumbent_score > 0.0
+    assert invalid_challenger.gain_lower_bound < 0.0
+    assert invalid_incumbent.incumbent_score == 0.0
+    assert invalid_incumbent.challenger_score > 0.0
+    assert invalid_incumbent.gain_lower_bound > 0.0

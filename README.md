@@ -57,6 +57,10 @@ hotkey-to-UID mapping and chain weight constraints before publishing. When the c
 longer registered or a valid vector is impossible, `weights` is `null` and Validators keep their
 last finalized weights.
 
+A selector that produces non-finite logits or sparse latents receives zero quality for the affected
+case. This rule is applied independently to the challenger and incumbent, so a pathological model
+cannot turn its own numerical failure into an infrastructure retry that blocks the FIFO queue.
+
 The launch checks use ten consecutive 384-case batches on NVIDIA H200 hardware. They require the
 VEDA incumbent to retain the title against MeanPool, shuffled-head and slightly perturbed VEDA
 challengers in every batch, while the reverse VEDA-versus-shuffled positive control must promote

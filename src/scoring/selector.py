@@ -108,9 +108,12 @@ class FixedSelector:
             raise ValueError("unknown selector route")
         q = _descriptors(q_descriptors, self.architecture.descriptor_dim, "Q")
         k = _descriptors(k_descriptors, self.architecture.descriptor_dim, "K")
-        q_projected = self._project(q, self.weights[f"{route}.proj_q"])
-        k_projected = self._project(k, self.weights[f"{route}.proj_k"])
-        result = q_projected @ k_projected.T / np.float32(sqrt(self.architecture.head_dim))
+        with np.errstate(over="ignore", invalid="ignore"):
+            q_projected = self._project(q, self.weights[f"{route}.proj_q"])
+            k_projected = self._project(k, self.weights[f"{route}.proj_k"])
+            result = q_projected @ k_projected.T / np.float32(
+                sqrt(self.architecture.head_dim)
+            )
         if not np.isfinite(result).all():
             raise ModelValidationError(
                 "MODEL_RUNTIME_INVALID", "selector produced non-finite logits"
