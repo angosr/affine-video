@@ -1,10 +1,13 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
 
 from miner.submit import ModelSubmission
-from validator.chain import scan_finalized_blocks
+from validator import chain as chain_module
+from validator.chain import scan_finalized_blocks, seed_legacy_exclusions
+from validator.queue import ChallengeState
 from validator.scan import extract_submissions
 from validator.store import ChallengeStore
 
@@ -188,7 +191,8 @@ def test_scanner_tolerates_another_process_advancing_finalized_cursor(tmp_path) 
         assert len(store.public_snapshot()["challenges"]) == 2
 
 
-def test_scanner_processes_timelock_reveal_plaintext(tmp_path) -> None:
+@pytest.mark.parametrize("mapping_shape", [False, True], ids=("sequence", "sdk-mapping"))
+def test_scanner_processes_timelock_reveal_plaintext(tmp_path, mapping_shape) -> None:
     payload = ModelSubmission("owner/model", "12" * 20).encode()
     block_hash = "0x" + f"{100:064x}"
     blocks = {
@@ -206,9 +210,8 @@ def test_scanner_processes_timelock_reveal_plaintext(tmp_path) -> None:
         )
     }
     client = FakeClient(blocks)
-    client.revealed = {
-        100: [SimpleNamespace(hotkey=HOTKEY, revealed=[(100, "0x" + payload.hex())])]
-    }
+    commitment = SimpleNamespace(hotkey=HOTKEY, revealed=[(100, "0x" + payload.hex())])
+    client.revealed = {100: {HOTKEY: commitment} if mapping_shape else [commitment]}
 
     with ChallengeStore(tmp_path / "validator.db") as store:
         result = asyncio.run(
@@ -223,3 +226,84 @@ def test_scanner_processes_timelock_reveal_plaintext(tmp_path) -> None:
         assert result.submissions_found == 1
         challenge = store.public_snapshot()["challenges"][0]
         assert challenge["repo_id"] == "owner/model"
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        (),
+        [(100, "0xnot-hex")],
+        [(100, "first"), (100, "second")],
+    ],
+    ids=("missing", "undecodable", "ambiguous"),
+)
+def test_scanner_skips_bad_timelock_reveals_and_advances_cursor(tmp_path, caplog, stored) -> None:
+    block_hash = "0x" + f"{100:064x}"
+    blocks = {
+        100: (
+            block_hash,
+            {"extrinsics": []},
+            [
+                {
+                    "extrinsic_idx": None,
+                    "module_id": "Commitments",
+                    "event_id": "CommitmentRevealed",
+                    "attributes": {"netuid": 7, "who": HOTKEY},
+                }
+            ],
+        )
+    }
+    client = FakeClient(blocks)
+    client.revealed = {100: [SimpleNamespace(hotkey=HOTKEY, revealed=stored)] if stored else []}
+
+    with ChallengeStore(tmp_path / "validator.db") as store, caplog.at_level(logging.WARNING):
+        result = asyncio.run(scan_finalized_blocks(client, store, netuid=7, track_start_block=100))
+
+        assert result.submissions_found == 0
+        assert store.chain_cursor() == (100, block_hash)
+        assert store.public_snapshot()["challenges"] == []
+    assert "skipping unmatched finalized commitment reveal" in caplog.text
+
+
+def test_legacy_snapshot_decodes_hex_timelock_reveals(monkeypatch, tmp_path) -> None:
+    activation = b"affine2|activate|signed"
+    commitment = SimpleNamespace(revealed=[(99, "0x" + activation.hex())])
+    neuron = SimpleNamespace(hotkey=HOTKEY, commitment=commitment)
+
+    class SnapshotClient:
+        async def at(self, height: int):
+            assert height == 99
+            return SimpleNamespace(
+                subnets=SimpleNamespace(
+                    metagraph=lambda _netuid, commitments: _ready(SimpleNamespace(neurons=[neuron]))
+                )
+            )
+
+    monkeypatch.setattr(
+        chain_module,
+        "is_valid_legacy_activation",
+        lambda payload, **_kwargs: payload == activation,
+    )
+    encoded = ModelSubmission("owner/model", "12" * 20).encode()
+    block_hash, block, events = chain_block(encoded, 100)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        count = asyncio.run(
+            seed_legacy_exclusions(
+                SnapshotClient(),
+                store,
+                netuid=7,
+                before_block=99,
+            )
+        )
+        identifier, _ = store.add_submission(
+            extract_submissions(
+                block_height=100,
+                block_hash=block_hash,
+                block=block,
+                events=events,
+                netuid=7,
+            )[0]
+        )
+
+        assert count == 1
+        assert store.get_challenge(identifier).state is ChallengeState.REJECTED_OTHER_COMPETITION

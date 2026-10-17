@@ -1,5 +1,3 @@
-import hashlib
-import json
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -8,9 +6,9 @@ import numpy as np
 import pytest
 from safetensors.numpy import save_file
 
+from scoring.cache import write_exact_cache_batch
 from scoring.evaluate import reference_attention
 from scoring.exact import ExactCase
-from scoring.generator import generate_sources, source_digest
 from scoring.model import validate_model
 from scoring.selector import SelectorArchitecture
 from scoring.spec import (
@@ -23,12 +21,16 @@ from scoring.spec import (
     BaseModelSpec,
     BudgetSpec,
     CacheSpec,
+    FullVideoSpec,
     InitialChampionSpec,
     ModelSpec,
     ScoringSpec,
+    StepWindowSpec,
     TrackSpec,
+    TrajectoryScheduleSpec,
 )
 from validator import scoring as scoring_module
+from validator.production.batches import ArchivedStage
 from validator.queue import ChainPosition, ChallengeState
 from validator.scoring import (
     IsolatedEvaluator,
@@ -37,7 +39,6 @@ from validator.scoring import (
     ScoringSettings,
     StageOutcome,
     TemporaryScoringError,
-    TrackEvaluator,
     evaluate_isolated,
     process_next_scoring,
     verify_initial_champion,
@@ -45,6 +46,50 @@ from validator.scoring import (
 from validator.store import ChallengeStore, LeasedChallenge
 
 from .test_store import submission_at
+
+
+def scoring_spec(*, routes: int, rollouts: int = 1) -> ScoringSpec:
+    return ScoringSpec(
+        budgets=(
+            BudgetSpec(1, 0, 1.0),
+            BudgetSpec(2, 0, 2.0),
+            BudgetSpec(3, 0, 4.0),
+        ),
+        sampled_route_count=routes,
+        rollouts_per_stratum=rollouts,
+        sampled_step_count=1,
+        query_tiles_per_case=2,
+        step_selection_algorithm="sha256-window-without-replacement-v1",
+        query_tile_selection_algorithm="sha256-segment-quota-v1",
+        trajectory_schedule=TrajectoryScheduleSpec(
+            "test",
+            (1.0, 0.0),
+            (StepWindowSpec("all", (0,), 1.0),),
+        ),
+        tail_mean_weight=0.8,
+        stratum_weights=(("all", 1.0),),
+        minimum_frontier_gain=0.001,
+        season_false_promotion_alpha=0.05,
+        bootstrap_resamples=20,
+        bootstrap_seed=7,
+    )
+
+
+def cache_spec() -> CacheSpec:
+    return CacheSpec(
+        1_000_000,
+        1,
+        1,
+        "veda-private-rollout-v1",
+        "veda-exact-cache-v2",
+        "float16",
+        "float32",
+        "float32",
+    )
+
+
+def video_spec() -> FullVideoSpec:
+    return FullVideoSpec(0.001, "test-v1", "ef" * 32, 0.4, 0.3, 0.3, 0.01, 2.0)
 
 
 def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) -> None:
@@ -74,6 +119,11 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
         mechid=0,
         track_start_block=1,
         publication_grace_blocks=1,
+        maximum_generation_batches=10,
+        maximum_effective_challenges=1,
+        track_close_grace_blocks=10,
+        source_pool_merkle_root="cd" * 32,
+        artifact_manifest_sha256="ef" * 32,
         initial_champion=InitialChampionSpec(
             0,
             "genesis-hotkey",
@@ -87,74 +137,59 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
         ),
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
-        cache=CacheSpec(1_000_000, 1, 1, "veda-source-v2"),
-        scoring=ScoringSpec(
-            budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
-            sample_count=1,
-            tail_mean_weight=0.8,
-            stratum_weights=(("all", 1.0),),
-            minimum_frontier_gain=0.001,
-            bootstrap_confidence=0.95,
-            bootstrap_resamples=20,
-            bootstrap_seed=7,
-        ),
+        cache=cache_spec(),
+        scoring=scoring_spec(routes=1, rollouts=4),
+        full_video=video_spec(),
         digest="ab" * 32,
     )
     cache_dir = tmp_path / "batches"
     cache_dir.mkdir()
-    arrays = {}
-    cases = []
-    generated = generate_sources(
-        track_spec_digest=track.digest,
+    generator = np.random.default_rng(1)
+    q = generator.normal(size=(2, 128, 2)).astype(np.float32)
+    k = generator.normal(size=(3, 128, 2)).astype(np.float32)
+    v = generator.normal(size=(3, 128, 2)).astype(np.float32)
+    dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
+    case = ExactCase(
+        route="layer_0_head_0",
+        stratum="all",
+        rollout_id="rollout-0",
+        source_id="source-0",
+        step_index=0,
+        step_window="all",
+        scheduler_timestep=1.0,
+        sigma=1.0,
+        tile_plan_hash="12" * 32,
+        query_tile_ids=(0, 1),
+        q=q,
+        k=k,
+        v=v,
+        dense=dense,
+        query_valid_counts=np.full(2, 128, dtype=np.int16),
+        key_valid_counts=np.full(3, 128, dtype=np.int16),
+        key_segments=np.zeros(3, dtype=np.int8),
+        required_keys=np.array([[True, False, False], [False, True, False]], dtype=np.bool_),
+        epsilon=1e-6,
+    )
+    cases = tuple(
+        replace(
+            case,
+            rollout_id=f"rollout-{index}",
+            source_id=f"source-{index}",
+        )
+        for index in range(4)
+    )
+    batch = write_exact_cache_batch(
+        cache_dir,
+        cases,
+        generated_block=101,
         seed_block_hash="0x" + "ab" * 32,
-        strata=("all",),
-        samples_per_stratum=1,
+        plan_digest="23" * 32,
+        track_spec_digest=track.digest,
+        artifact_manifest_sha256=track.artifact_manifest_sha256,
+        source_pool_merkle_root=track.source_pool_merkle_root,
+        source_proofs=tuple({"source_id": f"source-{index}"} for index in range(4)),
+        dense_references=tuple({"video_sha256": f"{index + 1:02x}" * 32} for index in range(4)),
     )
-    for index, seed in enumerate((1,)):
-        generator = np.random.default_rng(seed)
-        q = generator.normal(size=(2, 2, 2)).astype(np.float32)
-        k = generator.normal(size=(3, 2, 2)).astype(np.float32)
-        v = generator.normal(size=(3, 2, 2)).astype(np.float32)
-        dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
-        prefix = f"case_{index:06d}"
-        arrays.update(
-            {
-                f"{prefix}_q": q,
-                f"{prefix}_k": k,
-                f"{prefix}_v": v,
-                f"{prefix}_dense": dense,
-                f"{prefix}_valid_keys": np.ones(3, dtype=np.bool_),
-                f"{prefix}_required_keys": np.array(
-                    [[True, False, False], [False, True, False]], dtype=np.bool_
-                ),
-            }
-        )
-        cases.append(
-            {
-                "route": "layer_0_head_0",
-                "stratum": "all",
-                "sample_id": generated[0].sample_id,
-                "epsilon": 1e-6,
-            }
-        )
-    metadata = np.frombuffer(
-        json.dumps(
-            {
-                "format": "veda-exact-cache",
-                "generated_block": 101,
-                "source_digest": source_digest(generated),
-                "seed_block_hash": "0x" + "ab" * 32,
-                "cases": cases,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode(),
-        dtype=np.uint8,
-    )
-    temporary_batch = cache_dir / "temporary.npz"
-    np.savez(temporary_batch, metadata=metadata, **arrays)
-    batch_digest = hashlib.sha256(temporary_batch.read_bytes()).hexdigest()
-    temporary_batch.rename(cache_dir / f"101-{batch_digest}.npz")
 
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest=track.digest) as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=1)
@@ -198,7 +233,7 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
 
     assert evaluated["final_score"] == pytest.approx(evaluated["incumbent_score"])
     assert evaluated["evaluation_batch"]["generated_block"] == 101
-    assert evaluated["evaluation_batch"]["source_digest"] == source_digest(generated)
+    assert evaluated["evaluation_batch"]["plan_digest"] == batch.plan_digest
 
 
 def test_initial_champion_file_and_digest_are_verified(monkeypatch, tmp_path) -> None:
@@ -326,6 +361,60 @@ def test_authoritative_score_finishes_one_challenge(tmp_path) -> None:
         )
 
 
+def test_exact_winner_requires_a_new_full_video_batch_before_completion(tmp_path) -> None:
+    batches = {
+        ChallengeState.SCORING: (120, "12" * 32, True, 0.02),
+        ChallengeState.CONFIRMING: (140, "34" * 32, False, 0.01),
+    }
+
+    def evaluate(task):
+        block, digest, requires_confirmation, gain = batches[task.state]
+        return StageOutcome(
+            0.8,
+            {
+                "cache_generated_block": block,
+                "cache_plan_digest": digest,
+                "cache_seed_block_hash": "0x" + "ab" * 32,
+                "cache_sha256": digest,
+                "incumbent_score": 0.7,
+                "paired_gain_lower_bound": gain,
+                "requires_confirmation": requires_confirmation,
+            },
+        )
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_scoring(store)
+        exact = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=120,
+            settings=ScoringSettings(),
+            evaluator=evaluate,
+            now_ms=20,
+        )
+        confirmation = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=140,
+            settings=ScoringSettings(),
+            evaluator=evaluate,
+            now_ms=21,
+        )
+        challenge = store.public_challenge(identifier)
+
+    assert exact is not None and exact.state is ChallengeState.CONFIRMING
+    assert confirmation is not None and confirmation.state is ChallengeState.SUCCEEDED
+    assert [stage["stage"] for stage in challenge["stages"]] == [
+        ChallengeState.SCORING,
+        ChallengeState.CONFIRMING,
+    ]
+    assert [stage["evaluation_batch"]["generated_block"] for stage in challenge["stages"]] == [
+        120,
+        140,
+    ]
+    assert challenge["evaluation_batch"]["generated_block"] == 140
+
+
 def test_recorded_score_resumes_without_repeating_evaluation(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier = ready_for_scoring(store)
@@ -356,6 +445,39 @@ def test_recorded_score_resumes_without_repeating_evaluation(tmp_path) -> None:
         assert resumed is not None and resumed.state is ChallengeState.SUCCEEDED
         assert store.get_challenge(identifier).final_score == pytest.approx(0.8)
         assert store.get_challenge(identifier).score_block == 100
+
+
+def test_private_stage_archive_restores_without_repeating_evaluation(tmp_path) -> None:
+    archived = ArchivedStage(
+        0.8,
+        220,
+        {
+            "cache_generated_block": 120,
+            "requires_confirmation": True,
+        },
+    )
+    rewrites = []
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_scoring(store)
+        outcome = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=300,
+            settings=ScoringSettings(
+                restore_stage=lambda _task: archived,
+                archive_stage=lambda task, result, block: rewrites.append(
+                    (task.challenge_id, result.score, block)
+                ),
+            ),
+            evaluator=lambda _task: pytest.fail("archived stage was evaluated again"),
+            now_ms=20,
+        )
+
+        assert outcome is not None and outcome.state is ChallengeState.CONFIRMING
+        recorded = store.stage_score(identifier, ChallengeState.SCORING)
+        assert recorded is not None and recorded.score_block == 220
+        assert rewrites == [(identifier, 0.8, 220)]
 
 
 def test_participant_failure_is_terminal_but_temporary_failure_retries(tmp_path) -> None:
@@ -425,78 +547,53 @@ def test_repeated_infrastructure_failure_remains_retryable(tmp_path) -> None:
         assert store.get_challenge(identifier).score_block is None
 
 
-def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) -> None:
-    architecture = SelectorArchitecture(1, 1, 2, "float32")
-    model_path = tmp_path / "selector.safetensors"
-    save_file(
-        {
-            name: np.zeros(tensor.shape, dtype=np.float32)
-            for name, tensor in architecture.tensor_schema.items()
-        },
-        model_path,
+def test_scoring_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
+    alerts = []
+    settings = ScoringSettings(
+        max_attempts=1,
+        alert=lambda event, details: alerts.append((event, details)),
     )
-    track = TrackSpec(
-        track_id="test",
-        netuid=7,
-        mechid=0,
-        track_start_block=1,
-        publication_grace_blocks=1,
-        initial_champion=InitialChampionSpec(
-            0,
-            "genesis-hotkey",
-            VEDA_REPO_ID,
-            VEDA_REVISION,
-            VEDA_FILENAME,
-            VEDA_FILE_SHA256,
-            VEDA_EVALUATION_FILE_SHA256,
-            VEDA_MODEL_DIGEST,
-            0.7,
-        ),
-        model=ModelSpec("selector.safetensors", 10_000, architecture),
-        base_model=BaseModelSpec("owner/base", "12" * 20),
-        cache=CacheSpec(1_000_000, 1, 1, "veda-source-v2"),
-        scoring=ScoringSpec(
-            budgets=(BudgetSpec(1, 1.0), BudgetSpec(2, 2.0), BudgetSpec(3, 4.0)),
-            sample_count=4,
-            tail_mean_weight=0.8,
-            stratum_weights=(("all", 1.0),),
-            minimum_frontier_gain=0.001,
-            bootstrap_confidence=0.95,
-            bootstrap_resamples=20,
-            bootstrap_seed=7,
-        ),
-        digest="ab" * 32,
-    )
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_scoring(store)
 
-    exact_cases = []
-    for seed in (1, 2, 3, 4):
-        generator = np.random.default_rng(seed)
-        q = generator.normal(size=(2, 2, 2)).astype(np.float32)
-        k = generator.normal(size=(3, 2, 2)).astype(np.float32)
-        v = generator.normal(size=(3, 2, 2)).astype(np.float32)
-        valid = np.ones(3, dtype=np.bool_)
-        dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
-        required = np.array([[True, False, False], [False, True, False]], dtype=np.bool_)
-        exact_cases.append(
-            ExactCase("layer_0_head_0", "all", q, k, v, dense, valid, required, 1e-6, "sample")
+        def unavailable(_task):
+            raise TemporaryScoringError("SCORING_UNAVAILABLE", "worker unavailable")
+
+        outcome = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=100,
+            settings=settings,
+            evaluator=unavailable,
+            now_ms=20,
         )
 
-    evaluator = TrackEvaluator(track, exact_cases)
-    task = replace(
-        sample_task(),
-        model_path=str(model_path),
-        file_sha256=hashlib.sha256(model_path.read_bytes()).hexdigest(),
-    )
-    first = evaluator(task)
-    second = evaluator(task)
-    other_submission = evaluator(
-        replace(task, submission_id="78" * 32, position=ChainPosition(200, 1, 0))
-    )
+        assert outcome is not None and outcome.state is ChallengeState.SYSTEM_BLOCKED
+        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_BLOCKED
+        assert store.claim_next_scoring("other", lease_ms=100, now_ms=1_000_000) is None
+        assert alerts == [
+            (
+                "SCORING_RETRY_EXHAUSTED",
+                {
+                    "challenge_id": identifier,
+                    "attempts": 1,
+                    "code": "SCORING_UNAVAILABLE",
+                    "stage": "SCORING",
+                },
+            )
+        ]
 
-    with pytest.raises(TemporaryScoringError) as changed:
-        evaluator(replace(task, file_sha256="00" * 32))
+        assert store.resume_blocked(identifier, occurred_at_ms=30) is ChallengeState.SCORING
+        resumed = store.get_challenge(identifier)
+        assert resumed.state is ChallengeState.SCORING
+        assert resumed.attempts == 1
 
-    assert changed.value.code == "SCORING_MODEL_CHANGED"
-    assert first == second == other_submission
-    assert 0 <= first.score <= 1
-    assert first.metrics["sample_count"] == 4
+        success = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=100,
+            settings=settings,
+            evaluator=lambda _task: StageOutcome(0.7, {"stage": "scoring"}),
+            now_ms=40,
+        )
+        assert success is not None and success.state is ChallengeState.SUCCEEDED

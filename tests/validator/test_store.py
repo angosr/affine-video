@@ -236,6 +236,46 @@ def test_only_first_submission_per_hotkey_is_admitted(tmp_path) -> None:
         )
 
 
+def test_model_owner_lookup_validates_and_returns_the_registered_challenge(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        store.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=11)
+        store.transition(identifier, ChallengeState.VALIDATING, occurred_at_ms=12)
+        task = store.claim_next_admission(
+            "worker", lease_ms=1_000, ready_through_block=1_000, now_ms=13
+        )
+        assert task is not None
+        digest = "ab" * 32
+        registration = store.register_validated_model(
+            identifier,
+            task.lease_token,
+            model_digest=digest,
+            occurred_at_ms=14,
+        )
+
+        assert registration.accepted is True
+        assert store.model_owner(digest) == identifier
+        assert store.model_owner("cd" * 32) is None
+        with pytest.raises(ValueError, match="digest"):
+            store.model_owner("bad")
+
+
+def test_uid_zero_baseline_hotkey_is_cleanly_rejected_as_duplicate(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        store.reserve_uid_zero("uid0-hotkey", track_start_block=100)
+        identifier, _ = store.add_submission(
+            submission_at(101, hotkey="uid0-hotkey"), occurred_at_ms=10
+        )
+
+        challenge = store.get_challenge(identifier)
+        assert challenge.state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+        assert challenge.error_code == "REJECTED_DUPLICATE_HOTKEY"
+        assert (
+            store.claim_next_admission("worker", lease_ms=100, ready_through_block=1_000, now_ms=20)
+            is None
+        )
+
+
 def test_malformed_first_submission_consumes_hotkey_slot(tmp_path) -> None:
     malformed = submission_at(100)
     malformed = SubmissionRecord(
@@ -435,11 +475,25 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
                 "evaluation_batch": {
                     "sha256": "de" * 32,
                     "generated_block": 101,
-                    "source_digest": "ef" * 32,
+                    "plan_digest": "ef" * 32,
                     "seed_block_hash": "0x" + "ab" * 32,
                 },
                 "score_block": 110,
-                "stages": [],
+                "stages": [
+                    {
+                        "stage": ChallengeState.SCORING,
+                        "score": 0.8,
+                        "score_block": 110,
+                        "incumbent_score": 0.5,
+                        "paired_gain_lower_bound": 0.3,
+                        "evaluation_batch": {
+                            "sha256": "de" * 32,
+                            "generated_block": 101,
+                            "plan_digest": "ef" * 32,
+                            "seed_block_hash": "0x" + "ab" * 32,
+                        },
+                    }
+                ],
             }
         )
         tournament = resolve_tournament(
@@ -448,6 +502,7 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
             track_spec_digest=digest,
             netuid=7,
             minimum_gain=0.001,
+            minimum_exact_gain=0.5,
             initial_champion=Champion(
                 "genesis",
                 "genesis-hotkey",
@@ -733,7 +788,7 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
             metrics={
                 "upper_bound": 0.8,
                 "budget_scores": [0.6, 0.7, 0.8],
-                "sample_count": 12,
+                "case_count": 12,
                 "private": "must-not-export",
             },
             occurred_at_ms=24,
@@ -764,6 +819,36 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
             }
         ]
         assert challenge["events"][-1]["error_summary"] == "frozen cache is unavailable"
+
+
+def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        store.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=11)
+        store.transition(identifier, ChallengeState.VALIDATING, occurred_at_ms=12)
+        store.transition(identifier, ChallengeState.SCORING, occurred_at_ms=13)
+        task = store.claim_next_scoring("scorer", lease_ms=1_000, now_ms=14)
+        assert task is not None
+        store.record_stage_score(
+            identifier,
+            task.lease_token,
+            ChallengeState.SCORING,
+            score=0.7,
+            score_block=150,
+            metrics={"cache_generated_block": 120, "requires_confirmation": True},
+            occurred_at_ms=15,
+        )
+        store.advance_leased(
+            identifier,
+            task.lease_token,
+            ChallengeState.CONFIRMING,
+            release=True,
+            occurred_at_ms=16,
+        )
+
+        assert store.confirmation_challenge_ids(149, 149) == ()
+        assert store.confirmation_challenge_ids(150, 150) == (identifier,)
+        assert store.confirmation_challenge_ids(151, 151) == ()
 
 
 def test_public_challenge_reads_state_and_history_from_one_snapshot(monkeypatch, tmp_path) -> None:

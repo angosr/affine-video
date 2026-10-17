@@ -165,6 +165,11 @@ class ChallengeStore:
                 block_hash TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS finalized_blocks (
+                block_height INTEGER PRIMARY KEY CHECK (block_height >= 0),
+                block_hash TEXT NOT NULL UNIQUE
+            );
+
             CREATE TABLE IF NOT EXISTS store_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -234,6 +239,11 @@ class ChallengeStore:
 
             CREATE TABLE IF NOT EXISTS model_owners (
                 model_digest TEXT PRIMARY KEY,
+                challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS season_slots (
+                sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
                 challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id)
             );
 
@@ -393,6 +403,28 @@ class ChallengeStore:
             self._connection.rollback()
             raise
 
+    def reserve_uid_zero(self, hotkey: str, *, track_start_block: int) -> None:
+        """Reserve the synthetic baseline champion's chain identity."""
+
+        if not hotkey or type(track_start_block) is not int or track_start_block < 0:
+            raise ValueError("UID0 reservation is invalid")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO competition_exclusions (hotkey, first_block, reason)
+                VALUES (?, ?, 'RESERVED_UID0')
+                ON CONFLICT(hotkey) DO UPDATE SET
+                    first_block = MIN(first_block, excluded.first_block),
+                    reason = 'RESERVED_UID0'
+                """,
+                (hotkey, track_start_block),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
     def active_competitors(self, uid_by_hotkey: Mapping[str, int]) -> list[dict[str, Any]]:
         """Project current VDA choices onto one finalized metagraph snapshot."""
 
@@ -461,6 +493,69 @@ class ChallengeStore:
         ).fetchone()
         return None if row is None else row["value"]
 
+    def effective_challenge_count(self) -> int:
+        """Return the number of immutable chain-order season reservations."""
+
+        return int(self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0])
+
+    def reserve_season_slots(self, maximum: int) -> int:
+        """Reserve the first M eligible submissions before any model bytes are read."""
+
+        if maximum <= 0:
+            raise ValueError("maximum effective challenges must be positive")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            count = int(self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0])
+            if count > maximum:
+                raise RuntimeError("season reservation count exceeds the frozen capacity")
+            rows = self._connection.execute(
+                """
+                SELECT c.challenge_id
+                FROM challenges c
+                JOIN submissions s ON s.submission_id = c.submission_id
+                LEFT JOIN season_slots slot ON slot.challenge_id = c.challenge_id
+                WHERE s.admitted = 1 AND slot.challenge_id IS NULL
+                ORDER BY s.block_height, s.extrinsic_index, s.event_index
+                LIMIT ?
+                """,
+                (maximum - count,),
+            ).fetchall()
+            for offset, row in enumerate(rows, start=1):
+                self._connection.execute(
+                    "INSERT INTO season_slots (sequence, challenge_id) VALUES (?, ?)",
+                    (count + offset, row["challenge_id"]),
+                )
+            self._connection.commit()
+            return count + len(rows)
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def has_season_slot(self, identifier: str) -> bool:
+        """Return whether one challenge owns a non-refundable season test."""
+
+        return (
+            self._connection.execute(
+                "SELECT 1 FROM season_slots WHERE challenge_id = ?", (identifier,)
+            ).fetchone()
+            is not None
+        )
+
+    def model_owner(self, model_digest: str) -> str | None:
+        """Return the challenge that already owns canonical selector weights."""
+
+        if len(model_digest) != 64:
+            raise ValueError("model digest must contain 32 bytes")
+        try:
+            bytes.fromhex(model_digest)
+        except ValueError as exc:
+            raise ValueError("model digest must be hexadecimal") from exc
+        row = self._connection.execute(
+            "SELECT challenge_id FROM model_owners WHERE model_digest = ?",
+            (model_digest.lower(),),
+        ).fetchone()
+        return None if row is None else row["challenge_id"]
+
     def chain_cursor(self) -> tuple[int, str] | None:
         row = self._connection.execute(
             "SELECT block_height, block_hash FROM chain_cursor WHERE singleton = 1"
@@ -468,6 +563,65 @@ class ChallengeStore:
         if row is None:
             return None
         return row["block_height"], row["block_hash"]
+
+    def admitted_challenge_ids(self, first_block: int, last_block: int) -> tuple[str, ...]:
+        """Return the immutable admitted group for one finalized block interval."""
+
+        if not 0 <= first_block <= last_block:
+            raise ValueError("challenge block interval is invalid")
+        rows = self._connection.execute(
+            """
+            SELECT c.challenge_id
+            FROM season_slots slot
+            JOIN challenges c ON c.challenge_id = slot.challenge_id
+            JOIN submissions s ON s.submission_id = c.submission_id
+            WHERE s.block_height BETWEEN ? AND ?
+            ORDER BY s.block_height, s.extrinsic_index, s.event_index
+            """,
+            (first_block, last_block),
+        ).fetchall()
+        return tuple(row["challenge_id"] for row in rows)
+
+    def confirmation_challenge_ids(
+        self, first_decision_block: int, last_decision_block: int
+    ) -> tuple[str, ...]:
+        """Return exact winners whose decision maps to one future batch interval."""
+
+        if not 0 <= first_decision_block <= last_decision_block:
+            raise ValueError("confirmation decision interval is invalid")
+        rows = self._connection.execute(
+            """
+            SELECT c.challenge_id
+            FROM challenges c
+            JOIN submissions s ON s.submission_id = c.submission_id
+            JOIN stage_scores score
+              ON score.challenge_id = c.challenge_id AND score.stage = ?
+            WHERE c.state = ? AND score.score_block BETWEEN ? AND ?
+            ORDER BY s.block_height, s.extrinsic_index, s.event_index
+            """,
+            (
+                ChallengeState.SCORING,
+                ChallengeState.CONFIRMING,
+                first_decision_block,
+                last_decision_block,
+            ),
+        ).fetchall()
+        return tuple(row["challenge_id"] for row in rows)
+
+    def challenge_ids_in_state(self, state: ChallengeState) -> tuple[str, ...]:
+        """Return challenges in canonical chain order for private batch planning."""
+
+        rows = self._connection.execute(
+            """
+            SELECT c.challenge_id
+            FROM challenges c
+            JOIN submissions s ON s.submission_id = c.submission_id
+            WHERE c.state = ?
+            ORDER BY s.block_height, s.extrinsic_index, s.event_index
+            """,
+            (state,),
+        ).fetchall()
+        return tuple(row["challenge_id"] for row in rows)
 
     def advance_chain_cursor(self, block_height: int, block_hash: str) -> bool:
         """Persist the next scanned finalized block, enforcing continuity."""
@@ -486,6 +640,20 @@ class ChallengeStore:
                     return False
                 if block_height != current_height + 1:
                     raise ValueError("chain cursor must advance by exactly one block")
+            known = self._connection.execute(
+                "SELECT block_hash FROM finalized_blocks WHERE block_height = ?",
+                (block_height,),
+            ).fetchone()
+            if known is not None and known["block_hash"] != block_hash:
+                raise RuntimeError("finalized block hash changed")
+            self._connection.execute(
+                """
+                INSERT INTO finalized_blocks (block_height, block_hash)
+                VALUES (?, ?)
+                ON CONFLICT(block_height) DO NOTHING
+                """,
+                (block_height, block_hash),
+            )
             self._connection.execute(
                 """
                 INSERT INTO chain_cursor (singleton, block_height, block_hash)
@@ -501,6 +669,17 @@ class ChallengeStore:
             self._connection.rollback()
             raise
         return True
+
+    def finalized_block_hash(self, block_height: int) -> str | None:
+        """Return the hash observed while scanning one finalized block."""
+
+        if type(block_height) is not int or block_height < 0:
+            raise ValueError("block height must be non-negative")
+        row = self._connection.execute(
+            "SELECT block_hash FROM finalized_blocks WHERE block_height = ?",
+            (block_height,),
+        ).fetchone()
+        return None if row is None else row["block_hash"]
 
     def add_submission(
         self,
@@ -565,13 +744,11 @@ class ChallengeStore:
                 raise RuntimeError("submissions must be inserted in finalized chain order")
 
             malformed = submission.repo_id is None or submission.revision is None
-            excluded = (
-                self._connection.execute(
-                    "SELECT 1 FROM competition_exclusions WHERE hotkey = ?",
-                    (submission.hotkey,),
-                ).fetchone()
-                is not None
-            )
+            exclusion = self._connection.execute(
+                "SELECT reason FROM competition_exclusions WHERE hotkey = ?",
+                (submission.hotkey,),
+            ).fetchone()
+            excluded = exclusion is not None
             previous_hotkey_submission = self._connection.execute(
                 """
                 SELECT submission_id FROM submissions
@@ -621,6 +798,7 @@ class ChallengeStore:
             terminal = (
                 ChallengeState.REJECTED_DUPLICATE_HOTKEY
                 if not first_for_hotkey
+                or (exclusion is not None and exclusion["reason"] == "RESERVED_UID0")
                 else ChallengeState.REJECTED_OTHER_COMPETITION
                 if excluded
                 else ChallengeState.MALFORMED_SUBMISSION
@@ -681,7 +859,7 @@ class ChallengeStore:
 
         return self._claim_next(
             worker_id,
-            stages=(ChallengeState.SCORING,),
+            stages=(ChallengeState.SCORING, ChallengeState.CONFIRMING),
             include_queued=False,
             strict_fifo=True,
             lease_ms=lease_ms,
@@ -882,6 +1060,7 @@ class ChallengeStore:
                 ChallengeState.FETCHING,
                 ChallengeState.VALIDATING,
                 ChallengeState.SCORING,
+                ChallengeState.CONFIRMING,
             }
             if current not in retryable:
                 raise ValueError("challenge is not in a retryable stage")
@@ -906,6 +1085,97 @@ class ChallengeStore:
                 (resume, retry_after_ms, identifier),
             )
             self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def block_leased(
+        self,
+        identifier: str,
+        lease_token: str,
+        *,
+        error_code: str,
+        error_summary: str,
+        occurred_at_ms: int | None = None,
+    ) -> None:
+        """Stop automatic retries without turning infrastructure failure into a loss."""
+
+        timestamp = _timestamp(occurred_at_ms)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._require_lease_locked(identifier, lease_token)
+            if current not in {
+                ChallengeState.FETCHING,
+                ChallengeState.VALIDATING,
+                ChallengeState.SCORING,
+                ChallengeState.CONFIRMING,
+            }:
+                raise ValueError("challenge is not in a blockable stage")
+            self._transition_locked(
+                identifier,
+                ChallengeState.SYSTEM_BLOCKED,
+                timestamp=timestamp,
+                error_code=error_code,
+                error_summary=error_summary,
+                details={"retry_exhausted": True, "blocked_stage": current},
+            )
+            self._connection.execute(
+                """
+                UPDATE challenges
+                SET lease_token = NULL, lease_expires_at_ms = NULL,
+                    resume_state = ?, retry_after_ms = NULL
+                WHERE challenge_id = ?
+                """,
+                (current, identifier),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def resume_blocked(
+        self,
+        identifier: str,
+        *,
+        occurred_at_ms: int | None = None,
+    ) -> ChallengeState:
+        """Explicitly return one visible infrastructure block to its failed stage."""
+
+        timestamp = _timestamp(occurred_at_ms)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT state, resume_state FROM challenges WHERE challenge_id = ?",
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(identifier)
+            if ChallengeState(row["state"]) is not ChallengeState.SYSTEM_BLOCKED:
+                raise ValueError("challenge is not blocked by infrastructure")
+            if row["resume_state"] is None:
+                raise ValueError("blocked challenge has no resumable stage")
+            target = ChallengeState(row["resume_state"])
+            require_transition(ChallengeState.SYSTEM_BLOCKED, target)
+            self._transition_locked(
+                identifier,
+                target,
+                timestamp=timestamp,
+                error_code=None,
+                error_summary=None,
+                details={"operator_retry": True},
+            )
+            self._connection.execute(
+                """
+                UPDATE challenges
+                SET attempts = 0, lease_token = NULL, lease_expires_at_ms = NULL,
+                    resume_state = NULL, retry_after_ms = NULL,
+                    error_code = NULL, error_summary = NULL
+                WHERE challenge_id = ?
+                """,
+                (identifier,),
+            )
+            self._connection.commit()
+            return target
         except Exception:
             self._connection.rollback()
             raise
@@ -996,7 +1266,7 @@ class ChallengeStore:
     ) -> bool:
         """Persist one aggregate stage result; exact replay is idempotent."""
 
-        if stage is not ChallengeState.SCORING:
+        if stage not in {ChallengeState.SCORING, ChallengeState.CONFIRMING}:
             raise ValueError("stage does not produce a score")
         if not isfinite(score) or not 0 <= score <= 1:
             raise ValueError("stage score is out of range")
@@ -1070,7 +1340,7 @@ class ChallengeStore:
         if row is None:
             return None
         recorded_stage = ChallengeState(row["stage"])
-        if recorded_stage is not ChallengeState.SCORING:
+        if recorded_stage not in {ChallengeState.SCORING, ChallengeState.CONFIRMING}:
             raise RuntimeError("stored score has an invalid stage")
         return RecordedStageScore(
             stage=recorded_stage,
@@ -1102,13 +1372,10 @@ class ChallengeStore:
         lease_token: str | None = None,
         score_block: int | None = None,
     ) -> None:
-        """Commit a scored terminal state and its leaderboard projection atomically."""
+        """Commit a terminal state and its decision block atomically."""
 
-        if target not in {
-            ChallengeState.SUCCEEDED,
-            ChallengeState.PARTICIPANT_FAILED,
-        }:
-            raise ValueError("target is not a scored terminal state")
+        if target not in TERMINAL_STATES:
+            raise ValueError("target is not terminal")
         if target is ChallengeState.SUCCEEDED:
             if final_score is None:
                 raise ValueError("successful challenge requires a score")
@@ -1309,15 +1576,30 @@ class ChallengeStore:
                         "DELETE FROM stage_scores WHERE challenge_id = ?",
                         (match.challenge_id,),
                     )
-                    if target is ChallengeState.SUCCEEDED:
-                        batch = evaluation["evaluation_batch"]
-                        metrics = {
-                            "incumbent_score": evaluation["incumbent_score"],
-                            "paired_gain_lower_bound": evaluation["paired_gain_lower_bound"],
-                            "cache_sha256": batch["sha256"],
-                            "cache_generated_block": batch["generated_block"],
-                            "cache_source_digest": batch["source_digest"],
-                        }
+                    stages = evaluation.get("stages", [])
+                    if target is ChallengeState.SUCCEEDED and not stages:
+                        stages = [
+                            {
+                                "stage": ChallengeState.SCORING,
+                                "score": evaluation["final_score"],
+                                "score_block": evaluation["score_block"],
+                                "incumbent_score": evaluation["incumbent_score"],
+                                "paired_gain_lower_bound": evaluation["paired_gain_lower_bound"],
+                                "evaluation_batch": evaluation["evaluation_batch"],
+                            }
+                        ]
+                    for index, stage in enumerate(stages):
+                        batch = stage.get("evaluation_batch")
+                        metrics = {}
+                        if batch is not None:
+                            metrics = {
+                                "incumbent_score": stage["incumbent_score"],
+                                "paired_gain_lower_bound": stage["paired_gain_lower_bound"],
+                                "cache_sha256": batch["sha256"],
+                                "cache_generated_block": batch["generated_block"],
+                                "cache_plan_digest": batch["plan_digest"],
+                                "cache_seed_block_hash": batch["seed_block_hash"],
+                            }
                         self._connection.execute(
                             """
                             INSERT INTO stage_scores (
@@ -1327,11 +1609,11 @@ class ChallengeStore:
                             """,
                             (
                                 match.challenge_id,
-                                ChallengeState.SCORING,
-                                evaluation["final_score"],
-                                evaluation["score_block"],
+                                stage["stage"],
+                                stage["score"],
+                                stage["score_block"],
                                 _json(metrics),
-                                row["created_at_ms"],
+                                row["created_at_ms"] + index,
                             ),
                         )
                 model_digest = evaluation["model_digest"]
@@ -1438,6 +1720,25 @@ class ChallengeStore:
             """,
             (row["challenge_id"],),
         ).fetchall()
+        stage_documents = []
+        for stage in stage_rows:
+            stage_metrics = json.loads(stage["metrics_json"])
+            document = {
+                "stage": stage["stage"],
+                "score": stage["score"],
+                "score_block": stage["score_block"],
+                "created_at_ms": stage["created_at_ms"],
+            }
+            if "cache_sha256" in stage_metrics:
+                document["evaluation_batch"] = {
+                    "sha256": stage_metrics["cache_sha256"],
+                    "generated_block": stage_metrics.get("cache_generated_block"),
+                    "plan_digest": stage_metrics.get("cache_plan_digest"),
+                    "seed_block_hash": stage_metrics.get("cache_seed_block_hash"),
+                }
+                document["incumbent_score"] = stage_metrics.get("incumbent_score")
+                document["paired_gain_lower_bound"] = stage_metrics.get("paired_gain_lower_bound")
+            stage_documents.append(document)
         paired = {}
         if stage_rows:
             metrics = json.loads(stage_rows[-1]["metrics_json"])
@@ -1448,7 +1749,7 @@ class ChallengeStore:
                     {
                         "sha256": metrics.get("cache_sha256"),
                         "generated_block": metrics.get("cache_generated_block"),
-                        "source_digest": metrics.get("cache_source_digest"),
+                        "plan_digest": metrics.get("cache_plan_digest"),
                         "seed_block_hash": metrics.get("cache_seed_block_hash"),
                     }
                     if "cache_sha256" in metrics
@@ -1479,15 +1780,7 @@ class ChallengeStore:
             "evaluation_batch": paired.get("evaluation_batch"),
             "created_at_ms": row["created_at_ms"],
             "updated_at_ms": row["updated_at_ms"],
-            "stages": [
-                {
-                    "stage": stage["stage"],
-                    "score": stage["score"],
-                    "score_block": stage["score_block"],
-                    "created_at_ms": stage["created_at_ms"],
-                }
-                for stage in stage_rows
-            ],
+            "stages": stage_documents,
             "events": [
                 {
                     "sequence": event["sequence"],

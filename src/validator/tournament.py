@@ -119,7 +119,7 @@ def challenge_from_match(document: Mapping[str, Any]) -> dict[str, Any]:
         "incumbent_score": evaluation.get("incumbent_score"),
         "paired_gain_lower_bound": evaluation.get("paired_gain_lower_bound"),
         "evaluation_batch": evaluation.get("evaluation_batch"),
-        "stages": [],
+        "stages": evaluation.get("stages", []),
     }
 
 
@@ -131,6 +131,7 @@ def validate_match_document(
     track_spec_digest: str,
     netuid: int,
     minimum_gain: float,
+    minimum_exact_gain: float | None = None,
     incumbent: Champion,
     minimum_generation_delay_blocks: int = 1,
 ) -> MatchRecord:
@@ -144,6 +145,7 @@ def validate_match_document(
         track_spec_digest=track_spec_digest,
         netuid=netuid,
         minimum_gain=minimum_gain,
+        minimum_exact_gain=minimum_gain if minimum_exact_gain is None else minimum_exact_gain,
         incumbent=incumbent,
         minimum_generation_delay_blocks=minimum_generation_delay_blocks,
     )
@@ -159,6 +161,7 @@ def resolve_tournament(
     track_spec_digest: str,
     netuid: int,
     minimum_gain: float,
+    minimum_exact_gain: float | None = None,
     initial_champion: Champion,
     minimum_generation_delay_blocks: int = 1,
 ) -> Tournament:
@@ -176,6 +179,9 @@ def resolve_tournament(
         raise ValueError("netuid must fit in an unsigned 16-bit integer")
     if not isfinite(minimum_gain) or not 0 < minimum_gain <= 1:
         raise ValueError("minimum gain must be within (0, 1]")
+    exact_gain = minimum_gain if minimum_exact_gain is None else minimum_exact_gain
+    if not isfinite(exact_gain) or not 0 < exact_gain <= 1:
+        raise ValueError("minimum exact gain must be within (0, 1]")
 
     if initial_champion.uid != 0 or initial_champion.source != "VEDA_BASELINE":
         raise ValueError("initial champion must be the UID0 VEDA baseline")
@@ -201,6 +207,7 @@ def resolve_tournament(
             track_spec_digest=track_spec_digest.lower(),
             netuid=netuid,
             minimum_gain=minimum_gain,
+            minimum_exact_gain=exact_gain,
             incumbent=champion,
             minimum_generation_delay_blocks=minimum_generation_delay_blocks,
         )
@@ -246,6 +253,7 @@ def _resolve_match(
     track_spec_digest: str,
     netuid: int,
     minimum_gain: float,
+    minimum_exact_gain: float,
     incumbent: Champion,
     minimum_generation_delay_blocks: int,
 ) -> tuple[MatchRecord, Champion]:
@@ -264,6 +272,11 @@ def _resolve_match(
     model_size_bytes = _optional_integer(challenge.get("model_size_bytes"), "model_size_bytes")
     before = incumbent
     score_gain: float | None = None
+    stages = _evaluation_stages(
+        challenge.get("stages", []),
+        submission_block=position.block,
+        minimum_delay_blocks=minimum_generation_delay_blocks,
+    )
 
     if state is ChallengeState.SUCCEEDED:
         if repo_id is None or revision is None:
@@ -277,16 +290,51 @@ def _resolve_match(
         score = _score(challenge.get("final_score"), "final_score")
         candidate = Champion(identifier, hotkey, repo_id, revision, score, position)
         incumbent_score = _score(challenge.get("incumbent_score"), "incumbent_score")
+        score_block = _integer(challenge["score_block"], "score_block")
         batch = _evaluation_batch(
             challenge.get("evaluation_batch"),
             submission_block=position.block,
             minimum_delay_blocks=minimum_generation_delay_blocks,
         )
+        if score_block < batch["generated_block"]:
+            raise ValueError("decision block cannot precede its evaluation batch")
+        stage_batches = [
+            stage["evaluation_batch"] for stage in stages if "evaluation_batch" in stage
+        ]
+        if stage_batches and stage_batches[-1] != batch:
+            raise ValueError("final evaluation batch does not match the last scored stage")
         score_gain = _gain(
             challenge.get("paired_gain_lower_bound"),
             "paired_gain_lower_bound",
         )
-        if score_gain >= minimum_gain:
+        if not stages:
+            raise ValueError("successful challenge is missing its exact stage")
+        exact_stage = stages[0]
+        exact_gain = exact_stage.get("paired_gain_lower_bound")
+        if exact_gain is None:
+            raise ValueError("exact stage is missing its paired gain")
+        if len(stages) == 1 and exact_gain > minimum_exact_gain:
+            raise ValueError("an exact-stage promotion requires full-video confirmation")
+        if len(stages) == 2:
+            confirmation = stages[1]
+            if exact_gain <= minimum_exact_gain:
+                raise ValueError("full-video confirmation did not clear the exact gate")
+            exact_batch = exact_stage.get("evaluation_batch")
+            confirmation_batch = confirmation.get("evaluation_batch")
+            if exact_batch is None or confirmation_batch is None:
+                raise ValueError("both scoring stages must identify their evaluation batch")
+            if confirmation_batch["generated_block"] <= exact_stage["score_block"]:
+                raise ValueError("confirmation batch must be generated after the exact decision")
+            if confirmation["score_block"] < confirmation_batch["generated_block"]:
+                raise ValueError("confirmation decision predates its evaluation batch")
+        final_stage = stages[-1]
+        if (
+            final_stage["score"] != score
+            or final_stage.get("incumbent_score") != incumbent_score
+            or final_stage.get("paired_gain_lower_bound") != score_gain
+        ):
+            raise ValueError("final score does not match the last completed stage")
+        if score_gain > minimum_gain:
             outcome = MatchOutcome.CHALLENGER_WON
             incumbent = candidate
         else:
@@ -323,10 +371,11 @@ def _resolve_match(
         "paired_gain_lower_bound": score_gain,
         "evaluation_batch": batch,
         "model_object": (
-            f"models/{track_id}/{file_sha256}.safetensors"
+            f"models/{track_id}/{file_sha256}/manifest.json"
             if state is ChallengeState.SUCCEEDED
             else None
         ),
+        "stages": stages,
     }
     document = {
         "track_id": track_id,
@@ -445,28 +494,78 @@ def _evaluation_batch(
     expected = {
         "sha256",
         "generated_block",
-        "source_digest",
+        "plan_digest",
         "seed_block_hash",
     }
     if not isinstance(value, Mapping) or set(value) not in (expected, expected | {"object"}):
         raise ValueError("evaluation_batch fields are invalid")
     sha256 = _optional_digest(value["sha256"], "evaluation batch sha256")
-    source_digest = _optional_digest(value["source_digest"], "evaluation batch source_digest")
+    plan_digest = _optional_digest(value["plan_digest"], "evaluation batch plan_digest")
     generated_block = _integer(value["generated_block"], "evaluation batch generated_block")
     if generated_block < submission_block + minimum_delay_blocks:
         raise ValueError("evaluation batch predates the submission boundary")
-    assert sha256 is not None and source_digest is not None
+    assert sha256 is not None and plan_digest is not None
     seed_block_hash = _block_hash(value["seed_block_hash"])
-    object_name = f"batches/{sha256}.npz"
+    object_name = f"batches/{sha256}/manifest.json"
     if "object" in value and value["object"] != object_name:
         raise ValueError("evaluation batch object name is invalid")
     return {
         "sha256": sha256,
         "generated_block": generated_block,
-        "source_digest": source_digest,
+        "plan_digest": plan_digest,
         "seed_block_hash": seed_block_hash,
         "object": object_name,
     }
+
+
+def _evaluation_stages(
+    value: Any,
+    *,
+    submission_block: int,
+    minimum_delay_blocks: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("evaluation stages must be a list")
+    result = []
+    seen = set()
+    for row in value:
+        if not isinstance(row, Mapping):
+            raise ValueError("evaluation stage must be an object")
+        stage = ChallengeState(_required_string(row, "stage"))
+        if stage not in {ChallengeState.SCORING, ChallengeState.CONFIRMING} or stage in seen:
+            raise ValueError("evaluation stage order is invalid")
+        if stage is ChallengeState.SCORING and seen:
+            raise ValueError("exact stage must precede confirmation")
+        if stage is ChallengeState.CONFIRMING and ChallengeState.SCORING not in seen:
+            raise ValueError("confirmation stage requires an exact stage")
+        seen.add(stage)
+        score = _score(row.get("score"), "stage score")
+        score_block = _integer(row.get("score_block"), "stage score_block")
+        document: dict[str, Any] = {
+            "score": score,
+            "score_block": score_block,
+            "stage": stage,
+        }
+        if row.get("evaluation_batch") is not None:
+            batch = _evaluation_batch(
+                row["evaluation_batch"],
+                submission_block=submission_block,
+                minimum_delay_blocks=minimum_delay_blocks,
+            )
+            if score_block < batch["generated_block"]:
+                raise ValueError("stage decision block cannot precede its evaluation batch")
+            document.update(
+                {
+                    "evaluation_batch": batch,
+                    "incumbent_score": _score(row.get("incumbent_score"), "stage incumbent_score"),
+                    "paired_gain_lower_bound": _gain(
+                        row.get("paired_gain_lower_bound"),
+                        "stage paired_gain_lower_bound",
+                    ),
+                }
+            )
+        result.append(document)
+    return result
 
 
 def _block_hash(value: Any) -> str:

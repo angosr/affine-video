@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +16,8 @@ from validator.scan import (
     submission_from_commitment,
 )
 from validator.store import ChallengeStore
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +75,7 @@ async def scan_finalized_blocks(
         if reveals:
             snapshot = await client.at(block_height)
             current_commitments = await snapshot.subnets.commitments(netuid)
-            by_hotkey = {getattr(item, "hotkey", None): item for item in current_commitments or ()}
+            by_hotkey = _commitments_by_hotkey(current_commitments)
             for reveal in reveals:
                 item = by_hotkey.get(reveal.hotkey)
                 values = getattr(item, "revealed", ()) if item is not None else ()
@@ -82,9 +86,17 @@ async def scan_finalized_blocks(
                 ]
                 matching = [payload for payload in matching if payload is not None]
                 if len(matching) != 1:
-                    raise RuntimeError(
-                        "commitment reveal plaintext is missing or ambiguous in finalized storage"
+                    LOGGER.warning(
+                        "skipping unmatched finalized commitment reveal",
+                        extra={
+                            "block_height": block_height,
+                            "event_index": reveal.position.event_index,
+                            "hotkey": reveal.hotkey,
+                            "matching_plaintexts": len(matching),
+                            "netuid": netuid,
+                        },
                     )
+                    continue
                 commitments.append(
                     ChainCommitment(
                         reveal.hotkey,
@@ -161,11 +173,8 @@ async def seed_legacy_exclusions(
             block, value = item
             if type(block) is not int or block < 0 or block > before_block:
                 continue
-            if isinstance(value, str):
-                payload = value.encode("utf-8")
-            elif isinstance(value, (bytes, bytearray)):
-                payload = bytes(value)
-            else:
+            payload = revealed_payload(value)
+            if payload is None:
                 continue
             if not payload.startswith(LEGACY_ACTIVATION_PREFIX):
                 continue
@@ -173,3 +182,26 @@ async def seed_legacy_exclusions(
                 exclusions[hotkey] = min(block, exclusions.get(hotkey, block))
     store.seed_legacy_exclusions(exclusions)
     return len(exclusions)
+
+
+def _commitments_by_hotkey(value: Any) -> dict[str, Any]:
+    """Normalize the SDK's mapping shape and older sequence-shaped fixtures."""
+
+    if isinstance(value, Mapping):
+        rows = value.items()
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        rows = ((getattr(item, "hotkey", None), item) for item in value)
+    else:
+        LOGGER.warning("commitment snapshot has an unsupported shape")
+        return {}
+    result: dict[str, Any] = {}
+    for key, item in rows:
+        hotkey = getattr(item, "hotkey", key)
+        if not isinstance(hotkey, str) or not hotkey or hotkey != key:
+            LOGGER.warning("skipping commitment snapshot row with inconsistent hotkey")
+            continue
+        if hotkey in result:
+            LOGGER.warning("skipping duplicate commitment snapshot row", extra={"hotkey": hotkey})
+            continue
+        result[hotkey] = item
+    return result

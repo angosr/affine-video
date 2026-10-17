@@ -1,219 +1,179 @@
 import hashlib
-import json
 
 import numpy as np
 import pytest
 
 from scoring.cache import (
     CacheLoadError,
+    ExactCacheReader,
+    assemble_exact_cache_batch,
     inspect_exact_cache_batch,
-    load_exact_cache,
     select_exact_cache_batch,
     validate_exact_cache,
     write_exact_cache_batch,
 )
+from scoring.evaluate import reference_attention
 from scoring.exact import ExactCase
 
 
-def digest(path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def metadata(value: dict) -> np.ndarray:
-    return np.frombuffer(
-        json.dumps(value, sort_keys=True, separators=(",", ":")).encode(), dtype=np.uint8
+def exact_case(route: str, rollout: str, step: int) -> ExactCase:
+    generator = np.random.default_rng(step + int(rollout[-1]))
+    q = generator.normal(size=(2, 2, 2)).astype(np.float32)
+    k = generator.normal(size=(3, 2, 2)).astype(np.float32)
+    v = generator.normal(size=(3, 2, 2)).astype(np.float32)
+    dense = reference_attention(q, k, v, np.ones((2, 3), dtype=np.bool_))
+    return ExactCase(
+        route=route,
+        stratum="all",
+        rollout_id=rollout,
+        source_id=rollout.replace("rollout", "source"),
+        step_index=step,
+        step_window="early" if step == 0 else "late",
+        scheduler_timestep=float(step),
+        sigma=1.0 - step * 0.5,
+        tile_plan_hash="12" * 32,
+        query_tile_ids=(0, 1),
+        q=q,
+        k=k,
+        v=v,
+        dense=dense,
+        query_valid_counts=np.full(2, 2, dtype=np.int16),
+        key_valid_counts=np.full(3, 2, dtype=np.int16),
+        key_segments=np.zeros(3, dtype=np.int8),
+        required_keys=np.array([[True, False, False], [False, True, False]], dtype=np.bool_),
+        epsilon=1e-6,
     )
 
 
-def test_loads_exact_cache_and_rejects_digest_or_decoded_size(tmp_path) -> None:
-    path = tmp_path / "exact.npz"
-    np.savez(
-        path,
-        metadata=metadata(
-            {
-                "format": "veda-exact-cache",
-                "generated_block": 120,
-                "source_digest": "12" * 32,
-                "seed_block_hash": "0x" + "ab" * 32,
-                "cases": [
-                    {"route": "route0", "stratum": "all", "sample_id": "sample0", "epsilon": 1e-6}
-                ],
-            }
-        ),
-        case_000000_q=np.ones((2, 2, 2), dtype=np.float32),
-        case_000000_k=np.ones((3, 2, 2), dtype=np.float32),
-        case_000000_v=np.ones((3, 2, 2), dtype=np.float32),
-        case_000000_dense=np.ones((2, 2, 2), dtype=np.float32),
-        case_000000_valid_keys=np.ones(3, dtype=np.bool_),
-        case_000000_required_keys=np.array(
-            [[True, False, False], [False, True, False]], dtype=np.bool_
-        ),
+def write_batch(tmp_path):
+    cases = tuple(
+        exact_case(route, rollout, step)
+        for route in ("route-0", "route-1")
+        for rollout in ("rollout-0", "rollout-1")
+        for step in (0, 1)
     )
-
-    cases = load_exact_cache(path, expected_sha256=digest(path), max_bytes=100_000)
-    validate_exact_cache(
-        path,
-        expected_sha256=digest(path),
-        max_bytes=100_000,
-        min_blocks=1,
-        max_blocks=3,
-        head_dim=2,
-        routes=("route0",),
-        strata={"all": 1.0},
-        sample_count=1,
-    )
-
-    assert len(cases) == 1
-    assert cases[0].epsilon == 1e-6
-    batch = inspect_exact_cache_batch(path, max_bytes=100_000)
-    assert batch.generated_block == 120
-    assert batch.source_digest == "12" * 32
-    with pytest.raises(CacheLoadError, match="maximum block budget"):
-        validate_exact_cache(
-            path,
-            expected_sha256=digest(path),
-            max_bytes=100_000,
-            min_blocks=1,
-            max_blocks=4,
-            head_dim=2,
-            routes=("route0",),
-            strata={"all": 1.0},
-            sample_count=1,
-        )
-    with pytest.raises(CacheLoadError, match="array headers"):
-        validate_exact_cache(
-            path,
-            expected_sha256=digest(path),
-            max_bytes=100_000,
-            min_blocks=1,
-            max_blocks=3,
-            head_dim=3,
-            routes=("route0",),
-            strata={"all": 1.0},
-            sample_count=1,
-        )
-    with pytest.raises(CacheLoadError, match="sha256"):
-        load_exact_cache(path, expected_sha256="00" * 32, max_bytes=100_000)
-    with pytest.raises(CacheLoadError, match="decoded size"):
-        load_exact_cache(path, expected_sha256=digest(path), max_bytes=1)
-
-
-def test_exact_cache_rejects_unknown_route_and_insufficient_cases(tmp_path) -> None:
-    path = tmp_path / "exact.npz"
-    np.savez(
-        path,
-        metadata=metadata(
-            {
-                "format": "veda-exact-cache",
-                "generated_block": 120,
-                "source_digest": "12" * 32,
-                "seed_block_hash": "0x" + "ab" * 32,
-                "cases": [
-                    {"route": "route0", "stratum": "all", "sample_id": "sample0", "epsilon": 1e-6}
-                ],
-            }
-        ),
-        case_000000_q=np.ones((1, 2, 2), dtype=np.float32),
-        case_000000_k=np.ones((2, 2, 2), dtype=np.float32),
-        case_000000_v=np.ones((2, 2, 2), dtype=np.float32),
-        case_000000_dense=np.ones((1, 2, 2), dtype=np.float32),
-        case_000000_valid_keys=np.ones(2, dtype=np.bool_),
-        case_000000_required_keys=np.array([[True, False]], dtype=np.bool_),
-    )
-    arguments = {
-        "expected_sha256": digest(path),
-        "max_bytes": 100_000,
-        "min_blocks": 1,
-        "max_blocks": 1,
-        "head_dim": 2,
-        "strata": {"all": 1.0},
-    }
-
-    with pytest.raises(CacheLoadError, match="unknown selector route"):
-        validate_exact_cache(path, routes=("other",), sample_count=1, **arguments)
-    with pytest.raises(CacheLoadError, match="case count"):
-        validate_exact_cache(path, routes=("route0", "missing"), sample_count=2, **arguments)
-    with pytest.raises(CacheLoadError, match="case count"):
-        validate_exact_cache(
-            path,
-            routes=("route0",),
-            expected_sha256=digest(path),
-            max_bytes=100_000,
-            min_blocks=1,
-            max_blocks=1,
-            head_dim=2,
-            strata={"all": 0.5, "missing": 0.5},
-            sample_count=2,
-        )
-
-
-def test_cache_batch_must_be_generated_after_submission(tmp_path) -> None:
-    temporary = tmp_path / "temporary"
-    np.savez(
-        temporary,
-        metadata=metadata(
-            {
-                "format": "veda-exact-cache",
-                "generated_block": 120,
-                "source_digest": "34" * 32,
-                "seed_block_hash": "0x" + "ab" * 32,
-                "cases": [
-                    {"route": "route0", "stratum": "all", "sample_id": "sample0", "epsilon": 1e-6}
-                ],
-            }
-        ),
-        case_000000_q=np.ones((1, 2, 2), dtype=np.float32),
-        case_000000_k=np.ones((2, 2, 2), dtype=np.float32),
-        case_000000_v=np.ones((2, 2, 2), dtype=np.float32),
-        case_000000_dense=np.ones((1, 2, 2), dtype=np.float32),
-        case_000000_valid_keys=np.ones(2, dtype=np.bool_),
-        case_000000_required_keys=np.array([[True, False]], dtype=np.bool_),
-    )
-    temporary = temporary.with_suffix(".npz")
-    path = tmp_path / f"120-{digest(temporary)}.npz"
-    temporary.rename(path)
-    arguments = {
-        "directory": tmp_path,
-        "minimum_delay_blocks": 1,
-        "track_start_block": 100,
-        "generation_interval_blocks": 20,
-        "max_bytes": 100_000,
-        "min_blocks": 1,
-        "max_blocks": 1,
-        "head_dim": 2,
-        "routes": ("route0",),
-        "strata": {"all": 1.0},
-        "sample_count": 1,
-    }
-
-    selected = select_exact_cache_batch(submission_block=119, **arguments)
-    assert selected.path == path
-    with pytest.raises(CacheLoadError, match="scheduled"):
-        select_exact_cache_batch(submission_block=120, **arguments)
-
-
-def test_cache_batch_writer_is_atomic_and_self_identifying(tmp_path) -> None:
-    case = ExactCase(
-        "route0",
-        "all",
-        np.ones((1, 2, 2), dtype=np.float32),
-        np.ones((2, 2, 2), dtype=np.float32),
-        np.ones((2, 2, 2), dtype=np.float32),
-        np.ones((1, 2, 2), dtype=np.float32),
-        np.ones(2, dtype=np.bool_),
-        np.array([[True, False]], dtype=np.bool_),
-        1e-6,
-        "sample0",
-    )
-
-    batch = write_exact_cache_batch(
+    return write_exact_cache_batch(
         tmp_path,
-        (case,),
-        generated_block=200,
-        source_digest="56" * 32,
+        cases,
+        generated_block=120,
         seed_block_hash="0x" + "ab" * 32,
+        plan_digest="23" * 32,
+        track_spec_digest="34" * 32,
+        artifact_manifest_sha256="45" * 32,
+        source_pool_merkle_root="56" * 32,
+        source_proofs=({"source_id": "source-0"},),
+        dense_references=({"video_sha256": "67" * 32},),
     )
 
-    assert batch.path.name == f"200-{batch.sha256}.npz"
-    assert sorted(path.name for path in tmp_path.iterdir()) == [batch.path.name]
-    assert inspect_exact_cache_batch(batch.path, max_bytes=100_000) == batch
+
+def validation_arguments(batch):
+    return {
+        "expected_sha256": batch.sha256,
+        "expected_track_spec_digest": "34" * 32,
+        "max_bytes": 1_000_000,
+        "head_dim": 2,
+        "tile_size": 2,
+        "routes": ("route-0", "route-1", "route-2"),
+        "strata": {"all": 1.0},
+        "sampled_route_count": 2,
+        "rollouts_per_stratum": 2,
+        "sampled_step_count": 2,
+        "query_tiles_per_case": 2,
+    }
+
+
+def test_cache_v2_is_self_identifying_and_streams_cases(tmp_path) -> None:
+    batch = write_batch(tmp_path)
+
+    validate_exact_cache(batch.path, **validation_arguments(batch))
+    inspected = inspect_exact_cache_batch(batch.path, max_bytes=1_000_000)
+    assert inspected == batch
+    assert batch.path.name == f"120-{batch.sha256}.npz"
+    with ExactCacheReader(
+        batch.path,
+        expected_sha256=batch.sha256,
+        max_bytes=1_000_000,
+    ) as reader:
+        cases = list(reader)
+    assert len(cases) == 8
+    assert all(case.q.dtype == np.float16 for case in cases)
+    assert cases[0].route == "route-0"
+
+
+def test_cache_rejects_wrong_digest_track_or_decoded_limit(tmp_path) -> None:
+    batch = write_batch(tmp_path)
+    arguments = validation_arguments(batch)
+
+    with pytest.raises(CacheLoadError, match="different track"):
+        validate_exact_cache(
+            batch.path,
+            **{**arguments, "expected_track_spec_digest": "00" * 32},
+        )
+    with pytest.raises(CacheLoadError, match="SHA-256"):
+        ExactCacheReader(batch.path, expected_sha256="00" * 32, max_bytes=1_000_000)
+    with pytest.raises(CacheLoadError, match="decoded size"):
+        ExactCacheReader(batch.path, expected_sha256=batch.sha256, max_bytes=1)
+
+
+def test_selects_only_the_scheduled_generation_batch(tmp_path) -> None:
+    batch = write_batch(tmp_path)
+    arguments = validation_arguments(batch)
+    arguments.pop("expected_sha256")
+    selected = select_exact_cache_batch(
+        tmp_path,
+        submission_block=119,
+        minimum_delay_blocks=1,
+        track_start_block=100,
+        generation_interval_blocks=20,
+        **arguments,
+    )
+
+    assert selected == batch
+    with pytest.raises(CacheLoadError, match="scheduled"):
+        select_exact_cache_batch(
+            tmp_path,
+            submission_block=120,
+            minimum_delay_blocks=1,
+            track_start_block=100,
+            generation_interval_blocks=20,
+            **arguments,
+        )
+
+
+def test_written_file_digest_matches_batch_identity(tmp_path) -> None:
+    batch = write_batch(tmp_path)
+    digest = hashlib.sha256(batch.path.read_bytes()).hexdigest()
+    assert digest == batch.sha256
+
+
+def test_rollout_shards_assemble_without_loading_the_complete_batch(tmp_path) -> None:
+    cases = tuple(
+        exact_case(route, rollout, step)
+        for route in ("route-0", "route-1")
+        for rollout in ("rollout-0", "rollout-1")
+        for step in (0, 1)
+    )
+    common = {
+        "seed_block_hash": "0x" + "ab" * 32,
+        "plan_digest": "23" * 32,
+        "track_spec_digest": "34" * 32,
+        "artifact_manifest_sha256": "45" * 32,
+        "source_pool_merkle_root": "56" * 32,
+        "source_proofs": (),
+        "dense_references": (),
+    }
+    first = write_exact_cache_batch(tmp_path / "first", cases[:4], generated_block=120, **common)
+    second = write_exact_cache_batch(tmp_path / "second", cases[4:], generated_block=120, **common)
+
+    assembled = assemble_exact_cache_batch(
+        tmp_path / "assembled",
+        (first.path, second.path),
+        generated_block=120,
+        **common,
+    )
+
+    validate_exact_cache(assembled.path, **validation_arguments(assembled))
+    with ExactCacheReader(
+        assembled.path, expected_sha256=assembled.sha256, max_bytes=1_000_000
+    ) as reader:
+        assert len(list(reader)) == 8

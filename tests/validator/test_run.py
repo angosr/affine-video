@@ -66,6 +66,8 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
         netuid=120,
         track_start_block=100,
         publication_grace_blocks=1,
+        maximum_effective_challenges=10,
+        maximum_generation_batches=10,
         model=SimpleNamespace(
             max_bytes=1_000,
             tensor_schema={},
@@ -77,11 +79,12 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
             generation_interval_blocks=1,
         ),
         scoring=SimpleNamespace(
-            budgets=[SimpleNamespace(blocks=1)],
+            budgets=[SimpleNamespace(target_blocks=1)],
             stratum_weight_map={"stratum": 1.0},
-            sample_count=1,
+            case_count=1,
         ),
-        initial_champion=SimpleNamespace(),
+        initial_champion=SimpleNamespace(hotkey="uid0-hotkey"),
+        last_submission_block=1_000,
     )
     attempts = 0
     clients = 0
@@ -131,6 +134,7 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
                 archive_endpoints=None,
                 worker_id="worker",
                 publisher=Publisher(),
+                alert_webhook_url="https://alerts.example/veda",
                 report=report,
             )
         )
@@ -277,6 +281,14 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
     file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
     payload = ModelSubmission("owner/model", "12" * 20).encode()
     client = FakeClient({100: chain_block(payload, 100), 101: empty_chain_block(101)})
+    finalized_reads = 0
+
+    async def advancing_finalized_block():
+        nonlocal finalized_reads
+        finalized_reads += 1
+        return 350 if finalized_reads >= 3 else 101
+
+    client.finalized_block = advancing_finalized_block
     database = tmp_path / "validator.db"
     downloads = 0
 
@@ -294,7 +306,7 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
                 "paired_gain_lower_bound": 0.4,
                 "cache_sha256": "de" * 32,
                 "cache_generated_block": 101,
-                "cache_source_digest": "ef" * 32,
+                "cache_plan_digest": "ef" * 32,
                 "cache_seed_block_hash": "0x" + "ab" * 32,
             },
         )
@@ -326,6 +338,7 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
             track_spec_digest="ab" * 32,
             netuid=7,
             minimum_gain=0.001,
+            minimum_exact_gain=0.5,
             initial_champion=Champion(
                 "genesis",
                 "genesis-hotkey",
@@ -349,6 +362,8 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
     assert cycle.scoring.state is ChallengeState.SUCCEEDED
     assert challenge["state"] == ChallengeState.SUCCEEDED
     assert challenge["final_score"] == pytest.approx(0.9)
+    assert challenge["score_block"] == 350
+    assert cycle.finalized_block == 350
     assert [stage["stage"] for stage in challenge["stages"]] == [ChallengeState.SCORING]
     assert [event["state"] for event in challenge["events"]] == [
         ChallengeState.QUEUED,
@@ -361,3 +376,58 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
     assert plan.hotkeys == (HOTKEY,)
     assert plan.uids == (4,)
     assert plan.weights == (1.0,)
+
+
+def test_cycle_releases_scoring_lease_when_fresh_finalized_head_is_unavailable(tmp_path) -> None:
+    model_path = tmp_path / "selector.safetensors"
+    save_file(
+        {"selector.weight": np.ones((2, 3), dtype=np.float32)},
+        model_path,
+        metadata={"hotkey": HOTKEY},
+    )
+    file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    client = FakeClient({100: chain_block(payload, 100), 101: empty_chain_block(101)})
+    finalized_reads = 0
+
+    async def failing_finalized_block():
+        nonlocal finalized_reads
+        finalized_reads += 1
+        if finalized_reads >= 3:
+            raise RuntimeError("chain head unavailable")
+        return 101
+
+    client.finalized_block = failing_finalized_block
+
+    with ChallengeStore(tmp_path / "validator.db", track_spec_digest="ab" * 32) as store:
+        cycle = asyncio.run(
+            process_cycle(
+                client,
+                store,
+                netuid=7,
+                track_start_block=100,
+                admission_settings=AdmissionSettings(
+                    cache_dir=tmp_path / "cache",
+                    max_model_bytes=10_000,
+                    tensor_schema={"selector.weight": TensorSpec((2, 3), "float32")},
+                    publication_grace_blocks=1,
+                ),
+                scoring_settings=ScoringSettings(retry_base_ms=10, retry_max_ms=10),
+                evaluator=lambda _task: StageOutcome(0.7, {"stage": "scoring"}),
+                worker_id="validator-a",
+                downloader=lambda *_args, **_kwargs: DownloadedModel(
+                    model_path,
+                    file_digest,
+                    model_path.stat().st_size,
+                    None,
+                    None,
+                ),
+            )
+        )
+
+        assert cycle.scoring is not None
+        assert cycle.scoring.state is ChallengeState.SYSTEM_DEFERRED
+        assert cycle.scoring.code == "FINALIZED_HEAD_UNAVAILABLE"
+        challenge = store.get_challenge(cycle.scoring.challenge_id)
+        assert challenge.state is ChallengeState.SYSTEM_DEFERRED
+        assert store.claim_next_scoring("recovery", lease_ms=100, now_ms=10**18) is not None

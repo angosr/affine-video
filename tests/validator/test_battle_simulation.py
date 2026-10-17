@@ -23,6 +23,7 @@ class MissingObject(Exception):
 class MemoryS3:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.metadata: dict[str, dict] = {}
 
     def get_object(self, *, Bucket, Key):
         del Bucket
@@ -32,6 +33,16 @@ class MemoryS3:
 
     def put_object(self, **kwargs) -> None:
         self.objects[kwargs["Key"]] = kwargs["Body"]
+        self.metadata[kwargs["Key"]] = kwargs.get("Metadata", {})
+
+    def head_object(self, *, Bucket, Key):
+        del Bucket
+        if Key not in self.objects:
+            raise MissingObject
+        return {
+            "ContentLength": len(self.objects[Key]),
+            "Metadata": self.metadata.get(Key, {}),
+        }
 
 
 def challenge(
@@ -44,6 +55,54 @@ def challenge(
     paired_gain: float | None = None,
     error_code: str | None = None,
 ) -> dict:
+    gain = (
+        paired_gain
+        if paired_gain is not None
+        else score - incumbent_score
+        if score is not None and incumbent_score is not None
+        else None
+    )
+    exact_batch = {
+        "sha256": f"{sequence + 100:064x}",
+        "generated_block": 200 + sequence,
+        "plan_digest": f"{sequence + 200:064x}",
+        "seed_block_hash": "0x" + "ab" * 32,
+    }
+    confirmation_batch = {
+        "sha256": f"{sequence + 300:064x}",
+        "generated_block": 230 + sequence,
+        "plan_digest": f"{sequence + 400:064x}",
+        "seed_block_hash": "0x" + "cd" * 32,
+    }
+    stages = []
+    final_batch = None
+    final_block = 200 + sequence
+    if score is not None:
+        stages = [
+            {
+                "stage": "SCORING",
+                "score": score,
+                "score_block": 220 + sequence,
+                "incumbent_score": incumbent_score,
+                "paired_gain_lower_bound": gain,
+                "evaluation_batch": exact_batch,
+            }
+        ]
+        final_batch = exact_batch
+        final_block = 220 + sequence
+        if gain is not None and gain > 0.01:
+            stages.append(
+                {
+                    "stage": "CONFIRMING",
+                    "score": score,
+                    "score_block": 240 + sequence,
+                    "incumbent_score": incumbent_score,
+                    "paired_gain_lower_bound": gain,
+                    "evaluation_batch": confirmation_batch,
+                }
+            )
+            final_batch = confirmation_batch
+            final_block = 240 + sequence
     return {
         "challenge_id": f"challenge-{sequence}",
         "submission_id": f"submission-{sequence}",
@@ -63,38 +122,24 @@ def challenge(
         "track_spec_digest": None,
         "final_score": score,
         "incumbent_score": incumbent_score,
-        "paired_gain_lower_bound": (
-            paired_gain
-            if paired_gain is not None
-            else score - incumbent_score
-            if score is not None and incumbent_score is not None
-            else None
-        ),
-        "evaluation_batch": (
-            {
-                "sha256": f"{sequence + 100:064x}",
-                "generated_block": 200 + sequence,
-                "source_digest": f"{sequence + 200:064x}",
-                "seed_block_hash": "0x" + "ab" * 32,
-            }
-            if score is not None
-            else None
-        ),
-        "score_block": 200 + sequence if score is not None else 200 + sequence,
+        "paired_gain_lower_bound": gain,
+        "evaluation_batch": final_batch,
+        "score_block": final_block,
         "created_at_ms": sequence,
         "updated_at_ms": sequence,
-        "stages": [],
+        "stages": stages,
         "events": [],
     }
 
 
-def test_complete_fifo_battle_publication_recovery_and_weight_switch() -> None:
+def test_complete_fifo_battle_publication_recovery_and_weight_switch(tmp_path) -> None:
     raw = valid_spec()
     raw["track_id"] = "veda-sn120"
     raw["netuid"] = 120
     raw["initial_champion"]["hotkey"] = "uid0"
     raw["initial_champion"]["score"] = 0.5
     raw["scoring"]["minimum_frontier_gain"] = 0.01
+    raw["full_video"]["minimum_gain"] = 0.01
     track = parse_track_spec(raw)
     challenges = [
         challenge(1, "alice", state="SUCCEEDED", score=0.6, incumbent_score=0.5),
@@ -130,6 +175,7 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch() -> None:
         chain_cursor=lambda: (300, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": challenges},
         active_competitors=lambda _mapping: competitors,
+        model_path=lambda _challenge_id: None,
     )
     chain = WeightChainState(
         300,
@@ -179,6 +225,25 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch() -> None:
     assert rows["dave"]["champion"] is True
     assert rows["bob"]["outcome"] == "CHAMPION_RETAINED"
     assert rows["carol"]["outcome"] == "CHALLENGE_FAILED"
+
+    restored = tmp_path / "restored.safetensors"
+    resolved = []
+
+    def restore_model(sha256, size_bytes):
+        resolved.append((sha256, size_bytes))
+        return restored
+
+    with_files = build_public_artifacts(
+        store,
+        track,
+        chain,
+        version_key=1,
+        exact_cache_dir=tmp_path,
+        model_resolver=restore_model,
+    )
+    assert with_files is not None
+    assert resolved == [("ab" * 32, 550_000_000)] * 2
+    assert sum(item.object_name.startswith("models/") for item in with_files.files) == 1
 
     remote = MemoryS3()
     repository = S3Repository(remote, bucket="public-data", prefix="tracks/main")

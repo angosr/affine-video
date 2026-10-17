@@ -22,6 +22,7 @@ class AdmissionStatus(StrEnum):
     ACCEPTED = "ACCEPTED"
     FAILED = "FAILED"
     DEFERRED = "DEFERRED"
+    BLOCKED = "BLOCKED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,9 +31,14 @@ class AdmissionSettings:
     max_model_bytes: int
     tensor_schema: Mapping[str, TensorSpec]
     publication_grace_blocks: int
+    maximum_effective_challenges: int | None = None
+    last_submission_block: int | None = None
     lease_ms: int = 5 * 60 * 1000
     retry_base_ms: int = 30 * 1000
     retry_max_ms: int = 30 * 60 * 1000
+    max_attempts: int = 5
+    alert: Callable[[str, Mapping[str, object]], None] | None = None
+    archive: Callable[[str | Path, str, int], None] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -41,10 +47,15 @@ class AdmissionSettings:
                 self.lease_ms,
                 self.retry_base_ms,
                 self.retry_max_ms,
+                self.max_attempts,
             )
             <= 0
         ):
             raise ValueError("admission limits must be positive")
+        if self.maximum_effective_challenges is not None and self.maximum_effective_challenges <= 0:
+            raise ValueError("maximum effective challenges must be positive")
+        if self.last_submission_block is not None and self.last_submission_block < 0:
+            raise ValueError("last submission block must be non-negative")
         if self.retry_base_ms > self.retry_max_ms:
             raise ValueError("retry base cannot exceed retry maximum")
         if self.publication_grace_blocks <= 0:
@@ -82,6 +93,32 @@ def process_next_admission(
     )
     if task is None:
         return None
+
+    if (
+        settings.last_submission_block is not None
+        and task.position.block > settings.last_submission_block
+    ):
+        store.complete_challenge(
+            task.challenge_id,
+            ChallengeState.REJECTED_TRACK_CLOSED,
+            error_code="TRACK_CLOSED",
+            error_summary="submission is later than the final frozen evaluation interval",
+            occurred_at_ms=now,
+            lease_token=task.lease_token,
+            score_block=current_finalized_block,
+        )
+        return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, "TRACK_CLOSED")
+
+    if settings.maximum_effective_challenges is not None:
+        store.reserve_season_slots(settings.maximum_effective_challenges)
+        if not store.has_season_slot(task.challenge_id):
+            return _reject_track_capacity(
+                store,
+                task.challenge_id,
+                task.lease_token,
+                current_finalized_block=current_finalized_block,
+                now_ms=now,
+            )
 
     reference_owner = store.earlier_reference_owner(task.challenge_id)
     if reference_owner is not None:
@@ -212,6 +249,37 @@ def process_next_admission(
         )
         return AdmissionOutcome(task.challenge_id, status, error.code)
 
+    duplicate_owner = store.model_owner(validated.model_digest)
+    if duplicate_owner is not None:
+        return _reject_exact_duplicate(
+            store,
+            task.challenge_id,
+            task.lease_token,
+            duplicate_owner,
+            current_finalized_block=current_finalized_block,
+            now_ms=now,
+        )
+
+    if settings.archive is not None:
+        try:
+            settings.archive(model_path, validated.file_sha256, validated.size_bytes)
+        except Exception:
+            error = ModelDownloadError(
+                "MODEL_ARCHIVE_UNAVAILABLE",
+                "validated model could not be persisted outside the evaluator host",
+                temporary=True,
+            )
+            status = _defer_or_fail(
+                store,
+                task.challenge_id,
+                task.lease_token,
+                task.attempts,
+                settings,
+                now,
+                error,
+            )
+            return AdmissionOutcome(task.challenge_id, status, error.code)
+
     registration = store.register_validated_model(
         task.challenge_id,
         task.lease_token,
@@ -219,22 +287,67 @@ def process_next_admission(
         occurred_at_ms=now,
     )
     if not registration.accepted:
-        store.complete_challenge(
+        return _reject_exact_duplicate(
+            store,
             task.challenge_id,
-            ChallengeState.PARTICIPANT_FAILED,
-            error_code="EXACT_DUPLICATE",
-            error_summary="model weights duplicate an earlier submission",
-            occurred_at_ms=now,
-            lease_token=task.lease_token,
-            score_block=current_finalized_block,
-        )
-        return AdmissionOutcome(
-            task.challenge_id,
-            AdmissionStatus.FAILED,
-            "EXACT_DUPLICATE",
+            task.lease_token,
             registration.duplicate_of,
+            current_finalized_block=current_finalized_block,
+            now_ms=now,
         )
     return AdmissionOutcome(task.challenge_id, AdmissionStatus.ACCEPTED)
+
+
+def _reject_exact_duplicate(
+    store: ChallengeStore,
+    challenge_id: str,
+    lease_token: str,
+    duplicate_of: str | None,
+    *,
+    current_finalized_block: int,
+    now_ms: int,
+) -> AdmissionOutcome:
+    if duplicate_of is None:
+        raise RuntimeError("duplicate model is missing its earlier owner")
+    store.complete_challenge(
+        challenge_id,
+        ChallengeState.PARTICIPANT_FAILED,
+        error_code="EXACT_DUPLICATE",
+        error_summary="model weights duplicate an earlier submission",
+        occurred_at_ms=now_ms,
+        lease_token=lease_token,
+        score_block=current_finalized_block,
+    )
+    return AdmissionOutcome(
+        challenge_id,
+        AdmissionStatus.FAILED,
+        "EXACT_DUPLICATE",
+        duplicate_of,
+    )
+
+
+def _reject_track_capacity(
+    store: ChallengeStore,
+    challenge_id: str,
+    lease_token: str,
+    *,
+    current_finalized_block: int,
+    now_ms: int,
+) -> AdmissionOutcome:
+    store.complete_challenge(
+        challenge_id,
+        ChallengeState.REJECTED_TRACK_CAPACITY,
+        error_code="TRACK_CAPACITY_REACHED",
+        error_summary="the frozen track has no remaining effective challenge slots",
+        occurred_at_ms=now_ms,
+        lease_token=lease_token,
+        score_block=current_finalized_block,
+    )
+    return AdmissionOutcome(
+        challenge_id,
+        AdmissionStatus.FAILED,
+        "TRACK_CAPACITY_REACHED",
+    )
 
 
 def _defer_or_fail(
@@ -248,6 +361,20 @@ def _defer_or_fail(
     *,
     resume_state: ChallengeState | None = None,
 ) -> AdmissionStatus:
+    if attempts >= settings.max_attempts:
+        store.block_leased(
+            challenge_id,
+            lease_token,
+            error_code=error.code,
+            error_summary=str(error),
+            occurred_at_ms=now_ms,
+        )
+        if settings.alert is not None:
+            settings.alert(
+                "ADMISSION_RETRY_EXHAUSTED",
+                {"challenge_id": challenge_id, "attempts": attempts, "code": error.code},
+            )
+        return AdmissionStatus.BLOCKED
     multiplier = 1 << min(max(attempts - 1, 0), 20)
     delay = min(settings.retry_max_ms, settings.retry_base_ms * multiplier)
     store.defer_leased(

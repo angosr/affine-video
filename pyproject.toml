@@ -26,10 +26,6 @@ dev = [
   "pytest>=8.4,<9",
   "ruff>=0.14,<0.15",
 ]
-experiments = [
-    "scikit-learn==1.9.1",
-    "scipy==1.18.0",
-]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/miner", "src/validator", "src/scoring", "src/cli.py"]

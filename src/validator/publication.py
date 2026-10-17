@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,9 @@ from urllib.parse import urlparse
 import httpx
 
 from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
+from validator.chunks import ChunkManifest, build_chunk_manifest, chunk_object_name, read_part
 from validator.queue import TERMINAL_STATES
+from validator.s3 import client_config
 from validator.store import ChallengeStore
 from validator.system_matches import system_match_artifacts, system_match_summaries
 from validator.tournament import (
@@ -51,11 +54,12 @@ class PublicArtifacts:
     source_block: int
     track: bytes
     summary: bytes
-    weights: bytes
+    weights: bytes | None
     matches: tuple[tuple[str, bytes], ...]
     status: bytes | None = None
     system_matches: tuple[tuple[str, bytes], ...] = ()
     files: tuple[PublicFile, ...] = ()
+    runtime_manifest: tuple[str, bytes] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +91,9 @@ def build_public_artifacts(
     *,
     version_key: int,
     exact_cache_dir: str | Path | None = None,
+    batch_reference_resolver: Callable[[str], tuple[str, ...]] | None = None,
+    model_resolver: Callable[[str, int], Path] | None = None,
+    runtime_manifest: bytes | None = None,
 ) -> PublicArtifacts | None:
     """Build one auditable public snapshot when chain scanning is caught up."""
 
@@ -94,13 +101,20 @@ def build_public_artifacts(
     if cursor is None or cursor[0] != chain.finalized_block:
         return None
     snapshot = store.public_snapshot()
+    unfinished = [
+        challenge
+        for challenge in snapshot["challenges"]
+        if challenge["state"] not in {state.value for state in TERMINAL_STATES}
+    ]
+    aborted = chain.finalized_block > track.track_close_block and bool(unfinished)
     initial = genesis_champion(track)
     tournament = resolve_tournament(
         snapshot["challenges"],
         track_id=track.track_id,
         track_spec_digest=track.digest,
         netuid=track.netuid,
-        minimum_gain=track.scoring.minimum_frontier_gain,
+        minimum_gain=track.full_video.minimum_gain,
+        minimum_exact_gain=track.scoring.minimum_frontier_gain,
         initial_champion=initial,
         minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
     )
@@ -131,20 +145,54 @@ def build_public_artifacts(
         snapshot["challenges"],
     )
     files: dict[str, PublicFile] = {}
+    terminal_ids = {
+        challenge["challenge_id"]
+        for challenge in snapshot["challenges"]
+        if challenge["state"] in {state.value for state in TERMINAL_STATES}
+    }
+    disclosure: dict[str, bool] = {}
     for match in tournament.matches:
         evaluation = match.document["evaluation"]
         batch = evaluation["evaluation_batch"]
-        if batch is not None and exact_cache_dir is not None:
-            path = Path(exact_cache_dir) / f"{batch['generated_block']}-{batch['sha256']}.npz"
-            files[batch["object"]] = PublicFile(batch["object"], path, batch["sha256"])
+        stage_batches = [
+            stage["evaluation_batch"]
+            for stage in evaluation["stages"]
+            if "evaluation_batch" in stage
+        ]
+        if batch is not None:
+            stage_batches.append(batch)
+        if exact_cache_dir is not None:
+            for used_batch in stage_batches:
+                plan_digest = used_batch["plan_digest"]
+                if plan_digest not in disclosure:
+                    referenced = (
+                        ()
+                        if batch_reference_resolver is None
+                        else batch_reference_resolver(plan_digest)
+                    )
+                    disclosure[plan_digest] = bool(referenced) and set(referenced).issubset(
+                        terminal_ids
+                    )
+                if not disclosure[plan_digest]:
+                    continue
+                path = (
+                    Path(exact_cache_dir)
+                    / f"{used_batch['generated_block']}-{used_batch['sha256']}.npz"
+                )
+                files[used_batch["object"]] = PublicFile(
+                    used_batch["object"], path, used_batch["sha256"]
+                )
         if exact_cache_dir is not None and match.outcome.value == "CHALLENGER_WON":
             path_value = store.model_path(match.challenge_id)
-            if path_value is None:
-                raise PublicArtifactError("winning model has no local archive source")
+            path = None if path_value is None else Path(path_value)
+            if path is None or not path.is_file():
+                if model_resolver is None:
+                    raise PublicArtifactError("winning model has no durable archive source")
+                path = model_resolver(evaluation["file_sha256"], evaluation["model_size_bytes"])
             object_name = evaluation["model_object"]
             files[object_name] = PublicFile(
                 object_name,
-                Path(path_value),
+                path,
                 evaluation["file_sha256"],
             )
     return PublicArtifacts(
@@ -156,13 +204,14 @@ def build_public_artifacts(
             }
         ),
         summary=_json_bytes(summary),
-        weights=encode_weight_artifact(artifact),
+        weights=None if aborted else encode_weight_artifact(artifact),
         matches=tuple(
             (match.object_name, _json_bytes(match.document)) for match in tournament.matches
         ),
         status=_json_bytes(status),
         system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
         files=tuple(files.values()),
+        runtime_manifest=_runtime_manifest(track, runtime_manifest),
     )
 
 
@@ -171,6 +220,7 @@ def build_genesis_artifacts(
     chain: WeightChainState,
     *,
     version_key: int,
+    runtime_manifest: bytes | None = None,
 ) -> PublicArtifacts:
     """Build the complete pre-launch snapshot with UID0 as champion."""
 
@@ -179,7 +229,8 @@ def build_genesis_artifacts(
         track_id=track.track_id,
         track_spec_digest=track.digest,
         netuid=track.netuid,
-        minimum_gain=track.scoring.minimum_frontier_gain,
+        minimum_gain=track.full_video.minimum_gain,
+        minimum_exact_gain=track.scoring.minimum_frontier_gain,
         initial_champion=genesis_champion(track),
         minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
     )
@@ -209,7 +260,16 @@ def build_genesis_artifacts(
         matches=(),
         status=_json_bytes(_status_document(track, chain.finalized_block, tournament, [], [])),
         system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
+        runtime_manifest=_runtime_manifest(track, runtime_manifest),
     )
+
+
+def _runtime_manifest(track: TrackSpec, payload: bytes | None) -> tuple[str, bytes] | None:
+    if payload is None:
+        return None
+    if hashlib.sha256(payload).hexdigest() != track.artifact_manifest_sha256:
+        raise PublicArtifactError("runtime artifact manifest digest is incorrect")
+    return f"runtime/{track.artifact_manifest_sha256}/manifest.json", payload
 
 
 def encode_weight_artifact(artifact: WeightArtifact) -> bytes:
@@ -419,7 +479,6 @@ class S3Repository:
             raise ValueError("STORAGE_URL must be an HTTPS endpoint without credentials or query")
         try:
             import boto3
-            from botocore.config import Config
         except ImportError as exc:
             raise RuntimeError("publishing requires the 'storage' package extra") from exc
         client = boto3.client(
@@ -428,11 +487,14 @@ class S3Repository:
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name="auto",
-            config=Config(signature_version="s3v4"),
+            config=client_config(),
         )
         return cls(client, bucket=bucket, prefix=prefix)
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
+        await asyncio.to_thread(self._guard_progress, artifacts)
+        if artifacts.runtime_manifest is not None:
+            await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
         await asyncio.to_thread(self._put, "track.json", artifacts.track, False)
         for artifact in artifacts.files:
             await asyncio.to_thread(self._put_file_immutable, artifact)
@@ -443,49 +505,123 @@ class S3Repository:
         await asyncio.to_thread(self._put, "summary.json", artifacts.summary, False)
         if artifacts.status is not None:
             await asyncio.to_thread(self._put, "status.json", artifacts.status, False)
-        await asyncio.to_thread(self._put, "weights.json", artifacts.weights, False)
+        if artifacts.weights is not None:
+            await asyncio.to_thread(self._put, "weights.json", artifacts.weights, False)
+
+    def _guard_progress(self, artifacts: PublicArtifacts) -> None:
+        """Reject a sequential rollback of mutable pointers for the active track."""
+
+        current_track_payload = self._get_optional("track.json")
+        current_summary_payload = self._get_optional("summary.json")
+        if current_track_payload is None:
+            if current_summary_payload is not None:
+                raise PublicArtifactError("public summary exists without its track")
+            return
+        if (
+            current_track_payload == artifacts.track
+            and current_summary_payload == artifacts.summary
+        ):
+            return
+        current_track = _decode_canonical_object(current_track_payload, "track")
+        next_track = _decode_canonical_object(artifacts.track, "track")
+        try:
+            current_track_id = current_track["spec"]["track_id"]
+            next_track_id = next_track["spec"]["track_id"]
+        except (KeyError, TypeError) as exc:
+            raise PublicArtifactError("public track pointer is invalid") from exc
+        if current_track_id != next_track_id:
+            return
+        if current_track_payload != artifacts.track:
+            raise PublicArtifactError("an active track ID cannot change its specification")
+        if current_summary_payload is None:
+            return
+        current = _decode_canonical_object(current_summary_payload, "summary")
+        proposed = _decode_canonical_object(artifacts.summary, "summary")
+        try:
+            current_block = _integer(current["source_block"], "source_block")
+            proposed_block = _integer(proposed["source_block"], "source_block")
+            current_count = _integer(current["match_count"], "match_count")
+            proposed_count = _integer(proposed["match_count"], "match_count")
+        except KeyError as exc:
+            raise PublicArtifactError("public summary pointer is invalid") from exc
+        if proposed_block < current_block or proposed_count < current_count:
+            raise PublicArtifactError("public snapshot rollback is forbidden")
+        if proposed_block == current_block and current_summary_payload != artifacts.summary:
+            raise PublicArtifactError("one source block cannot identify two public snapshots")
 
     def _put_file_immutable(self, artifact: PublicFile) -> None:
+        if self._confirmed_immutable.get(artifact.object_name) == artifact.sha256:
+            return
+        existing = self._get_optional(artifact.object_name)
+        if existing is not None:
+            try:
+                manifest = ChunkManifest.decode(existing)
+            except ValueError as exc:
+                raise PublicArtifactError("immutable public file manifest is invalid") from exc
+            if manifest.sha256 != artifact.sha256:
+                raise PublicArtifactError("immutable public file conflicts with committed digest")
+            self._verify_public_chunks(artifact.object_name, manifest)
+            self._confirmed_immutable[artifact.object_name] = artifact.sha256
+            return
+
         if not artifact.path.is_file():
             raise PublicArtifactError(f"public file source is missing: {artifact.object_name}")
-        if _file_sha256(artifact.path) != artifact.sha256:
+        manifest = build_chunk_manifest(artifact.path)
+        if manifest.sha256 != artifact.sha256:
             raise PublicArtifactError(f"public file digest changed: {artifact.object_name}")
-        key = f"{self._prefix}/{artifact.object_name}"
-        try:
-            existing = self._client.head_object(Bucket=self._bucket, Key=key)
-        except Exception as exc:
-            response = getattr(exc, "response", None)
-            code = (response or {}).get("Error", {}).get("Code")
-            if str(code) not in {"404", "NoSuchKey", "NotFound"}:
-                raise
-        else:
-            metadata = existing.get("Metadata", {})
-            if (
-                metadata.get("sha256") != artifact.sha256
-                or existing.get("ContentLength") != artifact.path.stat().st_size
-            ):
-                raise PublicArtifactError(
-                    f"immutable public object conflicts with local content: {artifact.object_name}"
-                )
-            return
-        self._client.upload_file(
-            str(artifact.path),
-            self._bucket,
-            key,
-            ExtraArgs={
-                "ContentType": "application/octet-stream",
-                "CacheControl": "public, max-age=31536000, immutable",
-                "Metadata": {"sha256": artifact.sha256},
-            },
-        )
-        uploaded = self._client.head_object(Bucket=self._bucket, Key=key)
-        if (
-            uploaded.get("Metadata", {}).get("sha256") != artifact.sha256
-            or uploaded.get("ContentLength") != artifact.path.stat().st_size
-        ):
-            raise PublicArtifactError(
-                f"public file upload verification failed: {artifact.object_name}"
+        for index, part in enumerate(manifest.parts):
+            name = chunk_object_name(artifact.object_name, part.name)
+            key = f"{self._prefix}/{name}"
+            try:
+                uploaded = self._client.head_object(Bucket=self._bucket, Key=key)
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                code = (response or {}).get("Error", {}).get("Code")
+                if str(code) not in {"404", "NoSuchKey", "NotFound"}:
+                    raise
+            else:
+                if (
+                    uploaded.get("Metadata", {}).get("sha256") != part.sha256
+                    or uploaded.get("ContentLength") != part.size
+                ):
+                    raise PublicArtifactError("immutable public chunk conflicts with content")
+                continue
+            self._client.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=read_part(artifact.path, index, part.size),
+                ContentType="application/octet-stream",
+                CacheControl="public, max-age=31536000, immutable",
+                Metadata={"sha256": part.sha256},
             )
+            uploaded = self._client.head_object(Bucket=self._bucket, Key=key)
+            if (
+                uploaded.get("Metadata", {}).get("sha256") != part.sha256
+                or uploaded.get("ContentLength") != part.size
+            ):
+                raise PublicArtifactError("public chunk upload verification failed")
+        self._put(artifact.object_name, manifest.encode(), True)
+        self._confirmed_immutable[artifact.object_name] = artifact.sha256
+
+    def _verify_public_chunks(self, manifest_name: str, manifest: ChunkManifest) -> None:
+        for part in manifest.parts:
+            name = chunk_object_name(manifest_name, part.name)
+            try:
+                uploaded = self._client.head_object(
+                    Bucket=self._bucket,
+                    Key=f"{self._prefix}/{name}",
+                )
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                code = (response or {}).get("Error", {}).get("Code")
+                if str(code) in {"404", "NoSuchKey", "NotFound"}:
+                    raise PublicArtifactError(f"immutable public chunk is missing: {name}") from exc
+                raise
+            if (
+                uploaded.get("Metadata", {}).get("sha256") != part.sha256
+                or uploaded.get("ContentLength") != part.size
+            ):
+                raise PublicArtifactError("immutable public chunk conflicts with manifest")
 
     async def load(self, track: TrackSpec) -> PublicLedger:
         """Load and verify the committed public tournament ledger from object storage."""
@@ -551,7 +687,8 @@ class S3Repository:
                     track_id=track.track_id,
                     track_spec_digest=track.digest,
                     netuid=track.netuid,
-                    minimum_gain=track.scoring.minimum_frontier_gain,
+                    minimum_gain=track.full_video.minimum_gain,
+                    minimum_exact_gain=track.scoring.minimum_frontier_gain,
                     incumbent=incumbent,
                     minimum_generation_delay_blocks=(track.cache.minimum_generation_delay_blocks),
                 )
@@ -569,7 +706,8 @@ class S3Repository:
             track_id=track.track_id,
             track_spec_digest=track.digest,
             netuid=track.netuid,
-            minimum_gain=track.scoring.minimum_frontier_gain,
+            minimum_gain=track.full_video.minimum_gain,
+            minimum_exact_gain=track.scoring.minimum_frontier_gain,
             initial_champion=genesis_champion(track),
             minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
         )
@@ -599,7 +737,8 @@ class S3Repository:
                     track_id=track.track_id,
                     track_spec_digest=track.digest,
                     netuid=track.netuid,
-                    minimum_gain=track.scoring.minimum_frontier_gain,
+                    minimum_gain=track.full_video.minimum_gain,
+                    minimum_exact_gain=track.scoring.minimum_frontier_gain,
                     incumbent=incumbent,
                     minimum_generation_delay_blocks=(track.cache.minimum_generation_delay_blocks),
                 )
@@ -681,14 +820,6 @@ def _json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _summary_document(
     track: TrackSpec,
     source_block: int,
@@ -717,6 +848,21 @@ def _status_document(
 ) -> dict[str, Any]:
     """Build the bounded live view used by the operator monitor."""
 
+    unfinished = [
+        challenge
+        for challenge in challenges
+        if challenge["state"] not in {state.value for state in TERMINAL_STATES}
+    ]
+    if source_block > track.track_close_block and unfinished:
+        phase = "TRACK_ABORTED"
+    elif source_block < track.track_start_block:
+        phase = "SCHEDULED"
+    elif source_block <= track.last_submission_block:
+        phase = "ACCEPTING"
+    elif source_block <= track.track_close_block:
+        phase = "DRAINING"
+    else:
+        phase = "CLOSED"
     challenge_by_id = {item["submission_id"]: item for item in challenges}
     match_by_id = {item.challenge_id: item for item in tournament.matches}
     initial = genesis_champion(track)
@@ -775,7 +921,7 @@ def _status_document(
                 "champion": is_champion,
                 "attempts": challenge["attempts"],
                 "error_code": challenge["error_code"],
-                "alert": (challenge["state"] == "SYSTEM_DEFERRED" and challenge["attempts"] >= 3),
+                "alert": challenge["state"] == "SYSTEM_BLOCKED",
             }
         )
     waiting = [
@@ -796,6 +942,17 @@ def _status_document(
         "track_spec_digest": track.digest,
         "netuid": track.netuid,
         "source_block": source_block,
+        "track_phase": phase,
+        "last_submission_block": track.last_submission_block,
+        "track_close_block": track.track_close_block,
+        "abort": (
+            None
+            if phase != "TRACK_ABORTED"
+            else {
+                "reason": "UNFINISHED_SYSTEM_WORK_AFTER_CLOSE_GRACE",
+                "challenge_ids": sorted(item["challenge_id"] for item in unfinished),
+            }
+        ),
         "champion": tournament.champion.public(),
         "system_matches": system_match_summaries(track.track_id, track.digest, track.netuid),
         "participants": active_rows,

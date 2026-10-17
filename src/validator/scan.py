@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +10,8 @@ from typing import Any
 from miner.submit import MAGIC, ModelSubmission, SubmissionFormatError
 from validator.queue import ChainPosition, submission_id
 from validator.store import SubmissionRecord
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,12 +51,24 @@ def extract_commitment_reveals(
             continue
         hotkey = _attribute(event, "who")
         if not isinstance(hotkey, str) or not hotkey:
-            raise RuntimeError("commitment reveal contains an invalid hotkey")
+            LOGGER.warning(
+                "skipping commitment reveal with invalid hotkey",
+                extra={"block_height": block_height, "event_index": event_position},
+            )
+            continue
         extrinsic_index = event.get("extrinsic_idx")
         if extrinsic_index is None:
             extrinsic_index = 0
         if type(extrinsic_index) is not int or extrinsic_index < 0:
-            raise RuntimeError("commitment reveal contains an invalid extrinsic index")
+            LOGGER.warning(
+                "skipping commitment reveal with invalid extrinsic index",
+                extra={
+                    "block_height": block_height,
+                    "event_index": event_position,
+                    "hotkey": hotkey,
+                },
+            )
+            continue
         records.append(
             CommitmentReveal(
                 hotkey,

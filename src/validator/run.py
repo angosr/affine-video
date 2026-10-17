@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
@@ -19,8 +20,14 @@ from validator.admission import (
     AdmissionSettings,
     process_next_admission,
 )
+from validator.alerts import webhook_alerter
 from validator.chain import ScanResult, scan_finalized_blocks, seed_legacy_exclusions
 from validator.download import DownloadedModel, download_chunked_asset, download_public_model
+from validator.production.batches import ReadyBatchSource
+from validator.production.commitment import ArtifactManifest
+from validator.production.config import load_producer_config
+from validator.production.confirmation import ConfirmationWorkerPool
+from validator.production.storage import PrivateObjectStore
 from validator.publication import (
     PublicArtifacts,
     PublicLedger,
@@ -30,18 +37,20 @@ from validator.publication import (
     fetch_weight_artifact,
     validate_public_weights_url,
 )
+from validator.queue import TERMINAL_STATES
 from validator.scoring import (
+    EvaluatedStage,
     PairedTrackEvaluator,
     ScoringOutcome,
     ScoringSettings,
     StageOutcome,
-    process_next_scoring,
+    commit_evaluated_scoring,
+    defer_evaluated_scoring,
+    evaluate_next_scoring,
     verify_initial_champion,
 )
 from validator.store import ChallengeStore, LeasedChallenge
-from validator.system_matches import (
-    PRODUCTION_NETUID,
-)
+from validator.system_matches import PRODUCTION_NETUID
 from validator.tournament import MatchRecord
 from validator.weights import (
     WeightReceipt,
@@ -102,12 +111,15 @@ async def run_evaluator(
     archive_endpoints: list[str] | None,
     worker_id: str,
     publisher: ArtifactRepository,
+    production_config: str | Path | None = None,
     version_key: int = 0,
     poll_seconds: float = 12.0,
     max_scan_blocks: int = 100,
-    scoring_timeout_seconds: float = 30 * 60,
+    scoring_timeout_seconds: float = 4 * 60 * 60,
     scoring_max_memory_bytes: int | None = None,
     scoring_max_cpu_seconds: int | None = None,
+    scoring_device: str | None = None,
+    alert_webhook_url: str | None = None,
     once: bool = False,
     report: Callable[[EvaluationCycleResult], None] | None = None,
 ) -> None:
@@ -117,6 +129,11 @@ async def run_evaluator(
         raise ValueError("poll interval must be positive")
     if version_key < 0:
         raise ValueError("version identifier must be non-negative")
+    if not once and not alert_webhook_url:
+        raise ValueError("a push alert webhook is required for the continuous evaluator")
+    alert = (
+        webhook_alerter(alert_webhook_url, service="veda-evaluator") if alert_webhook_url else None
+    )
     track = load_track_spec(track_spec)
     ledger = await publisher.load(track)
     cache_dir = Path(exact_cache)
@@ -138,15 +155,55 @@ async def run_evaluator(
         track,
         model_path=initial_model_path,
     )
+    batch_source = None
+    confirmation_pool = None
+    runtime_manifest_payload = None
+    if production_config is not None:
+        data_config = load_producer_config(production_config)
+        if data_config.track_spec.resolve() != Path(track_spec).resolve():
+            raise ValueError("production configuration uses a different track specification")
+        if data_config.validator_database.resolve() != Path(database).resolve():
+            raise ValueError("production configuration uses a different validator database")
+        runtime_manifest_payload = data_config.artifact_manifest.read_bytes()
+        manifest = ArtifactManifest.decode(runtime_manifest_payload)
+        if manifest.digest != track.artifact_manifest_sha256:
+            raise ValueError("artifact manifest does not match the track commitment")
+        data_config.verify_manifest(manifest)
+        objects = PrivateObjectStore.from_environment(
+            bucket=data_config.storage_bucket,
+            prefix=f"{data_config.storage_prefix}/tracks/{track.digest}",
+        )
+        batch_source = ReadyBatchSource(track=track, objects=objects, cache_dir=cache_dir)
+        confirmation_pool = ConfirmationWorkerPool(
+            data_config,
+            track,
+            timeout_seconds=scoring_timeout_seconds,
+        )
+    scoring_settings = ScoringSettings(
+        lease_ms=ceil(scoring_timeout_seconds * 2 * 1000) + 60_000,
+        alert=alert,
+        archive_stage=None if batch_source is None else batch_source.archive_stage,
+        restore_stage=None if batch_source is None else batch_source.restore_stage,
+    )
     admission_settings = AdmissionSettings(
         cache_dir=Path(model_cache),
         max_model_bytes=track.model.max_bytes,
         tensor_schema=track.model.tensor_schema,
         publication_grace_blocks=track.publication_grace_blocks,
+        maximum_effective_challenges=track.maximum_effective_challenges,
+        last_submission_block=track.last_submission_block,
+        alert=alert,
+        archive=None if batch_source is None else batch_source.archive_model,
     )
-    scoring_settings = ScoringSettings(lease_ms=ceil(scoring_timeout_seconds * 2 * 1000) + 60_000)
 
-    with ChallengeStore(database, track_spec_digest=track.digest) as store:
+    with ExitStack() as resources:
+        store = resources.enter_context(ChallengeStore(database, track_spec_digest=track.digest))
+        if confirmation_pool is not None:
+            resources.callback(confirmation_pool.close)
+        store.reserve_uid_zero(
+            track.initial_champion.hotkey,
+            track_start_block=track.track_start_block,
+        )
         evaluator = PairedTrackEvaluator(
             track=track,
             store=store,
@@ -158,8 +215,13 @@ async def run_evaluator(
             max_memory_bytes=scoring_max_memory_bytes,
             max_cpu_seconds=scoring_max_cpu_seconds,
             seed_block_hashes={},
+            scoring_device=scoring_device,
+            batch_source=batch_source,
+            confirmation_pool=confirmation_pool,
         )
         recovery_index = 0
+        consecutive_cycle_errors = 0
+        consecutive_publication_errors = 0
         while True:
             try:
                 async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
@@ -176,6 +238,7 @@ async def run_evaluator(
                             track,
                             chain,
                             version_key=version_key,
+                            runtime_manifest=runtime_manifest_payload,
                         )
                         await publisher.publish(artifacts)
                         if report is not None:
@@ -231,9 +294,26 @@ async def run_evaluator(
                                     chain,
                                     version_key=version_key,
                                     exact_cache_dir=cache_dir,
+                                    batch_reference_resolver=(
+                                        None
+                                        if batch_source is None
+                                        else batch_source.batch_challenge_ids
+                                    ),
+                                    model_resolver=(
+                                        None if batch_source is None else batch_source.restore_model
+                                    ),
+                                    runtime_manifest=runtime_manifest_payload,
                                 )
                                 if artifacts is not None:
                                     await publisher.publish(artifacts)
+                                    if batch_source is not None:
+                                        terminal_ids = {
+                                            challenge["challenge_id"]
+                                            for challenge in store.public_snapshot()["challenges"]
+                                            if challenge["state"]
+                                            in {state.value for state in TERMINAL_STATES}
+                                        }
+                                        batch_source.prune_disclosed(terminal_ids)
                                     result = EvaluationCycleResult(
                                         result.finalized_block,
                                         result.scan,
@@ -253,6 +333,22 @@ async def run_evaluator(
                                 )
                         if report is not None:
                             report(result)
+                        if result.publication_error is None:
+                            consecutive_publication_errors = 0
+                        else:
+                            consecutive_publication_errors += 1
+                            if alert is not None and (
+                                consecutive_publication_errors == 3
+                                or consecutive_publication_errors % 10 == 0
+                            ):
+                                alert(
+                                    "PUBLICATION_FAILURE",
+                                    {
+                                        "consecutive_failures": consecutive_publication_errors,
+                                        "error": result.publication_error[:500],
+                                    },
+                                )
+                        consecutive_cycle_errors = 0
                         if once:
                             return
                         await asyncio.sleep(poll_seconds)
@@ -268,6 +364,18 @@ async def run_evaluator(
                             None,
                             cycle_error=str(exc) or type(exc).__name__,
                         )
+                    )
+                consecutive_cycle_errors += 1
+                if alert is not None and (
+                    consecutive_cycle_errors == 3 or consecutive_cycle_errors % 10 == 0
+                ):
+                    alert(
+                        "EVALUATOR_CYCLE_FAILURE",
+                        {
+                            "consecutive_failures": consecutive_cycle_errors,
+                            "error_type": type(exc).__name__,
+                            "error": (str(exc) or type(exc).__name__)[:500],
+                        },
                     )
                 await asyncio.sleep(poll_seconds)
 
@@ -446,13 +554,33 @@ async def process_cycle(
         downloader=downloader,
         model_validator=model_validator,
     )
-    scoring = process_next_scoring(
+    evaluated = evaluate_next_scoring(
         store,
         worker_id=f"{worker_id}:scoring",
         current_finalized_block=finalized_block,
         settings=scoring_settings,
         evaluator=evaluator,
     )
+    if isinstance(evaluated, EvaluatedStage):
+        try:
+            finalized_block = await client.finalized_block()
+        except Exception as exc:
+            scoring = defer_evaluated_scoring(
+                store,
+                evaluated,
+                settings=scoring_settings,
+                code="FINALIZED_HEAD_UNAVAILABLE",
+                summary=str(exc) or type(exc).__name__,
+            )
+        else:
+            scoring = commit_evaluated_scoring(
+                store,
+                evaluated,
+                current_finalized_block=finalized_block,
+                settings=scoring_settings,
+            )
+    else:
+        scoring = evaluated
     return EvaluationCycleResult(
         finalized_block,
         scan,

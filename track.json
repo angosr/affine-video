@@ -4,11 +4,20 @@
     "revision": "42ed227ee7df40d41602854ae760620d6eb651fe"
   },
   "cache": {
-    "exact_max_bytes": 1073741824,
-    "generation_interval_blocks": 100,
-    "generator": "veda-source-v2",
-    "minimum_generation_delay_blocks": 1
+    "accumulation_dtype": "float32",
+    "compute_dtype": "float32",
+    "exact_max_bytes": 17179869184,
+    "format": "veda-exact-cache-v2",
+    "generation_interval_blocks": 1200,
+    "generator": "veda-private-rollout-v1",
+    "minimum_generation_delay_blocks": 301,
+    "storage_dtype": "float16"
   },
+  "artifact_manifest_sha256": "0ae68f5bf4bf1568c4c6ca923bb30cc3b60a5dc47a3120df6f44415ec5d3714e",
+  "source_pool_merkle_root": "8d2fa29a3a0fd789735c198c0ff4dfadf7da4f15fc323c2e17213a587758473f",
+  "maximum_generation_batches": 80,
+  "maximum_effective_challenges": 20,
+  "track_close_grace_blocks": 3600,
   "initial_champion": {
     "evaluation_file_sha256": "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f",
     "file_sha256": "2a8d8845c5342756a2781e8e69563940e4bb573c9a40ebb534915ff8fd76573a",
@@ -33,34 +42,61 @@
   },
   "netuid": 120,
   "publication_grace_blocks": 300,
+  "full_video": {
+    "black_frame_threshold": 0.01,
+    "feature_model_sha256": "1f542c569f5e8912e30a156da860faff22a4ec08b4c432fb3cbbabded40dc016",
+    "flicker_threshold": 2.0,
+    "frame_weight": 0.3,
+    "latent_weight": 0.4,
+    "metric_version": "veda-video-fidelity-v1",
+    "minimum_gain": 0.005,
+    "temporal_weight": 0.3
+  },
   "scoring": {
-    "bootstrap_confidence": 0.95,
-    "bootstrap_resamples": 5000,
+    "bootstrap_resamples": 10000,
     "bootstrap_seed": 12020261017,
     "budgets": [
       {
-        "blocks": 16,
-        "calibrated_cost": 0.04096
+        "calibrated_cost": 0.04096,
+        "reference_blocks": 0,
+        "target_blocks": 16
       },
       {
-        "blocks": 32,
-        "calibrated_cost": 0.063936
+        "calibrated_cost": 0.063936,
+        "reference_blocks": 0,
+        "target_blocks": 32
       },
       {
-        "blocks": 64,
-        "calibrated_cost": 0.111328
+        "calibrated_cost": 0.111328,
+        "reference_blocks": 0,
+        "target_blocks": 64
       }
     ],
     "minimum_frontier_gain": 0.005,
-    "sample_count": 64,
+    "query_tile_selection_algorithm": "sha256-segment-quota-v1",
+    "query_tiles_per_case": 4,
+    "rollouts_per_stratum": 4,
+    "sampled_route_count": 8,
+    "sampled_step_count": 3,
+    "season_false_promotion_alpha": 0.05,
+    "step_selection_algorithm": "sha256-window-without-replacement-v1",
     "stratum_weights": {
-      "1x1_t72": 0.25,
-      "4x3_t102": 0.25,
-      "9x16_t37": 0.25,
-      "16x9_t37": 0.25
+      "1:1@72": 0.25,
+      "4:3@102": 0.25,
+      "9:16@37": 0.25,
+      "16:9@37": 0.25
     },
-    "tail_mean_weight": 0.8
+    "tail_mean_weight": 0.8,
+    "trajectory_schedule": {
+      "name": "minimax-h3-turbo-8",
+      "sigmas": [1.0, 0.9882, 0.973, 0.9524, 0.9231, 0.878, 0.8, 0.6316, 0.0],
+      "step_windows": [
+        {"indices": [0, 1, 2], "name": "early", "weight": 0.3333333333333333},
+        {"indices": [3, 4, 5], "name": "middle", "weight": 0.3333333333333333},
+        {"indices": [6, 7], "name": "late", "weight": 0.3333333333333334}
+      ]
+    }
   },
-  "track_id": "veda-sn120-v1",
+  "track_id": "veda-sn120-v2",
   "track_start_block": 9310000
 }

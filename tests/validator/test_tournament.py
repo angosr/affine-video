@@ -33,6 +33,54 @@ def challenge(
     paired_gain: float | None = None,
     error_code: str | None = None,
 ) -> dict:
+    gain = (
+        paired_gain
+        if paired_gain is not None
+        else canonical_score_gain(score, incumbent_score)
+        if score is not None and incumbent_score is not None
+        else None
+    )
+    exact_batch = {
+        "sha256": f"{sequence + 100:064x}",
+        "generated_block": 200 + sequence,
+        "plan_digest": f"{sequence + 200:064x}",
+        "seed_block_hash": "0x" + "ab" * 32,
+    }
+    confirmation_batch = {
+        "sha256": f"{sequence + 300:064x}",
+        "generated_block": 230 + sequence,
+        "plan_digest": f"{sequence + 400:064x}",
+        "seed_block_hash": "0x" + "cd" * 32,
+    }
+    stages = []
+    final_batch = None
+    final_block = None
+    if score is not None:
+        stages.append(
+            {
+                "stage": ChallengeState.SCORING,
+                "score": score,
+                "score_block": 220 + sequence,
+                "incumbent_score": incumbent_score,
+                "paired_gain_lower_bound": gain,
+                "evaluation_batch": exact_batch,
+            }
+        )
+        final_batch = exact_batch
+        final_block = 220 + sequence
+        if gain is not None and gain > 0.01:
+            stages.append(
+                {
+                    "stage": ChallengeState.CONFIRMING,
+                    "score": score,
+                    "score_block": 240 + sequence,
+                    "incumbent_score": incumbent_score,
+                    "paired_gain_lower_bound": gain,
+                    "evaluation_batch": confirmation_batch,
+                }
+            )
+            final_batch = confirmation_batch
+            final_block = 240 + sequence
     return {
         "challenge_id": f"challenge-{sequence}",
         "submission_id": f"submission-{sequence}",
@@ -49,25 +97,10 @@ def challenge(
         "model_size_bytes": 123 if score is not None else None,
         "final_score": score,
         "incumbent_score": incumbent_score,
-        "paired_gain_lower_bound": (
-            paired_gain
-            if paired_gain is not None
-            else canonical_score_gain(score, incumbent_score)
-            if score is not None and incumbent_score is not None
-            else None
-        ),
-        "evaluation_batch": (
-            {
-                "sha256": f"{sequence + 100:064x}",
-                "generated_block": 200 + sequence,
-                "source_digest": f"{sequence + 200:064x}",
-                "seed_block_hash": "0x" + "ab" * 32,
-            }
-            if score is not None
-            else None
-        ),
-        "score_block": 200 + sequence if score is not None else None,
-        "stages": [],
+        "paired_gain_lower_bound": gain,
+        "evaluation_batch": final_batch,
+        "score_block": final_block,
+        "stages": stages,
     }
 
 
@@ -102,7 +135,7 @@ def test_fifo_matches_replace_champion_only_after_required_gain() -> None:
     assert tournament.matches[1].document["champion_after"]["hotkey"] == "alice"
 
 
-def test_exact_decimal_minimum_gain_is_not_lost_to_binary_rounding() -> None:
+def test_gain_equal_to_the_threshold_does_not_promote() -> None:
     tournament = resolve(
         [
             challenge(1, "alice", score=0.2, incumbent_score=0.1),
@@ -111,7 +144,7 @@ def test_exact_decimal_minimum_gain_is_not_lost_to_binary_rounding() -> None:
     )
 
     assert tournament.matches[1].score_gain == 0.01
-    assert tournament.matches[1].outcome is MatchOutcome.CHALLENGER_WON
+    assert tournament.matches[1].outcome is MatchOutcome.CHAMPION_RETAINED
 
 
 def test_match_uses_paired_incumbent_score_not_historical_score() -> None:
@@ -119,13 +152,13 @@ def test_match_uses_paired_incumbent_score_not_historical_score() -> None:
 
     assert genesis().score == 0.1
     assert tournament.matches[0].score_gain == pytest.approx(0.01)
-    assert tournament.matches[0].outcome is MatchOutcome.CHALLENGER_WON
-    assert tournament.champion.hotkey == "alice"
+    assert tournament.matches[0].outcome is MatchOutcome.CHAMPION_RETAINED
+    assert tournament.champion.hotkey == "genesis-hotkey"
 
 
 def test_match_decision_uses_paired_gain_bound_not_raw_score_gap() -> None:
     retained = resolve([challenge(1, "alice", score=0.8, incumbent_score=0.5, paired_gain=0.009)])
-    won = resolve([challenge(1, "alice", score=0.51, incumbent_score=0.5, paired_gain=0.01)])
+    won = resolve([challenge(1, "alice", score=0.511, incumbent_score=0.5, paired_gain=0.011)])
 
     assert retained.matches[0].outcome is MatchOutcome.CHAMPION_RETAINED
     assert won.matches[0].outcome is MatchOutcome.CHALLENGER_WON

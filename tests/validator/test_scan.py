@@ -163,3 +163,27 @@ def test_decodes_revealed_payload_sdk_forms() -> None:
     assert revealed_payload("0x56444131") == b"VDA1"
     assert revealed_payload(b"bytes") == b"bytes"
     assert revealed_payload("0xzz") is None
+
+
+def test_malformed_timelock_reveal_is_skipped_without_losing_valid_reveals(caplog) -> None:
+    records = extract_commitment_reveals(
+        block_height=123,
+        events=[
+            {
+                "extrinsic_idx": -1,
+                "module_id": "Commitments",
+                "event_id": "CommitmentRevealed",
+                "attributes": {"netuid": 7, "who": HOTKEY},
+            },
+            {
+                "extrinsic_idx": None,
+                "module_id": "Commitments",
+                "event_id": "CommitmentRevealed",
+                "attributes": {"netuid": 7, "who": HOTKEY},
+            },
+        ],
+        netuid=7,
+    )
+
+    assert len(records) == 1
+    assert "invalid extrinsic index" in caplog.text

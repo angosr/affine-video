@@ -65,12 +65,16 @@ class ChallengeState(StrEnum):
     FETCHING = "FETCHING"
     VALIDATING = "VALIDATING"
     SCORING = "SCORING"
+    CONFIRMING = "CONFIRMING"
     SYSTEM_DEFERRED = "SYSTEM_DEFERRED"
+    SYSTEM_BLOCKED = "SYSTEM_BLOCKED"
     SUCCEEDED = "SUCCEEDED"
     PARTICIPANT_FAILED = "PARTICIPANT_FAILED"
     MALFORMED_SUBMISSION = "MALFORMED_SUBMISSION"
     REJECTED_DUPLICATE_HOTKEY = "REJECTED_DUPLICATE_HOTKEY"
     REJECTED_OTHER_COMPETITION = "REJECTED_OTHER_COMPETITION"
+    REJECTED_TRACK_CAPACITY = "REJECTED_TRACK_CAPACITY"
+    REJECTED_TRACK_CLOSED = "REJECTED_TRACK_CLOSED"
 
 
 TERMINAL_STATES = frozenset(
@@ -80,6 +84,8 @@ TERMINAL_STATES = frozenset(
         ChallengeState.MALFORMED_SUBMISSION,
         ChallengeState.REJECTED_DUPLICATE_HOTKEY,
         ChallengeState.REJECTED_OTHER_COMPETITION,
+        ChallengeState.REJECTED_TRACK_CAPACITY,
+        ChallengeState.REJECTED_TRACK_CLOSED,
     }
 )
 
@@ -88,6 +94,7 @@ _ACTIVE_STAGES = frozenset(
         ChallengeState.FETCHING,
         ChallengeState.VALIDATING,
         ChallengeState.SCORING,
+        ChallengeState.CONFIRMING,
     }
 )
 
@@ -105,6 +112,9 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
             ChallengeState.VALIDATING,
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
+            ChallengeState.SYSTEM_BLOCKED,
+            ChallengeState.REJECTED_TRACK_CAPACITY,
+            ChallengeState.REJECTED_TRACK_CLOSED,
         }
     ),
     ChallengeState.VALIDATING: frozenset(
@@ -112,16 +122,29 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
             ChallengeState.SCORING,
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
+            ChallengeState.SYSTEM_BLOCKED,
+            ChallengeState.REJECTED_TRACK_CAPACITY,
         }
     ),
     ChallengeState.SCORING: frozenset(
         {
+            ChallengeState.CONFIRMING,
             ChallengeState.SUCCEEDED,
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
+            ChallengeState.SYSTEM_BLOCKED,
+        }
+    ),
+    ChallengeState.CONFIRMING: frozenset(
+        {
+            ChallengeState.SUCCEEDED,
+            ChallengeState.PARTICIPANT_FAILED,
+            ChallengeState.SYSTEM_DEFERRED,
+            ChallengeState.SYSTEM_BLOCKED,
         }
     ),
     ChallengeState.SYSTEM_DEFERRED: _ACTIVE_STAGES,
+    ChallengeState.SYSTEM_BLOCKED: _ACTIVE_STAGES,
 }
 
 

@@ -26,17 +26,18 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
 3. The evaluator accepts exactly one `selector.safetensors` file. Its only metadata entry must be
    `hotkey`, set to the complete submitting hotkey. It rejects executable code, other metadata,
    unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.
-4. A valid model waits for its single scheduled exact-attention batch boundary. Boundaries occur at
-   the interval fixed by `track.json`; the finalized block hash at that boundary seeds the public
-   route/sample planner. The batch records that block hash, source digest, sample identifiers and
-   content hash. Each batch covers every configured stratum once per sampled route. A later batch
-   cannot be substituted to obtain a more favorable result.
+4. A valid model waits for its scheduled exact-attention batch boundary. The finalized block hash
+   at that boundary selects new private sources, noise, routes, steps and query tiles. It is not
+   known when the model is committed. Each batch contains four independent videos in each of four
+   strata, eight routes and three denoising steps: 384 paired cases in total. A later batch cannot
+   be substituted to obtain a more favorable result.
 5. UID 0 is the genesis champion without making a commit. Its identity is pinned to the official
    VEDA repository revision, filename and file SHA-256 in the track specification. Its baseline
-   and every challenger are evaluated by the same scorer. For every match, the challenger and
-   current champion are rerun on the same new batch. A challenger replaces the champion only when
-   the lower confidence bound of their paired per-case score gain reaches
-   `minimum_frontier_gain`.
+   and every challenger are evaluated on the same new batch. The exact stage resamples complete
+   video clusters rather than treating correlated routes as independent. A challenger that clears
+   this gate receives a second, newly seeded batch and runs complete eight-step video inference at
+   all three budgets beside the champion on GPUs 0 and 1. It replaces the champion only when the
+   paired per-video lower confidence bound exceeds the frozen full-video gain threshold.
 6. An immutable match record is published for every terminal item in the contiguous chain-order
    prefix. A failed or unfinished earlier submission can never be skipped to publish a later win.
 
@@ -54,12 +55,13 @@ hotkey-to-UID mapping and chain weight constraints before publishing. When the c
 longer registered or a valid vector is impossible, `weights` is `null` and Validators keep their
 last finalized weights.
 
-The launch checks use full-video trajectories on NVIDIA H200 hardware. The VEDA baseline beat both
-the MeanPool and shuffled-head controls on every tested geometry; those immutable measurements are
-published under `system_matches/`. Exact-cache ranking, cost calibration, bootstrap stability,
+The launch checks use ten consecutive 384-case batches on NVIDIA H200 hardware. They require the
+VEDA incumbent to retain the title against MeanPool, shuffled-head and slightly perturbed VEDA
+challengers in every batch, while the reverse VEDA-versus-shuffled positive control must promote
+in every batch. The immutable summaries are published under `system_matches/`. Full-video
+execution, cost calibration, clustered bootstrap stability,
 malformed archives, non-finite weights, metadata impersonation, repacking and re-signing duplicate
-weights are covered by the executable test suite. These checks validate the one runtime scorer;
-they are not a second scoring path.
+weights are covered by real-GPU checks and the executable test suite.
 
 ## Public object-storage state
 
@@ -71,20 +73,27 @@ tracks/main/
   summary.json
   status.json
   weights.json
+  runtime/
+    <artifact_manifest_sha256>/manifest.json
   system_matches/
-    veda-sn120-v1/
+    <track_id>/
       000000000001.json
       ...
   matches/
-    veda-sn120-v1/
+    <track_id>/
       000000000001.json
       000000000002.json
       ...
   batches/
-    <sha256>.npz
+    <sha256>/
+      manifest.json
+      part-00000
+      ...
   models/
-    veda-sn120-v1/
-      <sha256>.safetensors
+    <track_id>/<sha256>/
+      manifest.json
+      part-00000
+      ...
 ```
 
 - `track.json` is the stable pointer to the current canonical track specification and digest. An
@@ -93,21 +102,24 @@ tracks/main/
 - `system_matches/*.json` are immutable launch checks produced from real GPU panels. They compare
   the VEDA baseline with fixed control models, but never enter the Miner queue, tournament rank, or
   chain weights.
+- `runtime/<artifact_manifest_sha256>/manifest.json` publishes the canonical hashes and sizes of
+  every generator byte committed by the track, without exposing future private source samples.
 - `matches/<track_id>/*.json` are immutable terminal match facts in chain order: public model reference,
   content hashes, aggregate result, incumbent, decision, and decision block.
-- `batches/<sha256>.npz` publishes the exact QKV batch after its first match finishes, allowing
-  anyone to replay the score and verify its finalized-block seed.
-- `models/<track_id>/<sha256>.safetensors` is the durable copy of every winning selector. The next
-  match restores its incumbent from this archive, so deleting the original Hugging Face repository
-  cannot stop the tournament.
+- `batches/<sha256>/manifest.json` publishes the exact QKV batch only after every challenge linked
+  to that batch is terminal. The canonical manifest verifies every bounded part and the reassembled
+  file digest.
+- `models/<track_id>/<sha256>/manifest.json` is the public durable copy of every winning selector.
+  A private copy of every validated selector is stored before scoring, so publication and later
+  matches remain recoverable even if the GPU host or original Hugging Face repository disappears.
 - `summary.json` is a bounded current view containing the champion, top leaderboard and committed
   match count.
 - `status.json` is the bounded live view used by the monitoring CLI; it includes UID 0, active
-  entrants, queue positions, match numbers, scores and outcomes.
+  entrants, queue positions, match numbers, scores, outcomes and track lifecycle state.
 - `weights.json` is the small mutable artifact consumed by Validators.
 
-Publication writes the current track and immutable matches first, then `summary.json`, then
-`weights.json`.
+Publication writes the immutable runtime manifest, current track, immutable batch/model files and
+matches first, then `summary.json`, then `weights.json`.
 A crash can therefore leave an extra immutable match but cannot expose weights for an uncommitted
 summary. On restart the evaluator validates every committed match, follows any contiguous orphaned
 matches, and restores them instead of evaluating them again. Conflicting immutable bytes stop
@@ -119,10 +131,10 @@ downloaded model cache are disposable execution state: after loss, finalized cha
 verified published matches reconstruct completed work, and remaining submissions can be evaluated
 again.
 
-Before a match completes, public artifacts exclude its hidden arrays, per-sample metrics, local
-paths, worker and lease data, retry timing, error text, stack traces, and credentials. The used
-batch is revealed only with the immutable match. Only stable error codes and retry counts are
-public. Use a public HTTPS custom domain for reads; mutable objects are published with
+Before a batch's complete challenge group becomes terminal, public artifacts exclude its hidden
+arrays, per-sample metrics, local paths, worker and lease data, retry timing, error text, stack
+traces, and credentials. Only stable error codes and retry counts are public. Use a public HTTPS
+custom domain for reads; mutable objects are published with
 `Cache-Control: no-store`, while immutable objects receive long-lived immutable caching.
 
 ## Commands
@@ -170,21 +182,46 @@ uv sync --extra storage
 export STORAGE_URL=https://project.storage.supabase.co/storage/v1/s3
 export ACCESS_KEY=...
 export SECRET_ACCESS_KEY=...
+export PRIVATE_STORAGE_URL=https://account.r2.cloudflarestorage.com
+export PRIVATE_ACCESS_KEY=...
+export PRIVATE_SECRET_ACCESS_KEY=...
 
 uv run --extra storage veda validator evaluate \
   --track-spec /data/track.json \
   --database /data/validator.db \
   --model-cache /data/models \
   --exact-cache /data/exact-batches \
-  --archive-endpoint wss://archive.example \
-  --scoring-timeout-seconds 1800
+  --production-config /data/production.json \
+  --scoring-timeout-seconds 14400
 ```
 
-`--exact-cache` is a directory populated with immutable NPZ batches named
-`<generation-block>-<sha256>.npz`. Every batch contains that generation block, its finalized hash,
-source digest and selected sample identifiers in validated metadata. The evaluator verifies the
-hash against finalized chain state and publishes the used batch after the match. A lost GPU host
-can deterministically regenerate an unpublished batch from the public generator and chain seed.
+Set `VEDA_ALERT_WEBHOOK_URL` to an HTTPS push endpoint before continuous operation. Admission has
+five attempts; scoring and full-video confirmation allow nine attempts with bounded exponential
+delays, and scoring and producer workers have a four-hour wall-clock limit. Production retries a
+failed plan at most five times and sends a push alert on the first and final failure. Scoring
+exhaustion enters visible `SYSTEM_BLOCKED` state without becoming a Miner loss; after repairing the
+cause, resume its original stage with
+`veda validator retry <challenge-id> --database /data/validator.db`.
+
+After the track close grace block, any unfinished system work changes `status.json` to
+`TRACK_ABORTED` and stops refreshing `weights.json`; the affected Miner is not marked as losing.
+Recovery then requires a new track ID.
+
+`--exact-cache` contains immutable NPZ batches named `<generation-block>-<sha256>.npz`. Every batch
+binds its finalized block hash, source proofs, runtime artifacts and each case's planned
+source/rollout, route, step/sigma and deterministic query selection. Private R2
+stores the source pool, runtime-specific artifacts, every generated batch and every validated
+selector. The producer verifies atomic conditional creates and replacements against that endpoint
+before starting. Local SQLite, model downloads and work directories are disposable.
+
+Run the private data producer separately with the same production configuration:
+
+```bash
+uv run --extra storage veda validator produce --config /data/production.json
+```
+
+The fixed production allocation is GPUs 2-5 for streaming batch production, GPUs 0-1 for paired
+full-video confirmations, and GPUs 6-7 left free for continuing calibration experiments.
 
 If `--initial-model` is omitted, the evaluator restores the pinned UID 0 VEDA weights from the
 public chunk manifest, verifies every chunk, the complete file SHA-256, the canonical tensor

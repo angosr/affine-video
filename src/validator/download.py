@@ -24,6 +24,8 @@ from huggingface_hub.errors import (
     HTTPError as HubTransportError,
 )
 
+from validator.chunks import ChunkManifest
+
 MODEL_FILENAME = "selector.safetensors"
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PART_NAME = re.compile(r"^part-[0-9]{3}$")
@@ -45,6 +47,86 @@ class DownloadedModel:
     size_bytes: int
     etag: str | None
     download_host: str | None
+
+
+def download_chunked_file(
+    manifest_url: str,
+    *,
+    cache_dir: str | Path,
+    expected_sha256: str,
+    max_bytes: int,
+    suffix: str,
+    timeout_seconds: float = 120,
+    http_client: httpx.Client | None = None,
+) -> Path:
+    """Restore one generic public chunk manifest with bounded memory."""
+
+    parsed_url = urlparse(manifest_url)
+    if (
+        parsed_url.scheme != "https"
+        or not parsed_url.netloc
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or parsed_url.query
+        or parsed_url.fragment
+        or not parsed_url.path.endswith("/manifest.json")
+        or not _DIGEST.fullmatch(expected_sha256)
+        or not suffix.startswith(".")
+        or "/" in suffix
+    ):
+        raise ValueError("chunked public file request is invalid")
+    if max_bytes <= 0 or timeout_seconds <= 0:
+        raise ValueError("chunked public file limits must be positive")
+    cache = Path(cache_dir).resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / f"{expected_sha256}{suffix}"
+    if (
+        target.is_file()
+        and target.stat().st_size <= max_bytes
+        and _sha256(target) == expected_sha256
+    ):
+        return target
+
+    owned_client = http_client is None
+    client = http_client or httpx.Client(follow_redirects=False, timeout=timeout_seconds)
+    temporary: Path | None = None
+    try:
+        response = client.get(manifest_url, headers={"Accept": "application/json"})
+        response.raise_for_status()
+        if len(response.content) > _MAX_MANIFEST_BYTES:
+            raise ValueError("chunk manifest exceeds the byte limit")
+        manifest = ChunkManifest.decode(response.content)
+        if manifest.sha256 != expected_sha256 or manifest.size > max_bytes:
+            raise ValueError("chunk manifest conflicts with the expected file")
+        descriptor, name = tempfile.mkstemp(prefix=".partial-chunk-", dir=cache)
+        temporary = Path(name)
+        complete = hashlib.sha256()
+        with os.fdopen(descriptor, "wb") as output:
+            for part in manifest.parts:
+                part_url = urljoin(manifest_url, part.name)
+                if urlparse(part_url).netloc != parsed_url.netloc:
+                    raise ValueError("chunk URL escaped the manifest origin")
+                part_response = client.get(part_url)
+                part_response.raise_for_status()
+                content = part_response.content
+                if len(content) != part.size or hashlib.sha256(content).hexdigest() != part.sha256:
+                    raise ValueError("public chunk failed size or digest verification")
+                complete.update(content)
+                output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        if temporary.stat().st_size != manifest.size or complete.hexdigest() != expected_sha256:
+            raise ValueError("reassembled public file failed verification")
+        os.replace(temporary, target)
+        temporary = None
+        return target
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        raise RuntimeError("public chunked file could not be restored") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if owned_client:
+            client.close()
 
 
 def download_chunked_asset(
@@ -142,75 +224,6 @@ def download_chunked_asset(
         return target
     except (httpx.HTTPError, json.JSONDecodeError, OSError, ValueError) as exc:
         raise RuntimeError("public baseline asset could not be restored") from exc
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        if owned_client:
-            client.close()
-
-
-def download_public_asset(
-    url: str,
-    *,
-    cache_dir: str | Path,
-    expected_sha256: str,
-    max_bytes: int,
-    timeout_seconds: float = 120,
-    http_client: httpx.Client | None = None,
-) -> Path:
-    """Restore one immutable content-addressed public object with bounded streaming."""
-
-    parsed = urlparse(url)
-    if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-        or not _DIGEST.fullmatch(expected_sha256)
-        or not parsed.path.endswith(f"/{expected_sha256}.safetensors")
-    ):
-        raise ValueError("public model asset URL is invalid")
-    if max_bytes <= 0 or timeout_seconds <= 0:
-        raise ValueError("asset download limits must be positive")
-    cache = Path(cache_dir).resolve()
-    cache.mkdir(parents=True, exist_ok=True)
-    target = cache / f"{expected_sha256}.safetensors"
-    if (
-        target.is_file()
-        and target.stat().st_size <= max_bytes
-        and _sha256(target) == expected_sha256
-    ):
-        return target
-    owned_client = http_client is None
-    client = http_client or httpx.Client(follow_redirects=False, timeout=timeout_seconds)
-    temporary: Path | None = None
-    try:
-        descriptor, name = tempfile.mkstemp(prefix=".partial-champion-", dir=cache)
-        temporary = Path(name)
-        digest = hashlib.sha256()
-        received = 0
-        with os.fdopen(descriptor, "wb") as output, client.stream("GET", url) as response:
-            response.raise_for_status()
-            declared = response.headers.get("content-length")
-            if declared is not None and int(declared) > max_bytes:
-                raise ValueError("public model asset exceeds the byte limit")
-            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
-                received += len(chunk)
-                if received > max_bytes:
-                    raise ValueError("public model asset exceeds the byte limit")
-                digest.update(chunk)
-                output.write(chunk)
-            output.flush()
-            os.fsync(output.fileno())
-        if received == 0 or digest.hexdigest() != expected_sha256:
-            raise ValueError("public model asset digest is incorrect")
-        os.replace(temporary, target)
-        temporary = None
-        return target
-    except (httpx.HTTPError, OSError, ValueError) as exc:
-        raise RuntimeError("public champion asset could not be restored") from exc
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

@@ -54,7 +54,7 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
 
     title = (
         f"{bold}{cyan}VEDA SN{status.get('netuid', '?')}  "
-        f"block {status.get('source_block', '?')}{reset}"
+        f"block {status.get('source_block', '?')}  {status.get('track_phase', '?')}{reset}"
     )
     headers = (
         "UID",

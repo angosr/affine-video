@@ -107,18 +107,44 @@ def test_model_can_be_published_during_frozen_block_grace(tmp_path) -> None:
         assert store.get_challenge(identifier).state is ChallengeState.SCORING
 
 
+def test_submission_after_final_evaluation_interval_is_rejected_without_download(tmp_path) -> None:
+    configured = replace(settings(tmp_path), last_submission_block=100)
+
+    def unexpected_download(*_args, **_kwargs):
+        raise AssertionError("closed track submission was downloaded")
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier, _ = store.add_submission(submission_at(101, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=unexpected_download,
+        )
+
+        assert outcome is not None and outcome.code == "TRACK_CLOSED"
+        assert store.get_challenge(identifier).state is ChallengeState.REJECTED_TRACK_CLOSED
+
+
 def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) -> None:
     first_model = tmp_path / "first.safetensors"
     second_model = tmp_path / "second.safetensors"
     write_model(first_model, "hk1")
     write_model(second_model, "hk2")
 
+    archived = []
+    configured = replace(
+        settings(tmp_path),
+        archive=lambda path, digest, size: archived.append((path, digest, size)),
+    )
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
         first = process_next_admission(
             store,
             worker_id="admission",
-            settings=settings(tmp_path),
+            settings=configured,
             current_finalized_block=10_000,
             now_ms=100,
             downloader=model_downloader(first_model),
@@ -132,7 +158,7 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
         second = process_next_admission(
             store,
             worker_id="admission",
-            settings=settings(tmp_path),
+            settings=configured,
             current_finalized_block=10_000,
             now_ms=200,
             downloader=model_downloader(second_model),
@@ -145,6 +171,83 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
         duplicate = store.get_challenge(second_id)
         assert duplicate.state is ChallengeState.PARTICIPANT_FAILED
         assert duplicate.error_code == "EXACT_DUPLICATE"
+        assert [item[0] for item in archived] == [first_model]
+
+
+def test_frozen_effective_challenge_limit_is_enforced(tmp_path) -> None:
+    first_model = tmp_path / "first.safetensors"
+    second_model = tmp_path / "second.safetensors"
+    write_model(first_model, "hk1")
+    save_file(
+        {"selector.weight": np.zeros((2, 2), dtype=np.float32)},
+        second_model,
+        metadata={"hotkey": "hk2"},
+    )
+    configured = replace(settings(tmp_path), maximum_effective_challenges=1)
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        first = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=model_downloader(first_model),
+        )
+        second_id, _ = store.add_submission(
+            submission_at(101, "hk2", "other/model"), occurred_at_ms=2
+        )
+        second = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=200,
+            downloader=model_downloader(second_model),
+        )
+
+        assert first is not None and first.status is AdmissionStatus.ACCEPTED
+        assert second is not None and second.code == "TRACK_CAPACITY_REACHED"
+        assert store.get_challenge(second_id).state is ChallengeState.REJECTED_TRACK_CAPACITY
+
+
+def test_deferred_earlier_submission_keeps_its_non_refundable_season_slot(tmp_path) -> None:
+    configured = replace(settings(tmp_path), maximum_effective_challenges=1)
+    downloads = 0
+
+    def unavailable(*_args, **_kwargs):
+        nonlocal downloads
+        downloads += 1
+        raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "temporary outage", temporary=True)
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        first_id, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        second_id, _ = store.add_submission(
+            submission_at(101, "hk2", "other/model"), occurred_at_ms=2
+        )
+        first = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=unavailable,
+        )
+        second = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=200,
+            downloader=unavailable,
+        )
+
+        assert first is not None and first.status is AdmissionStatus.DEFERRED
+        assert store.has_season_slot(first_id)
+        assert second is not None and second.code == "TRACK_CAPACITY_REACHED"
+        assert store.get_challenge(second_id).state is ChallengeState.REJECTED_TRACK_CAPACITY
+        assert downloads == 1
 
 
 def test_same_repository_revision_is_rejected_before_redownload(tmp_path) -> None:
@@ -296,6 +399,100 @@ def test_repeated_download_infrastructure_failure_remains_retryable(tmp_path) ->
         assert challenge.state is ChallengeState.SYSTEM_DEFERRED
         assert challenge.score_block is None
         assert store.leaderboard() == []
+
+
+def test_model_is_durably_archived_before_entering_scoring(tmp_path) -> None:
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
+    archived = []
+    configured = replace(
+        settings(tmp_path),
+        archive=lambda path, digest, size: archived.append((path, digest, size)),
+    )
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=model_downloader(model),
+        )
+
+        assert outcome is not None and outcome.status is AdmissionStatus.ACCEPTED
+        assert store.get_challenge(identifier).state is ChallengeState.SCORING
+        assert archived == [
+            (model, hashlib.sha256(model.read_bytes()).hexdigest(), model.stat().st_size)
+        ]
+
+
+def test_archive_failure_defers_without_consuming_the_submission(tmp_path) -> None:
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
+
+    def unavailable(*_args):
+        raise RuntimeError("object store unavailable")
+
+    configured = replace(settings(tmp_path), archive=unavailable)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=model_downloader(model),
+        )
+
+        assert outcome is not None and outcome.status is AdmissionStatus.DEFERRED
+        challenge = store.get_challenge(identifier)
+        assert challenge.state is ChallengeState.SYSTEM_DEFERRED
+        assert challenge.error_code == "MODEL_ARCHIVE_UNAVAILABLE"
+        assert store.leaderboard() == []
+
+
+def test_admission_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
+    alerts = []
+
+    def unavailable(*_args, **_kwargs):
+        raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "temporary outage", temporary=True)
+
+    configured = replace(
+        settings(tmp_path),
+        max_attempts=1,
+        alert=lambda event, details: alerts.append((event, details)),
+    )
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=unavailable,
+        )
+
+        assert outcome is not None and outcome.status is AdmissionStatus.BLOCKED
+        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_BLOCKED
+        assert (
+            store.claim_next_admission(
+                "other", lease_ms=1_000, ready_through_block=10_000, now_ms=1_000_000
+            )
+            is None
+        )
+        assert alerts == [
+            (
+                "ADMISSION_RETRY_EXHAUSTED",
+                {
+                    "challenge_id": identifier,
+                    "attempts": 1,
+                    "code": "DOWNLOAD_TEMPORARY_FAILURE",
+                },
+            )
+        ]
 
 
 def test_permanent_download_failure_records_no_authoritative_score(tmp_path) -> None:

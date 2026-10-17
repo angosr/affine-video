@@ -1,0 +1,635 @@
+"""Deterministic generation plans and their one-way READY transition."""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, replace
+from math import isfinite
+from typing import Any
+
+from scoring.spec import ScoringSpec
+from validator.production.commitment import (
+    SourcePool,
+    SourceProof,
+    canonical_json,
+    decode_canonical_json,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedStep:
+    index: int
+    window: str
+    sigma: float
+    next_sigma: float
+
+    def __post_init__(self) -> None:
+        if type(self.index) is not int or self.index < 0:
+            raise ValueError("selected step index must be non-negative")
+        if not isinstance(self.window, str) or not self.window:
+            raise ValueError("selected step window cannot be empty")
+        if (
+            isinstance(self.sigma, bool)
+            or isinstance(self.next_sigma, bool)
+            or not isinstance(self.sigma, (int, float))
+            or not isinstance(self.next_sigma, (int, float))
+            or not isfinite(float(self.sigma))
+            or not isfinite(float(self.next_sigma))
+            or not 0 <= self.next_sigma < self.sigma <= 1
+        ):
+            raise ValueError("selected step sigma transition is invalid")
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "next_sigma": self.next_sigma,
+            "sigma": self.sigma,
+            "window": self.window,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutPlan:
+    rollout_id: str
+    source_id: str
+    stratum: str
+    noise_seed: int
+
+    def __post_init__(self) -> None:
+        if any(
+            not value
+            for value in (
+                self.rollout_id,
+                self.source_id,
+                self.stratum,
+            )
+        ):
+            raise ValueError("rollout identifiers cannot be empty")
+        if type(self.noise_seed) is not int or not 0 <= self.noise_seed < 2**64:
+            raise ValueError("rollout noise seed must fit in an unsigned 64-bit integer")
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "noise_seed": self.noise_seed,
+            "rollout_id": self.rollout_id,
+            "source_id": self.source_id,
+            "stratum": self.stratum,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyObject:
+    object_key: str
+    sha256: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        if not self.object_key or self.object_key.startswith("/"):
+            raise ValueError("ready object key is invalid")
+        _digest_bytes(self.sha256, "ready object SHA-256")
+        if type(self.size_bytes) is not int or self.size_bytes <= 0:
+            raise ValueError("ready object size must be positive")
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "object_key": self.object_key,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DenseReference:
+    rollout_id: str
+    video: ReadyObject
+    latent: ReadyObject
+
+    def __post_init__(self) -> None:
+        if not self.rollout_id:
+            raise ValueError("dense reference rollout ID cannot be empty")
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "latent": self.latent.document(),
+            "rollout_id": self.rollout_id,
+            "video": self.video.document(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BatchPlan:
+    track_spec_digest: str
+    generation_block: int
+    block_hash: str
+    batch_seed: str
+    submission_first_block: int
+    submission_last_block: int
+    exact_challenge_ids: tuple[str, ...]
+    confirmation_challenge_ids: tuple[str, ...]
+    source_proofs: tuple[SourceProof, ...]
+    selected_routes: tuple[str, ...]
+    selected_steps: tuple[SelectedStep, ...]
+    rollouts: tuple[RolloutPlan, ...]
+    query_selection_seed: str
+    plan_digest: str
+    state: str = "PLANNED"
+    exact: ReadyObject | None = None
+    dense_references: tuple[DenseReference, ...] = ()
+
+    def __post_init__(self) -> None:
+        _digest_bytes(self.track_spec_digest, "track specification digest")
+        _digest_bytes(self.block_hash.removeprefix("0x"), "generation block hash")
+        _digest_bytes(self.batch_seed, "batch seed")
+        _digest_bytes(self.query_selection_seed, "query selection seed")
+        _digest_bytes(self.plan_digest, "plan digest")
+        if type(self.generation_block) is not int or self.generation_block < 0:
+            raise ValueError("generation block must be non-negative")
+        if not 0 <= self.submission_first_block <= self.submission_last_block:
+            raise ValueError("submission interval is invalid")
+        if (
+            not self.source_proofs
+            or not self.selected_routes
+            or not self.selected_steps
+            or not self.rollouts
+        ):
+            raise ValueError("batch plan selection cannot be empty")
+        for values, name in (
+            (self.exact_challenge_ids, "exact challenge"),
+            (self.confirmation_challenge_ids, "confirmation challenge"),
+            (self.selected_routes, "selected route"),
+        ):
+            if len(set(values)) != len(values) or any(not value for value in values):
+                raise ValueError(f"{name} identifiers must be non-empty and unique")
+        if self.state == "PLANNED":
+            if self.exact is not None or self.dense_references:
+                raise ValueError("a PLANNED batch cannot reference completed objects")
+        elif self.state == "READY":
+            if self.exact is None or not self.dense_references:
+                raise ValueError("a READY batch requires exact data and dense references")
+        else:
+            raise ValueError("batch plan state must be PLANNED or READY")
+        if self.plan_digest != hashlib.sha256(canonical_json(self.planned_document())).hexdigest():
+            raise ValueError("batch plan digest does not match its planned fields")
+        if len({step.index for step in self.selected_steps}) != len(self.selected_steps):
+            raise ValueError("selected step indices must be unique")
+        source_ids = {proof.leaf.source_id for proof in self.source_proofs}
+        if len(source_ids) != len(self.source_proofs):
+            raise ValueError("plan source proofs must be unique")
+        if {rollout.source_id for rollout in self.rollouts} != source_ids:
+            raise ValueError("plan rollouts must cover exactly the proved sources")
+        if self.state == "READY" and {
+            reference.rollout_id for reference in self.dense_references
+        } != {rollout.rollout_id for rollout in self.rollouts}:
+            raise ValueError("READY references must cover every planned rollout")
+
+    def planned_document(self) -> dict[str, Any]:
+        return _planned_document(
+            {
+                "batch_seed": self.batch_seed,
+                "block_hash": self.block_hash,
+                "confirmation_challenge_ids": self.confirmation_challenge_ids,
+                "exact_challenge_ids": self.exact_challenge_ids,
+                "generation_block": self.generation_block,
+                "query_selection_seed": self.query_selection_seed,
+                "rollouts": self.rollouts,
+                "selected_routes": self.selected_routes,
+                "selected_steps": self.selected_steps,
+                "source_proofs": self.source_proofs,
+                "submission_first_block": self.submission_first_block,
+                "submission_last_block": self.submission_last_block,
+                "track_spec_digest": self.track_spec_digest,
+            }
+        )
+
+    def document(self) -> dict[str, Any]:
+        result = {
+            **self.planned_document(),
+            "plan_digest": self.plan_digest,
+            "state": self.state,
+        }
+        if self.state == "READY":
+            result["exact"] = self.exact.document() if self.exact is not None else None
+            result["dense_references"] = [
+                reference.document() for reference in self.dense_references
+            ]
+        return result
+
+    def encode(self) -> bytes:
+        return canonical_json(self.document())
+
+    def ready(
+        self,
+        *,
+        exact: ReadyObject,
+        dense_references: tuple[DenseReference, ...],
+    ) -> BatchPlan:
+        if self.state != "PLANNED":
+            raise ValueError("only a PLANNED batch can become READY")
+        return replace(self, state="READY", exact=exact, dense_references=dense_references)
+
+    @classmethod
+    def decode(cls, payload: bytes) -> BatchPlan:
+        """Recover a strictly canonical PLANNED or READY document."""
+
+        value = decode_canonical_json(payload)
+        if not isinstance(value, dict):
+            raise ValueError("batch plan must be a JSON object")
+        common = {
+            "batch_seed",
+            "block_hash",
+            "confirmation_challenge_ids",
+            "exact_challenge_ids",
+            "format",
+            "generation_block",
+            "plan_digest",
+            "query_selection_seed",
+            "rollouts",
+            "selected_routes",
+            "selected_steps",
+            "source_proofs",
+            "state",
+            "submission_first_block",
+            "submission_last_block",
+            "track_spec_digest",
+        }
+        state = value.get("state")
+        expected = common | ({"dense_references", "exact"} if state == "READY" else set())
+        if set(value) != expected or value.get("format") != "veda-generation-plan-v1":
+            raise ValueError("batch plan fields or format are invalid")
+
+        def strings(name: str) -> tuple[str, ...]:
+            rows = value[name]
+            if not isinstance(rows, list) or any(not isinstance(item, str) for item in rows):
+                raise ValueError(f"batch plan {name} must be a string list")
+            return tuple(rows)
+
+        steps_value = value["selected_steps"]
+        if not isinstance(steps_value, list):
+            raise ValueError("batch plan selected_steps must be a list")
+        steps = tuple(_parse_step(row) for row in steps_value)
+        rollouts_value = value["rollouts"]
+        if not isinstance(rollouts_value, list):
+            raise ValueError("batch plan rollouts must be a list")
+        rollouts = tuple(_parse_rollout(row) for row in rollouts_value)
+        proofs_value = value["source_proofs"]
+        if not isinstance(proofs_value, list):
+            raise ValueError("batch plan source_proofs must be a list")
+        exact = _parse_ready(value["exact"]) if state == "READY" else None
+        references_value = value.get("dense_references", [])
+        if not isinstance(references_value, list):
+            raise ValueError("batch plan dense_references must be a list")
+        return cls(
+            track_spec_digest=value["track_spec_digest"],
+            generation_block=value["generation_block"],
+            block_hash=value["block_hash"],
+            batch_seed=value["batch_seed"],
+            submission_first_block=value["submission_first_block"],
+            submission_last_block=value["submission_last_block"],
+            exact_challenge_ids=strings("exact_challenge_ids"),
+            confirmation_challenge_ids=strings("confirmation_challenge_ids"),
+            source_proofs=tuple(SourceProof.from_document(row) for row in proofs_value),
+            selected_routes=strings("selected_routes"),
+            selected_steps=steps,
+            rollouts=rollouts,
+            query_selection_seed=value["query_selection_seed"],
+            plan_digest=value["plan_digest"],
+            state=state,
+            exact=exact,
+            dense_references=tuple(_parse_reference(row) for row in references_value),
+        )
+
+
+def build_plan(
+    *,
+    track_spec_digest: str,
+    generation_block: int,
+    block_hash: str,
+    track_start_block: int,
+    minimum_generation_delay_blocks: int,
+    generation_interval_blocks: int,
+    exact_challenge_ids: tuple[str, ...],
+    confirmation_challenge_ids: tuple[str, ...],
+    source_proofs: tuple[SourceProof, ...],
+    scoring: ScoringSpec,
+    available_routes: tuple[str, ...],
+) -> BatchPlan:
+    """Build the sole plan selected by one finalized generation block."""
+
+    batch_seed = generation_seed(track_spec_digest, block_hash)
+    first, last = submission_interval(
+        generation_block,
+        track_start_block=track_start_block,
+        minimum_generation_delay_blocks=minimum_generation_delay_blocks,
+        generation_interval_blocks=generation_interval_blocks,
+    )
+    routes = _ranked(available_routes, batch_seed, "route")[: scoring.sampled_route_count]
+    if len(routes) != scoring.sampled_route_count:
+        raise ValueError("not enough selector routes for the batch plan")
+    steps = select_steps(batch_seed, scoring)
+    rollouts = _rollouts(batch_seed, source_proofs, scoring)
+    query_seed = hashlib.sha256(
+        b"veda-query-selection-v1\0" + bytes.fromhex(batch_seed)
+    ).hexdigest()
+    arguments = {
+        "track_spec_digest": track_spec_digest,
+        "generation_block": generation_block,
+        "block_hash": "0x" + block_hash.removeprefix("0x").lower(),
+        "batch_seed": batch_seed,
+        "submission_first_block": first,
+        "submission_last_block": last,
+        "exact_challenge_ids": tuple(exact_challenge_ids),
+        "confirmation_challenge_ids": tuple(confirmation_challenge_ids),
+        "source_proofs": tuple(source_proofs),
+        "selected_routes": routes,
+        "selected_steps": steps,
+        "rollouts": rollouts,
+        "query_selection_seed": query_seed,
+    }
+    digest = hashlib.sha256(canonical_json(_planned_document(arguments))).hexdigest()
+    return BatchPlan(**arguments, plan_digest=digest)
+
+
+def generation_seed(track_spec_digest: str, block_hash: str) -> str:
+    track = _digest_bytes(track_spec_digest, "track specification digest")
+    block = _digest_bytes(block_hash.removeprefix("0x"), "generation block hash")
+    return hashlib.sha256(b"veda-evaluation-batch-v1" + track + block).hexdigest()
+
+
+def scheduled_generation_block(
+    submission_block: int,
+    *,
+    track_start_block: int,
+    minimum_generation_delay_blocks: int,
+    generation_interval_blocks: int,
+) -> int:
+    if min(submission_block, track_start_block) < 0:
+        raise ValueError("block heights must be non-negative")
+    if min(minimum_generation_delay_blocks, generation_interval_blocks) <= 0:
+        raise ValueError("generation timing must be positive")
+    earliest = submission_block + minimum_generation_delay_blocks
+    offset = max(0, earliest - track_start_block)
+    return (
+        track_start_block
+        + ((offset + generation_interval_blocks - 1) // generation_interval_blocks)
+        * generation_interval_blocks
+    )
+
+
+def submission_interval(
+    generation_block: int,
+    *,
+    track_start_block: int,
+    minimum_generation_delay_blocks: int,
+    generation_interval_blocks: int,
+) -> tuple[int, int]:
+    if generation_block < track_start_block:
+        raise ValueError("generation block predates the track")
+    if (generation_block - track_start_block) % generation_interval_blocks:
+        raise ValueError("generation block is not on a scheduled boundary")
+    last = generation_block - minimum_generation_delay_blocks
+    first = max(
+        track_start_block,
+        generation_block - generation_interval_blocks - minimum_generation_delay_blocks + 1,
+    )
+    if last < first:
+        raise ValueError("generation boundary has no valid submission interval")
+    return first, last
+
+
+def select_steps(batch_seed: str, scoring: ScoringSpec) -> tuple[SelectedStep, ...]:
+    allocations = {window.name: 1 for window in scoring.trajectory_schedule.step_windows}
+    for _ in range(scoring.sampled_step_count - len(allocations)):
+        chosen = max(
+            scoring.trajectory_schedule.step_windows,
+            key=lambda window: (
+                window.weight * scoring.sampled_step_count - allocations[window.name],
+                window.name,
+            ),
+        )
+        if allocations[chosen.name] >= len(chosen.indices):
+            candidates = [
+                window
+                for window in scoring.trajectory_schedule.step_windows
+                if allocations[window.name] < len(window.indices)
+            ]
+            if not candidates:
+                raise ValueError("step windows cannot supply the requested sample count")
+            chosen = max(
+                candidates,
+                key=lambda window: (
+                    window.weight * scoring.sampled_step_count - allocations[window.name],
+                    window.name,
+                ),
+            )
+        allocations[chosen.name] += 1
+    selected = []
+    sigmas = scoring.trajectory_schedule.sigmas
+    for window in scoring.trajectory_schedule.step_windows:
+        ranked = _ranked(
+            tuple(str(index) for index in window.indices),
+            batch_seed,
+            f"step:{window.name}",
+        )
+        selected.extend(
+            SelectedStep(index, window.name, sigmas[index], sigmas[index + 1])
+            for index in sorted(int(value) for value in ranked[: allocations[window.name]])
+        )
+    return tuple(sorted(selected, key=lambda step: step.index))
+
+
+def select_query_tiles(
+    *,
+    query_selection_seed: str,
+    case_id: str,
+    target_tiles: tuple[int, ...],
+    reference_tiles: tuple[int, ...],
+    count: int,
+) -> tuple[int, ...]:
+    """Select target/reference queries; global rows are deliberately excluded."""
+
+    if count <= 0 or not case_id:
+        raise ValueError("query selection inputs are invalid")
+    target = tuple(sorted(set(target_tiles)))
+    reference = tuple(sorted(set(reference_tiles)))
+    if set(target) & set(reference) or not target:
+        raise ValueError("query tile segments are invalid")
+    if reference:
+        reference_count = min(len(reference), max(1, count // 4))
+        target_count = min(len(target), count - reference_count)
+        remaining = count - reference_count - target_count
+        target_count += min(remaining, len(target) - target_count)
+        remaining = count - reference_count - target_count
+        reference_count += min(remaining, len(reference) - reference_count)
+    else:
+        target_count = min(count, len(target))
+        reference_count = 0
+    if target_count + reference_count != count:
+        raise ValueError("query tile universe is smaller than query_tiles_per_case")
+    selected = _ranked(target, query_selection_seed, f"query:{case_id}:target")[:target_count]
+    selected += _ranked(reference, query_selection_seed, f"query:{case_id}:reference")[
+        :reference_count
+    ]
+    return tuple(sorted(selected))
+
+
+def select_source_proofs(
+    pool: SourcePool,
+    *,
+    strata: tuple[str, ...],
+    sources_per_stratum: int,
+    batch_seed: str,
+    used_families: frozenset[str],
+) -> tuple[SourceProof, ...]:
+    """Select independent, unused production families for every stratum."""
+
+    if not strata or len(set(strata)) != len(strata):
+        raise ValueError("source strata must be non-empty and unique")
+    if type(sources_per_stratum) is not int or sources_per_stratum <= 0:
+        raise ValueError("sources per stratum must be positive")
+    selected: list[SourceProof] = []
+    reserved = set(used_families)
+    for stratum in sorted(strata):
+        candidates = tuple(
+            leaf
+            for leaf in pool.leaves
+            if leaf.partition == "production"
+            and leaf.generation_geometry == stratum
+            and leaf.source_family_id not in reserved
+        )
+        ranked = _ranked(candidates, batch_seed, f"source:{stratum}")
+        chosen_for_stratum = []
+        for chosen in ranked:
+            if chosen.source_family_id in reserved:
+                continue
+            reserved.add(chosen.source_family_id)
+            chosen_for_stratum.append(pool.proof(chosen.source_id))
+            if len(chosen_for_stratum) == sources_per_stratum:
+                break
+        if len(chosen_for_stratum) != sources_per_stratum:
+            raise ValueError(f"source pool is exhausted for stratum {stratum}")
+        selected.extend(chosen_for_stratum)
+    return tuple(selected)
+
+
+def _rollouts(
+    batch_seed: str,
+    proofs: tuple[SourceProof, ...],
+    scoring: ScoringSpec,
+) -> tuple[RolloutPlan, ...]:
+    expected_strata = set(scoring.stratum_weight_map)
+    by_stratum = {
+        stratum: tuple(proof for proof in proofs if proof.leaf.generation_geometry == stratum)
+        for stratum in expected_strata
+    }
+    if (
+        any(proof.leaf.generation_geometry not in expected_strata for proof in proofs)
+        or any(len(items) != scoring.rollouts_per_stratum for items in by_stratum.values())
+        or sum(map(len, by_stratum.values())) != len(proofs)
+    ):
+        raise ValueError(
+            "source proofs must contain one independent source per rollout and stratum"
+        )
+    families = [proof.leaf.source_family_id for proof in proofs]
+    if len(set(families)) != len(families):
+        raise ValueError("rollout source families must be independent")
+    result = []
+    for stratum in sorted(expected_strata):
+        for proof in by_stratum[stratum]:
+            if proof.leaf.partition != "production":
+                raise ValueError("formal batch plans can only select production sources")
+            material = hashlib.sha256(
+                bytes.fromhex(batch_seed) + b"\0rollout\0" + proof.leaf.source_id.encode()
+            ).digest()
+            rollout_id = hashlib.sha256(b"veda-rollout-v1\0" + material).hexdigest()
+            result.append(
+                RolloutPlan(
+                    rollout_id,
+                    proof.leaf.source_id,
+                    proof.leaf.generation_geometry,
+                    int.from_bytes(material[8:16], "big"),
+                )
+            )
+    return tuple(result)
+
+
+def _ranked(values: tuple[Any, ...], seed: str, domain: str) -> tuple[Any, ...]:
+    if len(set(values)) != len(values):
+        raise ValueError("ranked values must be unique")
+    material = _digest_bytes(seed, "ranking seed")
+    return tuple(
+        sorted(
+            values,
+            key=lambda value: (
+                hashlib.sha256(
+                    material + b"\0" + domain.encode() + b"\0" + str(value).encode()
+                ).digest(),
+                str(value),
+            ),
+        )
+    )
+
+
+def _planned_document(arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "batch_seed": arguments["batch_seed"],
+        "block_hash": arguments["block_hash"],
+        "confirmation_challenge_ids": list(arguments["confirmation_challenge_ids"]),
+        "exact_challenge_ids": list(arguments["exact_challenge_ids"]),
+        "format": "veda-generation-plan-v1",
+        "generation_block": arguments["generation_block"],
+        "query_selection_seed": arguments["query_selection_seed"],
+        "rollouts": [rollout.document() for rollout in arguments["rollouts"]],
+        "selected_routes": list(arguments["selected_routes"]),
+        "selected_steps": [step.document() for step in arguments["selected_steps"]],
+        "source_proofs": [proof.document() for proof in arguments["source_proofs"]],
+        "submission_first_block": arguments["submission_first_block"],
+        "submission_last_block": arguments["submission_last_block"],
+        "track_spec_digest": arguments["track_spec_digest"],
+    }
+
+
+def _parse_step(value: Any) -> SelectedStep:
+    row = _row(value, {"index", "next_sigma", "sigma", "window"}, "selected step")
+    return SelectedStep(row["index"], row["window"], row["sigma"], row["next_sigma"])
+
+
+def _parse_rollout(value: Any) -> RolloutPlan:
+    row = _row(
+        value,
+        {"noise_seed", "rollout_id", "source_id", "stratum"},
+        "rollout",
+    )
+    return RolloutPlan(
+        row["rollout_id"],
+        row["source_id"],
+        row["stratum"],
+        row["noise_seed"],
+    )
+
+
+def _parse_ready(value: Any) -> ReadyObject:
+    row = _row(value, {"object_key", "sha256", "size_bytes"}, "ready object")
+    return ReadyObject(row["object_key"], row["sha256"], row["size_bytes"])
+
+
+def _parse_reference(value: Any) -> DenseReference:
+    row = _row(value, {"latent", "rollout_id", "video"}, "dense reference")
+    return DenseReference(
+        row["rollout_id"], _parse_ready(row["video"]), _parse_ready(row["latent"])
+    )
+
+
+def _row(value: Any, fields: set[str], name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError(f"{name} fields are invalid")
+    return value
+
+
+def _digest_bytes(value: str, name: str) -> bytes:
+    try:
+        result = bytes.fromhex(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be hexadecimal") from exc
+    if len(result) != 32:
+        raise ValueError(f"{name} must contain 32 bytes")
+    return result

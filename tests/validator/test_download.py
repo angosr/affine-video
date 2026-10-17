@@ -4,9 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from validator import chunks
+from validator.chunks import ChunkManifest, ChunkPart
 from validator.download import (
     ModelDownloadError,
     download_chunked_asset,
+    download_chunked_file,
     download_public_model,
 )
 
@@ -75,6 +78,13 @@ class AssetClient:
 
     def stream(self, method: str, url: str, *, headers: dict[str, str] | None = None):
         assert method == "GET"
+        if url.endswith("/manifest.json"):
+            assert headers == {"Accept": "application/json"}
+            return AssetResponse(self.manifest)
+        assert headers is None
+        return AssetResponse(self.parts[url.rsplit("/", 1)[-1]])
+
+    def get(self, url: str, *, headers: dict[str, str] | None = None):
         if url.endswith("/manifest.json"):
             assert headers == {"Accept": "application/json"}
             return AssetResponse(self.manifest)
@@ -150,6 +160,32 @@ def test_chunked_public_asset_rejects_a_corrupt_part(tmp_path) -> None:
             http_client=AssetClient(manifest, {"part-000": b"xxxxxx"}),
         )
     assert not list(tmp_path.glob(".partial-baseline-*"))
+
+
+def test_generic_chunked_file_is_reassembled(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(chunks, "CHUNK_BYTES", 3)
+    parts = {"part-00000": b"abc", "part-00001": b"def"}
+    complete = b"abcdef"
+    digest = hashlib.sha256(complete).hexdigest()
+    manifest = ChunkManifest(
+        digest,
+        len(complete),
+        tuple(
+            ChunkPart(name, hashlib.sha256(content).hexdigest(), len(content))
+            for name, content in parts.items()
+        ),
+    ).encode()
+
+    path = download_chunked_file(
+        "https://public.example/models/digest/manifest.json",
+        cache_dir=tmp_path,
+        expected_sha256=digest,
+        max_bytes=10,
+        suffix=".safetensors",
+        http_client=AssetClient(manifest, parts),
+    )
+
+    assert path.read_bytes() == complete
 
 
 def test_downloads_anonymously_into_content_addressed_cache(tmp_path) -> None:

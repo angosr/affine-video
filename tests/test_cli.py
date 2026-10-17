@@ -5,7 +5,7 @@ import pytest
 
 import cli as cli_module
 from cli import main
-from validator.queue import ChainPosition, submission_id
+from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
 
 
@@ -169,6 +169,39 @@ def test_validator_query_does_not_create_a_missing_database(tmp_path, capsys) ->
     assert not database.exists()
 
 
+def test_validator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch, capsys) -> None:
+    class Store:
+        def __init__(self, database):
+            assert database == "validator.db"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def resume_blocked(self, challenge_id):
+            assert challenge_id == "challenge-1"
+            return ChallengeState.CONFIRMING
+
+    monkeypatch.setattr(cli_module, "ChallengeStore", Store)
+
+    main(
+        [
+            "validator",
+            "retry",
+            "challenge-1",
+            "--database",
+            "validator.db",
+        ]
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "challenge_id": "challenge-1",
+        "state": "CONFIRMING",
+    }
+
+
 def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_path) -> None:
     called = {}
 
@@ -193,6 +226,8 @@ def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_p
             str(tmp_path / "models"),
             "--exact-cache",
             str(tmp_path / "exact.npz"),
+            "--production-config",
+            str(tmp_path / "production.json"),
             "--initial-model",
             str(tmp_path / "veda.safetensors"),
             "--archive-endpoint",
@@ -206,6 +241,7 @@ def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_p
     assert called["once"] is True
     assert called["network"] == "finney"
     assert called["exact_cache"] == str(tmp_path / "exact.npz")
+    assert called["production_config"] == str(tmp_path / "production.json")
     assert called["initial_model"] == str(tmp_path / "veda.safetensors")
     assert called["publisher"] == {
         "bucket": "affine_video",

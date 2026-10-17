@@ -17,15 +17,17 @@ from typing import Any
 from scoring.cache import (
     CacheLoadError,
     ExactCacheBatch,
-    load_exact_cache,
+    ExactCacheReader,
     select_exact_cache_batch,
 )
-from scoring.exact import ExactCase, paired_score_gain_bound, score_selector
-from scoring.generator import generate_sources, plan_batch, source_digest
+from scoring.exact import score_selector_pair
 from scoring.model import ModelValidationError, ValidatedModel, validate_model
 from scoring.selector import load_selector
 from scoring.spec import TrackSpec
-from validator.download import ModelDownloadError, download_public_asset, download_public_model
+from validator.download import ModelDownloadError, download_chunked_file, download_public_model
+from validator.production.batches import ReadyBatchSource
+from validator.production.confirmation import ConfirmationWorkerPool
+from validator.production.plan import scheduled_generation_block
 from validator.queue import ChallengeState, require_transition
 from validator.store import ChallengeStore, LeasedChallenge
 from validator.tournament import genesis_champion, resolve_tournament
@@ -74,9 +76,13 @@ class ScoringSettings:
     lease_ms: int = 30 * 60 * 1000
     retry_base_ms: int = 60 * 1000
     retry_max_ms: int = 60 * 60 * 1000
+    max_attempts: int = 9
+    alert: Callable[[str, Mapping[str, object]], None] | None = None
+    archive_stage: Callable[[LeasedChallenge, StageOutcome, int], None] | None = None
+    restore_stage: Callable[[LeasedChallenge], object | None] | None = None
 
     def __post_init__(self) -> None:
-        if min(self.lease_ms, self.retry_base_ms, self.retry_max_ms) <= 0:
+        if min(self.lease_ms, self.retry_base_ms, self.retry_max_ms, self.max_attempts) <= 0:
             raise ValueError("scoring timing limits must be positive")
         if self.retry_base_ms > self.retry_max_ms:
             raise ValueError("retry base cannot exceed retry maximum")
@@ -90,73 +96,14 @@ class ScoringOutcome:
 
 
 @dataclass(frozen=True, slots=True)
-class TrackEvaluator:
-    """Trusted authoritative evaluator over the frozen exact cache."""
+class EvaluatedStage:
+    """A leased successful stage waiting for a fresh finalized decision block."""
 
-    track: TrackSpec
-    exact_cases: Sequence[ExactCase]
-
-    def __call__(self, task: LeasedChallenge) -> StageOutcome:
-        if task.model_path is None or task.file_sha256 is None:
-            raise TemporaryScoringError(
-                "SCORING_MODEL_UNAVAILABLE", "validated model path is unavailable"
-            )
-        try:
-            current_digest = _file_sha256(Path(task.model_path))
-        except OSError as exc:
-            raise TemporaryScoringError(
-                "SCORING_MODEL_UNAVAILABLE", "validated model file cannot be read"
-            ) from exc
-        if current_digest != task.file_sha256:
-            raise TemporaryScoringError(
-                "SCORING_MODEL_CHANGED", "validated model cache checksum changed"
-            )
-        try:
-            selector = load_selector(
-                task.model_path,
-                self.track.model.selector,
-                expected_hotkey=task.hotkey,
-            )
-        except ModelValidationError as exc:
-            raise ParticipantScoringError(exc.code, str(exc)) from exc
-
-        scoring = self.track.scoring
-        try:
-            if task.state is ChallengeState.SCORING:
-                cases = tuple(self.exact_cases)
-                if len(cases) != scoring.sample_count:
-                    raise ValueError("exact cache case count does not match the track")
-                result = score_selector(
-                    selector,
-                    cases,
-                    scoring.budgets,
-                    stratum_weights=scoring.stratum_weight_map,
-                    tail_mean_weight=scoring.tail_mean_weight,
-                    bootstrap_confidence=scoring.bootstrap_confidence,
-                    bootstrap_resamples=scoring.bootstrap_resamples,
-                    bootstrap_seed=scoring.bootstrap_seed,
-                )
-                return StageOutcome(
-                    result.lower_bound,
-                    {
-                        "exact_score": result.aggregate.score,
-                        "lower_bound": result.lower_bound,
-                        "budget_scores": [item.quality for item in result.aggregate.budgets],
-                        "sample_count": len(cases),
-                        "sample_scores": list(result.sample_scores),
-                    },
-                )
-        except (ParticipantScoringError, TemporaryScoringError):
-            raise
-        except ModelValidationError as exc:
-            raise ParticipantScoringError(exc.code, str(exc)) from exc
-        except (ValueError, OSError) as exc:
-            raise TemporaryScoringError(
-                "SCORING_CACHE_INVALID", "frozen scoring data is invalid"
-            ) from exc
-        raise TemporaryScoringError(
-            "SCORING_STAGE_INVALID", f"unsupported scoring stage: {task.state}"
-        )
+    task: LeasedChallenge
+    result: StageOutcome
+    recorded_score_block: int | None
+    recorded_locally: bool
+    occurred_at_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,49 +114,56 @@ class FilePairedEvaluator:
     exact_cache: str
     exact_sha256: str
     incumbent: LeasedChallenge
+    scoring_device: str | None = None
 
     def __call__(self, challenger: LeasedChallenge) -> StageOutcome:
         try:
             scoring = self.track.scoring
-            exact_cases = load_exact_cache(
+            challenger_selector = _load_task_selector(self.track, challenger)
+            incumbent_selector = _load_task_selector(self.track, self.incumbent)
+            reader = ExactCacheReader(
                 self.exact_cache,
                 expected_sha256=self.exact_sha256,
                 max_bytes=self.track.cache.exact_max_bytes,
             )
-            if len(exact_cases) != scoring.sample_count:
+            if len(reader.metadata["cases"]) != scoring.case_count:
                 raise CacheLoadError("cache case count does not match the track")
-        except CacheLoadError as exc:
+            with reader:
+                paired = score_selector_pair(
+                    challenger_selector,
+                    incumbent_selector,
+                    reader,
+                    scoring.budgets,
+                    stratum_weights=scoring.stratum_weight_map,
+                    step_window_weights=scoring.step_window_weight_map,
+                    tail_mean_weight=scoring.tail_mean_weight,
+                    confidence=self.track.match_confidence,
+                    resamples=scoring.bootstrap_resamples,
+                    seed=scoring.bootstrap_seed,
+                    device=self.scoring_device,
+                )
+        except ModelValidationError as exc:
+            raise ParticipantScoringError(exc.code, str(exc)) from exc
+        except (CacheLoadError, ValueError, OSError) as exc:
             raise TemporaryScoringError("SCORING_CACHE_INVALID", str(exc)) from exc
-        evaluator = TrackEvaluator(self.track, exact_cases)
-        challenger_result = evaluator(challenger)
-        incumbent_result = evaluator(self.incumbent)
-        challenger_scores = challenger_result.metrics.get("sample_scores")
-        incumbent_scores = incumbent_result.metrics.get("sample_scores")
-        if not isinstance(challenger_scores, list) or not isinstance(incumbent_scores, list):
-            raise TemporaryScoringError(
-                "SCORING_WORKER_FAILURE", "paired scorer omitted per-case scores"
-            )
-        paired_gain = paired_score_gain_bound(
-            challenger_scores,
-            incumbent_scores,
-            exact_cases,
-            stratum_weights=scoring.stratum_weight_map,
-            confidence=scoring.bootstrap_confidence,
-            resamples=scoring.bootstrap_resamples,
-            seed=scoring.bootstrap_seed,
-        )
         return StageOutcome(
-            challenger_result.score,
+            paired.challenger_score,
             {
-                **{
-                    key: value
-                    for key, value in challenger_result.metrics.items()
-                    if key != "sample_scores"
-                },
-                "incumbent_score": incumbent_result.score,
-                "paired_gain_lower_bound": paired_gain,
+                "case_count": len(paired.challenger_cells),
+                "exact_score": paired.challenger_score,
+                "incumbent_score": paired.incumbent_score,
+                "paired_gain_lower_bound": paired.gain_lower_bound,
             },
         )
+
+
+def _load_task_selector(track: TrackSpec, task: LeasedChallenge):
+    if task.model_path is None or task.file_sha256 is None:
+        raise OSError("validated model path is unavailable")
+    path = Path(task.model_path)
+    if _file_sha256(path) != task.file_sha256:
+        raise OSError("validated model cache checksum changed")
+    return load_selector(path, track.model.selector, expected_hotkey=task.hotkey)
 
 
 def verify_initial_champion(
@@ -250,6 +204,9 @@ class PairedTrackEvaluator:
     max_cpu_seconds: int | None = None
     downloader: Callable[..., Any] = download_public_model
     seed_block_hashes: Mapping[int, str] | None = None
+    scoring_device: str | None = None
+    batch_source: ReadyBatchSource | None = None
+    confirmation_pool: ConfirmationWorkerPool | None = None
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         snapshot = self.store.public_snapshot()
@@ -258,18 +215,22 @@ class PairedTrackEvaluator:
             track_id=self.track.track_id,
             track_spec_digest=self.track.digest,
             netuid=self.track.netuid,
-            minimum_gain=self.track.scoring.minimum_frontier_gain,
+            minimum_gain=self.track.full_video.minimum_gain,
+            minimum_exact_gain=self.track.scoring.minimum_frontier_gain,
             initial_champion=genesis_champion(self.track),
             minimum_generation_delay_blocks=(self.track.cache.minimum_generation_delay_blocks),
         )
         incumbent = tournament.champion
-        batch = self._batch(task)
         incumbent_task = self._incumbent_task(incumbent, snapshot["challenges"])
+        if task.state is ChallengeState.CONFIRMING:
+            return self._confirm(task, incumbent_task)
+        batch = self._batch(task)
         evaluator = FilePairedEvaluator(
             self.track,
             str(batch.path),
             batch.sha256,
             incumbent_task,
+            self.scoring_device,
         )
         isolated = IsolatedEvaluator(
             evaluator,
@@ -284,59 +245,106 @@ class PairedTrackEvaluator:
                 **paired.metrics,
                 "cache_sha256": batch.sha256,
                 "cache_generated_block": batch.generated_block,
-                "cache_source_digest": batch.source_digest,
+                "cache_plan_digest": batch.plan_digest,
                 "cache_seed_block_hash": batch.seed_block_hash,
+                "requires_confirmation": (
+                    paired.metrics["paired_gain_lower_bound"]
+                    > self.track.scoring.minimum_frontier_gain
+                ),
+            },
+        )
+
+    def _confirm(
+        self,
+        challenger: LeasedChallenge,
+        incumbent: LeasedChallenge,
+    ) -> StageOutcome:
+        if self.batch_source is None or self.confirmation_pool is None:
+            raise TemporaryScoringError(
+                "CONFIRMATION_BATCH_UNAVAILABLE",
+                "full-video confirmation is not configured",
+            )
+        try:
+            _load_task_selector(self.track, challenger)
+            _load_task_selector(self.track, incumbent)
+            batch = self.batch_source.confirmation_batch(challenger.challenge_id)
+            exact = self.store.stage_score(challenger.challenge_id, ChallengeState.SCORING)
+            if exact is None:
+                raise RuntimeError("confirmation is missing its completed exact decision")
+            expected_block = scheduled_generation_block(
+                exact.score_block,
+                track_start_block=self.track.track_start_block,
+                minimum_generation_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
+                generation_interval_blocks=self.track.cache.generation_interval_blocks,
+            )
+            if batch.plan.generation_block != expected_block:
+                raise RuntimeError("confirmation batch does not follow the exact decision block")
+            result = self.confirmation_pool.run(
+                challenger_path=challenger.model_path or "",
+                incumbent_path=incumbent.model_path or "",
+                batch=batch,
+            )
+        except ModelValidationError as exc:
+            raise ParticipantScoringError(exc.code, str(exc)) from exc
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise TemporaryScoringError("CONFIRMATION_BATCH_UNAVAILABLE", str(exc)) from exc
+        return StageOutcome(
+            result.challenger_score,
+            {
+                "cache_generated_block": batch.plan.generation_block,
+                "cache_plan_digest": batch.plan.plan_digest,
+                "cache_seed_block_hash": batch.plan.block_hash,
+                "cache_sha256": batch.exact.sha256,
+                "case_count": len(result.challenger_cells),
+                "confirmation_score": result.challenger_score,
+                "incumbent_score": result.incumbent_score,
+                "paired_gain_lower_bound": result.gain_lower_bound,
             },
         )
 
     def _batch(self, task: LeasedChallenge) -> ExactCacheBatch:
         scoring = self.track.scoring
         try:
-            batch = select_exact_cache_batch(
-                self.cache_dir,
-                submission_block=task.position.block,
-                minimum_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
-                track_start_block=self.track.track_start_block,
-                generation_interval_blocks=self.track.cache.generation_interval_blocks,
-                max_bytes=self.track.cache.exact_max_bytes,
-                min_blocks=scoring.budgets[0].blocks,
-                max_blocks=scoring.budgets[-1].blocks,
-                head_dim=self.track.model.selector.head_dim,
-                routes=self.track.model.selector.routes,
-                strata=scoring.stratum_weight_map,
-                sample_count=scoring.sample_count,
-            )
+            if self.batch_source is None:
+                batch = select_exact_cache_batch(
+                    self.cache_dir,
+                    submission_block=task.position.block,
+                    minimum_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
+                    track_start_block=self.track.track_start_block,
+                    generation_interval_blocks=self.track.cache.generation_interval_blocks,
+                    expected_track_spec_digest=self.track.digest,
+                    max_bytes=self.track.cache.exact_max_bytes,
+                    head_dim=self.track.model.selector.head_dim,
+                    tile_size=128,
+                    routes=self.track.model.selector.routes,
+                    strata=scoring.stratum_weight_map,
+                    sampled_route_count=scoring.sampled_route_count,
+                    rollouts_per_stratum=scoring.rollouts_per_stratum,
+                    sampled_step_count=scoring.sampled_step_count,
+                    query_tiles_per_case=scoring.query_tiles_per_case,
+                )
+            else:
+                batch = self.batch_source.exact_batch(task.challenge_id)
+                expected_block = scheduled_generation_block(
+                    task.position.block,
+                    track_start_block=self.track.track_start_block,
+                    minimum_generation_delay_blocks=(
+                        self.track.cache.minimum_generation_delay_blocks
+                    ),
+                    generation_interval_blocks=self.track.cache.generation_interval_blocks,
+                )
+                if batch.generated_block != expected_block:
+                    raise CacheLoadError("challenge READY plan uses the wrong generation block")
             if self.seed_block_hashes is not None:
                 expected_hash = self.seed_block_hashes.get(batch.generated_block)
                 if expected_hash is None or batch.seed_block_hash.lower() != expected_hash.lower():
                     raise CacheLoadError(
                         "cache seed hash does not match its finalized generation block"
                     )
-            if self.track.cache.generator != "veda-source-v2":
+            if self.track.cache.generator != "veda-private-rollout-v1":
                 raise CacheLoadError("track cache generator is unsupported")
-            sources = generate_sources(
-                track_spec_digest=self.track.digest,
-                seed_block_hash=batch.seed_block_hash,
-                strata=tuple(scoring.stratum_weight_map),
-                samples_per_stratum=1,
-            )
-            if batch.source_digest != source_digest(sources):
-                raise CacheLoadError("cache source digest does not match its generated manifest")
-            by_stratum = {
-                stratum: tuple(sample.sample_id for sample in sources if sample.stratum == stratum)
-                for stratum in scoring.stratum_weight_map
-            }
-            planned = plan_batch(
-                track_spec_digest=self.track.digest,
-                seed_block_hash=batch.seed_block_hash,
-                routes=self.track.model.selector.routes,
-                samples_by_stratum=by_stratum,
-                sample_count=scoring.sample_count,
-            )
-            if batch.cases != tuple((case.route, case.stratum, case.sample_id) for case in planned):
-                raise CacheLoadError("cache cases do not match the finalized batch plan")
             return batch
-        except CacheLoadError as exc:
+        except (CacheLoadError, RuntimeError) as exc:
             raise TemporaryScoringError("SCORING_CACHE_UNAVAILABLE", str(exc)) from exc
 
     def _incumbent_task(
@@ -356,13 +364,23 @@ class PairedTrackEvaluator:
             expected_hotkey = incumbent.hotkey
             local_path = self.store.model_path(incumbent.challenge_id)
             if local_path is None or not Path(local_path).is_file():
+                path = None
+                if self.batch_source is not None:
+                    try:
+                        path = self.batch_source.restore_model(
+                            record["file_sha256"], record["model_size_bytes"]
+                        )
+                    except (OSError, RuntimeError):
+                        path = None
                 try:
-                    path = download_public_asset(
-                        f"{self.champion_archive_url.rstrip('/')}/{record['file_sha256']}.safetensors",
-                        cache_dir=self.model_cache / "champions",
-                        expected_sha256=record["file_sha256"],
-                        max_bytes=self.track.model.max_bytes,
-                    )
+                    if path is None:
+                        path = download_chunked_file(
+                            f"{self.champion_archive_url.rstrip('/')}/{record['file_sha256']}/manifest.json",
+                            cache_dir=self.model_cache / "champions",
+                            expected_sha256=record["file_sha256"],
+                            max_bytes=self.track.model.max_bytes,
+                            suffix=".safetensors",
+                        )
                 except RuntimeError:
                     try:
                         downloaded = self.downloader(
@@ -516,7 +534,7 @@ def evaluate_isolated(
     raise TemporaryScoringError(code, summary)
 
 
-def process_next_scoring(
+def evaluate_next_scoring(
     store: ChallengeStore,
     *,
     worker_id: str,
@@ -524,8 +542,8 @@ def process_next_scoring(
     settings: ScoringSettings,
     evaluator: Callable[[LeasedChallenge], StageOutcome],
     now_ms: int | None = None,
-) -> ScoringOutcome | None:
-    """Evaluate and commit at most one ready scoring stage."""
+) -> EvaluatedStage | ScoringOutcome | None:
+    """Evaluate at most one stage while retaining its lease for atomic commit."""
 
     now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
     task = store.claim_next_scoring(
@@ -539,7 +557,13 @@ def process_next_scoring(
     recorded = store.stage_score(task.challenge_id, task.state)
     if recorded is None:
         try:
-            result = evaluator(task)
+            archived = None if settings.restore_stage is None else settings.restore_stage(task)
+            if archived is None:
+                result = evaluator(task)
+                recorded_score_block = None
+            else:
+                result = StageOutcome(archived.score, archived.metrics)
+                recorded_score_block = archived.score_block
             generated_block = result.metrics.get("cache_generated_block")
             if generated_block is not None and (
                 type(generated_block) is not int or generated_block > current_finalized_block
@@ -548,7 +572,13 @@ def process_next_scoring(
                     "SCORING_CACHE_INVALID",
                     "cache generation block is not finalized",
                 )
-            require_transition(task.state, ChallengeState.SUCCEEDED)
+            target = (
+                ChallengeState.CONFIRMING
+                if task.state is ChallengeState.SCORING
+                and result.metrics.get("requires_confirmation") is True
+                else ChallengeState.SUCCEEDED
+            )
+            require_transition(task.state, target)
         except ParticipantScoringError as exc:
             store.complete_challenge(
                 task.challenge_id,
@@ -588,31 +618,125 @@ def process_next_scoring(
                 state,
                 "SCORING_WORKER_FAILURE",
             )
-        store.record_stage_score(
-            task.challenge_id,
-            task.lease_token,
-            task.state,
-            score=result.score,
-            score_block=current_finalized_block,
-            metrics=result.metrics,
-            occurred_at_ms=now,
-        )
-        result_score_block = current_finalized_block
+        recorded_locally = False
     else:
         result = StageOutcome(
             recorded.score,
             recorded.metrics,
         )
-        result_score_block = recorded.score_block
+        recorded_score_block = recorded.score_block
+        recorded_locally = True
+    return EvaluatedStage(task, result, recorded_score_block, recorded_locally, now)
+
+
+def commit_evaluated_scoring(
+    store: ChallengeStore,
+    evaluated: EvaluatedStage,
+    *,
+    current_finalized_block: int,
+    settings: ScoringSettings,
+) -> ScoringOutcome:
+    """Persist a successful stage against a finalized block read after evaluation."""
+
+    task = evaluated.task
+    result = evaluated.result
+    result_score_block = (
+        current_finalized_block
+        if evaluated.recorded_score_block is None
+        else evaluated.recorded_score_block
+    )
+    if not evaluated.recorded_locally:
+        if settings.archive_stage is not None:
+            try:
+                settings.archive_stage(task, result, result_score_block)
+            except Exception as exc:
+                state = _defer_or_fail(
+                    store,
+                    task,
+                    settings,
+                    evaluated.occurred_at_ms,
+                    code="STAGE_ARCHIVE_UNAVAILABLE",
+                    summary=str(exc) or type(exc).__name__,
+                )
+                return ScoringOutcome(task.challenge_id, state, "STAGE_ARCHIVE_UNAVAILABLE")
+        store.record_stage_score(
+            task.challenge_id,
+            task.lease_token,
+            task.state,
+            score=result.score,
+            score_block=result_score_block,
+            metrics=result.metrics,
+            occurred_at_ms=evaluated.occurred_at_ms,
+        )
+    if task.state is ChallengeState.SCORING and result.metrics.get("requires_confirmation") is True:
+        store.advance_leased(
+            task.challenge_id,
+            task.lease_token,
+            ChallengeState.CONFIRMING,
+            release=True,
+            occurred_at_ms=evaluated.occurred_at_ms,
+            details={"exact_score": result.score},
+        )
+        return ScoringOutcome(task.challenge_id, ChallengeState.CONFIRMING)
     store.complete_challenge(
         task.challenge_id,
         ChallengeState.SUCCEEDED,
         final_score=result.score,
-        occurred_at_ms=now,
+        occurred_at_ms=evaluated.occurred_at_ms,
         lease_token=task.lease_token,
         score_block=result_score_block,
     )
     return ScoringOutcome(task.challenge_id, ChallengeState.SUCCEEDED)
+
+
+def defer_evaluated_scoring(
+    store: ChallengeStore,
+    evaluated: EvaluatedStage,
+    *,
+    settings: ScoringSettings,
+    code: str,
+    summary: str,
+) -> ScoringOutcome:
+    """Release an evaluated stage when its post-evaluation commit precondition failed."""
+
+    state = _defer_or_fail(
+        store,
+        evaluated.task,
+        settings,
+        evaluated.occurred_at_ms,
+        code=code,
+        summary=summary,
+    )
+    return ScoringOutcome(evaluated.task.challenge_id, state, code)
+
+
+def process_next_scoring(
+    store: ChallengeStore,
+    *,
+    worker_id: str,
+    current_finalized_block: int,
+    settings: ScoringSettings,
+    evaluator: Callable[[LeasedChallenge], StageOutcome],
+    now_ms: int | None = None,
+) -> ScoringOutcome | None:
+    """Evaluate and commit one stage using a caller-supplied finalized block."""
+
+    evaluated = evaluate_next_scoring(
+        store,
+        worker_id=worker_id,
+        current_finalized_block=current_finalized_block,
+        settings=settings,
+        evaluator=evaluator,
+        now_ms=now_ms,
+    )
+    if evaluated is None or isinstance(evaluated, ScoringOutcome):
+        return evaluated
+    return commit_evaluated_scoring(
+        store,
+        evaluated,
+        current_finalized_block=current_finalized_block,
+        settings=settings,
+    )
 
 
 def _defer_or_fail(
@@ -624,6 +748,25 @@ def _defer_or_fail(
     code: str,
     summary: str,
 ) -> ChallengeState:
+    if task.attempts >= settings.max_attempts:
+        store.block_leased(
+            task.challenge_id,
+            task.lease_token,
+            error_code=code,
+            error_summary=summary,
+            occurred_at_ms=now_ms,
+        )
+        if settings.alert is not None:
+            settings.alert(
+                "SCORING_RETRY_EXHAUSTED",
+                {
+                    "challenge_id": task.challenge_id,
+                    "attempts": task.attempts,
+                    "code": code,
+                    "stage": str(task.state),
+                },
+            )
+        return ChallengeState.SYSTEM_BLOCKED
     multiplier = 1 << min(max(task.attempts - 1, 0), 20)
     delay = min(settings.retry_max_ms, settings.retry_base_ms * multiplier)
     store.defer_leased(

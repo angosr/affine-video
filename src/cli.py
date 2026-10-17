@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -61,6 +62,9 @@ def _parser() -> argparse.ArgumentParser:
 
     validator = modules.add_parser("validator", help="evaluate models or set chain weights")
     validator_commands = validator.add_subparsers(dest="command", required=True)
+    produce = validator_commands.add_parser("produce", help="produce private evaluation batches")
+    produce.add_argument("--config", required=True)
+    produce.add_argument("--once", action="store_true")
     leaderboard = validator_commands.add_parser("leaderboard")
     leaderboard.add_argument("--database", required=True)
     challenges = validator_commands.add_parser("challenges")
@@ -68,6 +72,11 @@ def _parser() -> argparse.ArgumentParser:
     challenge = validator_commands.add_parser("challenge")
     challenge.add_argument("challenge_id")
     challenge.add_argument("--database", required=True)
+    retry = validator_commands.add_parser(
+        "retry", help="resume one challenge stopped after infrastructure retries"
+    )
+    retry.add_argument("challenge_id")
+    retry.add_argument("--database", required=True)
     monitor = validator_commands.add_parser("monitor", help="watch the public ranking and queue")
     monitor.add_argument("--status-url", default=DEFAULT_PUBLIC_STATUS_URL)
     monitor.add_argument(
@@ -84,6 +93,7 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--database", required=True)
     evaluate.add_argument("--model-cache", required=True)
     evaluate.add_argument("--exact-cache", required=True)
+    evaluate.add_argument("--production-config", required=True)
     evaluate.add_argument("--initial-model")
     evaluate.add_argument(
         "--initial-model-manifest",
@@ -94,10 +104,19 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--worker-id", default="evaluator")
     evaluate.add_argument("--poll-seconds", default=12.0, type=float)
     evaluate.add_argument("--max-scan-blocks", default=100, type=int)
-    evaluate.add_argument("--scoring-timeout-seconds", default=1800.0, type=float)
+    evaluate.add_argument("--scoring-timeout-seconds", default=14400.0, type=float)
     evaluate.add_argument("--scoring-max-memory-bytes", type=int)
     evaluate.add_argument("--scoring-max-cpu-seconds", type=int)
+    evaluate.add_argument(
+        "--scoring-device",
+        help="authoritative CUDA device, for example cuda:0",
+    )
     evaluate.add_argument("--version-key", default=0, type=int)
+    evaluate.add_argument(
+        "--alert-webhook-url",
+        default=os.environ.get("VEDA_ALERT_WEBHOOK_URL"),
+        help="HTTPS endpoint for retry-exhaustion and evaluator-failure alerts",
+    )
     evaluate.add_argument("--once", action="store_true")
 
     run = validator_commands.add_parser("run", help="fetch public weights and submit them on-chain")
@@ -183,6 +202,31 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
 
 
 def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
+    if arguments.command == "produce":
+        try:
+            from validator.production.service import run_producer
+
+            run_producer(arguments.config, once=arguments.once)
+        except KeyboardInterrupt:
+            return
+        except (RuntimeError, OSError, ValueError) as exc:
+            parser.exit(1, f"error: {exc}\n")
+        return
+
+    if arguments.command == "retry":
+        try:
+            with ChallengeStore(arguments.database) as store:
+                state = store.resume_blocked(arguments.challenge_id)
+        except (KeyError, OSError, ValueError) as exc:
+            parser.exit(1, f"error: {exc}\n")
+        print(
+            json.dumps(
+                {"challenge_id": arguments.challenge_id, "state": state},
+                sort_keys=True,
+            )
+        )
+        return
+
     if arguments.command == "monitor":
         try:
             asyncio.run(_run_monitor(arguments.status_url, arguments.watch))
@@ -204,6 +248,7 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
                     database=arguments.database,
                     model_cache=arguments.model_cache,
                     exact_cache=arguments.exact_cache,
+                    production_config=arguments.production_config,
                     initial_model=arguments.initial_model,
                     initial_model_manifest_url=arguments.initial_model_manifest,
                     network=arguments.network,
@@ -216,6 +261,8 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
                     scoring_timeout_seconds=arguments.scoring_timeout_seconds,
                     scoring_max_memory_bytes=arguments.scoring_max_memory_bytes,
                     scoring_max_cpu_seconds=arguments.scoring_max_cpu_seconds,
+                    scoring_device=arguments.scoring_device,
+                    alert_webhook_url=arguments.alert_webhook_url,
                     once=arguments.once,
                     report=_print_evaluation_cycle,
                 )
