@@ -9,7 +9,9 @@ import multiprocessing
 import os
 import queue
 import shutil
+import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -48,6 +50,10 @@ from validator.store import ChallengeStore
 
 _MAX_PLAN_ATTEMPTS = 5
 _PRODUCER_ATTEMPT_TIMEOUT_SECONDS = 4 * 60 * 60
+
+
+class _DeadlineInterrupt(BaseException):
+    """Escape SDK retry loops before translating to a producer failure."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +479,23 @@ class ProducerService:
                 workers.close()
 
     def _execute(
+        self,
+        name: str,
+        stored: StoredObject,
+        plan: BatchPlan,
+        workers: WorkerPool,
+        *,
+        deadline: float,
+    ) -> BatchPlan:
+        try:
+            with _interrupt_at_deadline(deadline):
+                return self._execute_before_deadline(
+                    name, stored, plan, workers, deadline=deadline
+                )
+        except _DeadlineInterrupt:
+            raise RuntimeError("producer attempt exceeded the wall-clock limit") from None
+
+    def _execute_before_deadline(
         self,
         name: str,
         stored: StoredObject,
@@ -917,6 +940,30 @@ def _reserve_plan_attempt(
 def _require_before_deadline(deadline: float) -> None:
     if time.monotonic() >= deadline:
         raise RuntimeError("producer attempt exceeded the wall-clock limit")
+
+
+@contextmanager
+def _interrupt_at_deadline(deadline: float):
+    """Interrupt every synchronous phase when the attempt wall clock expires."""
+
+    _require_before_deadline(deadline)
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("producer attempts must run on the process main thread")
+    previous_delay, previous_interval = signal.getitimer(signal.ITIMER_REAL)
+    if previous_delay > 0 or previous_interval > 0:
+        raise RuntimeError("producer attempt cannot replace an active process timer")
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def expired(_signum, _frame):
+        raise _DeadlineInterrupt
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, max(deadline - time.monotonic(), 1e-6))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 @contextmanager

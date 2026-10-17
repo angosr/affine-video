@@ -1,6 +1,7 @@
 import hashlib
 import json
 import queue
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -595,6 +596,73 @@ def test_producer_attempt_deadline_covers_post_generation_work(
             Workers(),
             deadline=10.0,
         )
+
+
+@pytest.mark.parametrize("blocking_step", ["upload", "assembly"])
+def test_producer_attempt_deadline_interrupts_blocking_post_generation_work(
+    tmp_path, monkeypatch, blocking_step
+) -> None:
+    plan = build_plan(
+        track_spec_digest="ab" * 32,
+        generation_block=120,
+        block_hash="0x" + "cd" * 32,
+        track_start_block=100,
+        minimum_generation_delay_blocks=1,
+        generation_interval_blocks=20,
+        exact_challenge_ids=("challenge",),
+        confirmation_challenge_ids=(),
+        source_proofs=(proof(0), proof(1)),
+        scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+    monkeypatch.setattr(
+        production_service,
+        "_ready_file",
+        lambda _path, prefix, suffix: ReadyObject(
+            f"{prefix}/artifact{suffix}", "12" * 32, 1
+        ),
+    )
+
+    class Workers:
+        def run(self, _plan, *, deadline):
+            assert deadline > time.monotonic()
+            return (UnitResult(plan.rollouts[0].rollout_id, "shard", "video", "latent", 1, 0),)
+
+    class Objects:
+        def put_content(self, *_args, **_kwargs):
+            if blocking_step == "upload":
+                try:
+                    time.sleep(1)
+                except Exception as exc:
+                    raise AssertionError("SDK swallowed the deadline interrupt") from exc
+
+    def assemble(*_args, **_kwargs):
+        time.sleep(1)
+        raise AssertionError("blocking assembly was not interrupted")
+
+    if blocking_step == "assembly":
+        monkeypatch.setattr(production_service, "assemble_exact_cache_batch", assemble)
+    service = object.__new__(ProducerService)
+    service.objects = Objects()
+    service.config = SimpleNamespace(work_dir=tmp_path)
+    service.track = SimpleNamespace(
+        digest="ab" * 32,
+        artifact_manifest_sha256="34" * 32,
+        source_pool_merkle_root="56" * 32,
+        cache=SimpleNamespace(exact_max_bytes=10**9),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="attempt exceeded"):
+        service._execute(
+            "plans/120.json",
+            StoredObject(plan.encode(), "etag"),
+            plan,
+            Workers(),
+            deadline=started + 0.05,
+        )
+
+    assert time.monotonic() - started < 0.5
 
 
 def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkeypatch) -> None:
