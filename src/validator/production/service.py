@@ -535,6 +535,7 @@ def _produce_unit(
     plan: BatchPlan,
     rollout: RolloutPlan,
 ) -> UnitResult:
+    runtime.verify_trajectory_schedule(track.scoring.trajectory_schedule.sigmas)
     root = config.work_dir / plan.plan_digest / "units" / rollout.rollout_id
     root.mkdir(parents=True, exist_ok=True)
     existing = _find_valid_shard(root, plan, rollout, track)

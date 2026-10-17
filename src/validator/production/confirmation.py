@@ -160,6 +160,7 @@ def _confirmation_worker(
             prefetch=config.runtime.prefetch,
             mlp_chunk_rows=config.runtime.mlp_chunk_rows,
         )
+        runtime.verify_trajectory_schedule(track.scoring.trajectory_schedule.sigmas)
         metric = VideoFidelityMetric(
             config.artifact_path(config.runtime.feature_model),
             expected_sha256=track.full_video.feature_model_sha256,

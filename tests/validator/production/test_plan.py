@@ -26,7 +26,7 @@ from validator.production.plan import (
     select_source_proofs,
     submission_interval,
 )
-from validator.production.runtime import trajectory_tensor_key
+from validator.production.runtime import DenseRolloutRuntime, trajectory_tensor_key
 from validator.production.service import (
     PlanCoordinator,
     ProducerService,
@@ -73,6 +73,17 @@ def scoring() -> ScoringSpec:
         bootstrap_resamples=1000,
         bootstrap_seed=7,
     )
+
+
+def test_runtime_rejects_a_rounded_trajectory_commitment() -> None:
+    runtime = DenseRolloutRuntime.__new__(DenseRolloutRuntime)
+    runtime.teacher = SimpleNamespace(
+        schedule=SimpleNamespace(video=(1.0, 0.972972972972973, 0.0))
+    )
+
+    runtime.verify_trajectory_schedule((1.0, 0.972972972972973, 0.0))
+    with pytest.raises(RuntimeError, match="trajectory schedule"):
+        runtime.verify_trajectory_schedule((1.0, 0.973, 0.0))
 
 
 def proof(index: int = 0):

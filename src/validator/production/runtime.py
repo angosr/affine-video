@@ -7,6 +7,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from math import isclose
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -120,6 +121,16 @@ class DenseRolloutRuntime:
         )
         self.config = veda_attention.VedaConfig(target_budget=veda_mask.Budget(ratio=0.1))
         self.decoder: Any | None = None
+
+    def verify_trajectory_schedule(self, expected_sigmas: tuple[float, ...]) -> None:
+        """Fail before generation when the committed sigma grid is rounded or stale."""
+
+        actual = tuple(float(value) for value in self.teacher.schedule.video)
+        if len(actual) != len(expected_sigmas) or any(
+            not isclose(value, expected, rel_tol=0.0, abs_tol=1e-12)
+            for value, expected in zip(actual, expected_sigmas, strict=True)
+        ):
+            raise RuntimeError("runtime trajectory schedule differs from the track commitment")
 
     def generate_sparse(
         self,
