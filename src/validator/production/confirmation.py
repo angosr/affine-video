@@ -190,9 +190,11 @@ def _confirmation_worker(
             side, selector_path, batch = task
             try:
                 runtime = DenseRolloutRuntime(
-                    model_root=str(config.artifact_path(config.runtime.model_root)),
-                    adapter_path=str(config.artifact_path(config.runtime.adapter)),
-                    predictor_bundle=str(config.artifact_path(config.runtime.predictor)),
+                    model_root=str(config.evaluator_artifact_path(config.runtime.model_root)),
+                    adapter_path=str(config.evaluator_artifact_path(config.runtime.adapter)),
+                    predictor_bundle=str(
+                        config.evaluator_artifact_path(config.runtime.predictor)
+                    ),
                     sample_cache=str(batch.sample_cache_path),
                     offload_blocks=config.runtime.offload_blocks,
                     prefetch=config.runtime.prefetch,
@@ -200,7 +202,7 @@ def _confirmation_worker(
                 )
                 runtime.verify_trajectory_schedule(track.scoring.trajectory_schedule.sigmas)
                 metric = VideoFidelityMetric(
-                    config.artifact_path(config.runtime.feature_model),
+                    config.evaluator_artifact_path(config.runtime.feature_model),
                     expected_sha256=track.full_video.feature_model_sha256,
                     device="cuda:0",
                 )

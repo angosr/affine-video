@@ -173,21 +173,28 @@ async def run_evaluator(
         if data_config.validator_database.resolve() != Path(database).resolve():
             raise ValueError("production configuration uses a different validator database")
         scoring_device = data_config.validate_evaluation_device(scoring_device)
-        objects = PrivateObjectStore.from_environment(
+        objects = PrivateObjectStore.from_evaluator_environment(
             bucket=data_config.storage_bucket,
             prefix=f"{data_config.storage_prefix}/tracks/{track.digest}",
         )
         objects.verify_conditional_writes()
-        runtime_manifest_payload = objects.ensure_bootstrap(
-            "bootstrap/artifact_manifest.json", data_config.artifact_manifest
-        )
+        runtime_manifest_payload = objects.get("bootstrap/artifact_manifest.json").body
         manifest = ArtifactManifest.decode(runtime_manifest_payload)
         if manifest.digest != track.artifact_manifest_sha256:
             raise ValueError("artifact manifest does not match the track commitment")
         evaluator_artifacts = data_config.evaluator_artifact_names(manifest)
-        objects.ensure_artifacts(
+        hidden_artifacts = tuple(
+            artifact.object_key
+            for artifact in manifest.artifacts
+            if artifact.logical_name == data_config.runtime.source_binding
+            or artifact.logical_name.startswith(
+                data_config.runtime.sample_cache.rstrip("/") + "/"
+            )
+        )
+        objects.verify_evaluator_boundary(hidden_artifacts)
+        objects.restore_artifacts(
             manifest,
-            data_config.artifact_root,
+            data_config.evaluator_artifact_root,
             logical_names=evaluator_artifacts,
         )
         data_config.verify_evaluator_manifest(manifest)

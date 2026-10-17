@@ -45,6 +45,7 @@ class PrivateObjectStore:
         bucket: str,
         prefix: str,
         reconnect_from_environment: bool = False,
+        credential_role: str = "producer",
     ) -> None:
         if not bucket or "/" in bucket:
             raise ValueError("private storage bucket is invalid")
@@ -55,46 +56,57 @@ class PrivateObjectStore:
         self._bucket = bucket
         self._prefix = normalized
         self._reconnect_from_environment = reconnect_from_environment
+        if credential_role not in {"producer", "evaluator"}:
+            raise ValueError("private storage credential role is invalid")
+        self._credential_role = credential_role
 
     @classmethod
     def from_environment(cls, *, bucket: str, prefix: str) -> PrivateObjectStore:
-        private_values = (
-            os.environ.get("PRIVATE_STORAGE_URL"),
-            os.environ.get("PRIVATE_ACCESS_KEY"),
-            os.environ.get("PRIVATE_SECRET_ACCESS_KEY"),
-        )
-        if any(private_values) and not all(private_values):
-            raise ValueError("private storage credentials must be configured together")
-        endpoint, access_key, secret_key = (
-            private_values
-            if all(private_values)
-            else (
-                os.environ.get("STORAGE_URL"),
-                os.environ.get("ACCESS_KEY"),
-                os.environ.get("SECRET_ACCESS_KEY"),
-            )
-        )
-        if not endpoint or not access_key or not secret_key:
-            raise ValueError(
-                "PRIVATE_STORAGE_URL, PRIVATE_ACCESS_KEY, and "
-                "PRIVATE_SECRET_ACCESS_KEY are required"
-            )
-        parsed = urlparse(endpoint)
-        if (
-            parsed.scheme != "https"
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("STORAGE_URL must be an HTTPS endpoint without credentials or query")
+        endpoint, access_key, secret_key = _storage_credentials("producer")
         return cls(
             _environment_client(endpoint, access_key, secret_key),
             bucket=bucket,
             prefix=prefix,
             reconnect_from_environment=True,
+            credential_role="producer",
         )
+
+    @classmethod
+    def from_evaluator_environment(cls, *, bucket: str, prefix: str) -> PrivateObjectStore:
+        """Use a distinct IAM identity which cannot read the hidden source pool."""
+
+        endpoint, access_key, secret_key = _storage_credentials("evaluator")
+        return cls(
+            _environment_client(endpoint, access_key, secret_key),
+            bucket=bucket,
+            prefix=prefix,
+            reconnect_from_environment=True,
+            credential_role="evaluator",
+        )
+
+    def verify_evaluator_boundary(self, hidden_object_names: tuple[str, ...]) -> None:
+        """Fail unless evaluator IAM denies both hidden bootstrap and content objects."""
+
+        if self._credential_role != "evaluator" or not hidden_object_names:
+            raise ValueError("evaluator boundary requires hidden objects and evaluator credentials")
+        denied_objects = ("bootstrap/source_pool.json", *hidden_object_names)
+        for name in denied_objects:
+            try:
+                self.get(name)
+            except Exception as exc:
+                if _is_access_denied(exc):
+                    continue
+                raise StorageError(
+                    f"evaluator hidden-object denial could not be verified: {name}"
+                ) from exc
+            raise StorageError(f"evaluator credentials can read a hidden object: {name}")
+        try:
+            self.list_names("source-pool/")
+        except Exception as exc:
+            if not _is_access_denied(exc):
+                raise StorageError("evaluator hidden-prefix denial could not be verified") from exc
+        else:
+            raise StorageError("evaluator credentials can list the hidden source prefix")
 
     def __getstate__(self) -> dict[str, Any]:
         if not self._reconnect_from_environment:
@@ -103,13 +115,16 @@ class PrivateObjectStore:
             "_bucket": self._bucket,
             "_prefix": self._prefix,
             "_reconnect_from_environment": True,
+            "_credential_role": self._credential_role,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        restored = type(self).from_environment(
-            bucket=state["_bucket"],
-            prefix=state["_prefix"],
+        constructor = (
+            type(self).from_evaluator_environment
+            if state["_credential_role"] == "evaluator"
+            else type(self).from_environment
         )
+        restored = constructor(bucket=state["_bucket"], prefix=state["_prefix"])
         self.__dict__.update(restored.__dict__)
 
     def create_plan(self, name: str, payload: bytes) -> StoredObject:
@@ -213,6 +228,27 @@ class PrivateObjectStore:
     ) -> None:
         """Mirror committed runtime bytes and restore any missing local artifact."""
 
+        self._sync_artifacts(manifest, root, logical_names=logical_names, mirror=True)
+
+    def restore_artifacts(
+        self,
+        manifest: ArtifactManifest,
+        root: str | Path,
+        *,
+        logical_names: tuple[str, ...],
+    ) -> None:
+        """Restore selected evaluator artifacts without attempting any object writes."""
+
+        self._sync_artifacts(manifest, root, logical_names=logical_names, mirror=False)
+
+    def _sync_artifacts(
+        self,
+        manifest: ArtifactManifest,
+        root: str | Path,
+        *,
+        logical_names: tuple[str, ...] | None,
+        mirror: bool,
+    ) -> None:
         base = Path(root)
         base.mkdir(parents=True, exist_ok=True)
         selected = None if logical_names is None else set(logical_names)
@@ -228,13 +264,13 @@ class PrivateObjectStore:
                 and path.stat().st_size == artifact.size_bytes
                 and _file_sha256(path) == artifact.sha256
             )
-            if local_valid:
+            if local_valid and mirror:
                 self.put_content(
                     path,
                     sha256=artifact.sha256,
                     object_name=artifact.object_key,
                 )
-            else:
+            elif not local_valid:
                 self.download_content(
                     artifact.object_key,
                     path,
@@ -408,6 +444,57 @@ class PrivateObjectStore:
         return f"{self._prefix}/{normalized}"
 
 
+def _storage_credentials(role: str) -> tuple[str, str, str]:
+    if role == "evaluator":
+        names = (
+            "EVALUATOR_PRIVATE_STORAGE_URL",
+            "EVALUATOR_PRIVATE_ACCESS_KEY",
+            "EVALUATOR_PRIVATE_SECRET_ACCESS_KEY",
+        )
+        values = tuple(os.environ.get(name) for name in names)
+        if not all(values):
+            raise ValueError("evaluator private storage credentials are required")
+        endpoint, access_key, secret_key = values
+    else:
+        private_values = (
+            os.environ.get("PRIVATE_STORAGE_URL"),
+            os.environ.get("PRIVATE_ACCESS_KEY"),
+            os.environ.get("PRIVATE_SECRET_ACCESS_KEY"),
+        )
+        if any(private_values) and not all(private_values):
+            raise ValueError("private storage credentials must be configured together")
+        endpoint, access_key, secret_key = (
+            private_values
+            if all(private_values)
+            else (
+                os.environ.get("STORAGE_URL"),
+                os.environ.get("ACCESS_KEY"),
+                os.environ.get("SECRET_ACCESS_KEY"),
+            )
+        )
+        if not endpoint or not access_key or not secret_key:
+            raise ValueError(
+                "PRIVATE_STORAGE_URL, PRIVATE_ACCESS_KEY, and "
+                "PRIVATE_SECRET_ACCESS_KEY are required"
+            )
+    assert endpoint is not None and access_key is not None and secret_key is not None
+    return _validated_endpoint(endpoint), access_key, secret_key
+
+
+def _validated_endpoint(endpoint: str) -> str:
+    parsed = urlparse(endpoint)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("STORAGE_URL must be an HTTPS endpoint without credentials or query")
+    return endpoint
+
+
 def _environment_client(endpoint: str, access_key: str, secret_key: str) -> Any:
     try:
         import boto3
@@ -445,6 +532,15 @@ def _is_precondition_failed(exc: Exception) -> bool:
     status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
     code = response.get("Error", {}).get("Code")
     return status == 412 or str(code) in {"412", "PreconditionFailed"}
+
+
+def _is_access_denied(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    code = response.get("Error", {}).get("Code")
+    return status == 403 or str(code) in {"403", "AccessDenied", "Forbidden"}
 
 
 def _file_sha256(path: Path) -> str:

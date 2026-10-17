@@ -6,7 +6,7 @@ import pytest
 
 from validator import chunks
 from validator.production.commitment import Artifact, ArtifactManifest
-from validator.production.storage import PreconditionFailed, PrivateObjectStore
+from validator.production.storage import PreconditionFailed, PrivateObjectStore, StorageError
 from validator.s3 import client_config
 
 
@@ -122,6 +122,74 @@ def test_private_storage_credentials_take_precedence_and_must_be_complete(monkey
     monkeypatch.delenv("PRIVATE_SECRET_ACCESS_KEY")
     with pytest.raises(ValueError, match="configured together"):
         PrivateObjectStore.from_environment(bucket="private", prefix="tracks/abc")
+
+
+def test_evaluator_credentials_are_separate_and_do_not_fallback(monkeypatch) -> None:
+    captured = []
+
+    def client(endpoint, access_key, secret_key):
+        captured.append((endpoint, access_key, secret_key))
+        return MemoryS3()
+
+    monkeypatch.setenv("PRIVATE_STORAGE_URL", "https://producer.example/s3")
+    monkeypatch.setenv("PRIVATE_ACCESS_KEY", "producer-access")
+    monkeypatch.setenv("PRIVATE_SECRET_ACCESS_KEY", "producer-secret")
+    monkeypatch.setattr("validator.production.storage._environment_client", client)
+
+    with pytest.raises(ValueError, match="evaluator private storage credentials"):
+        PrivateObjectStore.from_evaluator_environment(bucket="private", prefix="tracks/abc")
+
+    monkeypatch.setenv("EVALUATOR_PRIVATE_STORAGE_URL", "https://evaluator.example/s3")
+    monkeypatch.setenv("EVALUATOR_PRIVATE_ACCESS_KEY", "evaluator-access")
+    monkeypatch.setenv("EVALUATOR_PRIVATE_SECRET_ACCESS_KEY", "evaluator-secret")
+    store = PrivateObjectStore.from_evaluator_environment(
+        bucket="private", prefix="tracks/abc"
+    )
+
+    assert store._credential_role == "evaluator"
+    assert captured == [("https://evaluator.example/s3", "evaluator-access", "evaluator-secret")]
+
+
+def test_evaluator_boundary_requires_real_access_denials() -> None:
+    class DeniedS3(MemoryS3):
+        def get_object(self, *, Bucket, Key):
+            if "/source-pool/" in Key or Key.endswith("bootstrap/source_pool.json"):
+                error = RuntimeError("denied")
+                error.response = {
+                    "Error": {"Code": "AccessDenied"},
+                    "ResponseMetadata": {"HTTPStatusCode": 403},
+                }
+                raise error
+            return super().get_object(Bucket=Bucket, Key=Key)
+
+        def list_objects_v2(self, *, Bucket, Prefix, **_kwargs):
+            if Prefix.endswith("source-pool"):
+                error = RuntimeError("denied")
+                error.response = {
+                    "Error": {"Code": "AccessDenied"},
+                    "ResponseMetadata": {"HTTPStatusCode": 403},
+                }
+                raise error
+            return {"Contents": [], "IsTruncated": False}
+
+    client = DeniedS3()
+    store = PrivateObjectStore(
+        client,
+        bucket="private",
+        prefix="tracks/abc",
+        credential_role="evaluator",
+    )
+
+    store.verify_evaluator_boundary(("source-pool/assets/hidden",))
+
+    permissive = PrivateObjectStore(
+        MemoryS3(),
+        bucket="private",
+        prefix="tracks/abc",
+        credential_role="evaluator",
+    )
+    with pytest.raises(StorageError, match="denial could not be verified"):
+        permissive.verify_evaluator_boundary(("source-pool/assets/hidden",))
 
 
 def test_injected_store_client_cannot_be_serialized() -> None:

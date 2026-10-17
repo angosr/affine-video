@@ -34,6 +34,7 @@ class ProducerConfig:
     source_pool: Path
     artifact_manifest: Path
     artifact_root: Path
+    evaluator_artifact_root: Path
     work_dir: Path
     storage_bucket: str
     storage_prefix: str
@@ -49,6 +50,15 @@ class ProducerConfig:
         root = self.artifact_root.resolve()
         if candidate != root and root not in candidate.parents:
             raise ValueError("runtime artifact path escapes artifact_root")
+        return candidate
+
+    def evaluator_artifact_path(self, logical_name: str) -> Path:
+        """Resolve an evaluator-only runtime path outside the producer's hidden tree."""
+
+        candidate = (self.evaluator_artifact_root / logical_name).resolve()
+        root = self.evaluator_artifact_root.resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError("runtime artifact path escapes evaluator_artifact_root")
         return candidate
 
     def verify_manifest(self, manifest: Any) -> None:
@@ -109,9 +119,9 @@ class ProducerConfig:
         """Verify the committed runtime without reading the hidden pool or full SampleCache."""
 
         names = self.evaluator_artifact_names(manifest)
-        manifest.verify_local(self.artifact_root, logical_names=names)
+        manifest.verify_local(self.evaluator_artifact_root, logical_names=names)
         manifest.verify_runtime_coverage(
-            self.artifact_root,
+            self.evaluator_artifact_root,
             files=(
                 self.runtime.adapter,
                 self.runtime.predictor,
@@ -125,8 +135,8 @@ class ProducerConfig:
         from validator.production.environment import verify_runtime_environment
 
         verify_runtime_environment(
-            self.artifact_path(self.runtime.source_bundle),
-            self.artifact_path(self.runtime.dependency_lock),
+            self.evaluator_artifact_path(self.runtime.source_bundle),
+            self.evaluator_artifact_path(self.runtime.dependency_lock),
         )
 
     def validate_evaluation_device(self, device: str | None) -> str:
@@ -169,6 +179,7 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
         {
             "artifact_manifest",
             "artifact_root",
+            "evaluator_artifact_root",
             "format",
             "gpu_ids",
             "evaluation_gpu_ids",
@@ -231,6 +242,9 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
         source_pool=_path(root["source_pool"], "source_pool"),
         artifact_manifest=_path(root["artifact_manifest"], "artifact_manifest"),
         artifact_root=_path(root["artifact_root"], "artifact_root"),
+        evaluator_artifact_root=_path(
+            root["evaluator_artifact_root"], "evaluator_artifact_root"
+        ),
         work_dir=_path(root["work_dir"], "work_dir"),
         storage_bucket=_string(root["storage_bucket"], "storage_bucket"),
         storage_prefix=_string(root["storage_prefix"], "storage_prefix").strip("/"),
@@ -254,6 +268,14 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
     )
     if not config.storage_prefix:
         raise ValueError("storage_prefix cannot be empty")
+    producer_root = config.artifact_root.resolve()
+    evaluator_root = config.evaluator_artifact_root.resolve()
+    if (
+        evaluator_root == producer_root
+        or evaluator_root in producer_root.parents
+        or producer_root in evaluator_root.parents
+    ):
+        raise ValueError("evaluator_artifact_root must be isolated from artifact_root")
     for name in (
         config.runtime.model_root,
         config.runtime.adapter,
@@ -266,6 +288,7 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
         config.runtime.oci_image,
     ):
         config.artifact_path(name)
+        config.evaluator_artifact_path(name)
     return config
 
 

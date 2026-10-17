@@ -10,6 +10,7 @@ def document(tmp_path):
     return {
         "artifact_manifest": str(tmp_path / "artifacts.json"),
         "artifact_root": str(tmp_path / "artifacts"),
+        "evaluator_artifact_root": str(tmp_path / "evaluator-artifacts"),
         "format": "veda-producer-config-v1",
         "gpu_ids": [2, 3, 4, 5],
         "evaluation_gpu_ids": [0, 1],
@@ -49,6 +50,9 @@ def test_config_fixes_formal_producer_gpu_assignment(tmp_path) -> None:
     assert config.artifact_path(config.runtime.adapter).is_relative_to(
         config.artifact_root.resolve()
     )
+    assert config.evaluator_artifact_path(config.runtime.adapter).is_relative_to(
+        config.evaluator_artifact_root.resolve()
+    )
 
 
 def test_config_rejects_gpu_or_path_escape(tmp_path) -> None:
@@ -63,6 +67,12 @@ def test_config_rejects_gpu_or_path_escape(tmp_path) -> None:
     value["runtime"]["adapter"] = "../escape"
     path.write_text(json.dumps(value), encoding="utf-8")
     with pytest.raises(ValueError, match="normalized relative"):
+        load_producer_config(path)
+
+    value = document(tmp_path)
+    value["evaluator_artifact_root"] = value["artifact_root"]
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="must be isolated"):
         load_producer_config(path)
 
 
