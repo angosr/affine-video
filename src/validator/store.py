@@ -843,6 +843,70 @@ class ChallengeStore:
             raise
         return identifier, True
 
+    def reject_submissions_after(
+        self,
+        last_submission_block: int,
+        *,
+        decision_block: int,
+        occurred_at_ms: int | None = None,
+    ) -> int:
+        """Terminalize scanned submissions that cannot belong to this track."""
+
+        if min(last_submission_block, decision_block) < 0:
+            raise ValueError("submission cutoff and decision block must be non-negative")
+        if decision_block < last_submission_block:
+            raise ValueError("decision block cannot precede the submission cutoff")
+        timestamp = _timestamp(occurred_at_ms)
+        terminal = tuple(state.value for state in TERMINAL_STATES)
+        placeholders = ",".join("?" for _ in terminal)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._connection.execute(
+                f"""
+                SELECT challenge.challenge_id, challenge.state, submission.block_height
+                FROM challenges challenge
+                JOIN submissions submission
+                  ON submission.submission_id = challenge.submission_id
+                WHERE submission.block_height > ?
+                  AND challenge.state NOT IN ({placeholders})
+                ORDER BY submission.block_height, submission.extrinsic_index,
+                         submission.event_index
+                """,
+                (last_submission_block, *terminal),
+            ).fetchall()
+            for row in rows:
+                current = ChallengeState(row["state"])
+                if current not in {ChallengeState.QUEUED, ChallengeState.FETCHING}:
+                    raise RuntimeError(
+                        "an ineligible late submission advanced beyond admission"
+                    )
+                if row["block_height"] > decision_block:
+                    raise RuntimeError("late submission is newer than its decision block")
+                self._transition_locked(
+                    row["challenge_id"],
+                    ChallengeState.REJECTED_TRACK_CLOSED,
+                    timestamp=timestamp,
+                    error_code="TRACK_CLOSED",
+                    error_summary=(
+                        "submission is later than the final frozen evaluation interval"
+                    ),
+                    details={"final_score": None},
+                )
+                self._connection.execute(
+                    """
+                    UPDATE challenges
+                    SET final_score = NULL, score_block = ?
+                    WHERE challenge_id = ?
+                    """,
+                    (decision_block, row["challenge_id"]),
+                )
+                self._clear_lease_locked(row["challenge_id"])
+            self._connection.commit()
+            return len(rows)
+        except Exception:
+            self._connection.rollback()
+            raise
+
     def claim_next_admission(
         self,
         worker_id: str,

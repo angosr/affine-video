@@ -246,7 +246,9 @@ After the track close grace block, unfinished system work first publishes an irr
 `weights.json` fence with `track_aborted=true` and no weight plan, then the immutable
 `TRACK_ABORTED` event. Validators stop submitting, and the evaluator stops evaluation and every
 later pointer refresh for that track; the affected Miner is not marked as losing. Recovery requires
-a new track ID.
+a new track ID. Commitments finalized after the close block are outside the track and are not added
+to its ledger; already-scanned submissions beyond the frozen submission cutoff are terminally
+recorded as `REJECTED_TRACK_CLOSED` without downloading or evaluating their models.
 
 `--exact-cache` contains immutable NPZ batches named `<generation-block>-<sha256>.npz`. Every batch
 binds its finalized block hash, source proofs, runtime artifacts and each case's planned

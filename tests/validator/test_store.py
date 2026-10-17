@@ -51,6 +51,33 @@ def test_submission_replay_is_idempotent(tmp_path) -> None:
         assert len(store.challenge_events(identifier)) == 1
 
 
+def test_late_submissions_are_terminalized_atomically(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        eligible, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        late, _ = store.add_submission(
+            submission_at(121, hotkey="late-hotkey"), occurred_at_ms=20
+        )
+
+        assert (
+            store.reject_submissions_after(
+                120,
+                decision_block=130,
+                occurred_at_ms=30,
+            )
+            == 1
+        )
+        assert store.reject_submissions_after(120, decision_block=130) == 0
+        assert store.get_challenge(eligible).state is ChallengeState.QUEUED
+        rejected = store.get_challenge(late)
+        assert rejected.state is ChallengeState.REJECTED_TRACK_CLOSED
+        assert rejected.error_code == "TRACK_CLOSED"
+        assert rejected.score_block == 130
+        assert [event.state for event in store.challenge_events(late)] == [
+            ChallengeState.QUEUED,
+            ChallengeState.REJECTED_TRACK_CLOSED,
+        ]
+
+
 def test_transition_updates_projection_and_appends_history(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(make_submission(), occurred_at_ms=10)

@@ -34,12 +34,15 @@ async def scan_finalized_blocks(
     *,
     netuid: int,
     track_start_block: int,
+    submission_end_block: int | None = None,
     max_blocks: int = 100,
 ) -> ScanResult:
     """Scan one bounded batch and commit the cursor after each complete block."""
 
     if track_start_block < 0:
         raise ValueError("track start block must be non-negative")
+    if submission_end_block is not None and submission_end_block < track_start_block:
+        raise ValueError("submission end block cannot precede the track")
     if max_blocks <= 0:
         raise ValueError("max blocks must be positive")
 
@@ -56,6 +59,18 @@ async def scan_finalized_blocks(
         if current is not None and current[0] >= block_height:
             continue
         block_hash = await client._substrate.block_hash(block_height)
+        if submission_end_block is not None and block_height > submission_end_block:
+            try:
+                store.advance_chain_cursor(block_height, block_hash)
+            except ValueError:
+                current = store.chain_cursor()
+                if (
+                    current is None
+                    or current[0] < block_height
+                    or (current[0] == block_height and current[1] != block_hash)
+                ):
+                    raise
+            continue
         block = await client._substrate.get_block(block_hash=block_hash)
         if block is None:
             raise RuntimeError(f"finalized block {block_height} is unavailable")

@@ -276,6 +276,51 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
         assert store.leaderboard()[0].final_score == pytest.approx(0.7)
 
 
+def test_closed_track_rejects_scanned_late_work_and_ignores_new_commitments(tmp_path) -> None:
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    blocks = {height: empty_chain_block(height) for height in range(100, 122)}
+    blocks[100] = chain_block(payload, 100)
+    blocks[121] = chain_block(payload, 121)
+    client = FakeClient(blocks)
+    external_calls = 0
+
+    def forbidden(*_args, **_kwargs):
+        nonlocal external_calls
+        external_calls += 1
+        raise AssertionError("closed tracks cannot start admission or scoring")
+
+    with ChallengeStore(tmp_path / "validator.db", track_spec_digest="ab" * 32) as store:
+        cycle = asyncio.run(
+            process_cycle(
+                client,
+                store,
+                netuid=7,
+                track_start_block=100,
+                track_close_block=120,
+                admission_settings=AdmissionSettings(
+                    cache_dir=tmp_path / "cache",
+                    max_model_bytes=10_000,
+                    tensor_schema={"selector.weight": TensorSpec((2, 3), "float32")},
+                    publication_grace_blocks=1,
+                    last_submission_block=99,
+                ),
+                scoring_settings=ScoringSettings(),
+                evaluator=forbidden,
+                worker_id="validator-a",
+                downloader=forbidden,
+            )
+        )
+
+        challenges = store.public_snapshot()["challenges"]
+        assert cycle.finalized_block == 121
+        assert cycle.admission is cycle.scoring is None
+        assert external_calls == 0
+        assert len(challenges) == 1
+        assert challenges[0]["block_height"] == 100
+        assert challenges[0]["state"] == ChallengeState.REJECTED_TRACK_CLOSED
+        assert challenges[0]["error_code"] == "TRACK_CLOSED"
+
+
 def test_cycle_does_not_commit_a_stage_after_the_track_closes(tmp_path) -> None:
     model_path = tmp_path / "selector.safetensors"
     save_file(

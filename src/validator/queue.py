@@ -105,6 +105,7 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
             ChallengeState.MALFORMED_SUBMISSION,
             ChallengeState.REJECTED_DUPLICATE_HOTKEY,
             ChallengeState.REJECTED_OTHER_COMPETITION,
+            ChallengeState.REJECTED_TRACK_CLOSED,
         }
     ),
     ChallengeState.FETCHING: frozenset(

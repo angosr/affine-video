@@ -124,6 +124,28 @@ def test_scanner_advances_persistent_cursor_in_bounded_batches(tmp_path) -> None
         assert challenge["block_height"] == 100
 
 
+def test_scanner_advances_without_recording_commitments_after_track_close(tmp_path) -> None:
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    blocks = {height: chain_block(payload, height) for height in range(100, 103)}
+    client = FakeClient(blocks)
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        result = asyncio.run(
+            scan_finalized_blocks(
+                client,
+                store,
+                netuid=7,
+                track_start_block=100,
+                submission_end_block=100,
+            )
+        )
+
+        assert result.blocks_scanned == 3
+        assert result.submissions_found == 1
+        assert store.chain_cursor() == (102, blocks[102][0])
+        assert len(store.public_snapshot()["challenges"]) == 1
+
+
 def test_scanner_does_not_advance_cursor_past_failed_block(tmp_path) -> None:
     payload = ModelSubmission("owner/model", "12" * 20).encode()
     blocks = {height: chain_block(payload, height) for height in range(100, 102)}

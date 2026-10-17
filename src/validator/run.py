@@ -570,6 +570,7 @@ async def process_cycle(
         store,
         netuid=netuid,
         track_start_block=track_start_block,
+        submission_end_block=track_close_block,
         max_blocks=max_scan_blocks,
     )
     finalized_block = await client.finalized_block()
@@ -585,9 +586,13 @@ async def process_cycle(
             None,
             restored_matches=restored_matches,
         )
-    if track_aborted or (
-        track_close_block is not None and finalized_block > track_close_block
-    ):
+    track_closed = track_close_block is not None and finalized_block > track_close_block
+    if track_closed and admission_settings.last_submission_block is not None:
+        store.reject_submissions_after(
+            admission_settings.last_submission_block,
+            decision_block=finalized_block,
+        )
+    if track_aborted or track_closed:
         return EvaluationCycleResult(
             finalized_block,
             scan,
