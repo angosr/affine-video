@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import queue
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,19 +70,57 @@ class ConfirmationWorkerPool:
         incumbent_path: str | Path,
         batch: ConfirmationBatch,
     ) -> ConfirmationResult:
+        cells = self.score_models(
+            model_paths={
+                "challenger": challenger_path,
+                "incumbent": incumbent_path,
+            },
+            batch=batch,
+        )
+        paired = paired_video_gain_bound(
+            cells["challenger"],
+            cells["incumbent"],
+            stratum_weights=self.track.scoring.stratum_weight_map,
+            budget_costs={
+                budget.target_blocks: budget.calibrated_cost
+                for budget in self.track.scoring.budgets
+            },
+            confidence=self.track.match_confidence,
+            resamples=self.track.scoring.bootstrap_resamples,
+            seed=self.track.scoring.bootstrap_seed,
+        )
+        return ConfirmationResult(
+            paired.challenger_score,
+            paired.incumbent_score,
+            paired.gain_lower_bound,
+            cells["challenger"],
+            cells["incumbent"],
+        )
+
+    def score_models(
+        self,
+        *,
+        model_paths: Mapping[str, str | Path],
+        batch: ConfirmationBatch,
+    ) -> dict[str, tuple[VideoCell, ...]]:
+        """Score each named model once against one batch's shared dense references."""
+
         if self._processes:
             raise RuntimeError("a full-video confirmation is already running")
+        jobs = tuple((name, str(path)) for name, path in model_paths.items())
+        if not jobs or any(not isinstance(name, str) or not name.strip() for name, _path in jobs):
+            raise ValueError("full-video model labels must be non-empty strings")
         try:
             self._start()
-            jobs = (
-                ("challenger", str(challenger_path)),
-                ("incumbent", str(incumbent_path)),
-            )
-            for tasks, job in zip(self._queues, jobs, strict=True):
+            if not self._queues:
+                raise RuntimeError("full-video confirmation has no evaluation workers")
+            for index, job in enumerate(jobs):
+                tasks = self._queues[index % len(self._queues)]
                 tasks.put((*job, batch))
             deadline = time.monotonic() + self.timeout_seconds
             cells: dict[str, tuple[VideoCell, ...]] = {}
-            while len(cells) < 2:
+            expected = {name for name, _path in jobs}
+            while len(cells) < len(jobs):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError("full-video confirmation exceeded its wall-clock limit")
@@ -96,31 +135,13 @@ class ConfirmationWorkerPool:
                     continue
                 if kind == "error":
                     raise RuntimeError(f"{side} confirmation failed: {payload}")
-                if side in cells or side not in {"challenger", "incumbent"}:
+                if side in cells or side not in expected:
                     raise RuntimeError("confirmation worker returned an invalid result")
                 value = tuple(payload)
                 if not value or any(not isinstance(item, VideoCell) for item in value):
                     raise RuntimeError("confirmation worker returned invalid video cells")
                 cells[side] = value
-            paired = paired_video_gain_bound(
-                cells["challenger"],
-                cells["incumbent"],
-                stratum_weights=self.track.scoring.stratum_weight_map,
-                budget_costs={
-                    budget.target_blocks: budget.calibrated_cost
-                    for budget in self.track.scoring.budgets
-                },
-                confidence=self.track.match_confidence,
-                resamples=self.track.scoring.bootstrap_resamples,
-                seed=self.track.scoring.bootstrap_seed,
-            )
-            return ConfirmationResult(
-                paired.challenger_score,
-                paired.incumbent_score,
-                paired.gain_lower_bound,
-                cells["challenger"],
-                cells["incumbent"],
-            )
+            return cells
         finally:
             self.close()
 

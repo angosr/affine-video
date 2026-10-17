@@ -179,3 +179,75 @@ def test_partial_worker_start_is_cleaned_up_and_pool_can_be_reused(monkeypatch) 
     assert result.gain_lower_bound == 0.0
     assert pool._processes == []
     assert pool._queues == []
+
+
+def test_score_models_dispatches_every_model_and_returns_one_shared_result(monkeypatch) -> None:
+    cells = {
+        name: (VideoCell("wide", f"rollout-{name}", 16, score),)
+        for name, score in (("baseline", 0.8), ("near", 0.7), ("other", 0.6))
+    }
+
+    class FakeQueue:
+        def __init__(self, values=()):
+            self.values = list(values)
+            self.puts = []
+
+        def put(self, value):
+            self.puts.append(value)
+
+        def get(self, *, timeout):
+            del timeout
+            return self.values.pop(0)
+
+        def close(self):
+            return None
+
+        def join_thread(self):
+            return None
+
+    class FakeProcess:
+        def join(self, *, timeout):
+            del timeout
+
+        def is_alive(self):
+            return False
+
+    result = FakeQueue(("ok", name, value) for name, value in cells.items())
+    tasks = [FakeQueue(), FakeQueue()]
+    config = SimpleNamespace(evaluation_gpu_ids=(0, 1))
+    pool = ConfirmationWorkerPool(config, track(), timeout_seconds=1)
+
+    def start() -> None:
+        pool._result = result
+        pool._queues = tasks
+        pool._processes = [FakeProcess(), FakeProcess()]
+
+    monkeypatch.setattr(pool, "_start", start)
+    result_cells = pool.score_models(
+        model_paths={
+            "baseline": "baseline.safetensors",
+            "near": "near.safetensors",
+            "other": "other.safetensors",
+        },
+        batch=object(),
+    )
+
+    assert result_cells == cells
+    assert [value[0] for value in tasks[0].puts[:-1]] == ["baseline", "other"]
+    assert [value[0] for value in tasks[1].puts[:-1]] == ["near"]
+    assert tasks[0].puts[-1] is None
+    assert tasks[1].puts[-1] is None
+    assert pool._processes == []
+
+
+def test_score_models_rejects_empty_model_set_without_starting(monkeypatch) -> None:
+    pool = ConfirmationWorkerPool(
+        SimpleNamespace(evaluation_gpu_ids=(0, 1)), track(), timeout_seconds=1
+    )
+    start = Mock()
+    monkeypatch.setattr(pool, "_start", start)
+
+    with pytest.raises(ValueError, match="labels"):
+        pool.score_models(model_paths={}, batch=object())
+
+    start.assert_not_called()
