@@ -30,7 +30,7 @@ from scoring.spec import (
     TrajectoryScheduleSpec,
 )
 from validator import scoring as scoring_module
-from validator.production.batches import ArchivedStage
+from validator.production.batches import ArchivedStage, ReadyBatchSource
 from validator.production.retries import PrivateRetryStore
 from validator.production.storage import PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState
@@ -95,7 +95,11 @@ def video_spec() -> FullVideoSpec:
     return FullVideoSpec(0.001, "test-v1", "ef" * 32, 0.4, 0.3, 0.3, 0.01, 2.0)
 
 
-def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) -> None:
+@pytest.mark.parametrize("cache_loss", ["none", "deleted", "corrupt"])
+@pytest.mark.parametrize("stage", ["exact", "confirmation"])
+def test_paired_evaluator_restores_challenger_for_both_stages(
+    tmp_path, monkeypatch, cache_loss, stage
+) -> None:
     architecture = SelectorArchitecture(1, 1, 2, "float32")
     tensors = {
         name: np.zeros(spec.shape, dtype=np.float32)
@@ -237,7 +241,55 @@ def test_paired_evaluator_scores_both_models_on_post_submission_batch(tmp_path) 
             baseline_path,
             "https://public.example/models/paired",
             30,
+            downloader=lambda *_args, **_kwargs: pytest.fail("archive recovery contacted HF"),
         )
+        source = ReadyBatchSource(
+            track=track,
+            objects=PrivateObjectStore(MemoryS3(), bucket="private", prefix="test"),
+            cache_dir=tmp_path / "restored",
+        )
+        source.archive_model(lease, challenger_path, challenger)
+        if cache_loss == "deleted":
+            challenger_path.unlink()
+        elif cache_loss == "corrupt":
+            challenger_path.write_bytes(b"broken")
+        evaluator.batch_source = source
+        monkeypatch.setattr(source, "is_ready", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(source, "exact_batch", lambda _identifier: batch)
+        if stage == "confirmation":
+            confirmation = SimpleNamespace(
+                plan=SimpleNamespace(
+                    generation_block=101, plan_digest=batch.plan_digest,
+                    block_hash=batch.seed_block_hash,
+                ),
+                exact=batch,
+            )
+            monkeypatch.setattr(source, "confirmation_batch", lambda _identifier: confirmation)
+            monkeypatch.setattr(
+                store, "stage_score", lambda *_args: SimpleNamespace(score_block=100)
+            )
+            calls = []
+
+            def run_confirmation(**kwargs):
+                recovered = validate_model(
+                    kwargs["challenger_path"], schema=architecture.tensor_schema,
+                    max_bytes=10_000, expected_hotkey="hk1",
+                )
+                assert recovered == challenger
+                calls.append(kwargs)
+                return SimpleNamespace(
+                    challenger_score=0.5, incumbent_score=0.5, gain_lower_bound=0.0,
+                    challenger_cells=(1, 2, 3, 4),
+                )
+
+            evaluator.confirmation_pool = SimpleNamespace(run=run_confirmation)
+            result = evaluator(replace(
+                lease, state=ChallengeState.CONFIRMING, model_path=str(challenger_path),
+                file_sha256=challenger.file_sha256,
+            ))
+            assert result.score == 0.5
+            assert len(calls) == 1
+            return
         scoring = process_next_scoring(
             store,
             worker_id="scoring",

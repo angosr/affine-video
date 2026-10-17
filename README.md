@@ -23,8 +23,10 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
    the new contest remains fixed even if it later writes unrelated commitments.
 2. After the fixed publication grace period, the evaluator processes submissions by finalized
    `(block, extrinsic, event)` order. Before any model I/O, each admission-eligible submission
-   atomically consumes one of `maximum_effective_challenges` season sequences; a download,
-   validation, duplicate-model, or scoring failure does not return it. Later submissions are
+   atomically reserves one of `maximum_effective_challenges` season slots. Deterministic
+   admission failures release the slot while consuming that hotkey's only submission.
+   Infrastructure retries retain the reservation; every valid model entering exact scoring
+   consumes its slot regardless of outcome. Later submissions are
    rejected before download when the frozen limit is full. The pinned revision must be anonymously
    downloadable.
 3. The evaluator accepts exactly one `selector.safetensors` file. Its only metadata entry must be
@@ -70,9 +72,9 @@ The launch checks use ten consecutive 384-case batches on NVIDIA H200 hardware. 
 VEDA incumbent to retain the title against MeanPool, shuffled-head and slightly perturbed VEDA
 challengers in every batch, while the reverse VEDA-versus-shuffled positive control must promote
 in every batch. The immutable summaries are published under `system_matches/`. Full-video
-execution, cost calibration, clustered bootstrap stability,
-malformed archives, non-finite weights, metadata impersonation, repacking and re-signing duplicate
-weights are covered by real-GPU checks and the executable test suite.
+execution, H200 cost calibration, and the complete design acceptance matrix remain release
+requirements until immutable, final-runtime evidence passes their registered gates. Unit tests and
+intermediate GPU mechanism checks do not establish release acceptance.
 
 ## Public object-storage state
 

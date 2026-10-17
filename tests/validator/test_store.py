@@ -552,7 +552,7 @@ def test_later_participant_failure_preserves_previous_authoritative_score(tmp_pa
         assert store.leaderboard()[0].final_score == 0.9
 
 
-def test_failed_public_match_restores_its_consumed_season_slot(tmp_path) -> None:
+def test_failed_admission_public_match_does_not_consume_season_slot(tmp_path) -> None:
     digest = "ab" * 32
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest=digest) as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
@@ -581,8 +581,8 @@ def test_failed_public_match_restores_its_consumed_season_slot(tmp_path) -> None
             )
             == 1
         )
-        assert store.has_season_slot(identifier)
-        assert store.effective_challenge_count() == 1
+        assert not store.has_season_slot(identifier)
+        assert store.effective_challenge_count() == 0
         assert store.model_owner("ef" * 32) is None
 
 
@@ -1051,3 +1051,107 @@ def test_public_challenge_reads_state_and_history_from_one_snapshot(monkeypatch,
         assert challenge["state"] == ChallengeState.QUEUED
         assert [event["state"] for event in challenge["events"]] == [ChallengeState.QUEUED]
         assert writer.get_challenge(identifier).state is ChallengeState.FETCHING
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_pending_season_reservation_survives_database_restart(tmp_path, blocked) -> None:
+    path = tmp_path / "validator.db"
+    with ChallengeStore(path) as store:
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=1)
+        task = store.claim_next_admission(
+            "worker", lease_ms=1_000, ready_through_block=100, now_ms=2
+        )
+        assert task is not None
+        assert store.reserve_season_slot(
+            identifier, task.lease_token, maximum_effective_challenges=1
+        )
+        if blocked:
+            store.block_leased(
+                identifier, task.lease_token, error_code="OUTAGE", error_summary="outage",
+                occurred_at_ms=3,
+            )
+    with ChallengeStore(path) as restored:
+        assert restored.has_season_slot(identifier)
+        assert restored.effective_challenge_count() == 1
+
+
+@pytest.mark.parametrize("participant_error", [False, True])
+def test_model_entering_exact_keeps_capacity_regardless_of_outcome(tmp_path, participant_error):
+    path = tmp_path / "validator.db"
+    with ChallengeStore(path) as store:
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=1)
+        task = store.claim_next_admission(
+            "worker", lease_ms=1_000, ready_through_block=100, now_ms=2
+        )
+        assert task is not None
+        assert store.reserve_season_slot(
+            identifier, task.lease_token, maximum_effective_challenges=1
+        )
+        store.record_downloaded_model(
+            identifier, task.lease_token, model_path="selector.safetensors",
+            file_sha256="cd" * 32, size_bytes=123, occurred_at_ms=3,
+        )
+        store.register_validated_model(
+            identifier, task.lease_token, model_digest="ab" * 32, occurred_at_ms=4
+        )
+        store.complete_challenge(
+            identifier,
+            ChallengeState.PARTICIPANT_FAILED if participant_error else ChallengeState.SUCCEEDED,
+            error_code="MODEL_NONFINITE" if participant_error else None,
+            final_score=None if participant_error else 0.0,
+            occurred_at_ms=5,
+        )
+        assert store.has_season_slot(identifier)
+    with ChallengeStore(path) as restored:
+        assert restored.has_season_slot(identifier)
+        assert restored.effective_challenge_count() == 1
+
+
+def test_public_recovery_preserves_only_effective_slots_and_fifo_sequence(tmp_path):
+    digest = "ab" * 32
+    submissions = [submission_at(100 + i, hotkey=f"hk{i}") for i in range(4)]
+    with ChallengeStore(tmp_path / "original.db", track_spec_digest=digest) as store:
+        for index, submission in enumerate(submissions):
+            identifier, _ = store.add_submission(submission, occurred_at_ms=10 * index + 1)
+            task = store.claim_next_admission(
+                "worker", lease_ms=1_000, ready_through_block=200, now_ms=10 * index + 2
+            )
+            assert task is not None
+            assert store.reserve_season_slot(
+                identifier, task.lease_token, maximum_effective_challenges=2
+            )
+            if index != 0:
+                store.record_downloaded_model(
+                    identifier, task.lease_token, model_path="selector.safetensors",
+                    file_sha256=f"{index:02x}" * 32, size_bytes=123,
+                    occurred_at_ms=10 * index + 3,
+                )
+            if index >= 2:
+                store.register_validated_model(
+                    identifier, task.lease_token, model_digest=f"{index:02x}" * 32,
+                    occurred_at_ms=10 * index + 4,
+                )
+            store.complete_challenge(
+                identifier, ChallengeState.PARTICIPANT_FAILED,
+                error_code=("REPOSITORY_UNAVAILABLE", "MODEL_SCHEMA_INVALID", "MODEL_NONFINITE",
+                            "MODEL_NONFINITE")[index],
+                occurred_at_ms=10 * index + 5,
+            )
+        expected = list(store._connection.execute(
+            "SELECT sequence, challenge_id FROM season_slots ORDER BY sequence"
+        ))
+        matches = resolve_tournament(
+            store.public_snapshot()["challenges"], track_id="track",
+            track_spec_digest=digest, netuid=7, minimum_gain=0.001,
+            minimum_exact_gain=0.5, initial_champion=genesis_champion(),
+        ).matches
+        assert len(expected) == 2
+    with ChallengeStore(tmp_path / "restored.db", track_spec_digest=digest) as restored:
+        for submission in submissions:
+            restored.add_submission(submission, occurred_at_ms=1)
+        assert restored.restore_public_matches(matches, maximum_effective_challenges=2) == 4
+        actual = list(restored._connection.execute(
+            "SELECT sequence, challenge_id FROM season_slots ORDER BY sequence"
+        ))
+        assert [tuple(row) for row in actual] == [tuple(row) for row in expected]
+        assert restored.effective_challenge_count() == 2

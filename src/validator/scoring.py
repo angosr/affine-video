@@ -9,7 +9,7 @@ import resource
 import signal
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -262,6 +262,7 @@ class PairedTrackEvaluator:
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         snapshot = self.store.public_snapshot()
+        task = self._restore_challenger(task, snapshot["challenges"])
         tournament = resolve_tournament(
             snapshot["challenges"],
             track_id=self.track.track_id,
@@ -305,6 +306,45 @@ class PairedTrackEvaluator:
                 ),
             },
         )
+
+    def _restore_challenger(
+        self, task: LeasedChallenge, challenges: Sequence[Mapping[str, Any]]
+    ) -> LeasedChallenge:
+        """Recover the admitted identity from private storage before either scoring stage."""
+
+        record = next(item for item in challenges if item["challenge_id"] == task.challenge_id)
+        try:
+            if task.file_sha256 is None or task.file_sha256 != record["file_sha256"]:
+                raise RuntimeError("challenger identity is unavailable or changed")
+            path = Path(task.model_path) if task.model_path is not None else None
+            if (
+                path is None
+                or not path.is_file()
+                or path.stat().st_size != record["model_size_bytes"]
+                or _file_sha256(path) != task.file_sha256
+            ):
+                if self.batch_source is None:
+                    raise RuntimeError("private challenger archive is unavailable")
+                path = self.batch_source.restore_model(
+                    task.file_sha256, record["model_size_bytes"]
+                )
+            validated = validate_model(
+                path,
+                schema=self.track.model.tensor_schema,
+                max_bytes=self.track.model.max_bytes,
+                expected_hotkey=task.hotkey,
+            )
+            if (
+                validated.file_sha256 != task.file_sha256
+                or validated.size_bytes != record["model_size_bytes"]
+                or validated.model_digest != record["model_digest"]
+            ):
+                raise RuntimeError("restored challenger identity changed")
+        except (OSError, RuntimeError, ModelValidationError) as exc:
+            raise TemporaryScoringError(
+                "CHALLENGER_MODEL_UNAVAILABLE", "admitted challenger cannot be restored"
+            ) from exc
+        return replace(task, model_path=str(path))
 
     def _confirm(
         self,

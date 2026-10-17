@@ -272,7 +272,9 @@ class ChallengeStore:
                 ON challenges (state, created_at_ms);
 
             DELETE FROM season_slots
-            WHERE challenge_id NOT IN (
+            WHERE challenge_id IN (
+                SELECT challenge_id FROM challenges WHERE state = 'PARTICIPANT_FAILED'
+            ) AND challenge_id NOT IN (
                 SELECT challenge_id FROM model_owners
             );
             COMMIT;
@@ -499,7 +501,7 @@ class ChallengeStore:
         return None if row is None else row["value"]
 
     def effective_challenge_count(self) -> int:
-        """Return the number of immutable chain-order season reservations."""
+        """Return effective challenges plus pending admission reservations."""
 
         return int(self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0])
 
@@ -535,7 +537,7 @@ class ChallengeStore:
         *,
         maximum_effective_challenges: int | None,
     ) -> bool:
-        """Reserve one immutable FIFO test sequence before any model I/O."""
+        """Reserve FIFO capacity before I/O; invalid admission releases it atomically."""
 
         if maximum_effective_challenges is not None and maximum_effective_challenges <= 0:
             raise ValueError("maximum effective challenges must be positive")
@@ -1703,6 +1705,13 @@ class ChallengeStore:
                 (final_score, effective_score_block, identifier),
             )
 
+            if target is ChallengeState.PARTICIPANT_FAILED and row["state"] in {
+                ChallengeState.FETCHING,
+                ChallengeState.VALIDATING,
+            }:
+                self._connection.execute(
+                    "DELETE FROM season_slots WHERE challenge_id = ?", (identifier,)
+                )
             self._clear_lease_locked(identifier)
             self._connection.commit()
         except Exception:
@@ -1899,10 +1908,11 @@ class ChallengeStore:
                                 row["created_at_ms"] + index,
                             ),
                         )
-                if target in {
-                    ChallengeState.SUCCEEDED,
-                    ChallengeState.PARTICIPANT_FAILED,
-                }:
+                if target is ChallengeState.SUCCEEDED or (
+                    target is ChallengeState.PARTICIPANT_FAILED
+                    and evaluation["model_digest"] is not None
+                    and evaluation["error_code"] not in {"EXACT_DUPLICATE", "REFERENCE_DUPLICATE"}
+                ):
                     slot = self._connection.execute(
                         "SELECT sequence FROM season_slots WHERE challenge_id = ?",
                         (match.challenge_id,),
@@ -1929,6 +1939,10 @@ class ChallengeStore:
                             "INSERT INTO season_slots (sequence, challenge_id) VALUES (?, ?)",
                             (next_sequence, match.challenge_id),
                         )
+                elif target is ChallengeState.PARTICIPANT_FAILED:
+                    self._connection.execute(
+                        "DELETE FROM season_slots WHERE challenge_id = ?", (match.challenge_id,)
+                    )
 
                 model_digest = evaluation["model_digest"]
                 if model_digest is not None and evaluation["error_code"] not in {
