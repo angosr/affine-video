@@ -564,6 +564,11 @@ def evaluate_next_scoring(
             else:
                 result = StageOutcome(archived.score, archived.metrics)
                 recorded_score_block = archived.score_block
+                if recorded_score_block > current_finalized_block:
+                    raise TemporaryScoringError(
+                        "SCORING_ARCHIVE_AHEAD",
+                        "archived stage result is newer than the finalized chain head",
+                    )
             generated_block = result.metrics.get("cache_generated_block")
             if generated_block is not None and (
                 type(generated_block) is not int or generated_block > current_finalized_block
@@ -620,6 +625,16 @@ def evaluate_next_scoring(
             )
         recorded_locally = False
     else:
+        if recorded.score_block > current_finalized_block:
+            state = _defer_or_fail(
+                store,
+                task,
+                settings,
+                now,
+                code="SCORING_RECORD_AHEAD",
+                summary="recorded stage result is newer than the finalized chain head",
+            )
+            return ScoringOutcome(task.challenge_id, state, "SCORING_RECORD_AHEAD")
         result = StageOutcome(
             recorded.score,
             recorded.metrics,

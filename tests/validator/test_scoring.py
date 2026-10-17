@@ -480,6 +480,34 @@ def test_private_stage_archive_restores_without_repeating_evaluation(tmp_path) -
         assert rewrites == [(identifier, 0.8, 220)]
 
 
+def test_private_stage_archive_waits_for_a_chain_head_that_covers_its_decision(tmp_path) -> None:
+    archived = ArchivedStage(
+        0.8,
+        220,
+        {"cache_generated_block": 120, "requires_confirmation": True},
+    )
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_scoring(store)
+        outcome = process_next_scoring(
+            store,
+            worker_id="worker",
+            current_finalized_block=200,
+            settings=ScoringSettings(
+                lease_ms=10,
+                retry_base_ms=10,
+                retry_max_ms=10,
+                restore_stage=lambda _task: archived,
+            ),
+            evaluator=lambda _task: pytest.fail("archived stage was evaluated again"),
+            now_ms=20,
+        )
+
+        assert outcome is not None
+        assert outcome.state is ChallengeState.SYSTEM_DEFERRED
+        assert outcome.code == "SCORING_ARCHIVE_AHEAD"
+        assert store.stage_score(identifier, ChallengeState.SCORING) is None
+
+
 def test_participant_failure_is_terminal_but_temporary_failure_retries(tmp_path) -> None:
     settings = ScoringSettings(lease_ms=100, retry_base_ms=10, retry_max_ms=100)
     with ChallengeStore(tmp_path / "participant.db") as store:

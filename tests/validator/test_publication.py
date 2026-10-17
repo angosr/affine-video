@@ -450,14 +450,33 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
     assert status["track_phase"] == "TRACK_ABORTED"
     assert status["abort"] == {
         "reason": "UNFINISHED_SYSTEM_WORK_AFTER_CLOSE_GRACE",
-        "challenge_ids": ["blocked-challenge"],
+        "abort_block": track.track_close_block + 1,
     }
+    assert artifacts.abort is not None
 
     client = MemoryS3()
     existing = b"existing-weights"
     client.objects["tracks/main/weights.json"] = existing
-    asyncio.run(S3Repository(client, bucket="public-data", prefix="tracks/main").publish(artifacts))
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    asyncio.run(repository.publish(artifacts))
     assert client.objects["tracks/main/weights.json"] == existing
+
+    ledger = asyncio.run(repository.load(track))
+    assert ledger.aborted is True
+    recovered_store = SimpleNamespace(
+        chain_cursor=lambda: (block, "0x" + "12" * 32),
+        public_snapshot=lambda: {"challenges": []},
+        active_competitors=lambda _mapping: [],
+    )
+    recovered = build_public_artifacts(
+        recovered_store,
+        track,
+        chain,
+        version_key=0,
+        track_aborted=ledger.aborted,
+    )
+    assert recovered is not None and recovered.weights is None
+    assert json.loads(recovered.status)["track_phase"] == "TRACK_ABORTED"
 
 
 def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None:

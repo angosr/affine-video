@@ -79,6 +79,8 @@ tracks/main/
     <track_id>/
       000000000001.json
       ...
+  events/
+    <track_id>/track-aborted.json
   matches/
     <track_id>/
       000000000001.json
@@ -102,6 +104,9 @@ tracks/main/
 - `system_matches/*.json` are immutable launch checks produced from real GPU panels. They compare
   the VEDA baseline with fixed control models, but never enter the Miner queue, tournament rank, or
   chain weights.
+- `events/<track_id>/track-aborted.json` is the immutable stop fact created when system work remains
+  unfinished after the close grace block. It survives loss of local state and prevents that track
+  from resuming evaluation or weight refresh.
 - `runtime/<artifact_manifest_sha256>/manifest.json` publishes the canonical hashes and sizes of
   every generator byte committed by the track, without exposing future private source samples.
 - `matches/<track_id>/*.json` are immutable terminal match facts in chain order: public model reference,

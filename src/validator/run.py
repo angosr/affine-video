@@ -220,6 +220,7 @@ async def run_evaluator(
             confirmation_pool=confirmation_pool,
         )
         recovery_index = 0
+        track_aborted = ledger.aborted
         consecutive_cycle_errors = 0
         consecutive_publication_errors = 0
         while True:
@@ -274,6 +275,7 @@ async def run_evaluator(
                             max_scan_blocks=max_scan_blocks,
                             recovery_matches=ledger.matches[recovery_index:],
                             minimum_finalized_block=ledger.required_finalized_block,
+                            track_aborted=track_aborted,
                         )
                         recovery_index += result.restored_matches
                         cursor = store.chain_cursor()
@@ -303,9 +305,12 @@ async def run_evaluator(
                                         None if batch_source is None else batch_source.restore_model
                                     ),
                                     runtime_manifest=runtime_manifest_payload,
+                                    track_aborted=track_aborted,
                                 )
                                 if artifacts is not None:
                                     await publisher.publish(artifacts)
+                                    if artifacts.abort is not None:
+                                        track_aborted = True
                                     if batch_source is not None:
                                         terminal_ids = {
                                             challenge["challenge_id"]
@@ -522,6 +527,7 @@ async def process_cycle(
     model_validator: Callable[..., ValidatedModel] = validate_model,
     recovery_matches: Sequence[MatchRecord] = (),
     minimum_finalized_block: int = 0,
+    track_aborted: bool = False,
 ) -> EvaluationCycleResult:
     """Synchronize the chain, admit one model, and score one ready stage."""
 
@@ -539,6 +545,14 @@ async def process_cycle(
     finalized_block = await client.finalized_block()
     restored_matches = store.restore_public_matches(recovery_matches)
     if finalized_block < minimum_finalized_block:
+        return EvaluationCycleResult(
+            finalized_block,
+            scan,
+            None,
+            None,
+            restored_matches=restored_matches,
+        )
+    if track_aborted:
         return EvaluationCycleResult(
             finalized_block,
             scan,

@@ -132,6 +132,13 @@ class ReadyBatchSource:
             or not isinstance(document.get("metrics"), dict)
         ):
             raise RuntimeError("archived stage result conflicts with its challenge")
+        generated_block = document["metrics"].get("cache_generated_block")
+        if generated_block is not None and (
+            type(generated_block) is not int
+            or generated_block < task.position.block
+            or generated_block > document["score_block"]
+        ):
+            raise RuntimeError("archived stage batch conflicts with its decision block")
         return ArchivedStage(
             float(document["score"]),
             document["score_block"],

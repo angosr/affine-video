@@ -60,6 +60,7 @@ class PublicArtifacts:
     system_matches: tuple[tuple[str, bytes], ...] = ()
     files: tuple[PublicFile, ...] = ()
     runtime_manifest: tuple[str, bytes] | None = None
+    abort: tuple[str, bytes] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +74,7 @@ class PublicFile:
 class PublicLedger:
     source_block: int | None
     matches: tuple[MatchRecord, ...]
+    aborted: bool = False
 
     @property
     def required_finalized_block(self) -> int:
@@ -94,6 +96,7 @@ def build_public_artifacts(
     batch_reference_resolver: Callable[[str], tuple[str, ...]] | None = None,
     model_resolver: Callable[[str, int], Path] | None = None,
     runtime_manifest: bytes | None = None,
+    track_aborted: bool = False,
 ) -> PublicArtifacts | None:
     """Build one auditable public snapshot when chain scanning is caught up."""
 
@@ -106,7 +109,9 @@ def build_public_artifacts(
         for challenge in snapshot["challenges"]
         if challenge["state"] not in {state.value for state in TERMINAL_STATES}
     ]
-    aborted = chain.finalized_block > track.track_close_block and bool(unfinished)
+    aborted = track_aborted or (
+        chain.finalized_block > track.track_close_block and bool(unfinished)
+    )
     initial = genesis_champion(track)
     tournament = resolve_tournament(
         snapshot["challenges"],
@@ -143,6 +148,7 @@ def build_public_artifacts(
         tournament,
         store.active_competitors(chain.uid_by_hotkey),
         snapshot["challenges"],
+        track_aborted=aborted,
     )
     files: dict[str, PublicFile] = {}
     terminal_ids = {
@@ -212,6 +218,7 @@ def build_public_artifacts(
         system_matches=system_match_artifacts(track.track_id, track.digest, track.netuid),
         files=tuple(files.values()),
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
+        abort=_track_abort_artifact(track) if aborted else None,
     )
 
 
@@ -502,6 +509,8 @@ class S3Repository:
             await asyncio.to_thread(self._put_immutable, name, payload)
         for name, payload in artifacts.matches:
             await asyncio.to_thread(self._put_immutable, name, payload)
+        if artifacts.abort is not None:
+            await asyncio.to_thread(self._put_immutable, *artifacts.abort)
         await asyncio.to_thread(self._put, "summary.json", artifacts.summary, False)
         if artifacts.status is not None:
             await asyncio.to_thread(self._put, "status.json", artifacts.status, False)
@@ -650,10 +659,13 @@ class S3Repository:
                 raise PublicArtifactError("an active track ID cannot change its specification")
             return PublicLedger(None, ())
 
+        aborted = self._load_track_abort(track)
+
         if summary_payload is None:
             return PublicLedger(
                 None,
                 tuple(self._load_following_matches(track, 1, genesis_champion(track))),
+                aborted,
             )
         summary = _decode_canonical_object(summary_payload, "summary")
         expected_fields = {
@@ -715,7 +727,17 @@ class S3Repository:
             raise PublicArtifactError("public summary does not match its immutable matches")
 
         matches.extend(self._load_following_matches(track, match_count + 1, incumbent))
-        return PublicLedger(source_block, tuple(matches))
+        return PublicLedger(source_block, tuple(matches), aborted)
+
+    def _load_track_abort(self, track: TrackSpec) -> bool:
+        name, expected = _track_abort_artifact(track)
+        payload = self._get_optional(name)
+        if payload is None:
+            return False
+        if payload != expected:
+            raise PublicArtifactError("public track-abort fact is invalid")
+        self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
+        return True
 
     def _load_following_matches(
         self,
@@ -845,6 +867,8 @@ def _status_document(
     tournament: Tournament,
     competitors: list[dict[str, Any]],
     challenges: list[dict[str, Any]],
+    *,
+    track_aborted: bool = False,
 ) -> dict[str, Any]:
     """Build the bounded live view used by the operator monitor."""
 
@@ -853,7 +877,7 @@ def _status_document(
         for challenge in challenges
         if challenge["state"] not in {state.value for state in TERMINAL_STATES}
     ]
-    if source_block > track.track_close_block and unfinished:
+    if track_aborted or (source_block > track.track_close_block and unfinished):
         phase = "TRACK_ABORTED"
     elif source_block < track.track_start_block:
         phase = "SCHEDULED"
@@ -950,13 +974,28 @@ def _status_document(
             if phase != "TRACK_ABORTED"
             else {
                 "reason": "UNFINISHED_SYSTEM_WORK_AFTER_CLOSE_GRACE",
-                "challenge_ids": sorted(item["challenge_id"] for item in unfinished),
+                "abort_block": track.track_close_block + 1,
             }
         ),
         "champion": tournament.champion.public(),
         "system_matches": system_match_summaries(track.track_id, track.digest, track.netuid),
         "participants": active_rows,
     }
+
+
+def _track_abort_artifact(track: TrackSpec) -> tuple[str, bytes]:
+    return (
+        f"events/{track.track_id}/track-aborted.json",
+        _json_bytes(
+            {
+                "event": "TRACK_ABORTED",
+                "reason": "UNFINISHED_SYSTEM_WORK_AFTER_CLOSE_GRACE",
+                "track_id": track.track_id,
+                "track_spec_digest": track.digest,
+                "abort_block": track.track_close_block + 1,
+            }
+        ),
+    )
 
 
 def _decode_canonical_object(payload: bytes, name: str) -> dict[str, Any]:

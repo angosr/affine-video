@@ -58,7 +58,7 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
 
     class Publisher:
         async def load(self, _track):
-            return SimpleNamespace(matches=(), required_finalized_block=0)
+            return SimpleNamespace(matches=(), required_finalized_block=0, aborted=False)
 
     track = SimpleNamespace(
         digest="ab" * 32,
@@ -259,10 +259,12 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
             "downloader": download,
         }
         paused = asyncio.run(process_cycle(client, store, minimum_finalized_block=102, **arguments))
+        aborted = asyncio.run(process_cycle(client, store, track_aborted=True, **arguments))
         first = asyncio.run(process_cycle(client, store, **arguments))
 
         assert paused.scan.submissions_found == 1
         assert paused.admission is paused.scoring is None
+        assert aborted.admission is aborted.scoring is None
         assert first.scan.blocks_scanned == 0
         assert first.admission is not None
         assert first.admission.status is AdmissionStatus.ACCEPTED
