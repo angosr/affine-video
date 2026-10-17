@@ -276,6 +276,61 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
         assert store.leaderboard()[0].final_score == pytest.approx(0.7)
 
 
+def test_cycle_does_not_commit_a_stage_after_the_track_closes(tmp_path) -> None:
+    model_path = tmp_path / "selector.safetensors"
+    save_file(
+        {"selector.weight": np.ones((2, 3), dtype=np.float32)},
+        model_path,
+        metadata={"hotkey": HOTKEY},
+    )
+    file_digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    client = FakeClient({100: chain_block(payload, 100), 101: empty_chain_block(101)})
+    finalized_reads = 0
+
+    async def advancing_finalized_block():
+        nonlocal finalized_reads
+        finalized_reads += 1
+        return 150 if finalized_reads >= 3 else 101
+
+    client.finalized_block = advancing_finalized_block
+    with ChallengeStore(tmp_path / "validator.db", track_spec_digest="ab" * 32) as store:
+        cycle = asyncio.run(
+            process_cycle(
+                client,
+                store,
+                netuid=7,
+                track_start_block=100,
+                track_close_block=120,
+                admission_settings=AdmissionSettings(
+                    cache_dir=tmp_path / "cache",
+                    max_model_bytes=10_000,
+                    tensor_schema={"selector.weight": TensorSpec((2, 3), "float32")},
+                    publication_grace_blocks=1,
+                ),
+                scoring_settings=ScoringSettings(),
+                evaluator=lambda _task: StageOutcome(0.9, {"stage": "scoring"}),
+                worker_id="validator-a",
+                downloader=lambda *_args, **_kwargs: DownloadedModel(
+                    model_path,
+                    file_digest,
+                    model_path.stat().st_size,
+                    None,
+                    None,
+                ),
+            )
+        )
+
+        assert cycle.finalized_block == 150
+        assert cycle.scoring is not None
+        assert cycle.scoring.state is ChallengeState.SYSTEM_DEFERRED
+        assert cycle.scoring.code == "TRACK_CLOSE_REACHED"
+        challenge = store.public_snapshot()["challenges"][0]
+        assert challenge["state"] == ChallengeState.SYSTEM_DEFERRED
+        assert challenge["final_score"] is None
+        assert challenge["stages"] == []
+
+
 def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_path) -> None:
     model_path = tmp_path / "selector.safetensors"
     save_file(

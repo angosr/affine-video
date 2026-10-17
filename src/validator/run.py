@@ -37,7 +37,7 @@ from validator.publication import (
     fetch_weight_artifact,
     validate_public_weights_url,
 )
-from validator.queue import TERMINAL_STATES
+from validator.queue import TERMINAL_STATES, ChallengeState
 from validator.scoring import (
     EvaluatedStage,
     PairedTrackEvaluator,
@@ -622,12 +622,26 @@ async def process_cycle(
                 summary=str(exc) or type(exc).__name__,
             )
         else:
-            scoring = commit_evaluated_scoring(
-                store,
-                evaluated,
-                current_finalized_block=finalized_block,
-                settings=scoring_settings,
-            )
+            if track_close_block is not None and finalized_block > track_close_block:
+                store.wait_leased(
+                    evaluated.task.challenge_id,
+                    evaluated.task.lease_token,
+                    retry_after_ms=evaluated.occurred_at_ms + scoring_settings.retry_base_ms,
+                    reason="TRACK_CLOSE_REACHED",
+                    occurred_at_ms=evaluated.occurred_at_ms,
+                )
+                scoring = ScoringOutcome(
+                    evaluated.task.challenge_id,
+                    ChallengeState.SYSTEM_DEFERRED,
+                    "TRACK_CLOSE_REACHED",
+                )
+            else:
+                scoring = commit_evaluated_scoring(
+                    store,
+                    evaluated,
+                    current_finalized_block=finalized_block,
+                    settings=scoring_settings,
+                )
     else:
         scoring = evaluated
     return EvaluationCycleResult(
