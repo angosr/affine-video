@@ -16,15 +16,18 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
 ## Competition flow
 
 1. A Miner commits a Hugging Face `repo_id` and a complete 40-character commit SHA on-chain.
+   Only that hotkey's first submission on the track is eligible; every later submission is
+   terminally rejected, even when the first submission is malformed or fails evaluation.
 2. After the fixed publication grace period, the evaluator processes submissions by finalized
    `(block, extrinsic, event)` order. The pinned revision must then be anonymously downloadable.
 3. The evaluator accepts exactly one `selector.safetensors` file. It rejects executable code,
    metadata, unknown tensors, adapters, base-model patches, invalid shapes, and excess bytes.
 4. Every valid model is scored once on the same hash-pinned hidden exact-attention cache. The score
    is the conservative lower bound of its multi-budget quality-cost curve.
-5. Completed submissions are adjudicated in chain order. The first successful model becomes the
-   initial champion. A later model replaces it only when
-   `challenger_score - champion_score >= minimum_frontier_gain`.
+5. UID 0 is the genesis champion without making a commit. Its identity is pinned to the official
+   VEDA repository revision, filename and file SHA-256 in the track specification. Its baseline
+   score is produced by the same frozen evaluation. A challenger replaces it, or any later
+   champion, only when `challenger_score - champion_score >= minimum_frontier_gain`.
 6. An immutable match record is published for every terminal item in the contiguous chain-order
    prefix. A failed or unfinished earlier submission can never be skipped to publish a later win.
 
@@ -34,13 +37,11 @@ track specification pins every score-affecting rule and asset hash. The evaluato
 layer and head derived from the fixed architecture. Kernel-required tiles are stored in the hidden
 cache, always retained, and counted inside each block budget before predictor Top-k fills the rest.
 
-Rewards use chronological frontier gains rather than raw leaderboard rank. Exact duplicates earn
-nothing, sub-threshold changes earn nothing, and splitting the same sequence of improvements among
-several hotkeys cannot increase total utility. Deregistered historical winners remain part of the
-frontier calculation, so their removal cannot retroactively turn an earlier loser into a winner.
-The resulting utilities are filtered to currently registered hotkeys and normalized under current
-Bittensor count and weight-cap constraints. When no valid vector exists, `weights` is `null` and
-Validators keep their last finalized weights.
+The current champion receives the full subnet weight. Before any successful challenge this is UID
+0; after a valid win it is the winning Miner's hotkey. The evaluator checks the current finalized
+hotkey-to-UID mapping and chain weight constraints before publishing. When the champion is no
+longer registered or a valid vector is impossible, `weights` is `null` and Validators keep their
+last finalized weights.
 
 Before live rewards, the frozen exact-cache score must be validated against full-video quality on
 the target GPU. The production track must also pass ranking stability, cost calibration, baseline
@@ -55,6 +56,7 @@ Each frozen track uses one prefix:
 tracks/<track>/
   track.json
   summary.json
+  status.json
   weights.json
   matches/
     000000000001.json
@@ -65,8 +67,10 @@ tracks/<track>/
 - `track.json` is immutable and contains the canonical public track specification and digest.
 - `matches/*.json` are immutable terminal match facts in chain order: public model reference,
   content hashes, aggregate result, incumbent, decision, and decision block.
-- `summary.json` is a bounded current view containing the champion, top leaderboard and reward
-  entries with their totals, and the committed match count.
+- `summary.json` is a bounded current view containing the champion, top leaderboard and committed
+  match count.
+- `status.json` is the bounded live view used by the monitoring CLI; it includes UID 0, active
+  entrants, queue positions, match numbers, scores and outcomes.
 - `weights.json` is the small mutable artifact consumed by Validators.
 
 Publication writes the immutable track and matches first, then `summary.json`, then `weights.json`.
@@ -126,6 +130,10 @@ uv run --extra storage veda validator evaluate \
   --storage-bucket affine_video \
   --storage-prefix tracks/main
 ```
+
+If `--initial-model` is omitted, the evaluator restores the pinned UID 0 VEDA weights from the
+public chunk manifest, verifies every chunk, the complete file SHA-256, the canonical tensor
+digest, and the frozen baseline score before scanning submissions. The cache is disposable.
 
 Run any Validator, including the evaluator operator's independent Validator:
 

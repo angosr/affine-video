@@ -5,7 +5,7 @@ import pytest
 
 from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
-from validator.tournament import resolve_tournament
+from validator.tournament import Champion, resolve_tournament
 
 
 def make_submission(*, hotkey: str = "hk1") -> SubmissionRecord:
@@ -222,22 +222,24 @@ def test_chain_cursor_is_contiguous_and_persistent(tmp_path) -> None:
         assert reopened.advance_chain_cursor(101, second_hash) is True
 
 
-def test_cooldown_is_based_on_last_accepted_submission(tmp_path) -> None:
+def test_only_first_submission_per_hotkey_is_admitted(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
-        first, _ = store.add_submission(submission_at(100), cooldown_blocks=20, occurred_at_ms=10)
-        rejected, _ = store.add_submission(
-            submission_at(119), cooldown_blocks=20, occurred_at_ms=20
-        )
-        next_accepted, _ = store.add_submission(
-            submission_at(120), cooldown_blocks=20, occurred_at_ms=30
-        )
+        first, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
+        rejected, _ = store.add_submission(submission_at(119), occurred_at_ms=20)
+        rejected_much_later, _ = store.add_submission(submission_at(10_000), occurred_at_ms=30)
 
         assert store.get_challenge(first).state is ChallengeState.QUEUED
-        assert store.get_challenge(rejected).state is ChallengeState.REJECTED_RATE_LIMIT
-        assert store.get_challenge(next_accepted).state is ChallengeState.QUEUED
+        assert (
+            store.get_challenge(rejected).state
+            is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+        )
+        assert (
+            store.get_challenge(rejected_much_later).state
+            is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+        )
 
 
-def test_malformed_submission_is_recorded_and_does_not_consume_cooldown(tmp_path) -> None:
+def test_malformed_first_submission_consumes_hotkey_slot(tmp_path) -> None:
     malformed = submission_at(100)
     malformed = SubmissionRecord(
         submission_id=malformed.submission_id,
@@ -250,13 +252,61 @@ def test_malformed_submission_is_recorded_and_does_not_consume_cooldown(tmp_path
         revision=None,
     )
     with ChallengeStore(tmp_path / "validator.db") as store:
-        malformed_id, _ = store.add_submission(malformed, cooldown_blocks=20, occurred_at_ms=10)
-        accepted_id, _ = store.add_submission(
-            submission_at(101), cooldown_blocks=20, occurred_at_ms=20
-        )
+        malformed_id, _ = store.add_submission(malformed, occurred_at_ms=10)
+        rejected_id, _ = store.add_submission(submission_at(101), occurred_at_ms=20)
 
         assert store.get_challenge(malformed_id).state is ChallengeState.MALFORMED_SUBMISSION
-        assert store.get_challenge(accepted_id).state is ChallengeState.QUEUED
+        assert (
+            store.get_challenge(rejected_id).state
+            is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+        )
+
+
+def test_current_vda_choice_always_points_to_hotkeys_first_submission(tmp_path) -> None:
+    first = submission_at(100)
+    later = submission_at(101)
+    database = tmp_path / "validator.db"
+    with ChallengeStore(database) as store:
+        first_challenge, _ = store.add_submission(first, occurred_at_ms=10)
+        store.observe_commitment(
+            hotkey=first.hotkey,
+            netuid=first.netuid,
+            block_hash=first.block_hash,
+            position=first.position,
+            payload=first.payload,
+            submission_id=first.submission_id,
+            legacy_excluded=False,
+        )
+        later_challenge, _ = store.add_submission(later, occurred_at_ms=20)
+        store.observe_commitment(
+            hotkey=later.hotkey,
+            netuid=later.netuid,
+            block_hash=later.block_hash,
+            position=later.position,
+            payload=later.payload,
+            submission_id=later.submission_id,
+            legacy_excluded=False,
+        )
+
+        assert (
+            store.get_challenge(later_challenge).state
+            is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+        )
+
+    with ChallengeStore(database) as store:
+        assert store.active_competitors({first.hotkey: 4}) == [
+            {
+                "uid": 4,
+                "hotkey": first.hotkey,
+                "submission_id": first.submission_id,
+                "repo_id": first.repo_id,
+                "revision": first.revision,
+                "block_height": first.position.block,
+                "extrinsic_index": first.position.extrinsic_index,
+                "event_index": first.position.event_index,
+            }
+        ]
+        assert first_challenge != later_challenge
 
 
 def advance_to_scoring(store: ChallengeStore, identifier: str, timestamp: int) -> None:
@@ -265,10 +315,12 @@ def advance_to_scoring(store: ChallengeStore, identifier: str, timestamp: int) -
     store.transition(identifier, ChallengeState.SCORING, occurred_at_ms=timestamp + 2)
 
 
-def test_leaderboard_keeps_hotkeys_best_authoritative_score(tmp_path) -> None:
+def test_leaderboard_orders_each_hotkeys_only_authoritative_score(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
-        newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
+        newer, _ = store.add_submission(
+            submission_at(120, hotkey="hk2"), occurred_at_ms=20
+        )
         advance_to_scoring(store, older, 30)
         advance_to_scoring(store, newer, 40)
 
@@ -286,15 +338,18 @@ def test_leaderboard_keeps_hotkeys_best_authoritative_score(tmp_path) -> None:
         )
 
         entries = store.leaderboard()
-        assert len(entries) == 1
+        assert len(entries) == 2
         assert entries[0].challenge_id == older
         assert entries[0].final_score == 0.9
+        assert entries[1].challenge_id == newer
 
 
 def test_later_participant_failure_preserves_previous_authoritative_score(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
-        newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
+        newer, _ = store.add_submission(
+            submission_at(120, hotkey="hk2"), occurred_at_ms=20
+        )
         advance_to_scoring(store, older, 30)
         store.complete_challenge(
             older,
@@ -317,7 +372,9 @@ def test_later_participant_failure_preserves_previous_authoritative_score(tmp_pa
 def test_system_failure_preserves_previous_success(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
-        newer, _ = store.add_submission(submission_at(120), occurred_at_ms=20)
+        newer, _ = store.add_submission(
+            submission_at(120, hotkey="hk2"), occurred_at_ms=20
+        )
         advance_to_scoring(store, older, 30)
         store.complete_challenge(
             older,
@@ -364,6 +421,16 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
             track_spec_digest=digest,
             netuid=7,
             minimum_gain=0.001,
+            initial_champion=Champion(
+                "genesis",
+                "genesis-hotkey",
+                "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview",
+                "76f202874608115408d73280be9531c4ab888242",
+                0.5,
+                ChainPosition(100, 0, 0),
+                uid=0,
+                source="VEDA_BASELINE",
+            ),
         )
 
         assert store.restore_public_matches(tournament.matches) == 1

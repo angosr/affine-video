@@ -60,20 +60,6 @@ def challenge_id(submission: str) -> str:
     return digest.hexdigest()
 
 
-def passes_cooldown(
-    *, current_block: int, last_accepted_block: int | None, cooldown_blocks: int
-) -> bool:
-    """Apply the track's per-hotkey rate limit using chain data only."""
-
-    if current_block < 0 or cooldown_blocks < 0:
-        raise ValueError("block values must be non-negative")
-    if last_accepted_block is None:
-        return True
-    if last_accepted_block < 0 or current_block < last_accepted_block:
-        raise ValueError("last accepted block cannot be in the future")
-    return current_block - last_accepted_block >= cooldown_blocks
-
-
 class ChallengeState(StrEnum):
     QUEUED = "QUEUED"
     FETCHING = "FETCHING"
@@ -84,7 +70,7 @@ class ChallengeState(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     PARTICIPANT_FAILED = "PARTICIPANT_FAILED"
     MALFORMED_SUBMISSION = "MALFORMED_SUBMISSION"
-    REJECTED_RATE_LIMIT = "REJECTED_RATE_LIMIT"
+    REJECTED_DUPLICATE_HOTKEY = "REJECTED_DUPLICATE_HOTKEY"
 
 
 TERMINAL_STATES = frozenset(
@@ -93,7 +79,7 @@ TERMINAL_STATES = frozenset(
         ChallengeState.PARTICIPANT_FAILED,
         ChallengeState.SYSTEM_FAILED,
         ChallengeState.MALFORMED_SUBMISSION,
-        ChallengeState.REJECTED_RATE_LIMIT,
+        ChallengeState.REJECTED_DUPLICATE_HOTKEY,
     }
 )
 
@@ -110,7 +96,7 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
         {
             ChallengeState.FETCHING,
             ChallengeState.MALFORMED_SUBMISSION,
-            ChallengeState.REJECTED_RATE_LIMIT,
+            ChallengeState.REJECTED_DUPLICATE_HOTKEY,
         }
     ),
     ChallengeState.FETCHING: frozenset(

@@ -1,6 +1,7 @@
 import hashlib
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,7 +10,22 @@ from safetensors.numpy import save_file
 from scoring.evaluate import reference_attention
 from scoring.exact import ExactCase
 from scoring.selector import SelectorArchitecture
-from scoring.spec import BaseModelSpec, BudgetSpec, CacheSpec, ModelSpec, ScoringSpec, TrackSpec
+from scoring.spec import (
+    VEDA_EVALUATION_FILE_SHA256,
+    VEDA_FILE_SHA256,
+    VEDA_FILENAME,
+    VEDA_MODEL_DIGEST,
+    VEDA_REPO_ID,
+    VEDA_REVISION,
+    BaseModelSpec,
+    BudgetSpec,
+    CacheSpec,
+    InitialChampionSpec,
+    ModelSpec,
+    ScoringSpec,
+    TrackSpec,
+)
+from validator import scoring as scoring_module
 from validator.queue import ChainPosition, ChallengeState
 from validator.scoring import (
     IsolatedEvaluator,
@@ -20,10 +36,55 @@ from validator.scoring import (
     TrackEvaluator,
     evaluate_isolated,
     process_next_scoring,
+    verify_initial_champion,
 )
 from validator.store import ChallengeStore, LeasedChallenge
 
 from .test_store import submission_at
+
+
+def test_initial_champion_file_and_score_are_verified(monkeypatch, tmp_path) -> None:
+    initial = SimpleNamespace(
+        hotkey="burn-hotkey",
+        repo_id=VEDA_REPO_ID,
+        revision=VEDA_REVISION,
+        evaluation_file_sha256=VEDA_EVALUATION_FILE_SHA256,
+        model_digest=VEDA_MODEL_DIGEST,
+        score=0.7,
+    )
+    track = SimpleNamespace(
+        initial_champion=initial,
+        model=SimpleNamespace(tensor_schema={}, max_bytes=1),
+        track_start_block=100,
+    )
+    validated = SimpleNamespace(
+        file_sha256=VEDA_EVALUATION_FILE_SHA256,
+        model_digest=VEDA_MODEL_DIGEST,
+    )
+    monkeypatch.setattr(scoring_module, "validate_model", lambda *_args, **_kwargs: validated)
+
+    class FakeEvaluator:
+        def __call__(self, task):
+            assert task.challenge_id == "genesis"
+            assert task.hotkey == "burn-hotkey"
+            return StageOutcome(0.7, {"baseline": True})
+
+    monkeypatch.setattr(scoring_module, "FileTrackEvaluator", lambda *_args: FakeEvaluator())
+
+    outcome = verify_initial_champion(
+        track,
+        exact_cache=tmp_path / "exact.npz",
+        model_path=tmp_path / "veda.safetensors",
+    )
+    assert outcome.score == 0.7
+
+    initial.score = 0.8
+    with pytest.raises(ValueError, match="score"):
+        verify_initial_champion(
+            track,
+            exact_cache=tmp_path / "exact.npz",
+            model_path=tmp_path / "veda.safetensors",
+        )
 
 
 def isolated_success(_task: LeasedChallenge) -> StageOutcome:
@@ -231,7 +292,17 @@ def test_track_evaluator_produces_deterministic_authoritative_score(tmp_path) ->
         netuid=7,
         track_start_block=1,
         publication_grace_blocks=1,
-        submission_cooldown_blocks=1,
+            initial_champion=InitialChampionSpec(
+                0,
+                "genesis-hotkey",
+                VEDA_REPO_ID,
+                VEDA_REVISION,
+                VEDA_FILENAME,
+                VEDA_FILE_SHA256,
+                VEDA_EVALUATION_FILE_SHA256,
+                VEDA_MODEL_DIGEST,
+                0.7,
+            ),
         model=ModelSpec("selector.safetensors", 10_000, architecture),
         base_model=BaseModelSpec("owner/base", "12" * 20),
         cache=CacheSpec("56" * 32, 1_000_000),

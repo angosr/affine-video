@@ -17,10 +17,10 @@ from typing import Any
 from scoring.cache import CacheLoadError, sample_exact_cache
 from scoring.evaluate import panel_seed, route_stratified_sample_indices
 from scoring.exact import ExactCase, score_selector
-from scoring.model import ModelValidationError
+from scoring.model import ModelValidationError, validate_model
 from scoring.selector import load_selector
 from scoring.spec import TrackSpec
-from validator.queue import ChallengeState, require_transition
+from validator.queue import ChainPosition, ChallengeState, require_transition
 from validator.store import ChallengeStore, LeasedChallenge
 
 
@@ -185,6 +185,47 @@ class FileTrackEvaluator:
             exact_cases,
             presampled=True,
         )(task)
+
+
+def verify_initial_champion(
+    track: TrackSpec,
+    *,
+    exact_cache: str | Path,
+    model_path: str | Path,
+) -> StageOutcome:
+    """Verify and score the fixed official VEDA baseline before processing Miners."""
+
+    initial = track.initial_champion
+    try:
+        validated = validate_model(
+            model_path,
+            schema=track.model.tensor_schema,
+            max_bytes=track.model.max_bytes,
+        )
+    except (OSError, ModelValidationError) as exc:
+        raise ValueError("initial VEDA evaluation weights are invalid") from exc
+    if validated.file_sha256 != initial.evaluation_file_sha256:
+        raise ValueError("initial VEDA evaluation file SHA-256 is incorrect")
+    if validated.model_digest != initial.model_digest:
+        raise ValueError("initial VEDA canonical model digest is incorrect")
+    task = LeasedChallenge(
+        challenge_id="genesis",
+        submission_id="genesis",
+        state=ChallengeState.SCORING,
+        hotkey=initial.hotkey,
+        repo_id=initial.repo_id,
+        revision=initial.revision,
+        position=ChainPosition(track.track_start_block, 0, 0),
+        lease_token="genesis",
+        lease_expires_at_ms=0,
+        attempts=1,
+        model_path=str(model_path),
+        file_sha256=validated.file_sha256,
+    )
+    outcome = FileTrackEvaluator(track, str(exact_cache))(task)
+    if abs(outcome.score - initial.score) > 1e-12:
+        raise ValueError("initial VEDA score does not match the frozen track specification")
+    return outcome
 
 
 @dataclass(frozen=True, slots=True)

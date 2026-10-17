@@ -14,12 +14,14 @@ from urllib.parse import urlparse
 import httpx
 
 from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
+from validator.queue import TERMINAL_STATES
 from validator.store import ChallengeStore
 from validator.tournament import (
     Champion,
     MatchRecord,
     Tournament,
     challenge_from_match,
+    genesis_champion,
     resolve_tournament,
     validate_match_document,
 )
@@ -27,8 +29,7 @@ from validator.weights import (
     WeightArtifact,
     WeightChainState,
     WeightPlan,
-    frontier_gains,
-    plan_weights,
+    plan_champion_weight,
 )
 
 _HEX_32 = re.compile(r"^[0-9a-f]{64}$")
@@ -37,7 +38,6 @@ _STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MAX_WEIGHT_ARTIFACT_BYTES = 1024 * 1024
 _MAX_PUBLIC_OBJECT_BYTES = 1024 * 1024
 _SUMMARY_LEADERBOARD_LIMIT = 100
-_SUMMARY_REWARD_LIMIT = 100
 
 
 class PublicArtifactError(RuntimeError):
@@ -51,6 +51,7 @@ class PublicArtifacts:
     summary: bytes
     weights: bytes
     matches: tuple[tuple[str, bytes], ...]
+    status: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,22 +83,23 @@ def build_public_artifacts(
     if cursor is None or cursor[0] != chain.finalized_block:
         return None
     snapshot = store.public_snapshot()
+    initial = genesis_champion(track)
     tournament = resolve_tournament(
         snapshot["challenges"],
         track_id=track.track_id,
         track_spec_digest=track.digest,
         netuid=track.netuid,
         minimum_gain=track.scoring.minimum_frontier_gain,
+        initial_champion=initial,
     )
     if any(match.document["decided_block"] > chain.finalized_block for match in tournament.matches):
         raise PublicArtifactError("a terminal decision is newer than the finalized chain snapshot")
-    plan = plan_weights(
-        tournament.reward_entries,
+    plan = plan_champion_weight(
+        tournament.champion,
         uid_by_hotkey=chain.uid_by_hotkey,
         current_block=chain.finalized_block,
         min_allowed_weights=chain.min_allowed_weights,
         max_weight=chain.max_weight,
-        minimum_frontier_gain=track.scoring.minimum_frontier_gain,
     )
     artifact = WeightArtifact(
         track_id=track.track_id,
@@ -109,6 +111,13 @@ def build_public_artifacts(
         plan=plan,
     )
     summary = _summary_document(track, chain.finalized_block, tournament)
+    status = _status_document(
+        track,
+        chain.finalized_block,
+        tournament,
+        store.active_competitors(chain.uid_by_hotkey),
+        snapshot["challenges"],
+    )
     return PublicArtifacts(
         source_block=chain.finalized_block,
         track=_json_bytes(
@@ -122,6 +131,7 @@ def build_public_artifacts(
         matches=tuple(
             (match.object_name, _json_bytes(match.document)) for match in tournament.matches
         ),
+        status=_json_bytes(status),
     )
 
 
@@ -318,6 +328,8 @@ class S3Repository:
         for name, payload in artifacts.matches:
             await asyncio.to_thread(self._put_immutable, name, payload)
         await asyncio.to_thread(self._put, "summary.json", artifacts.summary, False)
+        if artifacts.status is not None:
+            await asyncio.to_thread(self._put, "status.json", artifacts.status, False)
         await asyncio.to_thread(self._put, "weights.json", artifacts.weights, False)
 
     async def load(self, track: TrackSpec) -> PublicLedger:
@@ -345,7 +357,10 @@ class S3Repository:
         self._confirmed_immutable["track.json"] = hashlib.sha256(track_payload).hexdigest()
 
         if summary_payload is None:
-            return PublicLedger(None, tuple(self._load_following_matches(track, 1, None)))
+            return PublicLedger(
+                None,
+                tuple(self._load_following_matches(track, 1, genesis_champion(track))),
+            )
         summary = _decode_canonical_object(summary_payload, "summary")
         expected_fields = {
             "track_id",
@@ -357,8 +372,6 @@ class S3Repository:
             "champion",
             "leaderboard",
             "leaderboard_total",
-            "rewards",
-            "rewards_total",
         }
         if set(summary) != expected_fields:
             raise PublicArtifactError("public summary fields are invalid")
@@ -368,7 +381,7 @@ class S3Repository:
         match_count = _integer(summary["match_count"], "match_count")
         matches: list[MatchRecord] = []
         committed_challenges: list[dict[str, Any]] = []
-        incumbent = None
+        incumbent = genesis_champion(track)
         for sequence in range(1, match_count + 1):
             name = f"matches/{sequence:012d}.json"
             payload = self._get_optional(name)
@@ -400,6 +413,7 @@ class S3Repository:
             track_spec_digest=track.digest,
             netuid=track.netuid,
             minimum_gain=track.scoring.minimum_frontier_gain,
+            initial_champion=genesis_champion(track),
         )
         if summary != _summary_document(track, source_block, tournament):
             raise PublicArtifactError("public summary does not match its immutable matches")
@@ -411,7 +425,7 @@ class S3Repository:
         self,
         track: TrackSpec,
         sequence: int,
-        incumbent: Champion | None,
+        incumbent: Champion,
     ) -> list[MatchRecord]:
         matches: list[MatchRecord] = []
         while True:
@@ -513,11 +527,7 @@ def _summary_document(
     source_block: int,
     tournament: Tournament,
 ) -> dict[str, Any]:
-    rewards = frontier_gains(
-        tournament.reward_entries,
-        minimum_gain=track.scoring.minimum_frontier_gain,
-    )
-    ranked_rewards = sorted(rewards.items(), key=lambda item: (-item[1], item[0]))
+    champion = tournament.champion
     return {
         "track_id": track.track_id,
         "track_spec_digest": track.digest,
@@ -525,14 +535,84 @@ def _summary_document(
         "source_block": source_block,
         "match_count": len(tournament.matches),
         "latest_match": tournament.matches[-1].object_name if tournament.matches else None,
-        "champion": None if tournament.champion is None else tournament.champion.public(),
+        "champion": champion.public(),
         "leaderboard": list(tournament.leaderboard[:_SUMMARY_LEADERBOARD_LIMIT]),
         "leaderboard_total": len(tournament.leaderboard),
-        "rewards": [
-            {"hotkey": hotkey, "utility": utility}
-            for hotkey, utility in ranked_rewards[:_SUMMARY_REWARD_LIMIT]
-        ],
-        "rewards_total": len(ranked_rewards),
+    }
+
+
+def _status_document(
+    track: TrackSpec,
+    source_block: int,
+    tournament: Tournament,
+    competitors: list[dict[str, Any]],
+    challenges: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the bounded live view used by the operator monitor."""
+
+    challenge_by_id = {item["submission_id"]: item for item in challenges}
+    match_by_id = {item.challenge_id: item for item in tournament.matches}
+    initial = genesis_champion(track)
+    active_rows: list[dict[str, Any]] = [
+        {
+            "uid": initial.uid,
+            "hotkey": initial.hotkey,
+            "challenge_id": initial.challenge_id,
+            "submission_block": track.track_start_block,
+            "state": (
+                "CHAMPION"
+                if tournament.champion.challenge_id == initial.challenge_id
+                else "DISPLACED"
+            ),
+            "queue_position": None,
+            "match_sequence": 0,
+            "score": initial.score,
+            "outcome": "GENESIS",
+            "champion": tournament.champion.challenge_id == initial.challenge_id,
+        }
+    ]
+    for competitor in competitors:
+        challenge = challenge_by_id.get(competitor["submission_id"])
+        if challenge is None:
+            raise PublicArtifactError("active commitment has no local challenge")
+        match = match_by_id.get(challenge["challenge_id"])
+        active_rows.append(
+            {
+                "uid": competitor["uid"],
+                "hotkey": competitor["hotkey"],
+                "challenge_id": challenge["challenge_id"],
+                "submission_block": competitor["block_height"],
+                "state": challenge["state"],
+                "queue_position": None,
+                "match_sequence": None if match is None else match.sequence,
+                "score": challenge["final_score"],
+                "outcome": None if match is None else match.outcome,
+                "champion": (
+                    tournament.champion.challenge_id == challenge["challenge_id"]
+                ),
+            }
+        )
+    waiting = [
+        row
+        for row in active_rows
+        if row["match_sequence"] is None
+        and row["state"]
+        not in {str(state) for state in TERMINAL_STATES}
+    ]
+    waiting.sort(key=lambda row: (row["submission_block"], row["challenge_id"]))
+    queue_positions = {
+        row["challenge_id"]: position for position, row in enumerate(waiting, start=1)
+    }
+    for row in active_rows:
+        row["queue_position"] = queue_positions.get(row["challenge_id"])
+    active_rows.sort(key=lambda row: row["uid"])
+    return {
+        "track_id": track.track_id,
+        "track_spec_digest": track.digest,
+        "netuid": track.netuid,
+        "source_block": source_block,
+        "champion": tournament.champion.public(),
+        "participants": active_rows,
     }
 
 

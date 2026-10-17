@@ -22,7 +22,7 @@ from validator.admission import (
     process_next_admission,
 )
 from validator.chain import ScanResult, scan_finalized_blocks
-from validator.download import DownloadedModel, download_public_model
+from validator.download import DownloadedModel, download_chunked_asset, download_public_model
 from validator.publication import (
     PublicArtifacts,
     PublicLedger,
@@ -37,6 +37,7 @@ from validator.scoring import (
     ScoringSettings,
     StageOutcome,
     process_next_scoring,
+    verify_initial_champion,
 )
 from validator.store import ChallengeStore, LeasedChallenge
 from validator.tournament import MatchRecord
@@ -51,6 +52,10 @@ from validator.weights import (
 DEFAULT_PUBLIC_WEIGHTS_URL = (
     "https://iblosevwkuiootbbgnsy.supabase.co/storage/v1/object/public/"
     "affine_video/tracks/main/weights.json"
+)
+DEFAULT_BASELINE_MANIFEST_URL = (
+    "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/"
+    "affine_video/tracks/sn120/assets/veda_baseline_f16/manifest.json"
 )
 DEFAULT_NETUID = 7
 DEFAULT_TRACK_SPEC_DIGEST = "bbbba0ba4b416a2cd889958e4d6cab61abe51babd70e623eb06b1d9dcbbfc6ee"
@@ -88,6 +93,8 @@ async def run_evaluator(
     database: str | Path,
     model_cache: str | Path,
     exact_cache: str | Path,
+    initial_model: str | Path | None,
+    initial_model_manifest_url: str = DEFAULT_BASELINE_MANIFEST_URL,
     network: str,
     archive_endpoints: list[str] | None,
     worker_id: str,
@@ -121,6 +128,23 @@ async def run_evaluator(
         strata=track.scoring.stratum_weight_map,
         sample_count=track.scoring.sample_count,
     )
+    initial_model_path = (
+        Path(initial_model)
+        if initial_model is not None
+        else await asyncio.to_thread(
+            download_chunked_asset,
+            initial_model_manifest_url,
+            cache_dir=Path(model_cache) / "baseline",
+            expected_sha256=track.initial_champion.evaluation_file_sha256,
+            expected_model_digest=track.initial_champion.model_digest,
+            max_bytes=track.model.max_bytes,
+        )
+    )
+    verify_initial_champion(
+        track,
+        exact_cache=exact_cache,
+        model_path=initial_model_path,
+    )
     admission_settings = AdmissionSettings(
         cache_dir=Path(model_cache),
         max_model_bytes=track.model.max_bytes,
@@ -144,7 +168,6 @@ async def run_evaluator(
                     store,
                     netuid=track.netuid,
                     track_start_block=track.track_start_block,
-                    cooldown_blocks=track.submission_cooldown_blocks,
                     admission_settings=admission_settings,
                     scoring_settings=scoring_settings,
                     evaluator=evaluator,
@@ -318,7 +341,6 @@ async def process_cycle(
     *,
     netuid: int,
     track_start_block: int,
-    cooldown_blocks: int,
     admission_settings: AdmissionSettings,
     scoring_settings: ScoringSettings,
     evaluator: Callable[[LeasedChallenge], StageOutcome],
@@ -340,7 +362,6 @@ async def process_cycle(
         store,
         netuid=netuid,
         track_start_block=track_start_block,
-        cooldown_blocks=cooldown_blocks,
         max_blocks=max_scan_blocks,
     )
     finalized_block = await client.finalized_block()

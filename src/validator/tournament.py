@@ -9,12 +9,11 @@ from enum import StrEnum
 from math import isfinite
 from typing import Any
 
+from scoring.spec import TrackSpec
 from validator.queue import TERMINAL_STATES, ChainPosition, ChallengeState
-from validator.store import LeaderboardEntry
 
 
 class MatchOutcome(StrEnum):
-    INITIAL_CHAMPION = "INITIAL_CHAMPION"
     CHALLENGER_WON = "CHALLENGER_WON"
     CHAMPION_RETAINED = "CHAMPION_RETAINED"
     CHALLENGE_FAILED = "CHALLENGE_FAILED"
@@ -28,6 +27,8 @@ class Champion:
     revision: str
     score: float
     position: ChainPosition
+    uid: int | None = None
+    source: str = "MINER"
 
     def public(self) -> dict[str, Any]:
         return {
@@ -36,6 +37,8 @@ class Champion:
             "repo_id": self.repo_id,
             "revision": self.revision,
             "score": self.score,
+            "uid": self.uid,
+            "source": self.source,
             "block_height": self.position.block,
             "extrinsic_index": self.position.extrinsic_index,
             "event_index": self.position.event_index,
@@ -51,7 +54,7 @@ class MatchRecord:
     final_score: float | None
     score_gain: float | None
     outcome: MatchOutcome
-    champion_after: Champion | None
+    champion_after: Champion
     document: Mapping[str, Any]
 
     @property
@@ -62,9 +65,8 @@ class MatchRecord:
 @dataclass(frozen=True, slots=True)
 class Tournament:
     matches: tuple[MatchRecord, ...]
-    champion: Champion | None
+    champion: Champion
     leaderboard: tuple[dict[str, Any], ...]
-    reward_entries: tuple[LeaderboardEntry, ...]
 
 
 def canonical_score_gain(score: float, frontier: float) -> float:
@@ -73,6 +75,22 @@ def canonical_score_gain(score: float, frontier: float) -> float:
     if not isfinite(score) or not isfinite(frontier):
         raise ValueError("scores must be finite")
     return float(Decimal(str(score)) - Decimal(str(frontier)))
+
+
+def genesis_champion(track: TrackSpec) -> Champion:
+    """Return the code-defined UID0 champion that exists without an on-chain commit."""
+
+    initial = track.initial_champion
+    return Champion(
+        challenge_id="genesis",
+        hotkey=initial.hotkey,
+        repo_id=initial.repo_id,
+        revision=initial.revision,
+        score=initial.score,
+        position=ChainPosition(track.track_start_block, 0, 0),
+        uid=initial.uid,
+        source="VEDA_BASELINE",
+    )
 
 
 def challenge_from_match(document: Mapping[str, Any]) -> dict[str, Any]:
@@ -110,7 +128,7 @@ def validate_match_document(
     track_spec_digest: str,
     netuid: int,
     minimum_gain: float,
-    incumbent: Champion | None,
+    incumbent: Champion,
 ) -> MatchRecord:
     """Strictly validate one stored match and its link to the previous champion."""
 
@@ -136,6 +154,7 @@ def resolve_tournament(
     track_spec_digest: str,
     netuid: int,
     minimum_gain: float,
+    initial_champion: Champion,
 ) -> Tournament:
     """Resolve the contiguous terminal prefix in finalized submission order."""
 
@@ -152,15 +171,23 @@ def resolve_tournament(
     if not isfinite(minimum_gain) or not 0 < minimum_gain <= 1:
         raise ValueError("minimum gain must be within (0, 1]")
 
-    champion: Champion | None = None
+    if initial_champion.uid != 0 or initial_champion.source != "VEDA_BASELINE":
+        raise ValueError("initial champion must be the UID0 VEDA baseline")
+    champion = initial_champion
     matches: list[MatchRecord] = []
-    successful: list[LeaderboardEntry] = []
-    best_by_hotkey: dict[str, Champion] = {}
+    leaderboard_candidates: list[Champion] = [initial_champion]
+    seen_hotkeys: set[str] = {initial_champion.hotkey}
 
     for sequence, challenge in enumerate(challenges, start=1):
         state = ChallengeState(_required_string(challenge, "state"))
         if state not in TERMINAL_STATES:
             break
+        hotkey = _required_string(challenge, "hotkey")
+        repeated = hotkey in seen_hotkeys
+        rejected_as_duplicate = state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+        if repeated != rejected_as_duplicate:
+            raise ValueError("exactly a hotkey's later submissions must be rejected")
+        seen_hotkeys.add(hotkey)
         record, champion = _resolve_match(
             challenge,
             sequence=sequence,
@@ -174,15 +201,7 @@ def resolve_tournament(
         if state is ChallengeState.SUCCEEDED:
             position = _position(challenge)
             score = _score(challenge["final_score"], "final_score")
-            score_block = _integer(challenge["score_block"], "score_block")
-            entry = LeaderboardEntry(
-                hotkey=record.hotkey,
-                challenge_id=record.challenge_id,
-                final_score=score,
-                score_block=score_block,
-                position=position,
-            )
-            successful.append(entry)
+            _integer(challenge["score_block"], "score_block")
             repo_id = _required_string(challenge, "repo_id")
             revision = _required_string(challenge, "revision")
             candidate = Champion(
@@ -193,15 +212,13 @@ def resolve_tournament(
                 score,
                 position,
             )
-            current = best_by_hotkey.get(candidate.hotkey)
-            if current is None or _champion_order(candidate) < _champion_order(current):
-                best_by_hotkey[candidate.hotkey] = candidate
+            leaderboard_candidates.append(candidate)
 
-    ranked = sorted(best_by_hotkey.values(), key=_champion_order)
+    ranked = sorted(leaderboard_candidates, key=_champion_order)
     leaderboard = tuple(
         {"rank": rank, **candidate.public()} for rank, candidate in enumerate(ranked, start=1)
     )
-    return Tournament(tuple(matches), champion, leaderboard, tuple(successful))
+    return Tournament(tuple(matches), champion, leaderboard)
 
 
 def _resolve_match(
@@ -212,8 +229,8 @@ def _resolve_match(
     track_spec_digest: str,
     netuid: int,
     minimum_gain: float,
-    incumbent: Champion | None,
-) -> tuple[MatchRecord, Champion | None]:
+    incumbent: Champion,
+) -> tuple[MatchRecord, Champion]:
     identifier = _required_string(challenge, "challenge_id")
     submission_id = _required_string(challenge, "submission_id")
     hotkey = _required_string(challenge, "hotkey")
@@ -241,11 +258,8 @@ def _resolve_match(
             raise ValueError("successful challenge is missing its model facts")
         score = _score(challenge.get("final_score"), "final_score")
         candidate = Champion(identifier, hotkey, repo_id, revision, score, position)
-        score_gain = score if before is None else canonical_score_gain(score, before.score)
-        if before is None:
-            outcome = MatchOutcome.INITIAL_CHAMPION
-            incumbent = candidate
-        elif score_gain >= minimum_gain:
+        score_gain = canonical_score_gain(score, before.score)
+        if score_gain >= minimum_gain:
             outcome = MatchOutcome.CHALLENGER_WON
             incumbent = candidate
         else:
@@ -292,11 +306,11 @@ def _resolve_match(
             "event_index": position.event_index,
         },
         "evaluation": evaluation,
-        "incumbent_before": None if before is None else before.public(),
+        "incumbent_before": before.public(),
         "minimum_gain": minimum_gain,
         "score_gain": score_gain,
         "outcome": outcome,
-        "champion_after": None if incumbent is None else incumbent.public(),
+        "champion_after": incumbent.public(),
         "decided_block": decided_block,
     }
     return (

@@ -178,6 +178,7 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
     store = SimpleNamespace(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
+        active_competitors=lambda _mapping: [],
     )
     chain = WeightChainState(120, {"alice": 4}, 1, 1.0, 10, {"alice": 0})
     artifacts = build_public_artifacts(store, track, chain, mechid=0, version_key=0)
@@ -201,6 +202,41 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match() -> None:
     client.objects["veda/track/matches/000000000001.json"] = b"{}"
     with pytest.raises(PublicArtifactError, match="match is invalid"):
         asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
+
+
+def test_empty_track_publishes_uid_zero_veda_as_genesis_champion() -> None:
+    track = parse_track_spec(valid_spec())
+    store = SimpleNamespace(
+        chain_cursor=lambda: (120, "0x" + "12" * 32),
+        public_snapshot=lambda: {"challenges": []},
+        active_competitors=lambda _mapping: [],
+    )
+    chain = WeightChainState(
+        120,
+        {track.initial_champion.hotkey: 0},
+        1,
+        1.0,
+        10,
+        {track.initial_champion.hotkey: 0},
+    )
+
+    artifacts = build_public_artifacts(store, track, chain, mechid=0, version_key=0)
+
+    assert artifacts is not None
+    weights = decode_weight_artifact(artifacts.weights)
+    summary = json.loads(artifacts.summary)
+    status = json.loads(artifacts.status)
+    assert weights.plan == WeightPlan(
+        120,
+        (track.initial_champion.hotkey,),
+        (0,),
+        (1.0,),
+    )
+    assert summary["match_count"] == 0
+    assert summary["champion"]["uid"] == 0
+    assert summary["champion"]["source"] == "VEDA_BASELINE"
+    assert status["participants"][0]["challenge_id"] == "genesis"
+    assert status["participants"][0]["champion"] is True
 
 
 def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None:
@@ -227,6 +263,7 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary() -> None
     store = SimpleNamespace(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
+        active_competitors=lambda _mapping: [],
     )
     chain = WeightChainState(120, {"alice": 4, "bob": 5}, 1, 1.0, 10, {})
     committed = build_public_artifacts(store, track, chain, mechid=0, version_key=0)
@@ -296,16 +333,25 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
     store = SimpleNamespace(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
+        active_competitors=lambda _mapping: [],
     )
     track = SimpleNamespace(
         track_id="track",
         digest="ab" * 32,
         netuid=7,
+        track_start_block=100,
+        initial_champion=SimpleNamespace(
+            uid=0,
+            hotkey="genesis-hotkey",
+            repo_id="Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview",
+            revision="76f202874608115408d73280be9531c4ab888242",
+            score=0.5,
+        ),
         scoring=SimpleNamespace(minimum_frontier_gain=0.001),
     )
     chain = WeightChainState(
         120,
-        {"alice": 4},
+        {"genesis-hotkey": 0, "alice": 4},
         1,
         1.0,
         10,
@@ -323,8 +369,8 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(monke
     assert public_weights.plan.hotkeys == ("alice",)
     assert public_summary["champion"]["hotkey"] == "alice"
     assert public_summary["match_count"] == 1
-    assert public_summary["leaderboard_total"] == public_summary["rewards_total"] == 1
-    assert public_match["outcome"] == "INITIAL_CHAMPION"
+    assert public_summary["leaderboard_total"] == 2
+    assert public_match["outcome"] == "CHALLENGER_WON"
 
     store.chain_cursor = lambda: (119, "0x" + "11" * 32)
     assert build_public_artifacts(store, track, chain, mechid=2, version_key=9) is None

@@ -6,7 +6,6 @@ from validator.queue import (
     TERMINAL_STATES,
     ChainPosition,
     ChallengeState,
-    passes_cooldown,
     require_transition,
     submission_id,
 )
@@ -32,12 +31,6 @@ def test_submission_id_is_stable_and_domain_bound() -> None:
     assert first == second
     assert first != submission_id(8, block_hash, position)
     assert len(first) == 64
-
-
-def test_cooldown_uses_blocks_only() -> None:
-    assert passes_cooldown(current_block=100, last_accepted_block=None, cooldown_blocks=20)
-    assert not passes_cooldown(current_block=119, last_accepted_block=100, cooldown_blocks=20)
-    assert passes_cooldown(current_block=120, last_accepted_block=100, cooldown_blocks=20)
 
 
 def test_state_machine_accepts_scored_success() -> None:

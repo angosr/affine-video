@@ -78,7 +78,6 @@ def test_scanner_advances_persistent_cursor_in_bounded_batches(tmp_path) -> None
                 store,
                 netuid=7,
                 track_start_block=100,
-                cooldown_blocks=20,
                 max_blocks=2,
             )
         )
@@ -88,7 +87,6 @@ def test_scanner_advances_persistent_cursor_in_bounded_batches(tmp_path) -> None
                 store,
                 netuid=7,
                 track_start_block=100,
-                cooldown_blocks=20,
                 max_blocks=2,
             )
         )
@@ -98,7 +96,6 @@ def test_scanner_advances_persistent_cursor_in_bounded_batches(tmp_path) -> None
                 store,
                 netuid=7,
                 track_start_block=100,
-                cooldown_blocks=20,
                 max_blocks=2,
             )
         )
@@ -130,7 +127,6 @@ def test_scanner_does_not_advance_cursor_past_failed_block(tmp_path) -> None:
                     store,
                     netuid=7,
                     track_start_block=100,
-                    cooldown_blocks=20,
                 )
             )
 
@@ -158,7 +154,7 @@ def test_scanner_tolerates_another_process_advancing_finalized_cursor(tmp_path) 
                         events=blocks[height][2],
                         netuid=7,
                     ):
-                        other.add_submission(submission, cooldown_blocks=20)
+                        other.add_submission(submission)
                     other.advance_chain_cursor(height, blocks[height][0])
                 advanced = True
             return await original_events(block_hash)
@@ -170,7 +166,6 @@ def test_scanner_tolerates_another_process_advancing_finalized_cursor(tmp_path) 
                 store,
                 netuid=7,
                 track_start_block=100,
-                cooldown_blocks=20,
                 max_blocks=2,
             )
         )

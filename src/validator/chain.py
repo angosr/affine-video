@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from validator.scan import extract_submissions
+from validator.competition import is_valid_legacy_activation
+from validator.scan import extract_commitments, extract_submissions
 from validator.store import ChallengeStore
 
 
@@ -23,15 +24,12 @@ async def scan_finalized_blocks(
     *,
     netuid: int,
     track_start_block: int,
-    cooldown_blocks: int,
     max_blocks: int = 100,
 ) -> ScanResult:
     """Scan one bounded batch and commit the cursor after each complete block."""
 
     if track_start_block < 0:
         raise ValueError("track start block must be non-negative")
-    if cooldown_blocks < 0:
-        raise ValueError("cooldown blocks must be non-negative")
     if max_blocks <= 0:
         raise ValueError("max blocks must be positive")
 
@@ -52,6 +50,13 @@ async def scan_finalized_blocks(
         if block is None:
             raise RuntimeError(f"finalized block {block_height} is unavailable")
         events = await client._substrate.events(block_hash)
+        commitments = extract_commitments(
+            block_height=block_height,
+            block_hash=block_hash,
+            block=block,
+            events=events,
+            netuid=netuid,
+        )
         submissions = extract_submissions(
             block_height=block_height,
             block_hash=block_hash,
@@ -60,9 +65,23 @@ async def scan_finalized_blocks(
             netuid=netuid,
         )
         for submission in submissions:
-            store.add_submission(
-                submission,
-                cooldown_blocks=cooldown_blocks,
+            store.add_submission(submission)
+        submissions_by_position = {
+            submission.position: submission.submission_id for submission in submissions
+        }
+        for commitment in commitments:
+            store.observe_commitment(
+                hotkey=commitment.hotkey,
+                netuid=commitment.netuid,
+                block_hash=commitment.block_hash,
+                position=commitment.position,
+                payload=commitment.payload,
+                submission_id=submissions_by_position.get(commitment.position),
+                legacy_excluded=is_valid_legacy_activation(
+                    commitment.payload,
+                    hotkey=commitment.hotkey,
+                    netuid=netuid,
+                ),
             )
         try:
             store.advance_chain_cursor(block_height, block_hash)

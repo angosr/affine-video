@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from miner.submit import MAGIC, ModelSubmission, SubmissionFormatError
@@ -10,15 +11,26 @@ from validator.queue import ChainPosition, submission_id
 from validator.store import SubmissionRecord
 
 
-def extract_submissions(
+@dataclass(frozen=True, slots=True)
+class ChainCommitment:
+    """One successful commitment call in finalized chain order."""
+
+    hotkey: str
+    netuid: int
+    block_hash: str
+    position: ChainPosition
+    payload: bytes
+
+
+def extract_commitments(
     *,
     block_height: int,
     block_hash: str,
     block: Mapping[str, Any],
     events: Sequence[Mapping[str, Any]],
     netuid: int,
-) -> list[SubmissionRecord]:
-    """Extract successful top-level Veda commitment calls in chain order."""
+) -> list[ChainCommitment]:
+    """Extract every successful top-level commitment call in chain order."""
 
     successful = {
         event.get("extrinsic_idx")
@@ -33,7 +45,7 @@ def extract_submissions(
         and _attribute(event, "netuid") == netuid
     }
 
-    records: list[SubmissionRecord] = []
+    records: list[ChainCommitment] = []
     for extrinsic_index, extrinsic in enumerate(block.get("extrinsics", ())):
         call = extrinsic.get("call", {})
         if (
@@ -42,24 +54,53 @@ def extract_submissions(
             or call.get("call_function") != "set_commitment"
         ):
             continue
-
         arguments = {argument["name"]: argument["value"] for argument in call.get("call_args", ())}
         if arguments.get("netuid") != netuid:
             continue
         payload = _raw_payload(arguments.get("info"))
-        if payload is None or not payload.startswith(MAGIC):
+        if payload is None:
             continue
         if extrinsic_index not in commitment_events:
-            raise RuntimeError("successful Veda commitment is missing its chain event")
-
+            raise RuntimeError("successful commitment is missing its chain event")
         event_position, event = commitment_events[extrinsic_index]
         hotkey = _attribute(event, "who")
         if not isinstance(hotkey, str) or not hotkey:
-            raise RuntimeError("Veda commitment event contains an invalid hotkey")
+            raise RuntimeError("commitment event contains an invalid hotkey")
         if extrinsic.get("address") != hotkey:
-            raise RuntimeError("Veda commitment signer does not match its chain event")
+            raise RuntimeError("commitment signer does not match its chain event")
+        records.append(
+            ChainCommitment(
+                hotkey,
+                netuid,
+                block_hash,
+                ChainPosition(block_height, extrinsic_index, event_position),
+                payload,
+            )
+        )
+    return records
 
-        position = ChainPosition(block_height, extrinsic_index, event_position)
+
+def extract_submissions(
+    *,
+    block_height: int,
+    block_hash: str,
+    block: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+    netuid: int,
+) -> list[SubmissionRecord]:
+    """Extract successful top-level Veda commitment calls in chain order."""
+    records: list[SubmissionRecord] = []
+    commitments = extract_commitments(
+        block_height=block_height,
+        block_hash=block_hash,
+        block=block,
+        events=events,
+        netuid=netuid,
+    )
+    for commitment in commitments:
+        payload = commitment.payload
+        if not payload.startswith(MAGIC):
+            continue
         try:
             model = ModelSubmission.decode(payload)
         except SubmissionFormatError:
@@ -71,11 +112,11 @@ def extract_submissions(
 
         records.append(
             SubmissionRecord(
-                submission_id=submission_id(netuid, block_hash, position),
-                hotkey=hotkey,
+                submission_id=submission_id(netuid, block_hash, commitment.position),
+                hotkey=commitment.hotkey,
                 netuid=netuid,
                 block_hash=block_hash,
-                position=position,
+                position=commitment.position,
                 payload=payload,
                 repo_id=repo_id,
                 revision=revision,

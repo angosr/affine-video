@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 from miner.chain import ChainSubmissionError, submit_model
 from miner.submit import ModelSubmission, SubmissionFormatError
+from validator.monitor import fetch_status, render_status
 from validator.publication import S3Repository
 from validator.run import (
+    DEFAULT_BASELINE_MANIFEST_URL,
     DEFAULT_NETUID,
     DEFAULT_PUBLIC_WEIGHTS_URL,
     DEFAULT_TRACK_SPEC_DIGEST,
@@ -21,6 +24,8 @@ from validator.run import (
     run_validator,
 )
 from validator.store import ChallengeStore
+
+DEFAULT_PUBLIC_STATUS_URL = DEFAULT_PUBLIC_WEIGHTS_URL.removesuffix("weights.json") + "status.json"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -52,6 +57,14 @@ def _parser() -> argparse.ArgumentParser:
     challenge = validator_commands.add_parser("challenge")
     challenge.add_argument("challenge_id")
     challenge.add_argument("--database", required=True)
+    monitor = validator_commands.add_parser("monitor", help="watch the public ranking and queue")
+    monitor.add_argument("--status-url", default=DEFAULT_PUBLIC_STATUS_URL)
+    monitor.add_argument(
+        "--watch",
+        metavar="SECONDS",
+        type=float,
+        help="refresh continuously at this positive interval",
+    )
 
     evaluate = validator_commands.add_parser(
         "evaluate", help="evaluate submissions and publish public artifacts"
@@ -60,6 +73,11 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--database", required=True)
     evaluate.add_argument("--model-cache", required=True)
     evaluate.add_argument("--exact-cache", required=True)
+    evaluate.add_argument("--initial-model")
+    evaluate.add_argument(
+        "--initial-model-manifest",
+        default=DEFAULT_BASELINE_MANIFEST_URL,
+    )
     evaluate.add_argument("--network", default="finney")
     evaluate.add_argument("--archive-endpoint", dest="archive_endpoints", action="append")
     evaluate.add_argument("--worker-id", default="evaluator")
@@ -144,6 +162,15 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
 
 
 def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
+    if arguments.command == "monitor":
+        try:
+            asyncio.run(_run_monitor(arguments.status_url, arguments.watch))
+        except KeyboardInterrupt:
+            return
+        except (RuntimeError, ValueError) as exc:
+            parser.exit(1, f"error: {exc}\n")
+        return
+
     if arguments.command == "evaluate":
         try:
             publisher = S3Repository.from_environment(
@@ -156,6 +183,8 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
                     database=arguments.database,
                     model_cache=arguments.model_cache,
                     exact_cache=arguments.exact_cache,
+                    initial_model=arguments.initial_model,
+                    initial_model_manifest_url=arguments.initial_model_manifest,
                     network=arguments.network,
                     archive_endpoints=arguments.archive_endpoints,
                     worker_id=arguments.worker_id,
@@ -214,6 +243,22 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
     except (KeyError, RuntimeError, OSError) as exc:
         parser.exit(1, f"error: {exc}\n")
     print(json.dumps(output, sort_keys=True, ensure_ascii=False))
+
+
+async def _run_monitor(url: str, interval: float | None) -> None:
+    if interval is not None and interval <= 0:
+        raise ValueError("watch interval must be positive")
+    import httpx
+
+    async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
+        while True:
+            status = await fetch_status(url, client=client)
+            if interval is not None and sys.stdout.isatty():
+                print("\033[2J\033[H", end="")
+            print(render_status(status), flush=True)
+            if interval is None:
+                return
+            await asyncio.sleep(interval)
 
 
 def _print_evaluation_cycle(result: EvaluationCycleResult) -> None:

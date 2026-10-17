@@ -1,7 +1,20 @@
 import pytest
 
-from validator.queue import ChallengeState
-from validator.tournament import MatchOutcome, resolve_tournament, validate_match_document
+from validator.queue import ChainPosition, ChallengeState
+from validator.tournament import Champion, MatchOutcome, resolve_tournament, validate_match_document
+
+
+def genesis() -> Champion:
+    return Champion(
+        "genesis",
+        "genesis-hotkey",
+        "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview",
+        "76f202874608115408d73280be9531c4ab888242",
+        0.1,
+        ChainPosition(100, 0, 0),
+        uid=0,
+        source="VEDA_BASELINE",
+    )
 
 
 def challenge(
@@ -39,6 +52,7 @@ def resolve(items: list[dict]):
         track_spec_digest="ab" * 32,
         netuid=7,
         minimum_gain=0.01,
+        initial_champion=genesis(),
     )
 
 
@@ -52,7 +66,7 @@ def test_fifo_matches_replace_champion_only_after_required_gain() -> None:
     )
 
     assert [match.outcome for match in tournament.matches] == [
-        MatchOutcome.INITIAL_CHAMPION,
+        MatchOutcome.CHALLENGER_WON,
         MatchOutcome.CHAMPION_RETAINED,
         MatchOutcome.CHALLENGER_WON,
     ]
@@ -130,21 +144,36 @@ def test_public_match_validation_rejects_nonterminal_records() -> None:
             track_spec_digest="ab" * 32,
             netuid=7,
             minimum_gain=0.01,
-            incumbent=None,
+            incumbent=genesis(),
         )
 
 
-def test_leaderboard_keeps_each_hotkeys_best_authoritative_score() -> None:
+def test_duplicate_hotkey_is_terminally_rejected_and_excluded_from_rankings() -> None:
     tournament = resolve(
         [
             challenge(1, "alice", score=0.7),
             challenge(2, "bob", score=0.8),
-            challenge(3, "alice", score=0.6),
+            challenge(
+                3,
+                "alice",
+                state=ChallengeState.REJECTED_DUPLICATE_HOTKEY,
+                error_code="REJECTED_DUPLICATE_HOTKEY",
+            ),
         ]
     )
 
     assert [(entry["hotkey"], entry["score"]) for entry in tournament.leaderboard] == [
         ("bob", 0.8),
         ("alice", 0.7),
+        ("genesis-hotkey", 0.1),
     ]
-    assert [entry.final_score for entry in tournament.reward_entries] == [0.7, 0.8, 0.6]
+
+
+def test_tournament_rejects_a_second_non_rejected_submission_for_one_hotkey() -> None:
+    with pytest.raises(ValueError, match="later submissions"):
+        resolve(
+            [
+                challenge(1, "alice", score=0.7),
+                challenge(2, "alice", score=0.8),
+            ]
+        )

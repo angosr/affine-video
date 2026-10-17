@@ -4,34 +4,18 @@ from types import SimpleNamespace
 import pytest
 
 from validator.queue import ChainPosition
-from validator.store import LeaderboardEntry
+from validator.tournament import Champion
 from validator.weights import (
     WeightArtifact,
     WeightChainState,
     WeightPlan,
     WeightSubmissionError,
-    frontier_gains,
-    plan_weights,
+    plan_champion_weight,
     read_weight_chain_state,
     submit_weights,
     validate_weight_artifact,
-    waterfill_weights,
     weight_update_due,
 )
-
-
-def entry(
-    hotkey: str,
-    score: float,
-    block: int,
-) -> LeaderboardEntry:
-    return LeaderboardEntry(
-        hotkey=hotkey,
-        challenge_id=f"challenge-{hotkey}",
-        final_score=score,
-        score_block=block,
-        position=ChainPosition(block, 0, 0),
-    )
 
 
 def chain_state(
@@ -64,51 +48,6 @@ def artifact(*, source: int = 120, plan: WeightPlan | None = None) -> WeightArti
         source,
         plan,
     )
-
-
-def test_frontier_gains_telescope_ignore_copies_and_accumulate_hotkey() -> None:
-    gains = frontier_gains(
-        [
-            entry("alice", 0.6, 10),
-            entry("copy", 0.6, 20),
-            entry("bob", 0.8, 30),
-            entry("alice", 0.9, 40),
-        ],
-        minimum_gain=0.001,
-    )
-
-    assert gains == pytest.approx({"alice": 0.7, "bob": 0.2})
-    assert sum(gains.values()) == pytest.approx(0.9)
-
-
-def test_frontier_gains_ignore_numerical_dust() -> None:
-    gains = frontier_gains(
-        [
-            entry("first", 0.6, 10),
-            entry("dust", 0.6005, 20),
-            entry("material", 0.602, 30),
-        ],
-        minimum_gain=0.001,
-    )
-    assert gains == pytest.approx({"first": 0.6, "material": 0.002})
-
-
-def test_frontier_gain_accepts_an_exact_decimal_threshold() -> None:
-    gains = frontier_gains(
-        [entry("first", 0.2, 10), entry("second", 0.21, 20)],
-        minimum_gain=0.01,
-    )
-
-    assert gains == pytest.approx({"first": 0.2, "second": 0.01})
-
-
-def test_subthreshold_initial_champion_still_defines_the_frontier() -> None:
-    gains = frontier_gains(
-        [entry("first", 0.0005, 10), entry("second", 0.0014, 20)],
-        minimum_gain=0.001,
-    )
-
-    assert gains == {}
 
 
 def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
@@ -154,83 +93,52 @@ def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
     assert calls[0] == ("at", 123)
 
 
-def test_plan_excludes_deregistered_and_future_entries() -> None:
-    plan = plan_weights(
-        [
-            entry("alice", 0.3, 10),
-            entry("bob", 0.6, 20),
-            entry("carol", 0.9, 30),
-            entry("deregistered", 1.0, 40),
-            LeaderboardEntry(
-                hotkey="future",
-                challenge_id="challenge-future",
-                final_score=1.0,
-                score_block=101,
-                position=ChainPosition(50, 0, 0),
-            ),
-        ],
-        uid_by_hotkey={"alice": 8, "bob": 2, "carol": 5, "future": 9},
-        current_block=100,
-        min_allowed_weights=3,
-        max_weight=0.6,
-        minimum_frontier_gain=0.001,
+def test_champion_plan_assigns_all_weight_to_uid_zero_baseline() -> None:
+    champion = Champion(
+        "genesis",
+        "burn-hotkey",
+        "official/veda",
+        "12" * 20,
+        0.7,
+        ChainPosition(100, 0, 0),
+        uid=0,
+        source="VEDA_BASELINE",
     )
 
-    assert plan is not None
-    assert plan.hotkeys == ("bob", "carol", "alice")
-    assert plan.uids == (2, 5, 8)
-    assert plan.weights == pytest.approx((1 / 3, 1 / 3, 1 / 3))
-
-
-def test_deregistered_champion_does_not_turn_a_historical_loser_into_a_winner() -> None:
-    plan = plan_weights(
-        [
-            entry("former", 0.8, 10),
-            entry("loser", 0.7, 20),
-            entry("winner", 0.9, 30),
-        ],
-        uid_by_hotkey={"loser": 1, "winner": 2},
-        current_block=100,
+    plan = plan_champion_weight(
+        champion,
+        uid_by_hotkey={"burn-hotkey": 0, "other": 3},
+        current_block=120,
         min_allowed_weights=1,
         max_weight=1.0,
-        minimum_frontier_gain=0.001,
     )
 
-    assert plan is not None
-    assert plan.hotkeys == ("winner",)
-    assert plan.weights == (1.0,)
+    assert plan == WeightPlan(120, ("burn-hotkey",), (0,), (1.0,))
 
 
-def test_plan_rejects_infeasible_or_ambiguous_vectors() -> None:
-    entries = [entry("alice", 0.5, 10), entry("bob", 1.0, 20)]
+def test_champion_plan_fails_closed_on_uid_change_or_infeasible_chain_rules() -> None:
+    champion = Champion(
+        "genesis",
+        "burn-hotkey",
+        "official/veda",
+        "12" * 20,
+        0.7,
+        ChainPosition(100, 0, 0),
+        uid=0,
+        source="VEDA_BASELINE",
+    )
     arguments = {
-        "uid_by_hotkey": {"alice": 1, "bob": 2},
-        "current_block": 100,
-        "minimum_frontier_gain": 0.001,
+        "champion": champion,
+        "uid_by_hotkey": {"burn-hotkey": 4},
+        "current_block": 120,
     }
-    assert plan_weights(entries, min_allowed_weights=3, max_weight=1.0, **arguments) is None
-    assert plan_weights(entries, min_allowed_weights=2, max_weight=0.4, **arguments) is None
 
-    with pytest.raises(ValueError, match="same UID"):
-        plan_weights(
-            entries,
-            uid_by_hotkey={"alice": 3, "bob": 3},
-            current_block=100,
-            min_allowed_weights=2,
-            max_weight=0.6,
-            minimum_frontier_gain=0.001,
-        )
-
-
-def test_waterfill_is_deterministic_normalized_and_capped() -> None:
-    result = waterfill_weights(
-        {"alice": 8.0, "bob": 1.0, "carol": 1.0},
-        caps={"alice": 0.5, "bob": 0.7, "carol": 0.7},
-    )
-    assert result == pytest.approx({"alice": 0.5, "bob": 0.25, "carol": 0.25})
-    assert waterfill_weights({"bob": 2.0, "alice": 1.0}) == waterfill_weights(
-        {"alice": 1.0, "bob": 2.0}
-    )
+    assert plan_champion_weight(
+        **arguments, min_allowed_weights=1, max_weight=1.0
+    ) is None
+    assert plan_champion_weight(
+        **arguments, min_allowed_weights=2, max_weight=1.0
+    ) is None
 
 
 def test_public_weights_are_checked_against_current_chain_state() -> None:

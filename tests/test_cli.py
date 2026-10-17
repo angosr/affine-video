@@ -181,6 +181,8 @@ def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_p
             str(tmp_path / "models"),
             "--exact-cache",
             str(tmp_path / "exact.npz"),
+            "--initial-model",
+            str(tmp_path / "veda.safetensors"),
             "--archive-endpoint",
             "wss://archive-1.example",
             "--archive-endpoint",
@@ -196,6 +198,7 @@ def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_p
     assert called["once"] is True
     assert called["network"] == "finney"
     assert called["exact_cache"] == str(tmp_path / "exact.npz")
+    assert called["initial_model"] == str(tmp_path / "veda.safetensors")
     assert called["publisher"] == {
         "bucket": "public-data",
         "prefix": "veda/track",

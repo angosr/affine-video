@@ -1,8 +1,14 @@
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from validator.download import ModelDownloadError, download_public_model
+from validator.download import (
+    ModelDownloadError,
+    download_chunked_asset,
+    download_public_model,
+)
 
 
 class FakeApi:
@@ -41,8 +47,109 @@ class FakeClient:
         return FakeResponse()
 
 
+class AssetResponse:
+    status_code = 200
+
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.headers = {"content-length": str(len(content))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_bytes(self, *, chunk_size: int):
+        assert chunk_size in {64 * 1024, 1024 * 1024}
+        yield self.content
+
+
+class AssetClient:
+    def __init__(self, manifest: bytes, parts: dict[str, bytes]) -> None:
+        self.manifest = manifest
+        self.parts = parts
+
+    def stream(self, method: str, url: str, *, headers: dict[str, str] | None = None):
+        assert method == "GET"
+        if url.endswith("/manifest.json"):
+            assert headers == {"Accept": "application/json"}
+            return AssetResponse(self.manifest)
+        assert headers is None
+        return AssetResponse(self.parts[url.rsplit("/", 1)[-1]])
+
+
 def sibling(*, size: int | None):
     return SimpleNamespace(rfilename="selector.safetensors", size=size, lfs=None)
+
+
+def test_chunked_public_asset_is_reassembled_and_fully_verified(tmp_path) -> None:
+    parts = {"part-000": b"abc", "part-001": b"def"}
+    complete = b"".join(parts.values())
+    complete_digest = hashlib.sha256(complete).hexdigest()
+    model_digest = "ab" * 32
+    manifest = json.dumps(
+        {
+            "format": "chunked-safetensors",
+            "filename": "selector.safetensors",
+            "size": len(complete),
+            "sha256": complete_digest,
+            "model_digest": model_digest,
+            "source": {},
+            "parts": [
+                {
+                    "name": name,
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+                for name, payload in parts.items()
+            ],
+        }
+    ).encode()
+
+    path = download_chunked_asset(
+        "https://public.example/assets/manifest.json",
+        cache_dir=tmp_path,
+        expected_sha256=complete_digest,
+        expected_model_digest=model_digest,
+        max_bytes=10,
+        http_client=AssetClient(manifest, parts),
+    )
+
+    assert path.read_bytes() == complete
+    assert path.name == f"{complete_digest}.safetensors"
+    assert not list(tmp_path.glob(".partial-baseline-*"))
+
+
+def test_chunked_public_asset_rejects_a_corrupt_part(tmp_path) -> None:
+    expected = hashlib.sha256(b"abcdef").hexdigest()
+    manifest = json.dumps(
+        {
+            "format": "chunked-safetensors",
+            "filename": "selector.safetensors",
+            "size": 6,
+            "sha256": expected,
+            "model_digest": "ab" * 32,
+            "source": {},
+            "parts": [
+                {"name": "part-000", "size": 6, "sha256": expected},
+            ],
+        }
+    ).encode()
+
+    with pytest.raises(RuntimeError, match="could not be restored"):
+        download_chunked_asset(
+            "https://public.example/assets/manifest.json",
+            cache_dir=tmp_path,
+            expected_sha256=expected,
+            expected_model_digest="ab" * 32,
+            max_bytes=10,
+            http_client=AssetClient(manifest, {"part-000": b"xxxxxx"}),
+        )
+    assert not list(tmp_path.glob(".partial-baseline-*"))
 
 
 def test_downloads_anonymously_into_content_addressed_cache(tmp_path) -> None:

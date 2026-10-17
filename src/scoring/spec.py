@@ -16,6 +16,15 @@ from scoring.selector import SelectorArchitecture
 
 _REVISION = re.compile(r"^[0-9a-fA-F]{40}$")
 
+VEDA_REPO_ID = "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview"
+VEDA_REVISION = "76f202874608115408d73280be9531c4ab888242"
+VEDA_FILENAME = "minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors"
+VEDA_FILE_SHA256 = "2a8d8845c5342756a2781e8e69563940e4bb573c9a40ebb534915ff8fd76573a"
+VEDA_EVALUATION_FILE_SHA256 = (
+    "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f"
+)
+VEDA_MODEL_DIGEST = "3fef3eca0eebee238b1ed9c692b217dd25cb1082ef94779ec2ef7c93ae0560c9"
+
 
 class TrackSpecError(ValueError):
     """Raised when a track specification is ambiguous or incomplete."""
@@ -42,6 +51,19 @@ class ModelSpec:
 class BaseModelSpec:
     repo_id: str
     revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class InitialChampionSpec:
+    uid: int
+    hotkey: str
+    repo_id: str
+    revision: str
+    filename: str
+    file_sha256: str
+    evaluation_file_sha256: str
+    model_digest: str
+    score: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +94,7 @@ class TrackSpec:
     netuid: int
     track_start_block: int
     publication_grace_blocks: int
-    submission_cooldown_blocks: int
+    initial_champion: InitialChampionSpec
     model: ModelSpec
     base_model: BaseModelSpec
     cache: CacheSpec
@@ -88,7 +110,17 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
         "netuid": spec.netuid,
         "track_start_block": spec.track_start_block,
         "publication_grace_blocks": spec.publication_grace_blocks,
-        "submission_cooldown_blocks": spec.submission_cooldown_blocks,
+        "initial_champion": {
+            "uid": spec.initial_champion.uid,
+            "hotkey": spec.initial_champion.hotkey,
+            "repo_id": spec.initial_champion.repo_id,
+            "revision": spec.initial_champion.revision,
+            "filename": spec.initial_champion.filename,
+            "file_sha256": spec.initial_champion.file_sha256,
+            "evaluation_file_sha256": spec.initial_champion.evaluation_file_sha256,
+            "model_digest": spec.initial_champion.model_digest,
+            "score": spec.initial_champion.score,
+        },
         "model": {
             "filename": spec.model.filename,
             "max_bytes": spec.model.max_bytes,
@@ -146,7 +178,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "netuid",
             "track_start_block",
             "publication_grace_blocks",
-            "submission_cooldown_blocks",
+            "initial_champion",
             "model",
             "base_model",
             "cache",
@@ -158,6 +190,51 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     netuid = _integer(root["netuid"], "netuid", minimum=0)
     if netuid > 0xFFFF:
         raise TrackSpecError("netuid must fit in an unsigned 16-bit integer")
+
+    initial_raw = _object(
+        root["initial_champion"],
+        {
+            "uid",
+            "hotkey",
+            "repo_id",
+            "revision",
+            "filename",
+            "file_sha256",
+            "evaluation_file_sha256",
+            "model_digest",
+            "score",
+        },
+        "initial_champion",
+    )
+    initial_uid = _integer(initial_raw["uid"], "initial champion uid", minimum=0)
+    if initial_uid != 0:
+        raise TrackSpecError("initial champion uid must be 0")
+    initial_hotkey = _nonempty_string(initial_raw["hotkey"], "initial champion hotkey")
+    initial_repo = _nonempty_string(initial_raw["repo_id"], "initial champion repo_id")
+    initial_revision = _nonempty_string(
+        initial_raw["revision"], "initial champion revision"
+    ).lower()
+    initial_filename = _nonempty_string(
+        initial_raw["filename"], "initial champion filename"
+    )
+    initial_sha256 = _digest(initial_raw["file_sha256"], "initial champion file_sha256")
+    initial_evaluation_sha256 = _digest(
+        initial_raw["evaluation_file_sha256"],
+        "initial champion evaluation_file_sha256",
+    )
+    initial_model_digest = _digest(
+        initial_raw["model_digest"], "initial champion model_digest"
+    )
+    if (
+        initial_repo != VEDA_REPO_ID
+        or initial_revision != VEDA_REVISION
+        or initial_filename != VEDA_FILENAME
+        or initial_sha256 != VEDA_FILE_SHA256
+        or initial_evaluation_sha256 != VEDA_EVALUATION_FILE_SHA256
+        or initial_model_digest != VEDA_MODEL_DIGEST
+    ):
+        raise TrackSpecError("initial champion must be the pinned official VEDA model")
+    initial_score = _unit(initial_raw["score"], "initial champion score")
 
     model_raw = _object(root["model"], {"filename", "max_bytes", "selector"}, "model")
     if model_raw["filename"] != "selector.safetensors":
@@ -260,11 +337,17 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "publication_grace_blocks",
             minimum=1,
         ),
-        "submission_cooldown_blocks": _integer(
-            root["submission_cooldown_blocks"],
-            "submission_cooldown_blocks",
-            minimum=0,
-        ),
+        "initial_champion": {
+            "uid": initial_uid,
+            "hotkey": initial_hotkey,
+            "repo_id": initial_repo,
+            "revision": initial_revision,
+            "filename": initial_filename,
+            "file_sha256": initial_sha256,
+            "evaluation_file_sha256": initial_evaluation_sha256,
+            "model_digest": initial_model_digest,
+            "score": initial_score,
+        },
         "model": {
             "filename": "selector.safetensors",
             "max_bytes": max_model_bytes,
@@ -316,7 +399,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         netuid=netuid,
         track_start_block=spec_without_digest["track_start_block"],
         publication_grace_blocks=spec_without_digest["publication_grace_blocks"],
-        submission_cooldown_blocks=spec_without_digest["submission_cooldown_blocks"],
+        initial_champion=InitialChampionSpec(**spec_without_digest["initial_champion"]),
         model=ModelSpec(
             filename="selector.safetensors",
             max_bytes=spec_without_digest["model"]["max_bytes"],

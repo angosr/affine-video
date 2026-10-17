@@ -4,22 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
-from typing import Any
+from typing import Any, Protocol
 
 import bittensor as bt
 from bittensor.intents import normalize as normalize_weights
-
-from validator.store import LeaderboardEntry
-from validator.tournament import canonical_score_gain
 
 _HEX_32 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class WeightSubmissionError(RuntimeError):
     """Raised when a weight transaction does not finalize successfully."""
+
+
+class ChampionIdentity(Protocol):
+    hotkey: str
+    uid: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,45 +150,15 @@ async def read_weight_chain_state(
     )
 
 
-def frontier_gains(entries: Iterable[LeaderboardEntry], *, minimum_gain: float) -> dict[str, float]:
-    """Credit only score improvements over earlier on-chain submissions.
-
-    Credited gains are disjoint frontier increments bounded by the best score,
-    so copied or Sybil-split models cannot multiply total utility merely by
-    occupying more hotkeys.
-    """
-
-    if not isfinite(minimum_gain) or not 0 < minimum_gain <= 1:
-        raise ValueError("minimum frontier gain must be within (0, 1]")
-    ordered = sorted(entries, key=lambda entry: entry.position)
-    frontier: float | None = None
-    gains: dict[str, float] = {}
-    for entry in ordered:
-        if not isfinite(entry.final_score) or not 0 <= entry.final_score <= 1:
-            raise ValueError("leaderboard scores must be finite and within [0, 1]")
-        gain = (
-            entry.final_score
-            if frontier is None
-            else canonical_score_gain(entry.final_score, frontier)
-        )
-        if frontier is None:
-            frontier = entry.final_score
-        if gain >= minimum_gain:
-            gains[entry.hotkey] = gains.get(entry.hotkey, 0.0) + gain
-            frontier = entry.final_score
-    return gains
-
-
-def plan_weights(
-    entries: Iterable[LeaderboardEntry],
+def plan_champion_weight(
+    champion: ChampionIdentity,
     *,
     uid_by_hotkey: Mapping[str, int],
     current_block: int,
     min_allowed_weights: int,
     max_weight: float,
-    minimum_frontier_gain: float,
 ) -> WeightPlan | None:
-    """Build a chain-ready vector, or return None when it is infeasible."""
+    """Assign the entire feasible vector to the current tournament champion."""
 
     if current_block < 0:
         raise ValueError("current block must be non-negative")
@@ -194,44 +166,16 @@ def plan_weights(
         raise ValueError("minimum allowed weights must be non-negative")
     if not isfinite(max_weight) or not 0 < max_weight <= 1:
         raise ValueError("maximum weight must be within (0, 1]")
-    settled_entries = [entry for entry in entries if entry.score_block <= current_block]
-    historical_utilities = frontier_gains(
-        settled_entries,
-        minimum_gain=minimum_frontier_gain,
-    )
-    utilities = {
-        hotkey: utility
-        for hotkey, utility in historical_utilities.items()
-        if hotkey in uid_by_hotkey
-    }
-    caps: dict[str, float] = {}
-    seen_uids: dict[int, str] = {}
-    for hotkey in utilities:
-        uid = uid_by_hotkey[hotkey]
-        if uid < 0 or uid > 0xFFFF:
-            raise ValueError("UIDs must fit in an unsigned 16-bit integer")
-        other = seen_uids.setdefault(uid, hotkey)
-        if other != hotkey:
-            raise ValueError("multiple hotkeys map to the same UID")
-        caps[hotkey] = max_weight
-
-    required = max(1, min_allowed_weights)
-    if len(utilities) < required or sum(caps.values()) < 1 - 1e-12:
+    if max(1, min_allowed_weights) != 1 or max_weight < 1.0:
         return None
-
-    allocated = waterfill_weights(utilities, caps=caps)
-    ordered = sorted(allocated, key=lambda hotkey: uid_by_hotkey[hotkey])
-    ordered_uids = tuple(uid_by_hotkey[hotkey] for hotkey in ordered)
-    ordered_weights = tuple(allocated[hotkey] for hotkey in ordered)
-    quantized_uids, _ = normalize_weights(ordered_uids, ordered_weights)
-    if len(quantized_uids) < required:
+    hotkey = champion.hotkey
+    uid = uid_by_hotkey.get(hotkey)
+    if uid is None:
         return None
-    return WeightPlan(
-        source_block=current_block,
-        hotkeys=tuple(ordered),
-        uids=ordered_uids,
-        weights=ordered_weights,
-    )
+    expected_uid = champion.uid
+    if expected_uid is not None and uid != expected_uid:
+        return None
+    return WeightPlan(current_block, (hotkey,), (uid,), (1.0,))
 
 
 async def submit_weights(
@@ -333,58 +277,3 @@ def weight_update_due(
     if chain.finalized_block < last_update + chain.weights_rate_limit:
         return False, "RATE_LIMIT"
     return True, "READY"
-
-
-def waterfill_weights(
-    utilities: Mapping[str, float], *, caps: Mapping[str, float] | None = None
-) -> dict[str, float]:
-    """Normalize positive utilities while respecting per-hotkey caps."""
-
-    caps = caps or {}
-    positive: dict[str, float] = {}
-    limits: dict[str, float] = {}
-
-    for hotkey in sorted(utilities):
-        utility = utilities[hotkey]
-        cap = caps.get(hotkey, 1.0)
-        if not isfinite(utility) or utility < 0:
-            raise ValueError("utilities must be finite and non-negative")
-        if not isfinite(cap) or not 0 < cap <= 1:
-            raise ValueError("caps must be finite and within (0, 1]")
-        if utility > 0:
-            positive[hotkey] = utility
-            limits[hotkey] = cap
-
-    if not positive:
-        return {}
-    if sum(limits.values()) < 1 - 1e-12:
-        raise ValueError("positive hotkey caps cannot hold a normalized vector")
-
-    result: dict[str, float] = {}
-    active = set(positive)
-    remaining = 1.0
-
-    while active:
-        utility_sum = sum(positive[hotkey] for hotkey in active)
-        capped = [
-            hotkey
-            for hotkey in sorted(active)
-            if remaining * positive[hotkey] / utility_sum > limits[hotkey] + 1e-15
-        ]
-        if not capped:
-            for hotkey in sorted(active):
-                result[hotkey] = remaining * positive[hotkey] / utility_sum
-            break
-
-        for hotkey in capped:
-            result[hotkey] = limits[hotkey]
-            remaining -= limits[hotkey]
-            active.remove(hotkey)
-
-        if remaining < -1e-12:
-            raise AssertionError("water-filling allocated more than one")
-
-    total = sum(result.values())
-    if abs(total - 1.0) > 1e-12:
-        raise AssertionError("water-filling did not produce a normalized vector")
-    return result

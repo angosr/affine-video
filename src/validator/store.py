@@ -17,7 +17,6 @@ from validator.queue import (
     ChainPosition,
     ChallengeState,
     challenge_id,
-    passes_cooldown,
     require_transition,
 )
 from validator.queue import (
@@ -156,12 +155,6 @@ class ChallengeStore:
         self.close()
 
     def _initialize(self) -> None:
-        initialized = self._connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chain_cursor'"
-        ).fetchone()
-        if initialized is not None:
-            return
-
         self._connection.executescript(
             """
             BEGIN IMMEDIATE;
@@ -244,13 +237,186 @@ class ChallengeStore:
                 challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id)
             );
 
+            CREATE TABLE IF NOT EXISTS commitment_choices (
+                hotkey TEXT PRIMARY KEY,
+                netuid INTEGER NOT NULL,
+                block_hash TEXT NOT NULL,
+                block_height INTEGER NOT NULL,
+                extrinsic_index INTEGER NOT NULL,
+                event_index INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                submission_id TEXT REFERENCES submissions(submission_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS competition_exclusions (
+                hotkey TEXT PRIMARY KEY,
+                first_block INTEGER NOT NULL CHECK (first_block >= 0),
+                reason TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS submissions_chain_order
                 ON submissions (block_height, extrinsic_index, event_index);
+            CREATE INDEX IF NOT EXISTS submissions_hotkey
+                ON submissions (hotkey);
             CREATE INDEX IF NOT EXISTS challenges_state_order
                 ON challenges (state, created_at_ms);
             COMMIT;
             """
         )
+
+    def observe_commitment(
+        self,
+        *,
+        hotkey: str,
+        netuid: int,
+        block_hash: str,
+        position: ChainPosition,
+        payload: bytes,
+        submission_id: str | None,
+        legacy_excluded: bool,
+    ) -> None:
+        """Record the current contest choice while pinning VDA to its first submission."""
+
+        if not hotkey or not payload:
+            raise ValueError("commitment hotkey and payload cannot be empty")
+        if not 0 <= netuid <= 0xFFFF:
+            raise ValueError("netuid must fit in an unsigned 16-bit integer")
+        normalized_hash = _block_hash(block_hash)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            selected_submission_id = None
+            if submission_id is not None:
+                submitted = self._connection.execute(
+                    """
+                    SELECT hotkey FROM submissions WHERE submission_id = ?
+                    """,
+                    (submission_id,),
+                ).fetchone()
+                if submitted is None or submitted["hotkey"] != hotkey:
+                    raise ValueError("commitment submission does not belong to its hotkey")
+                first = self._connection.execute(
+                    """
+                    SELECT submission_id
+                    FROM submissions
+                    WHERE hotkey = ?
+                    ORDER BY block_height, extrinsic_index, event_index
+                    LIMIT 1
+                    """,
+                    (hotkey,),
+                ).fetchone()
+                if first is None:
+                    raise RuntimeError("VDA commitment has no recorded submission")
+                selected_submission_id = first["submission_id"]
+            current = self._connection.execute(
+                """
+                SELECT block_height, extrinsic_index, event_index, block_hash, payload,
+                       submission_id
+                FROM commitment_choices WHERE hotkey = ?
+                """,
+                (hotkey,),
+            ).fetchone()
+            incoming = (position.block, position.extrinsic_index, position.event_index)
+            if current is not None:
+                existing = (
+                    current["block_height"],
+                    current["extrinsic_index"],
+                    current["event_index"],
+                )
+                if incoming < existing:
+                    raise ValueError("commitment choice cannot move backward")
+                if incoming == existing:
+                    if (
+                        current["block_hash"] != normalized_hash
+                        or bytes(current["payload"]) != payload
+                        or current["submission_id"] != selected_submission_id
+                    ):
+                        raise RuntimeError("replayed commitment choice contains different data")
+                else:
+                    self._connection.execute(
+                        """
+                        UPDATE commitment_choices
+                        SET netuid = ?, block_hash = ?, block_height = ?,
+                            extrinsic_index = ?, event_index = ?, payload = ?, submission_id = ?
+                        WHERE hotkey = ?
+                        """,
+                        (
+                            netuid,
+                            normalized_hash,
+                            position.block,
+                            position.extrinsic_index,
+                            position.event_index,
+                            payload,
+                            selected_submission_id,
+                            hotkey,
+                        ),
+                    )
+            else:
+                self._connection.execute(
+                    """
+                    INSERT INTO commitment_choices (
+                        hotkey, netuid, block_hash, block_height, extrinsic_index,
+                        event_index, payload, submission_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        hotkey,
+                        netuid,
+                        normalized_hash,
+                        position.block,
+                        position.extrinsic_index,
+                        position.event_index,
+                        payload,
+                        selected_submission_id,
+                    ),
+                )
+            if legacy_excluded:
+                self._connection.execute(
+                    """
+                    INSERT INTO competition_exclusions (hotkey, first_block, reason)
+                    VALUES (?, ?, 'LEGACY_CONTEST_ACTIVATED')
+                    ON CONFLICT(hotkey) DO NOTHING
+                    """,
+                    (hotkey, position.block),
+                )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def active_competitors(self, uid_by_hotkey: Mapping[str, int]) -> list[dict[str, Any]]:
+        """Project current VDA choices onto one finalized metagraph snapshot."""
+
+        rows = self._connection.execute(
+            """
+            SELECT choice.hotkey, submission.block_height,
+                   submission.extrinsic_index, submission.event_index,
+                   choice.submission_id, submission.repo_id, submission.revision,
+                   exclusion.reason AS exclusion_reason
+            FROM commitment_choices choice
+            LEFT JOIN submissions submission
+              ON submission.submission_id = choice.submission_id
+            LEFT JOIN competition_exclusions exclusion
+              ON exclusion.hotkey = choice.hotkey
+            ORDER BY choice.block_height, choice.extrinsic_index, choice.event_index
+            """
+        ).fetchall()
+        return [
+            {
+                "uid": uid_by_hotkey[row["hotkey"]],
+                "hotkey": row["hotkey"],
+                "submission_id": row["submission_id"],
+                "repo_id": row["repo_id"],
+                "revision": row["revision"],
+                "block_height": row["block_height"],
+                "extrinsic_index": row["extrinsic_index"],
+                "event_index": row["event_index"],
+            }
+            for row in rows
+            if row["hotkey"] in uid_by_hotkey
+            and row["submission_id"] is not None
+            and row["repo_id"] is not None
+            and row["exclusion_reason"] is None
+        ]
 
     def bind_track_spec(self, digest: str) -> None:
         """Bind all future challenges in this database to one frozen spec."""
@@ -330,17 +496,14 @@ class ChallengeStore:
         self,
         submission: SubmissionRecord,
         *,
-        cooldown_blocks: int = 0,
         occurred_at_ms: int | None = None,
     ) -> tuple[str, bool]:
-        """Create a queued challenge, returning ``(challenge_id, inserted)``.
+        """Record a submission, admitting only the hotkey's first one on this track.
 
         Replaying the identical chain record is idempotent. Reusing an identifier
         for different content is treated as database corruption.
         """
 
-        if cooldown_blocks < 0:
-            raise ValueError("cooldown blocks must be non-negative")
         timestamp = _timestamp(occurred_at_ms)
         identifier = challenge_id(submission.submission_id)
         values = (
@@ -392,22 +555,16 @@ class ChallengeStore:
                 raise RuntimeError("submissions must be inserted in finalized chain order")
 
             malformed = submission.repo_id is None or submission.revision is None
-            last_accepted = self._connection.execute(
+            previous_hotkey_submission = self._connection.execute(
                 """
-                SELECT block_height FROM submissions
-                WHERE hotkey = ? AND admitted = 1
-                ORDER BY block_height DESC, extrinsic_index DESC, event_index DESC
+                SELECT submission_id FROM submissions
+                WHERE hotkey = ?
                 LIMIT 1
                 """,
                 (submission.hotkey,),
             ).fetchone()
-            admitted = not malformed and passes_cooldown(
-                current_block=submission.position.block,
-                last_accepted_block=(
-                    None if last_accepted is None else last_accepted["block_height"]
-                ),
-                cooldown_blocks=cooldown_blocks,
-            )
+            first_for_hotkey = previous_hotkey_submission is None
+            admitted = not malformed and first_for_hotkey
 
             self._connection.execute(
                 """
@@ -445,10 +602,10 @@ class ChallengeStore:
                 (identifier, ChallengeState.QUEUED, timestamp),
             )
             terminal = (
-                ChallengeState.MALFORMED_SUBMISSION
+                ChallengeState.REJECTED_DUPLICATE_HOTKEY
+                if not first_for_hotkey
+                else ChallengeState.MALFORMED_SUBMISSION
                 if malformed
-                else ChallengeState.REJECTED_RATE_LIMIT
-                if not admitted
                 else None
             )
             if terminal is not None:
@@ -1046,29 +1203,18 @@ class ChallengeStore:
     def leaderboard(self) -> list[LeaderboardEntry]:
         rows = self._connection.execute(
             """
-            WITH ranked AS (
-                SELECT submission.hotkey, challenge.challenge_id,
-                       challenge.final_score, challenge.score_block,
-                       submission.block_height, submission.extrinsic_index,
-                       submission.event_index,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY submission.hotkey
-                           ORDER BY challenge.final_score DESC,
-                                    submission.block_height ASC,
-                                    submission.extrinsic_index ASC,
-                                    submission.event_index ASC
-                       ) AS hotkey_rank
-                FROM challenges challenge
-                JOIN submissions submission
-                  ON submission.submission_id = challenge.submission_id
-                WHERE challenge.state = ?
-            )
-            SELECT hotkey, challenge_id, final_score, score_block,
-                   block_height, extrinsic_index, event_index
-            FROM ranked
-            WHERE hotkey_rank = 1
-            ORDER BY final_score DESC,
-                     block_height ASC, extrinsic_index ASC, event_index ASC
+            SELECT submission.hotkey, challenge.challenge_id,
+                   challenge.final_score, challenge.score_block,
+                   submission.block_height, submission.extrinsic_index,
+                   submission.event_index
+            FROM challenges challenge
+            JOIN submissions submission
+              ON submission.submission_id = challenge.submission_id
+            WHERE challenge.state = ?
+            ORDER BY challenge.final_score DESC,
+                     submission.block_height ASC,
+                     submission.extrinsic_index ASC,
+                     submission.event_index ASC
             """,
             (ChallengeState.SUCCEEDED,),
         ).fetchall()

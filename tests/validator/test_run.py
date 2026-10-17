@@ -13,17 +13,17 @@ from validator import run as run_module
 from validator.admission import AdmissionSettings, AdmissionStatus
 from validator.download import DownloadedModel
 from validator.publication import encode_weight_artifact
-from validator.queue import ChallengeState
+from validator.queue import ChainPosition, ChallengeState
 from validator.run import process_cycle, process_weight_cycle
 from validator.scoring import ScoringSettings, StageOutcome
 from validator.store import ChallengeStore
-from validator.tournament import resolve_tournament
+from validator.tournament import Champion, resolve_tournament
 from validator.weights import (
     WeightArtifact,
     WeightChainState,
     WeightPlan,
     WeightReceipt,
-    plan_weights,
+    plan_champion_weight,
 )
 
 from .test_chain import HOTKEY, FakeClient, chain_block
@@ -106,7 +106,6 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
         arguments = {
             "netuid": 7,
             "track_start_block": 100,
-            "cooldown_blocks": 10,
             "admission_settings": AdmissionSettings(
                 cache_dir=tmp_path / "cache",
                 max_model_bytes=10_000,
@@ -153,7 +152,6 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
     arguments = {
         "netuid": 7,
         "track_start_block": 100,
-        "cooldown_blocks": 10,
         "admission_settings": AdmissionSettings(
             cache_dir=tmp_path / "cache",
             max_model_bytes=10_000,
@@ -178,14 +176,23 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
             track_spec_digest="ab" * 32,
             netuid=7,
             minimum_gain=0.001,
+            initial_champion=Champion(
+                "genesis",
+                "genesis-hotkey",
+                "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview",
+                "76f202874608115408d73280be9531c4ab888242",
+                0.5,
+                ChainPosition(100, 0, 0),
+                uid=0,
+                source="VEDA_BASELINE",
+            ),
         )
-        plan = plan_weights(
-            tournament.reward_entries,
+        plan = plan_champion_weight(
+            tournament.champion,
             uid_by_hotkey={HOTKEY: 4},
             current_block=101,
             min_allowed_weights=1,
             max_weight=1.0,
-            minimum_frontier_gain=0.001,
         )
 
     assert downloads == 1
