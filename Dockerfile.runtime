@@ -2,7 +2,8 @@ FROM pytorch/pytorch@sha256:6961740947d7eb3a2f25ce6a6f28aff6383a48d3ceec56257d5e
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates ffmpeg git \
