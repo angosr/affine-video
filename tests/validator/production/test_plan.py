@@ -28,6 +28,7 @@ from validator.production.plan import (
     DenseReference,
     ReadyObject,
     ReadySampleCache,
+    build_audit_evidence_plan,
     build_plan,
     generation_seed,
     scheduled_generation_block,
@@ -289,10 +290,12 @@ def test_source_selection_is_partition_explicit_and_audit_is_deterministic() -> 
     )
     pool = SourcePool(leaves)
     commitments = source_commitments(pool)
+    track_digest = "ab" * 32
+    block_hash = "0x" + "cd" * 32
     arguments = {
         "strata": ("16:9@37",),
         "sources_per_stratum": 2,
-        "batch_seed": "56" * 32,
+        "batch_seed": generation_seed(track_digest, block_hash),
         "used_source_digests": frozenset(),
     }
 
@@ -304,11 +307,61 @@ def test_source_selection_is_partition_explicit_and_audit_is_deterministic() -> 
     )
     expected = select_source_digests(commitments, partition="audit", **arguments)
     production = select_source_digests(commitments, partition="production", **arguments)
+    production_proofs = select_source_proofs(
+        pool,
+        commitments=commitments,
+        partition="production",
+        **arguments,
+    )
 
     assert tuple(proof.leaf.digest for proof in selected) == expected
     assert all(proof.leaf.partition == "audit" for proof in selected)
     assert set(expected).isdisjoint(production)
     assert expected == select_source_digests(commitments, partition="audit", **arguments)
+
+    audit_plan = build_audit_evidence_plan(
+        track_spec_digest=track_digest,
+        generation_block=120,
+        block_hash=block_hash,
+        track_start_block=100,
+        minimum_generation_delay_blocks=1,
+        generation_interval_blocks=20,
+        evidence_id="audit-panel-0",
+        source_proofs=selected,
+        scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+    production_plan = build_plan(
+        track_spec_digest=track_digest,
+        generation_block=120,
+        block_hash=block_hash,
+        track_start_block=100,
+        minimum_generation_delay_blocks=1,
+        generation_interval_blocks=20,
+        exact_challenge_ids=("production-challenge",),
+        confirmation_challenge_ids=(),
+        source_proofs=production_proofs,
+        scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+    commitment_digests = tuple(item.sha256 for item in commitments)
+    assert BatchPlan.decode(audit_plan.encode()) == audit_plan
+    assert tuple(proof.leaf.digest for proof in audit_plan.source_proofs) == expected
+    assert audit_plan.selected_routes == production_plan.selected_routes
+    assert audit_plan.selected_steps == production_plan.selected_steps
+    assert audit_plan.query_selection_seed == production_plan.query_selection_seed
+    assert all(
+        verify_source_proof(
+            proof,
+            pool.root,
+            commitment_digests=commitment_digests,
+        )
+        for proof in audit_plan.source_proofs
+    )
+    with pytest.raises(ValueError, match="public commitment index"):
+        validate_source_selection_sequence(
+            (audit_plan,), commitments=commitments, scoring=scoring()
+        )
 
 
 @pytest.mark.parametrize("partition", ["", "staging", True, None])

@@ -348,6 +348,70 @@ def build_plan(
 ) -> BatchPlan:
     """Build the sole plan selected by one finalized generation block."""
 
+    return _build_plan(
+        track_spec_digest=track_spec_digest,
+        generation_block=generation_block,
+        block_hash=block_hash,
+        track_start_block=track_start_block,
+        minimum_generation_delay_blocks=minimum_generation_delay_blocks,
+        generation_interval_blocks=generation_interval_blocks,
+        exact_challenge_ids=exact_challenge_ids,
+        confirmation_challenge_ids=confirmation_challenge_ids,
+        source_proofs=source_proofs,
+        scoring=scoring,
+        available_routes=available_routes,
+        source_partition="production",
+    )
+
+
+def build_audit_evidence_plan(
+    *,
+    track_spec_digest: str,
+    generation_block: int,
+    block_hash: str,
+    track_start_block: int,
+    minimum_generation_delay_blocks: int,
+    generation_interval_blocks: int,
+    evidence_id: str,
+    source_proofs: tuple[SourceProof, ...],
+    scoring: ScoringSpec,
+    available_routes: tuple[str, ...],
+) -> BatchPlan:
+    """Build an audit-only launch-evidence plan outside the live coordinator."""
+
+    if not isinstance(evidence_id, str) or not evidence_id:
+        raise ValueError("audit evidence ID cannot be empty")
+    return _build_plan(
+        track_spec_digest=track_spec_digest,
+        generation_block=generation_block,
+        block_hash=block_hash,
+        track_start_block=track_start_block,
+        minimum_generation_delay_blocks=minimum_generation_delay_blocks,
+        generation_interval_blocks=generation_interval_blocks,
+        exact_challenge_ids=(evidence_id,),
+        confirmation_challenge_ids=(),
+        source_proofs=source_proofs,
+        scoring=scoring,
+        available_routes=available_routes,
+        source_partition="audit",
+    )
+
+
+def _build_plan(
+    *,
+    track_spec_digest: str,
+    generation_block: int,
+    block_hash: str,
+    track_start_block: int,
+    minimum_generation_delay_blocks: int,
+    generation_interval_blocks: int,
+    exact_challenge_ids: tuple[str, ...],
+    confirmation_challenge_ids: tuple[str, ...],
+    source_proofs: tuple[SourceProof, ...],
+    scoring: ScoringSpec,
+    available_routes: tuple[str, ...],
+    source_partition: str,
+) -> BatchPlan:
     batch_seed = generation_seed(track_spec_digest, block_hash)
     first, last = submission_interval(
         generation_block,
@@ -359,7 +423,12 @@ def build_plan(
     if len(routes) != scoring.sampled_route_count:
         raise ValueError("not enough selector routes for the batch plan")
     steps = select_steps(batch_seed, scoring)
-    rollouts = _rollouts(batch_seed, source_proofs, scoring)
+    rollouts = _rollouts(
+        batch_seed,
+        source_proofs,
+        scoring,
+        source_partition=source_partition,
+    )
     query_seed = hashlib.sha256(
         b"veda-query-selection-v1\0" + bytes.fromhex(batch_seed)
     ).hexdigest()
@@ -604,7 +673,13 @@ def _rollouts(
     batch_seed: str,
     proofs: tuple[SourceProof, ...],
     scoring: ScoringSpec,
+    *,
+    source_partition: str,
 ) -> tuple[RolloutPlan, ...]:
+    if source_partition not in {"production", "audit"}:
+        raise ValueError("rollout source partition must be production or audit")
+    if any(proof.leaf.partition != source_partition for proof in proofs):
+        raise ValueError(f"batch plan can only select {source_partition} sources")
     expected_strata = set(scoring.stratum_weight_map)
     by_stratum = {
         stratum: tuple(proof for proof in proofs if proof.leaf.generation_geometry == stratum)
@@ -624,8 +699,6 @@ def _rollouts(
     result = []
     for stratum in sorted(expected_strata):
         for proof in by_stratum[stratum]:
-            if proof.leaf.partition != "production":
-                raise ValueError("formal batch plans can only select production sources")
             material = hashlib.sha256(
                 bytes.fromhex(batch_seed) + b"\0rollout\0" + proof.leaf.source_id.encode()
             ).digest()
