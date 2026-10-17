@@ -42,7 +42,7 @@ def test_monitor_renders_all_active_competitors_in_uid_order() -> None:
 
     rendered = render_status(status, color=False)
 
-    assert "VEDA SN120  block 12345" in rendered
+    assert "VEDA SN120  block 12345  ACTIVE" in rendered
     assert "abcdef" in rendered and "123456" in rendered
     assert "CHAMPION" in rendered
     assert "#1" in rendered and "#2" in rendered

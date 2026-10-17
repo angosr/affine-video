@@ -51,10 +51,13 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
     yellow = "\033[33m" if use_color else ""
     bold = "\033[1m" if use_color else ""
     reset = "\033[0m" if use_color else ""
+    phase = status.get("track_phase", "ACTIVE")
+    if not isinstance(phase, str) or not phase:
+        raise PublicArtifactError("public status track phase is invalid")
 
     title = (
         f"{bold}{cyan}VEDA SN{status.get('netuid', '?')}  "
-        f"block {status.get('source_block', '?')}  {status.get('track_phase', '?')}{reset}"
+        f"block {status.get('source_block', '?')}  {phase}{reset}"
     )
     headers = (
         "UID",
