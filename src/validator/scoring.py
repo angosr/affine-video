@@ -163,7 +163,8 @@ def _load_task_selector(track: TrackSpec, task: LeasedChallenge):
     path = Path(task.model_path)
     if _file_sha256(path) != task.file_sha256:
         raise OSError("validated model cache checksum changed")
-    return load_selector(path, track.model.selector, expected_hotkey=task.hotkey)
+    expected_hotkey = None if task.challenge_id == "genesis" else task.hotkey
+    return load_selector(path, track.model.selector, expected_hotkey=expected_hotkey)
 
 
 def verify_initial_champion(

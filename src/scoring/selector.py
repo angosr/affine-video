@@ -142,7 +142,8 @@ def load_selector(
     try:
         with safe_open(Path(path), framework="numpy") as tensors:
             metadata = tensors.metadata() or {}
-            if metadata not in ({}, {"hotkey": expected_hotkey}):
+            expected_metadata = {} if expected_hotkey is None else {"hotkey": expected_hotkey}
+            if metadata != expected_metadata:
                 raise ModelValidationError(
                     "MODEL_OWNER_MISMATCH",
                     "selector metadata does not match the submitting hotkey",

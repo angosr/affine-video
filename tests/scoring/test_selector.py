@@ -84,6 +84,21 @@ def test_zero_veda_projection_equals_mean_pooled_qk(tmp_path) -> None:
     assert result == pytest.approx(np.array([[11]], dtype=np.float32) / np.sqrt(2))
 
 
+def test_selector_requires_exact_owner_metadata_when_hotkey_is_expected(tmp_path) -> None:
+    spec = architecture()
+    path = tmp_path / "selector.safetensors"
+    save_file(weights(spec), path)
+
+    with pytest.raises(ModelValidationError, match="submitting hotkey"):
+        load_selector(path, spec, expected_hotkey="owner")
+
+    save_file(weights(spec), path, metadata={"hotkey": "owner"})
+    load_selector(path, spec, expected_hotkey="owner")
+
+    with pytest.raises(ModelValidationError, match="submitting hotkey"):
+        load_selector(path, spec, expected_hotkey="different")
+
+
 def test_selector_rejects_extra_tensors_and_non_finite_runtime_input(tmp_path) -> None:
     spec = architecture()
     values = weights(spec)
