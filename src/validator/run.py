@@ -50,15 +50,15 @@ from validator.weights import (
 )
 
 DEFAULT_PUBLIC_WEIGHTS_URL = (
-    "https://iblosevwkuiootbbgnsy.supabase.co/storage/v1/object/public/"
-    "affine_video/tracks/main/weights.json"
+    "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/"
+    "affine_video/tracks/sn120/weights.json"
 )
 DEFAULT_BASELINE_MANIFEST_URL = (
     "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/"
     "affine_video/tracks/sn120/assets/veda_baseline_f16/manifest.json"
 )
-DEFAULT_NETUID = 7
-DEFAULT_TRACK_SPEC_DIGEST = "bbbba0ba4b416a2cd889958e4d6cab61abe51babd70e623eb06b1d9dcbbfc6ee"
+DEFAULT_NETUID = 120
+DEFAULT_TRACK_SPEC_DIGEST = "0" * 64
 
 
 class ArtifactRepository(Protocol):
@@ -251,6 +251,8 @@ async def run_validator(
     normalized_track_digest = track_spec_digest.lower()
     if re.fullmatch(r"[0-9a-f]{64}", normalized_track_digest) is None:
         raise ValueError("track specification digest must be 32-byte hexadecimal")
+    if normalized_track_digest == "0" * 64:
+        raise ValueError("production track has not been released")
     validate_public_weights_url(public_weights_url)
     if poll_seconds <= 0:
         raise ValueError("poll interval must be positive")

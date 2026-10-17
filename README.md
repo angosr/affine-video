@@ -131,7 +131,7 @@ uv run --extra storage veda validator evaluate \
   --exact-cache /data/exact.npz \
   --archive-endpoint wss://archive.example \
   --storage-bucket affine_video \
-  --storage-prefix tracks/main
+  --storage-prefix tracks/sn120
 ```
 
 If `--initial-model` is omitted, the evaluator restores the pinned UID 0 VEDA weights from the

@@ -29,6 +29,24 @@ from validator.weights import (
 from .test_chain import HOTKEY, FakeClient, chain_block
 
 
+def test_unreleased_default_track_fails_before_wallet_or_network_access() -> None:
+    with pytest.raises(ValueError, match="not been released"):
+        asyncio.run(
+            run_module.run_validator(
+                public_weights_url=run_module.DEFAULT_PUBLIC_WEIGHTS_URL,
+                netuid=run_module.DEFAULT_NETUID,
+                track_spec_digest=run_module.DEFAULT_TRACK_SPEC_DIGEST,
+                network="finney",
+                wallet_name="default",
+                hotkey_name="default",
+                once=True,
+            )
+        )
+
+    assert run_module.DEFAULT_NETUID == 120
+    assert "/tracks/sn120/weights.json" in run_module.DEFAULT_PUBLIC_WEIGHTS_URL
+
+
 def empty_chain_block(block_height: int) -> tuple[str, dict, list[dict]]:
     return "0x" + f"{block_height:064x}", {"extrinsics": []}, []
 
