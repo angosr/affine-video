@@ -669,6 +669,19 @@
           "Overflow probe modifies in-memory FP32 values; not a legal FP16 submitted file",
           "Original batch driver exits with a registration-key error before starting adversarial probe; only that missing probe was subsequently run separately, and all listed individual GPU processes exited zero"
         ],
+        "supplemental_cuda_regressions": {
+          "candidate_source_commit": "8863972",
+          "physical_gpu": 6,
+          "passed": 5,
+          "skipped": 0,
+          "gpu6_calibration_completed_before_tests": true,
+          "relevant_scoring_files_byte_identical_to_live_b81": true,
+          "verified_unit_collection_commit": "8e21c4b",
+          "verified_unit_collection_case_ids": 770,
+          "all_case_ids_passed_across_three_runs": true,
+          "single_full_gpu_suite_claimed": false,
+          "scope": "Real H200 tie-order, three-dtype fused/cached pooling and legal allocation replay. Exact source/test identity checked against live numerical files; offline pytest and explicit candidate source overlay, not a frozen new production image, ranking or match acceptance."
+        },
         "historical_d1b_fp16_probe": {
           "file_sha256": "7f476b03c39069de4ba24f650a5d74c1d76feab80c3803bb806dc7435f2eb7c1",
           "weight_value": 65504.0,
@@ -716,6 +729,11 @@
           "path": "evidence/system-panel/acceptance-d1b38764/fp16-maximum-exact-gpu6.raw.log",
           "sha256": "5339061b3c8f9a69733789abc79fb683af22a25acde1f39d309d8f7e9fd54203",
           "scope": "Historical D1B only, not current 860 acceptance: Supplemental actual spawned scoring of one schema-valid 100-tensor FP16 selector with all weights 65504 and hotkey metadata on a fresh 16-video exact batch; normal baseline then reproduces reference exactly, with no remaining child and the temporary file deleted; not all extreme models, full-video scoring, or live chain admission"
+        },
+        {
+          "path": "private/torch-cuda-verification-8863972/result.json",
+          "sha256": "1ca5620acc097d401d864167de061297bab82426d668c55945617b7242e52b8b",
+          "scope": "Five original CUDA tests actually pass on H200 GPU6, no skips or overlap with that card's cost measurement. Source/Git and three verified JUnit collections cover all770 8e21 case IDs, not a single770-pass GPU run. Numerical modules and regressions match live b81; source/testing overlay, not a new formal runtime."
         }
       ],
       "release_blocker": true,
@@ -772,15 +790,40 @@
         "last_verified_fixed_asset_coverage": {
           "formal_artifacts": 56,
           "formal_total_bytes": 97294548471,
-          "artifacts_sha_verified_in_this_audit": 45,
-          "runtime_packages_with_prior_full_sha_evidence": 3,
-          "total_artifacts_with_sha_evidence": 48,
+          "artifacts_sha_verified_in_this_audit": 48,
           "total_bytes_with_sha_evidence": 56033950679,
           "artifacts_not_yet_fully_preserved": 8,
           "complete_size_of_unverified_artifacts_bytes": 41260597792,
           "historical_extra_assets_not_used_by_formal_runtime": 38,
           "historical_extra_assets_bytes": 67938105720,
-          "scope": "Current formal manifest mapped to actual off-GPU inputs; seven prior length-only shards now fully SHA-read. Corrected receipt preserves raw64-bit metadata exactly, original rounded receipt retained as failed observer evidence. Other eight artifacts remain partial/missing or unverified. Public pinned HF fallback checked for47 base files and one LoRA, not guaranteed permanent. Excludes genesis selector, credentials and private ledger recovery; not whole-host acceptance."
+          "scope": "The single manifest-driven preserver freshly stream-SHA-verified all48 reused local artifacts, including runtime packages and v7 inputs; no reused file retransmission. Other eight artifacts remain unverified. Public pinned HF fallback checked for47 base files and one LoRA, not guaranteed permanent. Excludes genesis selector, credentials and private ledger recovery; not whole-host acceptance."
+        },
+        "current_manifest_preserver": {
+          "operations_commit": "8e21c4b",
+          "service": "veda-preserve-runtime-assets.service",
+          "single_destination_lock_verified": true,
+          "old_revision_specific_writer_retired": true,
+          "selected_artifacts": 56,
+          "initial_transfer_artifacts": 8,
+          "reuse_artifacts": 48,
+          "historical_extra_artifacts_no_longer_transferred": 38,
+          "scope": "Only the explicit current manifest and existing local mirrors/partials; external runtime/v7/predictor files remain read-only. One writer, bounded transfers, no GPU source or formal container changes. Transfer completion and full56 recovery remain pending."
+        },
+        "current_public_chunk_recovery": {
+          "runtime_source_commit": "b81bfa8",
+          "synthetic_bytes": 41944064,
+          "parts": 2,
+          "first_part_successful_logical_puts": 1,
+          "first_put_acknowledged_then_response_lost": true,
+          "new_repository_resumes_without_first_part_reupload": true,
+          "missing_local_source_reverification_requires_no_restore_or_put": true,
+          "anonymous_manifest_and_two_part_full_sha_verified": true,
+          "owned_s3_objects_deleted_and_independently_absent": 3,
+          "formal_container_start_unchanged": true,
+          "formal_pointer_writes": 0,
+          "elapsed_seconds": 55.7447509681806,
+          "peak_gpu_host_cpu_rss_kib": 182232,
+          "scope": "Actual formal S3Repository and public Supabase/HTTP, synthetic data only. One transfer process with three new repository instances plus a separate read-only cleanup observer; not process restart, real match, hidden disclosure or whole10GiB throughput acceptance. Original pre-exec SSH observer quoting error preserved and corrected without changing preregistration/harness/deadline."
         },
         "current_production_plan_lifecycle": {
           "videos": 16,
@@ -929,9 +972,19 @@
           "scope": "Formal56-asset mapping, actual small/current-input SHA reads, historical runtime package proof references, precise HF provenance and legacy38-asset difference. Only SHA/size/path evidence reused; rounded mtime_ns is not evidence of exact metadata agreement."
         },
         {
-          "path": "private/formal-asset-coverage-8863972/large-sha-verified.json",
-          "sha256": "902e5ad63daa30faf9228a992de09b4e205af3c25094ada034342e8575747b92",
-          "scope": "Actual full seven-shard36.22GB streaming SHA supplement; root verified exact integer-preserving raw9 events, manifest and all artifact records. Together with parent/prior runtime proofs covers48/56, not full restore. Original rounded observer receipt and failure retained, no rescan to obtain a favorable result."
+          "path": "private/runtime-preservation-current-manifest-20261019-0500/reused-complete-verification.json",
+          "sha256": "7dc99e6d23b1262e6074ed190188c280f1d30cd7c3dcda6762aa1eb7ec6447a1",
+          "scope": "New sole preserver actually rehashed all48 reused artifacts56.03GB. Root verified raw prefix and each48 manifest/event identity; current coverage supersedes prior partial-hash checkpoint, whose immutable original raw remains archived. Not complete56 or whole-host recovery."
+        },
+        {
+          "path": "private/runtime-preservation-current-manifest-20261019-0500/handoff.json",
+          "sha256": "a4a68ac53ecec483bcc11d82d6cb66ccbc234ecd7ec19773d210051539e493d1",
+          "scope": "Controlled retirement of old88 scope and one current-manifest writer with explicit read-only reuse and existing partials. Root read complete implementation, independently passed34 focused tests, verified all handoff artifact hashes and current destination-lock holder; no formal runtime/digest change."
+        },
+        {
+          "path": "private/public-chunk-recovery-860-20261019/result.json",
+          "sha256": "25cf4e32c805cbac9c80c9e7bcdb45f8ff5a0b219fa4afec1533831e22b0ebe6",
+          "scope": "Actual frozen formal public S3 chunk publication, first-part lost-response resume without duplicate upload, no-local-source verification, anonymous complete-byte SHA and independent cleanup of three exact owned keys. Synthetic bytes, no hidden data or mutable pointers, not whole-batch/tournament acceptance."
         }
       ],
       "release_blocker": false,
