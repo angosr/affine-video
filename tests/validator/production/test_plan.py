@@ -531,6 +531,54 @@ def test_local_work_pruning_only_removes_unretained_plan_directories(tmp_path) -
     assert (tmp_path / "operator-notes").is_dir()
 
 
+def test_local_work_pruning_removes_only_abandoned_batch_temporaries(tmp_path) -> None:
+    work = tmp_path / "work"
+    plan = work / ("a" * 64)
+    batch = plan / "batch"
+    batch.mkdir(parents=True)
+    abandoned = batch / "tmpinterrupted.tmp"
+    abandoned.write_bytes(b"interrupted NPZ assembly")
+    sealed = batch / "120-sealed.npz"
+    sealed.write_bytes(b"immutable complete cache")
+    preserved = (
+        batch / "operator.tmp",
+        plan / "units" / "tmpunit.tmp",
+        work / "content" / "tmpcontent.tmp",
+        work / "operator-notes" / "tmpnotes.tmp",
+    )
+    for path in preserved:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"outside abandoned batch assembly scope")
+    outside = tmp_path / "outside.tmp"
+    outside.write_bytes(b"external original")
+    alias = batch / "tmpalias.tmp"
+    alias.symlink_to(outside)
+
+    _prune_local_work(work, frozenset({plan.name}))
+
+    assert not abandoned.exists()
+    assert sealed.read_bytes() == b"immutable complete cache"
+    assert all(path.read_bytes() == b"outside abandoned batch assembly scope" for path in preserved)
+    assert alias.is_symlink() and outside.read_bytes() == b"external original"
+
+
+def test_local_work_pruning_does_not_follow_retained_plan_or_batch_links(tmp_path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    external = tmp_path / "external"
+    (external / "batch").mkdir(parents=True)
+    abandoned = external / "batch" / "tmpinterrupted.tmp"
+    abandoned.write_bytes(b"not owned by this work directory")
+    (work / ("a" * 64)).symlink_to(external, target_is_directory=True)
+    second = work / ("b" * 64)
+    second.mkdir()
+    (second / "batch").symlink_to(external / "batch", target_is_directory=True)
+
+    _prune_local_work(work, frozenset({"a" * 64, "b" * 64}))
+
+    assert abandoned.read_bytes() == b"not owned by this work directory"
+
+
 def test_local_work_directory_allows_only_one_producer(tmp_path) -> None:
     with (
         _work_directory_lock(tmp_path),
@@ -732,12 +780,15 @@ def test_producer_close_stops_pending_work_and_releases_workers(
             ),
             sample_cache=ready_sample_cache(),
         )
+    abandoned = tmp_path / plan.plan_digest / "batch" / "tmpinterrupted.tmp"
+    abandoned.parent.mkdir(parents=True)
+    abandoned.write_bytes(b"prior failed assembly must be reclaimed before the next attempt")
     database = tmp_path / "validator.db"
     with ChallengeStore(database, track_spec_digest=plan.track_spec_digest) as store:
         store.advance_chain_cursor(201 if initially_closed else 200, "0x" + "cd" * 32)
     objects = AttemptObjects({"plans/120.json": plan.encode()})
     original = objects.get("plans/120.json")
-    executions, closed_workers = [], []
+    executions, closed_workers, stale_before_execution = [], [], []
 
     class Coordinator:
         def __init__(self, **_kwargs):
@@ -761,6 +812,7 @@ def test_producer_close_stops_pending_work_and_releases_workers(
     service._needs_regeneration = lambda _plan: True
 
     def execute(*_args, **_kwargs):
+        stale_before_execution.append(abandoned.exists())
         executions.append(plan.plan_digest)
         assert len(executions) == 1, "no attempt may start after the close cursor"
         with ChallengeStore(database, track_spec_digest=plan.track_spec_digest) as store:
@@ -784,6 +836,8 @@ def test_producer_close_stops_pending_work_and_releases_workers(
     assert len(executions) == len(closed_workers) == expected
     assert _plan_attempt_count(objects, plan) == expected
     assert objects.get("plans/120.json") == original
+    assert stale_before_execution == ([] if initially_closed else [False])
+    assert abandoned.exists() is initially_closed
 
 
 def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
@@ -900,7 +954,9 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
     assert _plan_attempt_count(AttemptObjects(durable), plan) == 9
 
 
-@pytest.mark.parametrize("phase", ["database", "cursor", "create", "list", "reserve", "timeout"])
+@pytest.mark.parametrize(
+    "phase", ["database", "cursor", "create", "list", "prune", "reserve", "timeout"],
+)
 @pytest.mark.parametrize("once", [False, True])
 def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
     monkeypatch, tmp_path, phase, once,
@@ -966,6 +1022,12 @@ def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
         fail("reserve")
         return real_reserve(objects, pending)
 
+    real_prune = production_service._prune_local_work
+
+    def prune(root, retained):
+        fail("prune")
+        real_prune(root, retained)
+
     def execute(_name, _stored, pending, _workers, **_kwargs):
         assert pending == plan
         completed.append(pending.plan_digest)
@@ -984,6 +1046,7 @@ def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
     monkeypatch.setattr(production_service, "ChallengeStore", Store)
     monkeypatch.setattr(production_service, "PlanCoordinator", Coordinator)
     monkeypatch.setattr(production_service, "_reserve_plan_attempt", reserve)
+    monkeypatch.setattr(production_service, "_prune_local_work", prune)
     monkeypatch.setattr(production_service, "_PRODUCER_ATTEMPT_TIMEOUT_SECONDS", 0.02)
     monkeypatch.setattr(production_service.time, "sleep", lambda seconds: sleeps.append(seconds))
     monkeypatch.setattr(
@@ -1162,7 +1225,7 @@ def test_producer_worker_constructs_teacher_once_on_first_cache_miss(tmp_path, m
     assert [results.get_nowait(), results.get_nowait()] == [("ok", "first"), ("ok", "second")]
 
 
-def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch) -> None:
+def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch, tmp_path) -> None:
     plan = build_plan(
         track_spec_digest="ab" * 32,
         generation_block=120,
@@ -1200,7 +1263,9 @@ def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch) -> 
     objects = AttemptObjects()
     alerts = []
     service = object.__new__(ProducerService)
-    service.config = SimpleNamespace(validator_database="unused.db", poll_seconds=0.01)
+    service.config = SimpleNamespace(
+        validator_database="unused.db", poll_seconds=0.01, work_dir=tmp_path,
+    )
     service.track = SimpleNamespace(digest=plan.track_spec_digest, track_close_block=200)
     service.objects = objects
     service.pool = None

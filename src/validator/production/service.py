@@ -472,6 +472,7 @@ class ProducerService:
                              or self._needs_regeneration(row[2])), None,
                         )
                         retained = _retained_plan_digests(plans)
+                        _prune_local_work(self.config.work_dir, retained)
                         attempt = (
                             None if pending is None
                             else _reserve_plan_attempt(self.objects, pending[2])
@@ -547,7 +548,6 @@ class ProducerService:
                         ))
                         continue
                     ready_block = ready.generation_block
-                _prune_local_work(self.config.work_dir, retained)
                 _report_cycle(
                     ProducerCycle(
                         None if created is None else created.generation_block,
@@ -1224,16 +1224,28 @@ def _retained_plan_digests(
 
 
 def _prune_local_work(root: Path, retained: frozenset[str]) -> None:
-    """Remove unit scratch only; sealed content remains until successful disclosure."""
+    """Prune scratch under the producer lock; never touch sealed content.
+
+    SIGKILL bypasses the assembler's finally block. Reclaim its abandoned
+    temporary files before reserving another attempt, including retained plans.
+    """
 
     for child in root.iterdir():
         if (
-            child.is_dir()
-            and len(child.name) == 64
-            and all(character in "0123456789abcdef" for character in child.name)
-            and child.name not in retained
+            child.is_symlink() or not child.is_dir()
+            or len(child.name) != 64
+            or any(character not in "0123456789abcdef" for character in child.name)
         ):
+            continue
+        if child.name not in retained:
             shutil.rmtree(child)
+            continue
+        batch = child / "batch"
+        if batch.is_symlink():
+            continue
+        for temporary in batch.glob("tmp*.tmp"):
+            if not temporary.is_symlink() and temporary.is_file():
+                temporary.unlink()
 
 
 def _validate_source_capacity(pool: SourcePool, track: TrackSpec) -> None:
