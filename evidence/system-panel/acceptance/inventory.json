@@ -55,15 +55,60 @@
       "subject": "缓存数值忠实度"
     },
     {
-      "acceptance_manifest": null,
+      "acceptance_manifest": {
+        "path": "evidence/system-panel/acceptance-d1b38764/e3-two-stage.json",
+        "sha256": "d98d19e427b8459ba9d39247ef8c3c276ec38969b352196d1e17b59c7bdf0445"
+      },
       "acceptance_rule": "真实GPU执行固定self和退化对照，完成一次两阶段FIFO闭环；self不能晋级，较好基线能战胜可控退化，两阶段均过线才替换冠军，confirmation使用exact决策之后的新批次；报告局部与完整视频分数差异，不宣称已证明总体排序一致",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "d1b387642e1da0fa35411c6d7ebfa830567a14e84be8c6163e2062afe4257260",
+        "runtime_source_commit": "18e9c5c",
+        "independent_videos_per_phase": 16,
+        "exact_cases_per_phase": 384,
+        "full_video_cells": 96,
+        "exact_gain_lower_bound": 0.1124564422946204,
+        "full_video_baseline_score": 0.748815835848915,
+        "full_video_shuffled_score": 0.6697538860530137,
+        "full_video_gain_lower_bound": 0.03787727964707052,
+        "minimum_gain": 0.005,
+        "self_gain_lower_bound": 0.0,
+        "phase_source_families_disjoint": true,
+        "both_stage_gates_required_for_promotion": true,
+        "following_fifo_negative_preserves_new_champion": true,
+        "archived_stages_restored_without_rescoring": true,
+        "private_s3_stage_objects_independently_verified": 5,
+        "saved_sqlite_databases_verified": 10,
+        "memory_s3_used": false,
+        "clock": "user-approved isolated accelerated chain fixture",
+        "real_chain_admission_or_weight_transaction_claimed": false
+      },
       "id": "E3",
       "method": "用固定只读self和退化模型运行真实exact及完整视频，核验FIFO、未来confirmation、冠军替换及持久化事实；更广的跨批次、近阈值和排序研究上线后继续，不训练模型",
-      "pass": false,
-      "raw_evidence": [],
+      "pass": true,
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/confirmation-result.json",
+          "sha256": "6e176d5d9355d294224be2074c0f98c3d4c69ced03d9659f7a45af9086291776",
+          "scope": "Fresh independent 16-video future audit confirmation using the actual frozen 18e9c5c scorer; virtual chain clock, not a real Miner match"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/sqlite-final/result.json",
+          "sha256": "143f6aeb53457b8d26aad75362c4389d7e13d0ab8f214f0d2a98d5f565508b75",
+          "scope": "Real GPU reports wired to SQLite, actual off-GPU S3 stage archives, two-stage promotion, FIFO, loss-before-local-commit recovery and ledger replay; controlled degraded incumbent, no HF admission or official genesis defeat"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/sqlite-final.raw.log",
+          "sha256": "f4ca2c06c8dd64b27426544f0eb02213458cc96bb19c62b5db9064fbfec34c09",
+          "scope": "Actual isolated two-stage SQLite/S3 execution, exit zero; no public writes or chain transaction"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/sqlite-final/independent-s3-check.json",
+          "sha256": "7884b757f198117843c33584f947a2838c133127683659b7eee496b954b73173",
+          "scope": "Independent control-host GET of all five archived stage bodies and SHA/identity/metrics verification against ten integrity-checked saved SQLite databases"
+        }
+      ],
       "release_blocker": true,
-      "status": "not_final_runtime_verified",
+      "status": "isolated_two_stage_launch_checks_passed",
       "subject": "teacher-state 到完整稀疏 rollout 的分布偏移"
     },
     {
@@ -334,10 +379,29 @@
         "model_archive_probe_sha256_verified": true,
         "model_archive_probe_temporary_objects_deleted": 2,
         "whole_model_archive_throughput_measured": false,
-        "observed_regenerated_mp4_hash_mismatches": 2,
+        "expanded_regeneration_rollouts": 16,
+        "expanded_regeneration_shard_hash_mismatches": 0,
+        "expanded_regeneration_joint_latent_hash_mismatches": 0,
+        "observed_regenerated_mp4_hash_mismatches": 5,
         "shard_and_latent_hashes_equal_in_both_mismatches": true,
         "decoded_video_equal_for_one_mismatching_pair": true,
         "decoded_audio_equal_for_that_pair": false,
+        "candidate_c916_video_only_component": {
+          "runtime_file_sha256": "b8f1dd0c56b81fa07cda8735ba646a621eac8551272b99a7b6a3be7bc1b763a1",
+          "base_image_source_commit": "18e9c5c",
+          "real_exports": 64,
+          "same_card_identical_pairs": 32,
+          "cross_card_identical_corresponding_exports": 32,
+          "original_joint_latent_hash_matches": 64,
+          "source_videos": 16,
+          "geometries": 4,
+          "audio_streams_present": 0,
+          "frozen_runtime_acceptance_claimed": false
+        },
+        "public_s3_probe_chunk_bytes": 41943040,
+        "public_s3_probe_upload_seconds": 5.807924913708121,
+        "public_s3_probe_anonymous_sha_download_seconds": 10.106576198711991,
+        "public_s3_probe_objects_deleted": 1,
         "whole_batch_regeneration_passed": false,
         "whole_host_recovery_proven": false
       },
@@ -369,6 +433,31 @@
           "path": "evidence/system-panel/acceptance-d1b38764/mp4-regeneration-comparison.raw.log",
           "sha256": "b3f1352b8abc782fa084f3fddc9d1033b4edd7699e9df67f1433d3e9652651ab",
           "scope": "Actual FFmpeg decoded-stream comparison of one failed regeneration pair: decoded video hash equal, decoded audio hash different. Not a repaired recovery path or proof about all remaining rollouts"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-batch-gpu6-diagnostic.raw.log",
+          "sha256": "16b42db466053acdb4fb09b1e69ea79c6f561a49f4ca6fee7c587324dc816b35",
+          "scope": "All eight assigned pinned rollouts completed for diagnosis: original QKV/latent hashes all equal, three MP4 mismatches retained, nonzero exit; no resampling"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-batch-gpu7-diagnostic.raw.log",
+          "sha256": "99b96ec1867b5046b4f031baba50c83ab8d64610b18c8802595d3f3aeef6b553",
+          "scope": "Other eight pinned rollouts: original QKV/latent hashes all equal, two MP4 mismatches retained, nonzero exit"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/video-only-candidate-gpu6.raw.log",
+          "sha256": "b3b42c9d74b6f3bc9c41adc094bbeaf9596e594143eb2f52b1aa0f3bd869e16f",
+          "scope": "Exact candidate source override on frozen base: real VAE/FFmpeg, 16 saved sources exported twice, no audio, original joint latent bytes preserved; not a new frozen release acceptance or full-host recovery"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/video-only-candidate-gpu7.raw.log",
+          "sha256": "923885cc168dcaf869a9c02b0c868a7f6766679de7faff713d6398754a877e9c",
+          "scope": "Independent H200 candidate-source exports for the same 16 saved sources; all 32 corresponding MP4/latent hashes equal the other card, temporary outputs removed"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/public-chunk-transport.raw.log",
+          "sha256": "caa0c12f9a95dca2e48b700184221ea7518c6f16a43c80e696d5dab7ec78ed1a",
+          "scope": "Actual 40 MiB public S3 upload and anonymous canonical-URL SHA-256 readback, with unique probe object deleted; distinct from the slow private tunnel and not full-batch throughput"
         }
       ],
       "release_blocker": false,
