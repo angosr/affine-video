@@ -1,4 +1,8 @@
-"""Lease-safe orchestration of one staged scoring task."""
+"""Lease-safe scoring of admitted models.
+
+Admission owns permanent model rejection. Subsequent input failures are retryable;
+non-finite model outputs receive zero quality inside the exact/video scorers.
+"""
 
 from __future__ import annotations
 
@@ -38,14 +42,6 @@ from validator.retries import (
 )
 from validator.store import ChallengeStore, LeasedChallenge
 from validator.tournament import genesis_champion, resolve_tournament
-
-
-class ParticipantScoringError(RuntimeError):
-    """A deterministic model failure that makes the submission invalid."""
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
 
 
 class TemporaryScoringError(RuntimeError):
@@ -153,8 +149,6 @@ class FilePairedEvaluator:
                     seed=scoring.bootstrap_seed,
                     device=self.scoring_device,
                 )
-        except ModelValidationError as exc:
-            raise ParticipantScoringError(exc.code, str(exc)) from exc
         except (CacheLoadError, ValueError, OSError) as exc:
             raise TemporaryScoringError("SCORING_CACHE_INVALID", str(exc)) from exc
         return StageOutcome(
@@ -376,8 +370,6 @@ class PairedTrackEvaluator:
                 incumbent_path=incumbent.model_path or "",
                 batch=batch,
             )
-        except ModelValidationError as exc:
-            raise ParticipantScoringError(exc.code, str(exc)) from exc
         except (OSError, RuntimeError, ValueError) as exc:
             raise TemporaryScoringError("CONFIRMATION_BATCH_UNAVAILABLE", str(exc)) from exc
         return StageOutcome(
@@ -687,8 +679,6 @@ def evaluate_isolated(
             )
         return result
     code, summary = payload
-    if kind == "participant":
-        raise ParticipantScoringError(code, summary)
     raise TemporaryScoringError(code, summary)
 
 
@@ -799,21 +789,6 @@ def evaluate_next_scoring(
                 else ChallengeState.SUCCEEDED
             )
             require_transition(task.state, target)
-        except ParticipantScoringError as exc:
-            store.complete_challenge(
-                task.challenge_id,
-                ChallengeState.PARTICIPANT_FAILED,
-                error_code=exc.code,
-                error_summary=str(exc),
-                occurred_at_ms=now,
-                lease_token=task.lease_token,
-                score_block=current_finalized_block,
-            )
-            return ScoringOutcome(
-                task.challenge_id,
-                ChallengeState.PARTICIPANT_FAILED,
-                exc.code,
-            )
         except TemporaryScoringError as exc:
             state = _defer_or_fail(
                 store,
@@ -1077,8 +1052,6 @@ def _isolated_entry(
         if not isinstance(result, StageOutcome):
             raise TypeError("evaluator did not return StageOutcome")
         sender.send(("ok", result))
-    except ParticipantScoringError as exc:
-        sender.send(("participant", exc.code, str(exc)))
     except TemporaryScoringError as exc:
         sender.send(("temporary", exc.code, str(exc)))
     except MemoryError:

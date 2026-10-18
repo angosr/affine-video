@@ -8,7 +8,7 @@ from safetensors.numpy import save_file
 
 from scoring.cache import write_exact_cache_batch
 from scoring.exact import ExactCase, canonical_dense_reference
-from scoring.model import validate_model
+from scoring.model import ModelValidationError, validate_model
 from scoring.selector import SelectorArchitecture
 from scoring.spec import (
     VEDA_EVALUATION_FILE_SHA256,
@@ -35,9 +35,9 @@ from validator.production.retries import PrivateRetryStore
 from validator.production.storage import PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState
 from validator.scoring import (
+    FilePairedEvaluator,
     IsolatedEvaluator,
     PairedTrackEvaluator,
-    ParticipantScoringError,
     ScoringSettings,
     StageOutcome,
     TemporaryScoringError,
@@ -473,8 +473,8 @@ def isolated_sleep(task: LeasedChallenge) -> StageOutcome:
     return isolated_success(task)
 
 
-def isolated_participant_failure(_task: LeasedChallenge) -> StageOutcome:
-    raise ParticipantScoringError("MODEL_RUNTIME_INVALID", "invalid output")
+def isolated_model_read_failure(_task: LeasedChallenge) -> StageOutcome:
+    raise ModelValidationError("MODEL_SCHEMA_INVALID", "admitted model cannot be loaded")
 
 
 def isolated_memory_failure(_task: LeasedChallenge) -> StageOutcome:
@@ -506,6 +506,100 @@ def ready_for_scoring(store: ChallengeStore) -> str:
     return identifier
 
 
+@pytest.mark.parametrize("stage", ["exact", "confirmation"])
+@pytest.mark.parametrize("damaged_side", ["challenger", "incumbent"])
+def test_admitted_model_read_failure_does_not_eliminate_challenger(
+    tmp_path, monkeypatch, stage, damaged_side,
+) -> None:
+    architecture = SelectorArchitecture(1, 1, 2, "float32")
+    tensors = {
+        name: np.zeros(spec.shape, dtype=np.float32)
+        for name, spec in architecture.tensor_schema.items()
+    }
+    paths = {name: tmp_path / f"{name}.safetensors" for name in ("challenger", "incumbent")}
+    validated = {}
+    originals = {}
+    for name, path in paths.items():
+        save_file(tensors, path, metadata={"hotkey": "hotkey"})
+        validated[name] = validate_model(
+            path, schema=architecture.tensor_schema, max_bytes=10_000,
+            expected_hotkey="hotkey",
+        )
+        originals[name] = path.read_bytes()
+    track = SimpleNamespace(
+        model=SimpleNamespace(selector=architecture), scoring=scoring_spec(routes=1),
+    )
+    incumbent = replace(
+        sample_task(), challenge_id="incumbent", model_path=str(paths["incumbent"]),
+        file_sha256=validated["incumbent"].file_sha256,
+    )
+    hash_file = scoring_module._file_sha256
+    damaged = []
+
+    def fail_after_checksum(path):
+        checksum = hash_file(path)
+        if path == paths[damaged_side] and not damaged:
+            path.write_bytes(b"local disk failure after the checksum")
+            damaged.append(True)
+        return checksum
+
+    monkeypatch.setattr(scoring_module, "_file_sha256", fail_after_checksum)
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        identifier = ready_for_scoring(store)
+        expected_stage = ChallengeState.SCORING
+        if stage == "confirmation":
+            store.transition(identifier, ChallengeState.CONFIRMING, occurred_at_ms=14)
+            expected_stage = ChallengeState.CONFIRMING
+
+        def evaluate(task):
+            assert task.state is expected_stage
+            challenger = replace(
+                task, hotkey="hotkey", model_path=str(paths["challenger"]),
+                file_sha256=validated["challenger"].file_sha256,
+            )
+            if stage == "exact":
+                return FilePairedEvaluator(track, "unused.npz", "ab" * 32, incumbent)(challenger)
+            evaluator = PairedTrackEvaluator(
+                track, store, tmp_path, tmp_path, paths["incumbent"], "unused", 30,
+                batch_source=object(), confirmation_pool=object(),
+            )
+            return evaluator._confirm(challenger, incumbent)
+
+        settings = ScoringSettings(retry_base_ms=10)
+        outcome = process_next_scoring(
+            store, worker_id="worker", current_finalized_block=100, settings=settings,
+            evaluator=evaluate, now_ms=20,
+        )
+        assert damaged == [True]
+        assert outcome.state is ChallengeState.SYSTEM_DEFERRED
+        assert outcome.code == (
+            "SCORING_CACHE_INVALID" if stage == "exact" else "CONFIRMATION_BATCH_UNAVAILABLE"
+        )
+        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_DEFERRED
+
+        for name, path in paths.items():
+            path.write_bytes(originals[name])
+
+        def recovered(task):
+            assert task.state is expected_stage
+            for name, path in paths.items():
+                loaded = scoring_module._load_task_selector(
+                    track, replace(
+                        task, hotkey="hotkey", model_path=str(path),
+                        file_sha256=validated[name].file_sha256,
+                    ),
+                )
+                assert loaded.architecture == architecture
+            return StageOutcome(0.5, {})
+
+        retried = process_next_scoring(
+            store, worker_id="worker", current_finalized_block=100, settings=settings,
+            evaluator=recovered, now_ms=30,
+        )
+        assert retried.state is ChallengeState.SUCCEEDED
+        assert store.get_challenge(identifier).attempts == 2
+
+
 def test_isolated_evaluator_returns_only_structured_result() -> None:
     result = IsolatedEvaluator(isolated_success, timeout_seconds=5)(sample_task())
 
@@ -518,9 +612,9 @@ def test_isolated_evaluator_terminates_timeout_and_preserves_error_class() -> No
         evaluate_isolated(isolated_sleep, sample_task(), timeout_seconds=0.1)
     assert timeout.value.code == "SCORING_TIMEOUT"
 
-    with pytest.raises(ParticipantScoringError) as invalid:
-        evaluate_isolated(isolated_participant_failure, sample_task(), timeout_seconds=5)
-    assert invalid.value.code == "MODEL_RUNTIME_INVALID"
+    with pytest.raises(TemporaryScoringError) as invalid:
+        evaluate_isolated(isolated_model_read_failure, sample_task(), timeout_seconds=5)
+    assert invalid.value.code == "SCORING_WORKER_FAILURE"
 
     with pytest.raises(TemporaryScoringError) as memory:
         evaluate_isolated(isolated_memory_failure, sample_task(), timeout_seconds=5)
@@ -753,25 +847,8 @@ def test_private_stage_archive_waits_for_a_chain_head_that_covers_its_decision(t
         assert store.stage_score(identifier, ChallengeState.SCORING) is None
 
 
-def test_participant_failure_is_terminal_but_temporary_failure_retries(tmp_path) -> None:
+def test_temporary_failure_retries_without_consuming_submission(tmp_path) -> None:
     settings = ScoringSettings(lease_ms=100, retry_base_ms=10, retry_max_ms=100)
-    with ChallengeStore(tmp_path / "participant.db") as store:
-        identifier = ready_for_scoring(store)
-
-        def invalid(_task):
-            raise ParticipantScoringError("MODEL_RUNTIME_INVALID", "non-finite output")
-
-        outcome = process_next_scoring(
-            store,
-            worker_id="worker",
-            current_finalized_block=100,
-            settings=settings,
-            evaluator=invalid,
-            now_ms=20,
-        )
-        assert outcome is not None and outcome.state is ChallengeState.PARTICIPANT_FAILED
-        assert store.get_challenge(identifier).error_code == "MODEL_RUNTIME_INVALID"
-
     with ChallengeStore(tmp_path / "temporary.db") as store:
         identifier = ready_for_scoring(store)
 
