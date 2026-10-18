@@ -894,7 +894,7 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkey
         source_pool_merkle_root=pool.root,
         source_proofs=tuple(item.document() for item in plan.source_proofs),
         dense_references=(),
-        selected_inputs={},
+        sample_cache={},
     )
     video = tmp_path / f"{rollout.rollout_id}.mp4"
     latent = tmp_path / f"{rollout.rollout_id}.safetensors"
@@ -931,7 +931,7 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkey
         source_pool_merkle_root=pool.root,
         source_proofs=tuple(item.document() for item in plan.source_proofs),
         dense_references=(),
-        selected_inputs={},
+        sample_cache={},
     )
     _write_unit_completion(tmp_path, plan, rollout, inconsistent.path, video, latent)
     assert _find_valid_shard(tmp_path, plan, rollout, track) is None
@@ -1017,7 +1017,7 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
         for rollout in planned.rollouts
     )
 
-    def write(directory, values):
+    def write(directory, values, *, sample_cache=None):
         return write_exact_cache_batch(
             directory,
             values,
@@ -1029,7 +1029,9 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
             source_pool_merkle_root=pool.root,
             source_proofs=tuple(item.document() for item in planned.source_proofs),
             dense_references=tuple(item.document() for item in references),
-            selected_inputs=ready_sample_cache().document(),
+            sample_cache=(
+                ready_sample_cache().document() if sample_cache is None else sample_cache
+            ),
         )
 
     track = SimpleNamespace(
@@ -1046,6 +1048,7 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
         dense_references=references,
         sample_cache=ready_sample_cache(),
     )
+    assert batch.sample_cache == ready.sample_cache.document()
     _validate_plan_case_binding(batch.path, ready, track)
 
     substituted_inputs = replace(
@@ -1055,6 +1058,14 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
             ready_sample_cache().text,
         ),
     )
+    assert substituted_inputs.plan_digest == ready.plan_digest
+    substituted_batch = write(
+        tmp_path / "substituted-cache",
+        cases,
+        sample_cache=substituted_inputs.sample_cache.document(),
+    )
+    assert substituted_batch.plan_digest == batch.plan_digest
+    assert substituted_batch.sha256 != batch.sha256
     with pytest.raises(CacheLoadError, match="selected inputs"):
         _validate_plan_case_binding(batch.path, substituted_inputs, track)
 

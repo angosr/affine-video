@@ -550,7 +550,7 @@ class ProducerService:
             source_pool_merkle_root=self.track.source_pool_merkle_root,
             source_proofs=tuple(proof.document() for proof in plan.source_proofs),
             dense_references=tuple(reference.document() for reference in references),
-            selected_inputs=selected_cache.document(),
+            sample_cache=selected_cache.document(),
         )
         _require_before_deadline(deadline)
         if batch.path.stat().st_size > self.track.cache.exact_max_bytes:
@@ -665,7 +665,7 @@ def _produce_unit(
         source_pool_merkle_root=track.source_pool_merkle_root,
         source_proofs=tuple(proof.document() for proof in plan.source_proofs),
         dense_references=(),
-        selected_inputs={},
+        sample_cache={},
     )
     _write_unit_completion(root, plan, rollout, shard.path, output.video_path, output.latent_path)
     validated = _find_valid_shard(root, plan, rollout, track, dense_device="cuda:0")

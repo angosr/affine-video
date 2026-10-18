@@ -308,7 +308,7 @@ class ReadyBatchSource:
             or batch.dense_references
             != tuple(reference.document() for reference in plan.dense_references)
             or plan.sample_cache is None
-            or batch.selected_inputs != plan.sample_cache.document()
+            or batch.sample_cache != plan.sample_cache.document()
         ):
             raise RuntimeError("restored exact batch conflicts with its READY plan")
         self._validated_exact.add(batch.sha256)
@@ -617,7 +617,7 @@ def _validate_plan_case_binding(path: Path, plan: BatchPlan, track: TrackSpec) -
         expected_sha256=plan.exact.sha256 if plan.exact is not None else "",
         max_bytes=track.cache.exact_max_bytes,
     )
-    if plan.sample_cache is None or reader.metadata["selected_inputs"] != (
+    if plan.sample_cache is None or reader.metadata["sample_cache"] != (
         plan.sample_cache.document()
     ):
         raise CacheLoadError("cache selected inputs conflict with the frozen READY plan")

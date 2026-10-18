@@ -205,7 +205,7 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
         source_pool_merkle_root=track.source_pool_merkle_root,
         source_proofs=tuple({"source_id": f"source-{index}"} for index in range(4)),
         dense_references=tuple({"video_sha256": f"{index + 1:02x}" * 32} for index in range(4)),
-        selected_inputs={},
+        sample_cache={},
     )
 
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest=track.digest) as store:

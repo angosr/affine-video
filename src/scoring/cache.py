@@ -64,7 +64,7 @@ _ROOT_FIELDS = {
     "storage_dtype",
     "track_spec_digest",
     "dense_references",
-    "selected_inputs",
+    "sample_cache",
 }
 
 
@@ -81,7 +81,7 @@ class ExactCacheBatch:
     source_pool_merkle_root: str
     source_proofs: tuple[Mapping[str, Any], ...]
     dense_references: tuple[Mapping[str, Any], ...]
-    selected_inputs: Mapping[str, Any]
+    sample_cache: Mapping[str, Any]
 
 
 def write_exact_cache_batch(
@@ -96,7 +96,7 @@ def write_exact_cache_batch(
     source_pool_merkle_root: str,
     source_proofs: tuple[Mapping[str, Any], ...],
     dense_references: tuple[Mapping[str, Any], ...],
-    selected_inputs: Mapping[str, Any],
+    sample_cache: Mapping[str, Any],
     storage_dtype: str = "float16",
 ) -> ExactCacheBatch:
     """Atomically serialize a plan-bound cache in canonical case order."""
@@ -142,7 +142,7 @@ def write_exact_cache_batch(
         "storage_dtype": storage_dtype,
         "track_spec_digest": track_spec_digest,
         "dense_references": list(dense_references),
-        "selected_inputs": dict(selected_inputs),
+        "sample_cache": dict(sample_cache),
     }
     metadata = np.frombuffer(_canonical_json(metadata_document), dtype=np.uint8)
     root = Path(directory)
@@ -193,7 +193,7 @@ def assemble_exact_cache_batch(
     source_pool_merkle_root: str,
     source_proofs: tuple[Mapping[str, Any], ...],
     dense_references: tuple[Mapping[str, Any], ...],
-    selected_inputs: Mapping[str, Any],
+    sample_cache: Mapping[str, Any],
 ) -> ExactCacheBatch:
     """Assemble rollout shards without materializing any Q/K/V array."""
 
@@ -241,7 +241,7 @@ def assemble_exact_cache_batch(
         "storage_dtype": "float16",
         "track_spec_digest": track_spec_digest,
         "dense_references": list(dense_references),
-        "selected_inputs": dict(selected_inputs),
+        "sample_cache": dict(sample_cache),
     }
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
@@ -543,7 +543,7 @@ def _read_metadata(path: Path) -> dict[str, Any]:
         if (
             not isinstance(root["source_proofs"], list)
             or not isinstance(root["dense_references"], list)
-            or not isinstance(root["selected_inputs"], dict)
+            or not isinstance(root["sample_cache"], dict)
         ):
             raise CacheLoadError("cache disclosure metadata is invalid")
         return root
@@ -607,7 +607,7 @@ def _batch_from_metadata(path: Path, sha256: str, metadata: dict[str, Any]) -> E
         metadata["source_pool_merkle_root"],
         tuple(metadata["source_proofs"]),
         tuple(metadata["dense_references"]),
-        metadata["selected_inputs"],
+        metadata["sample_cache"],
     )
 
 
