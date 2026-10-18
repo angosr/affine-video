@@ -21,6 +21,103 @@ def controls():
     }
 
 
+def test_panel_generation_assembles_real_shards_with_the_selected_cache(tmp_path, monkeypatch):
+    """Stub GPU work, but exercise real assembly, metadata inspection and resume."""
+    from scoring.cache import ExactCacheReader, inspect_exact_cache_batch, write_exact_cache_batch
+    from tests.scoring.test_cache import write_batch
+    from validator.production import service
+    from validator.production.plan import ReadySampleCache
+    from validator.production.storage import INPUTS_NAMESPACE
+
+    original = write_batch(tmp_path / "source")
+    with ExactCacheReader(
+        original.path, expected_sha256=original.sha256, max_bytes=1_000_000,
+    ) as reader:
+        cases = tuple(reader)
+    results = []
+    for rollout in ("rollout-0", "rollout-1"):
+        directory = tmp_path / rollout
+        shard = write_exact_cache_batch(
+            directory, tuple(case for case in cases if case.rollout_id == rollout),
+            generated_block=original.generated_block, seed_block_hash=original.seed_block_hash,
+            plan_digest=original.plan_digest, track_spec_digest=original.track_spec_digest,
+            artifact_manifest_sha256=original.artifact_manifest_sha256,
+            source_pool_merkle_root=original.source_pool_merkle_root,
+            source_proofs=original.source_proofs, dense_references=(), sample_cache={},
+        )
+        video, latent = directory / "dense.mp4", directory / "dense.safetensors"
+        video.write_bytes(b"GPU video fixture")
+        latent.write_bytes(b"GPU latent fixture")
+        results.append(service.UnitResult(rollout, str(shard.path), str(video), str(latent), 1, 0))
+    plan = SimpleNamespace(
+        plan_digest=original.plan_digest, generation_block=original.generated_block,
+        block_hash=original.seed_block_hash, batch_seed="ab" * 32,
+        source_proofs=(SimpleNamespace(
+            leaf=SimpleNamespace(
+                source_id="source-0", source_family_id="family-0", digest="12" * 32,
+            ),
+            document=lambda: original.source_proofs[0],
+        ),),
+    )
+    track = SimpleNamespace(
+        digest=original.track_spec_digest,
+        artifact_manifest_sha256=original.artifact_manifest_sha256,
+        source_pool_merkle_root=original.source_pool_merkle_root,
+        scoring=SimpleNamespace(case_count=len(cases)),
+        cache=SimpleNamespace(exact_max_bytes=1_000_000),
+    )
+    calls = []
+
+    class Workers:
+        def __init__(self, config, active_track):
+            assert active_track is track
+            calls.append("start")
+
+        def run(self, active_plan):
+            assert active_plan is plan
+            calls.append("generate")
+            return tuple(results)
+
+        def close(self):
+            calls.append("close")
+
+    selected = []
+
+    def export_inputs(config, active_plan, destination):
+        assert active_plan is plan
+        destination.mkdir(parents=True)
+        index, text = destination / "index.json", destination / "text.safetensors"
+        index.write_bytes(b"{}")
+        text.write_bytes(b"encoded-input fixture")
+        cache = ReadySampleCache(
+            service._ready_file(index, INPUTS_NAMESPACE, ".json"),
+            service._ready_file(text, INPUTS_NAMESPACE, ".safetensors"),
+        )
+        selected.append(cache.document())
+        return cache, ()
+
+    monkeypatch.setattr(panel, "ROOT", tmp_path)
+    monkeypatch.setattr(panel, "labels", lambda: ("production-00",))
+    monkeypatch.setattr(
+        panel, "load_producer_context",
+        lambda: (SimpleNamespace(), track, None, None, {"production-00": plan}),
+    )
+    monkeypatch.setattr(panel, "record_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "WorkerPool", Workers)
+    monkeypatch.setattr(service, "_build_selected_sample_cache", export_inputs)
+    (tmp_path / "runtime-verification.json").write_text("{}")
+
+    panel.generate()
+    report = json.loads((tmp_path / "batches/production-00.json").read_text())
+    batch = inspect_exact_cache_batch(report["exact_path"], max_bytes=1_000_000)
+    assert len(batch.cases) == len(cases)
+    assert batch.sample_cache == report["selected_inputs"] == selected[0]
+    assert len(batch.dense_references) == len(results)
+    assert report["exact_sha256"] == batch.sha256
+    panel.generate()
+    assert calls == ["start", "generate", "close"]
+
+
 def test_panel_positive_and_negative_directions_are_required():
     result = panel._directional_gates(controls(), 0.02, 0.005, "production-00")
     assert result["reverse_veda_vs_shuffled"]["promoted"] is True

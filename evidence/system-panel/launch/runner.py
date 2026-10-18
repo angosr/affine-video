@@ -677,7 +677,7 @@ def generate() -> None:
                 source_pool_merkle_root=track.source_pool_merkle_root,
                 source_proofs=tuple(proof.document() for proof in plan.source_proofs),
                 dense_references=tuple(reference.document() for reference in references),
-                selected_inputs=selected_cache.document(),
+                sample_cache=selected_cache.document(),
             )
             inspected = inspect_exact_cache_batch(exact.path, max_bytes=track.cache.exact_max_bytes)
             if inspected.sha256 != exact.sha256 or len(inspected.cases) != track.scoring.case_count:
