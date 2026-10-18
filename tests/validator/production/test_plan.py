@@ -1,6 +1,7 @@
 import hashlib
 import json
 import queue
+import shutil
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -57,7 +58,7 @@ from validator.production.service import (
     _work_directory_lock,
     _write_unit_completion,
 )
-from validator.production.storage import PreconditionFailed, StoredObject
+from validator.production.storage import LocalBatchStore, PreconditionFailed, StoredObject
 from validator.queue import ChainPosition, ChallengeState
 
 
@@ -575,12 +576,112 @@ class AttemptObjects:
     def get(self, name):
         return StoredObject(self.values[name], hashlib.sha256(self.values[name]).hexdigest())
 
+    def get_optional(self, name):
+        return self.get(name) if name in self.values else None
+
     def create_plan(self, name, payload):
         existing = self.values.get(name)
         if existing is not None and existing != payload:
             raise PreconditionFailed("different bytes")
         self.values[name] = payload
         return self.get(name)
+
+
+def test_gpu_local_ready_regeneration_preserves_binding_and_blocks_changed_bytes(
+    tmp_path, monkeypatch,
+) -> None:
+    """Storage/orchestration regression, not GPU determinism or score evidence."""
+
+    plan = build_plan(
+        track_spec_digest="ab" * 32, generation_block=120,
+        block_hash="0x" + "cd" * 32, track_start_block=100,
+        minimum_generation_delay_blocks=1, generation_interval_blocks=20,
+        exact_challenge_ids=("challenge",), confirmation_challenge_ids=(),
+        source_proofs=(proof(0), proof(1)), scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+
+    class Objects(AttemptObjects):
+        def replace_plan(self, name, payload, *, etag):
+            assert self.get(name).etag == etag
+            self.values[name] = payload
+            return self.get(name)
+
+        def put_content(self, *_args, **_kwargs):
+            pytest.fail("hidden batch bytes must never be uploaded")
+
+    objects = Objects({"plans/120.json": plan.encode()})
+    service = object.__new__(ProducerService)
+    service.objects = objects
+    service.config = SimpleNamespace(work_dir=tmp_path / "work")
+    service.track = SimpleNamespace(
+        digest=plan.track_spec_digest, artifact_manifest_sha256="34" * 32,
+        source_pool_merkle_root="56" * 32, cache=SimpleNamespace(exact_max_bytes=10**9),
+    )
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+
+    def input_file(name, payload):
+        path = input_dir / name
+        path.write_bytes(payload)
+        return path, production_service._ready_file(path, "inputs", path.suffix)
+
+    index_path, index = input_file("index.json", b'{"samples":[]}')
+    text_path, text = input_file("text.safetensors", b"inputs")
+    inputs = ReadySampleCache(index, text)
+    monkeypatch.setattr(
+        production_service, "_build_selected_sample_cache",
+        lambda *_args: (inputs, ((index_path, index), (text_path, text))),
+    )
+    payload = [b"deterministic exact fixture"]
+
+    def assemble(directory, *_args, **_kwargs):
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "batch.npz"
+        path.write_bytes(payload[0])
+        return SimpleNamespace(path=path, sha256=hashlib.sha256(payload[0]).hexdigest())
+
+    monkeypatch.setattr(production_service, "assemble_exact_cache_batch", assemble)
+
+    class Workers:
+        def run(self, pending, **_kwargs):
+            results = []
+            for index, rollout in enumerate(pending.rollouts):
+                video = tmp_path / f"{index}.mp4"
+                latent = tmp_path / f"{index}.safetensors"
+                video.write_bytes(f"video-{index}".encode())
+                latent.write_bytes(f"latent-{index}".encode())
+                results.append(UnitResult(
+                    rollout.rollout_id, "unused-shard", str(video), str(latent), 1, 0,
+                ))
+            return tuple(results)
+
+    ready = service._execute(
+        "plans/120.json", objects.get("plans/120.json"), plan, Workers(),
+        deadline=time.monotonic() + 30,
+    )
+    assert ready.state == "READY"
+    assert not service._needs_regeneration(ready)
+    immutable_ready = objects.get("plans/120.json")
+    objects.create_plan("stages/challenge/SCORING.json", b"immutable scored result")
+    shutil.rmtree(service.content.root)
+    assert service._needs_regeneration(ready)
+    recovered = service._execute(
+        "plans/120.json", immutable_ready, ready, Workers(), deadline=time.monotonic() + 30,
+    )
+    assert recovered.encode() == immutable_ready.body
+    assert objects.get("plans/120.json") == immutable_ready
+    assert not service._needs_regeneration(ready)
+    shutil.rmtree(service.content.root)
+    payload[0] = b"non-reproducible replacement"
+    with pytest.raises(RuntimeError, match="SYSTEM_BLOCKED"):
+        service._execute(
+            "plans/120.json", immutable_ready, ready, Workers(), deadline=time.monotonic() + 30,
+        )
+    assert objects.get("plans/120.json") == immutable_ready
+    assert objects.get("stages/challenge/SCORING.json").body == b"immutable scored result"
+    assert objects.get_optional(f"interruptions/{plan.plan_digest}.json") is not None
+    assert not service._needs_regeneration(ready)  # durable stop, not an endless GPU retry
 
 
 def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
@@ -610,6 +711,7 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
     assert len(durable) == 5
     assert _reserve_plan_attempt(AttemptObjects(durable), plan, now_ms=3_600_100) == 6
     assert _reserve_plan_attempt(AttemptObjects(durable), plan, now_ms=3_600_101) is None
+    completed = []
 
     class Store:
         def __enter__(self):
@@ -626,6 +728,8 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
             return None
 
         def plans(self):
+            if completed:
+                return ()
             return (("plans/120.json", StoredObject(plan.encode(), "etag"), plan),)
 
     service = object.__new__(ProducerService)
@@ -647,7 +751,6 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
         service._run_locked(once=True)
     clock = [3_600_101]
     closed = []
-    completed = []
     sleeps = []
     probes = []
     alerts = []
@@ -751,6 +854,8 @@ def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
         def plans(self):
             fail("list")
             fail("timeout")
+            if completed:
+                return ()
             return (("plans/120.json", StoredObject(plan.encode(), "etag"), plan),)
 
     real_reserve = production_service._reserve_plan_attempt
@@ -1016,7 +1121,7 @@ def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch) -> 
     assert "could not start" in alerts[0][1]["error"]
 
 
-@pytest.mark.parametrize("slow_step", ["upload", "assembly"])
+@pytest.mark.parametrize("slow_step", ["local-storage", "assembly"])
 def test_producer_attempt_deadline_covers_post_generation_work(
     tmp_path, monkeypatch, slow_step
 ) -> None:
@@ -1053,10 +1158,9 @@ def test_producer_attempt_deadline_covers_post_generation_work(
             assert deadline == 10.0
             return (UnitResult(plan.rollouts[0].rollout_id, "shard", "video", "latent", 1, 0),)
 
-    class Objects:
-        def put_content(self, *_args, **_kwargs):
-            if slow_step == "upload":
-                clock["now"] = 11.0
+    def retain(*_args):
+        if slow_step == "local-storage":
+            clock["now"] = 11.0
 
     def assemble(*_args, **_kwargs):
         clock["now"] = 11.0
@@ -1065,7 +1169,7 @@ def test_producer_attempt_deadline_covers_post_generation_work(
     if slow_step == "assembly":
         monkeypatch.setattr(production_service, "assemble_exact_cache_batch", assemble)
     service = object.__new__(ProducerService)
-    service.objects = Objects()
+    service._retain_content = retain
     service.config = SimpleNamespace(work_dir=tmp_path)
     service.track = SimpleNamespace(
         digest="ab" * 32,
@@ -1084,7 +1188,7 @@ def test_producer_attempt_deadline_covers_post_generation_work(
         )
 
 
-@pytest.mark.parametrize("blocking_step", ["upload", "assembly"])
+@pytest.mark.parametrize("blocking_step", ["local-storage", "assembly"])
 def test_producer_attempt_deadline_interrupts_blocking_post_generation_work(
     tmp_path, monkeypatch, blocking_step
 ) -> None:
@@ -1119,13 +1223,9 @@ def test_producer_attempt_deadline_interrupts_blocking_post_generation_work(
             assert deadline > time.monotonic()
             return (UnitResult(plan.rollouts[0].rollout_id, "shard", "video", "latent", 1, 0),)
 
-    class Objects:
-        def put_content(self, *_args, **_kwargs):
-            if blocking_step == "upload":
-                try:
-                    time.sleep(1)
-                except Exception as exc:
-                    raise AssertionError("SDK swallowed the deadline interrupt") from exc
+    def retain(*_args):
+        if blocking_step == "local-storage":
+            time.sleep(1)
 
     def assemble(*_args, **_kwargs):
         time.sleep(1)
@@ -1134,7 +1234,7 @@ def test_producer_attempt_deadline_interrupts_blocking_post_generation_work(
     if blocking_step == "assembly":
         monkeypatch.setattr(production_service, "assemble_exact_cache_batch", assemble)
     service = object.__new__(ProducerService)
-    service.objects = Objects()
+    service._retain_content = retain
     service.config = SimpleNamespace(work_dir=tmp_path)
     service.track = SimpleNamespace(
         digest="ab" * 32,
@@ -1437,21 +1537,14 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
         sample_cache=ready_sample_cache(),
     )
 
-    class Objects:
-        @staticmethod
-        def download_content(_object_name, destination, *, sha256, size_bytes):
-            payload = inconsistent.path.read_bytes()
-            assert hashlib.sha256(payload).hexdigest() == sha256
-            assert len(payload) == size_bytes
-            target = Path(destination)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(payload)
-            return target
-
     source = ReadyBatchSource(
         track=track,
-        objects=Objects(),
+        objects=object(),
         cache_dir=tmp_path / "restored-inconsistent",
+    )
+    source.content.put(
+        inconsistent.path, sha256=inconsistent.sha256,
+        size_bytes=inconsistent.path.stat().st_size,
     )
     with pytest.raises(RuntimeError, match="restored exact batch is invalid"):
         source._restore_exact(inconsistent_ready)
@@ -1567,10 +1660,18 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
             return path
 
     objects = Objects()
+    content_dir = tmp_path / "content"
+    content_store = LocalBatchStore(content_dir)
+    for key, content in payloads.items():
+        path = tmp_path / "seed" / key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        content_store.put(path, sha256=hashlib.sha256(content).hexdigest(), size_bytes=len(content))
     source = ReadyBatchSource(
         track=track,
         objects=objects,
         cache_dir=tmp_path,
+        batch_dir=content_dir,
     )
     exact_path = tmp_path / "exact-source.npz"
     exact_path.write_bytes(b"exact")

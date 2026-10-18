@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import tempfile
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,7 +21,7 @@ from validator.chunks import (
     read_part,
     verify_chunked_content,
 )
-from validator.production.commitment import Artifact, ArtifactManifest
+from validator.production.commitment import Artifact
 from validator.s3 import client_config
 
 ADMISSIONS_NAMESPACE = "admissions"
@@ -39,20 +41,18 @@ SOURCE_POOL_OBJECT = "bootstrap/source_pool.json"
 _EVALUATOR_LIST_NAMESPACES = (PLANS_NAMESPACE,)
 _EVALUATOR_READ_NAMESPACES = (
     ADMISSIONS_NAMESPACE,
-    ARTIFACTS_NAMESPACE,
     CAPABILITY_PROBES_NAMESPACE,
-    EXACT_NAMESPACE,
-    INPUTS_NAMESPACE,
-    LATENTS_NAMESPACE,
+    "disclosed",
+    "interruptions",
     MODELS_NAMESPACE,
     PLANS_NAMESPACE,
     RETRY_STATE_NAMESPACE,
     STAGES_NAMESPACE,
-    VIDEOS_NAMESPACE,
 )
 _EVALUATOR_WRITE_NAMESPACES = (
     ADMISSIONS_NAMESPACE,
     CAPABILITY_PROBES_NAMESPACE,
+    "disclosed",
     MODELS_NAMESPACE,
     RETRY_STATE_NAMESPACE,
     STAGES_NAMESPACE,
@@ -161,6 +161,105 @@ class PreconditionFailed(StorageError):
 class StoredObject:
     body: bytes
     etag: str
+
+
+class LocalBatchStore:
+    """One GPU-local immutable content store shared by producer and evaluator.
+
+    Object keys remain disclosure identifiers, not private S3 locations. Runtime
+    assets and the full hidden source pool must not be placed in this directory.
+    """
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        self._verified: dict[str, tuple[int, int, int, int]] = {}
+
+    def path(self, sha256: str) -> Path:
+        if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
+            raise ValueError("local batch digest must be lowercase SHA-256")
+        return self.root / sha256
+
+    def get(self, *, sha256: str, size_bytes: int) -> Path:
+        path = self.path(sha256)
+        try:
+            stat = path.stat()
+            identity = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            if not path.is_file() or stat.st_size != size_bytes:
+                raise StorageError("local batch content is missing or has the wrong size")
+            if self._verified.get(sha256) != identity:
+                with path.open("rb") as handle:
+                    digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                after = path.stat()
+                if digest != sha256 or identity != (
+                    after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+                ):
+                    raise StorageError("local batch content failed SHA-256 verification")
+                self._verified[sha256] = identity
+            return path
+        except OSError as exc:
+            raise StorageError(
+                "GPU batch content is unavailable; original plan needs regeneration"
+            ) from exc
+
+    def put(self, source: str | Path, *, sha256: str, size_bytes: int) -> Path:
+        """Seal a completed output without uploading or duplicating its large bytes."""
+
+        source = Path(source)
+        self.root.mkdir(parents=True, exist_ok=True)
+        destination = self.path(sha256)
+        with source.open("rb") as handle:
+            if (
+                os.fstat(handle.fileno()).st_size != size_bytes
+                or hashlib.file_digest(handle, "sha256").hexdigest() != sha256
+            ):
+                raise StorageError("completed batch content disagrees with its descriptor")
+            os.fsync(handle.fileno())
+        try:
+            os.link(source, destination)
+        except FileExistsError:
+            try:
+                self.get(sha256=sha256, size_bytes=size_bytes)
+            except StorageError:
+                temporary = destination.with_name(f".{sha256}.{uuid.uuid4().hex}")
+                try:
+                    os.link(source, temporary)
+                    os.replace(temporary, destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        except OSError:
+            # Cross-device deployment is valid, but still uses a single final CAS file.
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=self.root, delete=False) as output:
+                    temporary = Path(output.name)
+                    with source.open("rb") as handle:
+                        shutil.copyfileobj(handle, output, 1024 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+                with suppress(FileExistsError):
+                    os.link(temporary, destination)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        directory_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return self.get(sha256=sha256, size_bytes=size_bytes)
+
+    def materialize(self, destination: Path, *, sha256: str, size_bytes: int) -> Path:
+        source = self.get(sha256=sha256, size_bytes=size_bytes)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink() and destination.resolve() == source.resolve():
+            return destination
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}")
+        try:
+            temporary.symlink_to(source.resolve())
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
 
 
 class PrivateObjectStore:
@@ -359,73 +458,10 @@ class PrivateObjectStore:
             raise StorageError(f"private bootstrap object is empty: {name}")
         return self.create_plan(name, payload).body
 
-    def ensure_artifacts(
-        self,
-        manifest: ArtifactManifest,
-        root: str | Path,
-        *,
-        logical_names: tuple[str, ...] | None = None,
-    ) -> None:
-        """Mirror committed runtime bytes and restore any missing local artifact."""
-
-        self._sync_artifacts(manifest, root, logical_names=logical_names, mirror=True)
-
-    def restore_artifacts(
-        self,
-        manifest: ArtifactManifest,
-        root: str | Path,
-        *,
-        logical_names: tuple[str, ...],
-    ) -> None:
-        """Restore selected evaluator artifacts without attempting any object writes."""
-
-        self._sync_artifacts(manifest, root, logical_names=logical_names, mirror=False)
-
-    def _sync_artifacts(
-        self,
-        manifest: ArtifactManifest,
-        root: str | Path,
-        *,
-        logical_names: tuple[str, ...] | None,
-        mirror: bool,
-    ) -> None:
-        base = Path(root)
-        base.mkdir(parents=True, exist_ok=True)
-        selected = None if logical_names is None else set(logical_names)
-        known = {artifact.logical_name for artifact in manifest.artifacts}
-        if selected is not None and (not selected or not selected <= known):
-            raise ValueError("selected artifact names are empty or absent from the manifest")
-        for artifact in manifest.artifacts:
-            if selected is not None and artifact.logical_name not in selected:
-                continue
-            path = base / artifact.logical_name
-            local_manifest = None
-            if mirror and path.is_file() and path.stat().st_size == artifact.size_bytes:
-                try:
-                    local_manifest = build_chunk_manifest(path)
-                except ValueError:
-                    local_manifest = None
-            if (
-                local_manifest is not None
-                and local_manifest.sha256 == artifact.sha256
-                and local_manifest.size == artifact.size_bytes
-            ):
-                self._put_content(
-                    path,
-                    local_manifest,
-                    object_name=artifact.object_key,
-                )
-            else:
-                self.download_content(
-                    artifact.object_key,
-                    path,
-                    sha256=artifact.sha256,
-                    size_bytes=artifact.size_bytes,
-                )
-
     def put_content(self, path: str | Path, *, sha256: str, object_name: str) -> None:
         """Upload one immutable file as storage-limit-safe verified chunks."""
 
+        _reject_hidden_batch_transport(object_name)
         source = Path(path)
         if not source.is_file():
             raise StorageError("content source is missing or its SHA-256 is wrong")
@@ -531,6 +567,7 @@ class PrivateObjectStore:
     ) -> Path:
         """Restore immutable content through a checked atomic local rename."""
 
+        _reject_hidden_batch_transport(object_name)
         if size_bytes <= 0:
             raise ValueError("content size must be positive")
         target = Path(destination)
@@ -606,6 +643,13 @@ class PrivateObjectStore:
         if not normalized or any(part in {"", ".", ".."} for part in normalized.split("/")):
             raise ValueError("private object name is invalid")
         return f"{self._prefix}/{normalized}"
+
+
+def _reject_hidden_batch_transport(object_name: str) -> None:
+    if object_name.split("/", 1)[0] in {
+        EXACT_NAMESPACE, INPUTS_NAMESPACE, LATENTS_NAMESPACE, VIDEOS_NAMESPACE,
+    }:
+        raise StorageError("hidden batch payloads are GPU-local, not private S3 objects")
 
 
 def _storage_credentials(role: str) -> tuple[str, str, str]:

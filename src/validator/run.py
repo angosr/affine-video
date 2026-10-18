@@ -356,7 +356,6 @@ async def run_evaluator(
         if manifest.digest != track.artifact_manifest_sha256:
             raise ValueError("artifact manifest does not match the track commitment")
         _require_production_release(track, runtime_manifest_payload, publisher)
-        evaluator_artifacts = data_config.evaluator_artifact_names(manifest)
         hidden_artifacts = tuple(
             artifact
             for artifact in manifest.artifacts
@@ -366,16 +365,12 @@ async def run_evaluator(
             )
         )
         objects.verify_evaluator_boundary(hidden_artifacts)
-        objects.restore_artifacts(
-            manifest,
-            data_config.evaluator_artifact_root,
-            logical_names=evaluator_artifacts,
-        )
         data_config.verify_evaluator_manifest(manifest)
         batch_source = ReadyBatchSource(
             track=track,
             objects=objects,
             cache_dir=cache_dir,
+            batch_dir=data_config.work_dir / "content",
             validation_device=scoring_device,
         )
         retry_store = PrivateRetryStore(objects, track_spec_digest=track.digest)

@@ -520,6 +520,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
                     hashlib.sha256(payload).hexdigest(), len(payload),
                 )
                 paths[item.object_key] = path
+                source.content.put(path, sha256=item.sha256, size_bytes=item.size_bytes)
                 return item
 
             exact = content("batch.npz")

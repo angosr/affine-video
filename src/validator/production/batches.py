@@ -1,4 +1,4 @@
-"""Restore authoritative READY evaluation batches from private object storage."""
+"""Resolve GPU-local READY bytes and archive small authoritative decisions."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from validator.production.commitment import canonical_json, verify_source_proof
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
+    ReadyObject,
     ReadySampleCache,
     build_plan,
     select_query_tiles,
@@ -41,6 +42,7 @@ from validator.production.storage import (
     PLANS_NAMESPACE,
     STAGES_NAMESPACE,
     VIDEOS_NAMESPACE,
+    LocalBatchStore,
     PrivateObjectStore,
 )
 
@@ -106,11 +108,15 @@ class ReadyBatchSource:
         track: TrackSpec,
         objects: PrivateObjectStore,
         cache_dir: str | Path,
+        batch_dir: str | Path | None = None,
         validation_device: str | None = None,
     ) -> None:
         self.track = track
         self.objects = objects
         self.cache_dir = Path(cache_dir)
+        self.content = LocalBatchStore(
+            self.cache_dir / "content" if batch_dir is None else batch_dir
+        )
         self.validation_device = validation_device
         self._validated_exact: set[str] = set()
 
@@ -336,8 +342,7 @@ class ReadyBatchSource:
         if plan.exact is None:
             raise RuntimeError("READY plan omitted its exact object")
         destination = self.cache_dir / f"{plan.generation_block}-{plan.exact.sha256}.npz"
-        path = self.objects.download_content(
-            plan.exact.object_key,
+        path = self.content.materialize(
             destination,
             sha256=plan.exact.sha256,
             size_bytes=plan.exact.size_bytes,
@@ -387,8 +392,7 @@ class ReadyBatchSource:
         references = []
         for reference in plan.dense_references:
             latent = reference.latent
-            path = self.objects.download_content(
-                latent.object_key,
+            path = self.content.materialize(
                 destination / f"{latent.sha256}.safetensors",
                 sha256=latent.sha256,
                 size_bytes=latent.size_bytes,
@@ -409,8 +413,7 @@ class ReadyBatchSource:
         destination.mkdir(parents=True, exist_ok=True)
         objects = (("index.json", selected.index), ("text.safetensors", selected.text))
         for name, item in objects:
-            self.objects.download_content(
-                item.object_key,
+            self.content.materialize(
                 destination / name,
                 sha256=item.sha256,
                 size_bytes=item.size_bytes,
@@ -420,8 +423,7 @@ class ReadyBatchSource:
             if condition_path.exists():
                 condition_path.unlink()
         else:
-            self.objects.download_content(
-                selected.condition.object_key,
+            self.content.materialize(
                 condition_path,
                 sha256=selected.condition.sha256,
                 size_bytes=selected.condition.size_bytes,
@@ -473,8 +475,7 @@ class ReadyBatchSource:
                 ("video", reference.video, ".mp4"),
                 ("latent", reference.latent, ".safetensors"),
             ):
-                path = self.objects.download_content(
-                    item.object_key,
+                path = self.content.materialize(
                     directory / f"{item.sha256}{suffix}",
                     sha256=item.sha256,
                     size_bytes=item.size_bytes,
@@ -538,14 +539,28 @@ class ReadyBatchSource:
         return plan
 
     def prune_disclosed(self, terminal_challenge_ids: set[str]) -> int:
-        """Remove only local copies of READY batches whose whole group is terminal."""
+        """Called only after publication; retain a small durable disclosure fence."""
 
         removed = 0
-        for _name, plan in self._plans():
+        plans = self._plans()
+        retained = {
+            item.sha256
+            for _name, plan in plans
+            if not set(plan.exact_challenge_ids + plan.confirmation_challenge_ids)
+            <= terminal_challenge_ids
+            for item in ready_objects(plan)
+        }
+        for _name, plan in plans:
             references = set(plan.exact_challenge_ids + plan.confirmation_challenge_ids)
             if plan.state != "READY" or not references or not references <= terminal_challenge_ids:
                 continue
             assert plan.exact is not None
+            self.objects.create_plan(
+                f"disclosed/{plan.plan_digest}.json",
+                canonical_json({
+                    "plan_digest": plan.plan_digest, "exact_sha256": plan.exact.sha256,
+                }),
+            )
             exact = self.cache_dir / f"{plan.generation_block}-{plan.exact.sha256}.npz"
             if exact.is_file():
                 exact.unlink()
@@ -562,6 +577,9 @@ class ReadyBatchSource:
             if disclosure.is_dir():
                 shutil.rmtree(disclosure)
                 removed += 1
+            for item in ready_objects(plan):
+                if item.sha256 not in retained:
+                    self.content.path(item.sha256).unlink(missing_ok=True)
         return removed
 
     def _plan_for(self, challenge_id: str, *, confirmation: bool) -> BatchPlan:
@@ -577,6 +595,12 @@ class ReadyBatchSource:
         if len(matches) > 1:
             raise RuntimeError("challenge is assigned to multiple private plans")
         if matches and matches[0].state == "READY":
+            interruption = f"interruptions/{matches[0].plan_digest}.json"
+            if self.objects.get_optional(interruption) is not None:
+                raise RuntimeError(
+                    "SYSTEM_INTERRUPTED: original READY cannot be restored; "
+                    "challenge remains in FIFO awaiting verifiable replacement data"
+                )
             return matches[0]
         if matches:
             raise RuntimeError("challenge batch is not READY")
@@ -648,6 +672,16 @@ class ReadyBatchSource:
                 for item, namespace in objects
             ):
                 raise RuntimeError("READY plan object is outside its runtime namespace")
+
+
+def ready_objects(plan: BatchPlan) -> tuple[ReadyObject, ...]:
+    if plan.exact is None or plan.sample_cache is None:
+        return ()
+    return (
+        plan.exact, plan.sample_cache.index, plan.sample_cache.text,
+        *((plan.sample_cache.condition,) if plan.sample_cache.condition is not None else ()),
+        *(item for ref in plan.dense_references for item in (ref.video, ref.latent)),
+    )
 
 
 def validate_selected_sample_cache(path: Path, plan: BatchPlan) -> None:

@@ -16,7 +16,8 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from scoring.cache import (
 )
 from scoring.spec import TrackSpec, load_track_spec, required_production_sources_per_stratum
 from validator.alerts import webhook_alerter
+from validator.production.batches import ready_objects
 from validator.production.commitment import (
     ArtifactManifest,
     SourcePool,
@@ -60,8 +62,10 @@ from validator.production.storage import (
     SOURCE_POOL_OBJECT,
     STAGES_NAMESPACE,
     VIDEOS_NAMESPACE,
+    LocalBatchStore,
     PreconditionFailed,
     PrivateObjectStore,
+    StorageError,
     StoredObject,
 )
 from validator.production.workers import close_workers
@@ -389,6 +393,10 @@ class WorkerPool:
 
 
 class ProducerService:
+    @cached_property
+    def content(self) -> LocalBatchStore:
+        return LocalBatchStore(self.config.work_dir / "content")
+
     def __init__(
         self,
         config: ProducerConfig,
@@ -415,7 +423,6 @@ class ProducerService:
         )
         if self.manifest.digest != self.track.artifact_manifest_sha256:
             raise ValueError("artifact manifest does not match the track commitment")
-        self.objects.ensure_artifacts(self.manifest, config.artifact_root)
         config.verify_manifest(self.manifest)
         self.pool = load_bound_source_pool(
             source_pool_payload,
@@ -450,19 +457,21 @@ class ProducerService:
                         ) as store,
                     ):
                         cursor = store.chain_cursor()
-                        if cursor is not None and cursor[0] > self.track.track_close_block:
-                            return
                         coordinator = PlanCoordinator(
                             track=self.track,
                             store=store,
                             objects=self.objects,
                             source_pool=self.pool,
                         )
-                        created = coordinator.create_next()
+                        closed = cursor is not None and cursor[0] > self.track.track_close_block
+                        created = None if closed else coordinator.create_next()
                         plans = coordinator.plans()
                         pending = next(
-                            (row for row in plans if row[2].state == "PLANNED"), None,
+                            (row for row in plans if row[2].state == "PLANNED"
+                             or self._needs_regeneration(row[2])), None,
                         )
+                        if closed and pending is None:
+                            return
                         retained = _retained_plan_digests(plans)
                         attempt = (
                             None if pending is None
@@ -515,6 +524,8 @@ class ProducerService:
                         if workers is not None:
                             workers.close()
                         workers = None
+                        if plan.state == "READY" and attempt >= _FAST_PLAN_ATTEMPTS:
+                            self._interrupt(plan, "REGENERATION_EXHAUSTED")
                         if self.alert is not None and (
                             attempt == 1 or attempt >= _FAST_PLAN_ATTEMPTS
                         ):
@@ -585,13 +596,9 @@ class ProducerService:
         for result in results:
             video = _ready_file(Path(result.video_path), VIDEOS_NAMESPACE, ".mp4")
             latent = _ready_file(Path(result.latent_path), LATENTS_NAMESPACE, ".safetensors")
-            self.objects.put_content(
-                result.video_path, sha256=video.sha256, object_name=video.object_key
-            )
+            self._retain_content(Path(result.video_path), video)
             _require_before_deadline(deadline)
-            self.objects.put_content(
-                result.latent_path, sha256=latent.sha256, object_name=latent.object_key
-            )
+            self._retain_content(Path(result.latent_path), latent)
             _require_before_deadline(deadline)
             references.append(DenseReference(result.rollout_id, video, latent))
         directory = self.config.work_dir / plan.plan_digest / "batch"
@@ -601,7 +608,7 @@ class ProducerService:
             directory / "sample-cache",
         )
         for path, item in cache_files:
-            self.objects.put_content(path, sha256=item.sha256, object_name=item.object_key)
+            self._retain_content(path, item)
             _require_before_deadline(deadline)
         batch = assemble_exact_cache_batch(
             directory,
@@ -624,13 +631,22 @@ class ProducerService:
             batch.sha256,
             batch.path.stat().st_size,
         )
-        self.objects.put_content(batch.path, sha256=exact.sha256, object_name=exact.object_key)
+        self._retain_content(batch.path, exact)
         _require_before_deadline(deadline)
-        ready = plan.ready(
+        planned = replace(plan, state="PLANNED", exact=None, dense_references=(), sample_cache=None)
+        ready = planned.ready(
             exact=exact,
             dense_references=tuple(references),
             sample_cache=selected_cache,
         )
+        if plan.state == "READY":
+            if ready.encode() != plan.encode():
+                self._interrupt(plan, "REGENERATION_MISMATCH")
+                raise RuntimeError(
+                    "SYSTEM_BLOCKED: regenerated bytes differ from immutable READY; "
+                    "original challenge and stage facts are preserved"
+                )
+            return plan
         try:
             self.objects.replace_plan(name, ready.encode(), etag=stored.etag)
         except PreconditionFailed:
@@ -642,6 +658,35 @@ class ProducerService:
             return winner
         _require_before_deadline(deadline)
         return ready
+
+    def _retain_content(self, path: Path, item: ReadyObject) -> None:
+        self.content.put(
+            path, sha256=item.sha256, size_bytes=item.size_bytes,
+        )
+
+    def _interrupt(self, plan: BatchPlan, reason: str) -> None:
+        name = f"interruptions/{plan.plan_digest}.json"
+        if self.objects.get_optional(name) is not None:
+            return
+        self.objects.create_plan(name, canonical_json({
+            "format": "veda-batch-interruption-v1",
+            "track_spec_digest": self.track.digest,
+            "plan_digest": plan.plan_digest,
+            "reason": reason,
+            "original_ready": plan.document(),
+        }))
+
+    def _needs_regeneration(self, plan: BatchPlan) -> bool:
+        if self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is not None:
+            return False
+        if self.objects.get_optional(f"interruptions/{plan.plan_digest}.json") is not None:
+            return False
+        try:
+            for item in ready_objects(plan):
+                self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)
+        except StorageError:
+            return True
+        return False
 
 
 def run_producer(config_path: str | Path, *, once: bool = False) -> None:
@@ -1182,7 +1227,7 @@ def _retained_plan_digests(
 
 
 def _prune_local_work(root: Path, retained: frozenset[str]) -> None:
-    """Remove only reconstructible, uploaded plan work older than the local safety tail."""
+    """Remove unit scratch only; sealed content remains until successful disclosure."""
 
     for child in root.iterdir():
         if (

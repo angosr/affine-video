@@ -10,6 +10,7 @@ from validator import chunks
 from validator.production.commitment import Artifact, ArtifactManifest
 from validator.production.storage import (
     RETRY_STATE_NAMESPACE,
+    LocalBatchStore,
     PreconditionFailed,
     PrivateObjectStore,
     StorageError,
@@ -99,7 +100,9 @@ def test_evaluator_iam_policy_is_derived_from_runtime_namespaces() -> None:
     encoded = json.dumps(policy, sort_keys=True)
     assert f"/tracks/test/{RETRY_STATE_NAMESPACE}/*" in encoded
     assert "/tracks/test/retries/*" not in encoded
-    assert "/tracks/test/videos/*" in encoded
+    assert "/tracks/test/disclosed/*" in encoded
+    for namespace in ("videos", "latents", "inputs", "exact", "artifacts"):
+        assert f"/tracks/test/{namespace}/*" not in encoded
     assert "/tracks/test/bootstrap/artifact_manifest.json" in encoded
 
 
@@ -462,71 +465,50 @@ def test_private_upload_and_restore_stream_and_close_actual_chunk_bodies(tmp_pat
     assert all(body.closed for body in bodies)
 
 
-@pytest.mark.parametrize("mirror", [False, True])
-def test_warm_artifact_sync_reads_local_bytes_once_before_final_verification(
-    tmp_path, monkeypatch, mirror,
-):
-    source = tmp_path / "model.bin"
-    data = b"runtime bytes"
-    source.write_bytes(data)
-    digest = hashlib.sha256(data).hexdigest()
-    manifest = ArtifactManifest((Artifact("model.bin", digest, len(data), f"artifacts/{digest}"),))
-    store = PrivateObjectStore(MemoryS3(), bucket="private", prefix="root")
-    store.put_content(source, sha256=digest, object_name=f"artifacts/{digest}")
-    read_bytes = 0
-    original_open = type(source).open
-
-    class Reader:
-        def __init__(self, stream):
-            self.stream = stream
-
-        def read(self, *args, **kwargs):
-            nonlocal read_bytes
-            content = self.stream.read(*args, **kwargs)
-            read_bytes += len(content)
-            return content
-
-        def __enter__(self):
-            self.stream.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self.stream.__exit__(*args)
-
-    def tracked_open(path, *args, **kwargs):
-        stream = original_open(path, *args, **kwargs)
-        return Reader(stream) if path == source else stream
-
-    monkeypatch.setattr(type(source), "open", tracked_open)
-    if mirror:
-        store.ensure_artifacts(manifest, tmp_path)
-    else:
-        store.restore_artifacts(manifest, tmp_path, logical_names=("model.bin",))
-    assert read_bytes == len(data)
-    manifest.verify_local(tmp_path)
-    assert read_bytes == 2 * len(data)
+def test_local_batch_content_is_shared_without_s3_and_detects_corruption(tmp_path):
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"video")
+    digest = hashlib.sha256(b"video").hexdigest()
+    producer = LocalBatchStore(tmp_path / "content")
+    sealed = producer.put(source, sha256=digest, size_bytes=5)
+    assert sealed.stat().st_ino == source.stat().st_ino
+    evaluator = LocalBatchStore(tmp_path / "content")
+    view = evaluator.materialize(tmp_path / "view/video.mp4", sha256=digest, size_bytes=5)
+    assert view.is_symlink() and view.read_bytes() == b"video"
+    source.unlink()
+    assert evaluator.get(sha256=digest, size_bytes=5) == sealed
+    sealed.write_bytes(b"other")
+    with pytest.raises(StorageError, match="SHA-256"):
+        evaluator.get(sha256=digest, size_bytes=5)
 
 
-@pytest.mark.parametrize("mirror", [False, True])
-def test_artifact_sync_restores_same_size_corrupted_local_bytes(tmp_path, mirror):
-    source = tmp_path / "model.bin"
-    source.write_bytes(b"model")
-    digest = hashlib.sha256(b"model").hexdigest()
-    manifest = ArtifactManifest((Artifact("model.bin", digest, 5, f"artifacts/{digest}"),))
-    store = PrivateObjectStore(MemoryS3(), bucket="private", prefix="root")
-    store.put_content(source, sha256=digest, object_name=f"artifacts/{digest}")
-    source.write_bytes(b"other")
-
-    if mirror:
-        store.ensure_artifacts(manifest, tmp_path)
-    else:
-        store.restore_artifacts(manifest, tmp_path, logical_names=("model.bin",))
-
-    assert source.read_bytes() == b"model"
-    manifest.verify_local(tmp_path)
+def test_local_batch_loss_requires_regeneration_and_never_reads_private_s3(tmp_path):
+    store = LocalBatchStore(tmp_path / "content")
+    digest = hashlib.sha256(b"input").hexdigest()
+    with pytest.raises(StorageError, match="regeneration"):
+        store.get(sha256=digest, size_bytes=5)
+    path = tmp_path / "regenerated"
+    path.write_bytes(b"input")
+    store.put(path, sha256=digest, size_bytes=5)
+    assert store.get(sha256=digest, size_bytes=5).read_bytes() == b"input"
+    with pytest.raises(StorageError, match="descriptor"):
+        store.put(path, sha256="00" * 32, size_bytes=5)
 
 
-def test_bootstrap_and_manifest_restore_survive_loss_of_local_artifacts(
+@pytest.mark.parametrize("namespace", ["exact", "inputs", "latents", "videos"])
+def test_private_store_rejects_retired_hidden_bulk_transport(tmp_path, namespace):
+    client = MemoryS3()
+    store = PrivateObjectStore(client, bucket="private", prefix="root")
+    with pytest.raises(StorageError, match="GPU-local"):
+        store.put_content(tmp_path / "absent", sha256="ab" * 32, object_name=f"{namespace}/a")
+    with pytest.raises(StorageError, match="GPU-local"):
+        store.download_content(
+            f"{namespace}/a", tmp_path / "absent", sha256="ab" * 32, size_bytes=1,
+        )
+    assert client.objects == {}
+
+
+def test_small_bootstrap_restore_does_not_upload_runtime_artifacts(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setattr(chunks, "CHUNK_BYTES", 4)
@@ -542,12 +524,12 @@ def test_bootstrap_and_manifest_restore_survive_loss_of_local_artifacts(
     store = PrivateObjectStore(client, bucket="private", prefix="tracks/abc")
 
     payload = store.ensure_bootstrap("bootstrap/artifact_manifest.json", bootstrap)
-    store.ensure_artifacts(ArtifactManifest.decode(payload), root)
     path.unlink()
     bootstrap.unlink()
 
     restored_payload = store.ensure_bootstrap("bootstrap/artifact_manifest.json", bootstrap)
-    store.ensure_artifacts(ArtifactManifest.decode(restored_payload), root)
 
     assert restored_payload == manifest.encode()
-    assert path.read_bytes() == b"abcdefghij"
+    assert not path.exists()
+    assert len(client.objects) == 1
+    assert payload == restored_payload
