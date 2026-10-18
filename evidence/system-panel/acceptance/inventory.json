@@ -408,7 +408,16 @@
         "observed_cases_above_fixed_10_percent_threshold": 30,
         "maximum_non_attention_over_dense_fraction": 0.10682635913483662,
         "threshold_changed": false,
-        "scope": "Same final-runtime E10 diagnostic and independent review: first/final layers and text107 only, original profile_components accounting, no claim of all50-layer or full E11 acceptance. Measurement uncertainty and independent confirmation remain unquantified."
+        "scope": "Same final-runtime E10 diagnostic and independent review: first/final layers and text107 only, original profile_components accounting, no claim of all50-layer or full E11 acceptance. Measurement uncertainty and independent confirmation remain unquantified.",
+        "static_layout_cache_probe": {
+          "paired_cases": 120,
+          "mask_and_output_mismatches": 0,
+          "median_cached_over_original_wall_ratio": 0.9784652126308471,
+          "cached_max_nonattention_fraction": 0.10641194086491923,
+          "cached_cases_above_fixed_threshold": 26,
+          "production_adopted": false,
+          "scope": "New paired no_grad cohort, same context as formal video runtime, not a relabeling of prior inference_mode timings. Small warm-path benefit does not meet full E11; cache state not added to production."
+        }
       },
       "id": "E11",
       "method": "分离测量 TripPool、残差投影、稳定 Top k、mask 准备和稀疏 attention",
@@ -418,6 +427,11 @@
           "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/independent-review.json",
           "sha256": "8a2f54a43b4ce3f332f8acff63f74ee8090791e41f5d5d2781b36ee9efa2b857",
           "scope": "Original CUDA component spans and wall medians independently recomputed; observed threshold misses retained without GPU reruns, threshold relaxation, source/parameter change or complete E11 claim"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/layout-cache-independent-review.json",
+          "sha256": "3bc320972daa4e67c37d2d215a8747e85b4319f778d86164e9f6ba5cb7839de2",
+          "scope": "120 paired original/prototype cases, strict native GPU mask/output equality and independently recomputed timings; 26 cached cases still exceed unchanged10% threshold. Prototype not adopted, no deployed or all50-layer claim."
         }
       ],
       "release_blocker": false,
@@ -667,59 +681,14 @@
       "actual_values": {
         "current_track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
         "current_runtime_source_commit": "b81bfa8",
-        "historical_d1b_counterexample": {
-          "track_spec_digest": "d1b387642e1da0fa35411c6d7ebfa830567a14e84be8c6163e2062afe4257260",
-          "cross_card_regenerated_units": 1,
-          "regenerated_shard_latent_and_video_hashes_equal": true,
-          "regeneration_seconds": 109.61946485890076,
-          "model_archive_probe_chunk_bytes": 41943040,
-          "model_archive_probe_roundtrip_seconds": 315.9163267230615,
-          "model_archive_probe_sha256_verified": true,
-          "model_archive_probe_temporary_objects_deleted": 2,
-          "whole_model_archive_throughput_measured": false,
-          "expanded_regeneration_rollouts": 16,
-          "expanded_regeneration_shard_hash_mismatches": 0,
-          "expanded_regeneration_joint_latent_hash_mismatches": 0,
-          "observed_regenerated_mp4_hash_mismatches": 5,
-          "shard_and_latent_hashes_equal_in_both_mismatches": true,
-          "decoded_video_equal_for_one_mismatching_pair": true,
-          "decoded_audio_equal_for_that_pair": false,
-          "candidate_c916_video_only_component": {
-            "runtime_file_sha256": "b8f1dd0c56b81fa07cda8735ba646a621eac8551272b99a7b6a3be7bc1b763a1",
-            "base_image_source_commit": "18e9c5c",
-            "real_exports": 64,
-            "same_card_identical_pairs": 32,
-            "cross_card_identical_corresponding_exports": 32,
-            "original_joint_latent_hash_matches": 64,
-            "source_videos": 16,
-            "geometries": 4,
-            "audio_streams_present": 0,
-            "frozen_runtime_acceptance_claimed": false
-          },
-          "public_s3_probe_chunk_bytes": 41943040,
-          "public_s3_probe_upload_seconds": 5.807924913708121,
-          "public_s3_probe_anonymous_sha_download_seconds": 10.106576198711991,
-          "public_s3_probe_objects_deleted": 1,
-          "whole_batch_regeneration_passed": false,
-          "whole_host_recovery_proven": false
-        },
-        "e91_component_regeneration": {
-          "image_id": "sha256:37210df90b861b0ad06ed9f84af612e296aca19d9ac5bb7b224e0728953b022c",
-          "physical_gpus": [
-            6,
-            7
-          ],
-          "videos": 16,
-          "qkv_mismatches": 0,
-          "joint_latent_mismatches": 0,
-          "mp4_mismatches": 0,
-          "scope": "Actual native producer units in fresh work directories; unchanged producer component versus b81, not b81 whole-host recovery"
-        },
         "current_production_plan_lifecycle": {
           "videos": 16,
           "exact_cases": 384,
           "generation_workers": 2,
-          "physical_gpus": [6, 7],
+          "physical_gpus": [
+            6,
+            7
+          ],
           "actual_service_constructors": 3,
           "actual_same_etag_cas_winners": 1,
           "actual_same_etag_cas_rejections": 1,
@@ -769,72 +738,30 @@
             "9:16@37": 240
           },
           "scope": "Fixed-byte source-cache integrity and declared input bounds only; not generated-batch throughput, joint GPU capacity or complete host recovery"
+        },
+        "current_ready_batch_data_loss_recovery": {
+          "actual_run_once_and_worker_pool": true,
+          "newly_regenerated_units": 16,
+          "byte_equal_unit_files": 48,
+          "complete_npz_byte_equal": true,
+          "complete_npz_bytes": 10364189042,
+          "authoritative_plan_writes_during_regeneration": 0,
+          "real_remote_attempt": 1,
+          "actual_private_s3_objects_after_run": 4,
+          "ready_body_and_etag_unchanged": true,
+          "initial_sqlite_work_units_and_content_empty": true,
+          "sqlite_challenge_or_stage_replay_claimed": false,
+          "static_assets_survived": true,
+          "whole_host_recovery_claimed": false,
+          "actual_run_seconds": 845.6014928277582,
+          "total_seconds_including_validation": 1045.1573085188866,
+          "scope": "Frozen860/3749 run(once=True), reservation, sixteen actual newly produced units and complete10.36GB NPZ byte comparison plus original CUDA Reader. Bootstrap/READY only cloned; empty SQLite has no admissions/stages, so not queue replay or static-asset/whole-host recovery. Older D1/E91 component evidence remains archived off-repository and in index history; current index uses this actual860 run instead."
         }
       },
       "id": "E18",
       "method": "压测上传校验、轻量缓存、精确缓存、完整视频、重试和故障恢复",
       "pass": false,
       "raw_evidence": [
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-gpu7.raw.log",
-          "sha256": "5da71af6f348ce8460b415d26e95bbb4e41da5d3caa99d38786e0d3ec4fa54e8",
-          "scope": "Historical D1B/component evidence: One real final-runtime producer rollout regenerated on a different H200 from an empty work directory; not whole-batch or whole-host recovery"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/model-transport-40m.raw.log",
-          "sha256": "f94a669d45403d44b432e24ec767be1e45dd3762d574524a0187c64e3a5e42ef",
-          "scope": "Historical D1B/component evidence: Actual 40 MiB PrivateObjectStore.put_content upload and full SHA-256 readback through the formal TLS/SSH endpoint; both temporary probe objects deleted; not whole-model admission or recovery"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-batch-gpu6-resume.raw.log",
-          "sha256": "9f2aa150c7899aaca2fac85a5a70a180ea6a2cb075e83d1524642b44a428214b",
-          "scope": "Historical D1B/component evidence: Failed expanded recovery probe: one regenerated unit has equal QKV/latent hashes but a different MP4 hash. Earlier probe logging failure is retained and linked; original outputs were not overwritten or resampled"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-batch-gpu7-resume.raw.log",
-          "sha256": "59cc0f41bc501f58b2457222ffba45cdd918bbef06dc9e534f0502c4147b0d8b",
-          "scope": "Historical D1B/component evidence: Independent H200 counterexample: regenerated QKV and latent bytes equal original, encoded MP4 differs; genuine failure is retained rather than marked accepted"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/mp4-regeneration-comparison.raw.log",
-          "sha256": "b3f1352b8abc782fa084f3fddc9d1033b4edd7699e9df67f1433d3e9652651ab",
-          "scope": "Historical D1B/component evidence: Actual FFmpeg decoded-stream comparison of one failed regeneration pair: decoded video hash equal, decoded audio hash different. Not a repaired recovery path or proof about all remaining rollouts"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-batch-gpu6-diagnostic.raw.log",
-          "sha256": "16b42db466053acdb4fb09b1e69ea79c6f561a49f4ca6fee7c587324dc816b35",
-          "scope": "Historical D1B/component evidence: All eight assigned pinned rollouts completed for diagnosis: original QKV/latent hashes all equal, three MP4 mismatches retained, nonzero exit; no resampling"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-batch-gpu7-diagnostic.raw.log",
-          "sha256": "99b96ec1867b5046b4f031baba50c83ab8d64610b18c8802595d3f3aeef6b553",
-          "scope": "Historical D1B/component evidence: Other eight pinned rollouts: original QKV/latent hashes all equal, two MP4 mismatches retained, nonzero exit"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/video-only-candidate-gpu6.raw.log",
-          "sha256": "b3b42c9d74b6f3bc9c41adc094bbeaf9596e594143eb2f52b1aa0f3bd869e16f",
-          "scope": "Historical D1B/component evidence: Exact candidate source override on frozen base: real VAE/FFmpeg, 16 saved sources exported twice, no audio, original joint latent bytes preserved; not a new frozen release acceptance or full-host recovery"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/video-only-candidate-gpu7.raw.log",
-          "sha256": "923885cc168dcaf869a9c02b0c868a7f6766679de7faff713d6398754a877e9c",
-          "scope": "Historical D1B/component evidence: Independent H200 candidate-source exports for the same 16 saved sources; all 32 corresponding MP4/latent hashes equal the other card, temporary outputs removed"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/public-chunk-transport.raw.log",
-          "sha256": "caa0c12f9a95dca2e48b700184221ea7518c6f16a43c80e696d5dab7ec78ed1a",
-          "scope": "Historical D1B/component evidence: Actual 40 MiB public S3 upload and anonymous canonical-URL SHA-256 readback, with unique probe object deleted; distinct from the slow private tunnel and not full-batch throughput"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-e91fa0e7/regeneration-batch-gpu6.raw.log",
-          "sha256": "867a17c8cccf1bdcd1c65a9168bcdcbc9dc6ab8cda5cfc16999f5e881a50702a",
-          "scope": "Actual frozen E91/372 cross-card regeneration of eight of sixteen units; original QKV/latent/MP4 SHA identical; not b81 whole-host restoration"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-e91fa0e7/regeneration-batch-gpu7.raw.log",
-          "sha256": "41a0e9ad2400b08e4cb22b3f339e72b9b7d8c91d3f62ba17f797fc68e1d05170",
-          "scope": "Actual frozen E91/372 cross-card regeneration of eight of sixteen units; original QKV/latent/MP4 SHA identical; not b81 whole-host restoration"
-        },
         {
           "path": "evidence/system-panel/acceptance-8608cf5d/fixed-input-envelope.json",
           "sha256": "43c7404630239fd9fb17c5eb2c4808d815bedd4d6e25a05b6139d4c387cf4c5a",
@@ -859,10 +786,20 @@
           "path": "private/production-plan-860-20261019-0205/controller-retry-independent-check.json",
           "sha256": "5f21fad43718c5d8cac1b5acd857646f445574f278017f707d7a1182f920ccc9",
           "scope": "Root actual S3 checkpoint GET plus SHA/quick_check of six sealed SQLite databases; real retry ceiling/idempotency/cold-state restoration and original FIFO eligibility at simulated cooldown expiry; failed observer/raw hashes retained, no retry reset or claimed push delivery"
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/ready-regeneration/gpu-small/result.json",
+          "sha256": "f3aa31be46c4ee96ae4d314cbfe2ac75c112f9948d84e5fda3ffe47981cd34b6",
+          "scope": "Actual original service scheduler and WorkerPool regenerate all16 units from an empty work/content/SQLite state, compare48 unit files and whole NPZ bytes, and restore CUDA Reader; static inputs survive, no unit reuse, chain/HF, scoring or entire-host claim."
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/ready-regeneration/controller-independent-check.json",
+          "sha256": "8e728d9c32269f083afa207725f4cf7948dd2b77fbf035d6f0a3949714e05d17",
+          "scope": "Root actual TLS S3 GET/List of all4 small objects, READY/attempt equality, all48 recorded bindings and empty SQLite integrity; no hidden bulk copied/rehashed. First observer SCORING-row expectation corrected to the actual intentionally empty recovery DB, no GPU rerun or state modification."
         }
       ],
       "release_blocker": false,
-      "status": "production_plan_cas_and_cold_retry_components_passed_full_recovery_pending",
+      "status": "current_batch_data_loss_recovery_verified_whole_host_and_capacity_pending",
       "subject": "评测容量"
     }
   ],
