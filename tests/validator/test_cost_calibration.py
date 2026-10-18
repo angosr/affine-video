@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from scoring.model import ModelValidationError, TensorSpec, validate_model
 from scoring.spec import parse_track_spec
 from tests.scoring.test_spec import valid_spec
 
@@ -17,6 +18,62 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 analysis = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(analysis)
+
+MEASUREMENT_SPEC = importlib.util.spec_from_file_location(
+    "cost_calibration", ROOT / "evidence/system-panel/launch/cost_calibration.py"
+)
+assert MEASUREMENT_SPEC and MEASUREMENT_SPEC.loader
+measurement = importlib.util.module_from_spec(MEASUREMENT_SPEC)
+MEASUREMENT_SPEC.loader.exec_module(measurement)
+
+
+@pytest.mark.parametrize("metadata", [None, {"hotkey": "fixed-control-owner"}])
+def test_cost_control_accepts_declared_owner_without_changing_identity(tmp_path, metadata):
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    path = tmp_path / "control.safetensors"
+    save_file({"weights": np.ones((2, 2), dtype=np.float16)}, path, metadata=metadata)
+    schema = {"weights": TensorSpec((2, 2), "float16")}
+    expected = validate_model(
+        path, schema=schema, max_bytes=1024,
+        expected_hotkey=None if metadata is None else metadata["hotkey"],
+    )
+    assert measurement.control_identity(path, schema=schema, max_bytes=1024) == {
+        "file_sha256": expected.file_sha256,
+        "model_digest": expected.model_digest,
+    }
+
+
+def test_cost_control_still_rejects_unrecognized_metadata(tmp_path):
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    path = tmp_path / "control.safetensors"
+    save_file(
+        {"weights": np.ones((2, 2), dtype=np.float16)}, path,
+        metadata={"hotkey": "fixed-control-owner", "extra": "not-permitted"},
+    )
+    with pytest.raises(ModelValidationError, match="only the submitting hotkey"):
+        measurement.control_identity(
+            path, schema={"weights": TensorSpec((2, 2), "float16")}, max_bytes=1024,
+        )
+
+
+def test_cost_control_owner_change_invalidates_registered_file_identity(tmp_path):
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    schema = {"weights": TensorSpec((2, 2), "float16")}
+    identities = []
+    for owner in ("original-control-owner", "different-control-owner"):
+        path = tmp_path / f"{owner}.safetensors"
+        save_file(
+            {"weights": np.ones((2, 2), dtype=np.float16)}, path, metadata={"hotkey": owner},
+        )
+        identities.append(measurement.control_identity(path, schema=schema, max_bytes=1024))
+    assert identities[0]["model_digest"] == identities[1]["model_digest"]
+    assert identities[0]["file_sha256"] != identities[1]["file_sha256"]
 
 
 def write(path, value):

@@ -29,6 +29,19 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def control_identity(path, *, schema, max_bytes):
+    """Validate fixed benchmark controls, not a miner's chain ownership."""
+
+    from safetensors import safe_open
+
+    from scoring.model import validate_model
+
+    with safe_open(path, framework="numpy") as tensors:
+        owner = (tensors.metadata() or {}).get("hotkey")
+    model = validate_model(path, schema=schema, max_bytes=max_bytes, expected_hotkey=owner)
+    return {"file_sha256": model.file_sha256, "model_digest": model.model_digest}
+
+
 def write_once(path, value):
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     if path.exists():
@@ -146,7 +159,6 @@ def run(arguments):
     from miowtion.veda.plan import PlanTable, TilePlan
     from safetensors import safe_open
 
-    from scoring.model import validate_model
     from scoring.spec import load_track_spec, track_spec_dict
     from validator.production import runtime
     from validator.production.environment import (
@@ -225,12 +237,11 @@ def run(arguments):
         model_name = "baseline_self" if name.startswith("pattern_") else name
         if name.startswith("pattern_") and name.removeprefix("pattern_") not in PATTERNS:
             raise ValueError("unknown mask pattern probe")
-        model = validate_model(
+        identities[name] = control_identity(
             arguments.controls / f"{model_name}.safetensors",
             schema=track.model.tensor_schema,
             max_bytes=track.model.max_bytes,
         )
-        identities[name] = {"file_sha256": model.file_sha256, "model_digest": model.model_digest}
     if identities != registration["model_identities"]:
         raise ValueError("cost model identities differ from preregistration")
     if sha256(arguments.predictor_bundle) != registration["predictor_bundle_sha256"]:

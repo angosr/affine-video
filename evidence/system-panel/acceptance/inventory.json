@@ -347,6 +347,23 @@
         "matched_budget_curve_spearman_min": 1.0,
         "live_cost_shape_median_relative_error_range": [0.15809427335877607, 0.21173196183345233],
         "live_cost_shape_p95_relative_error_range": [0.2371847097625259, 0.3197362491308101],
+        "recorded_control_sensitivity": {
+          "measured_global_cost_curves_replayed": 40,
+          "full_video_control_outcome_flips": 0,
+          "positive_full_video_lower_bound_range": [0.039722235385358365, 0.04107226488683644],
+          "recorded_exact_positive_lipschitz_floor": 0.01432551403343861,
+          "minimum_gain_unchanged": 0.005,
+          "scope": "One fixed 16-video control pair, original seed/resamples and frozen source. Finite recorded-statistic sensitivity only, not coverage or robustness of all legal/near-threshold models; no timing inference or live cost changes."
+        },
+        "fixed_control_metadata_preflight": {
+          "real_models_stream_validated": 3,
+          "owner_bearing_controls": 2,
+          "original_anonymous_only_failure_reproduced": true,
+          "benchmark_helper_corrected": true,
+          "miner_authentication_changed": false,
+          "gpu_devices_requested": false,
+          "scope": "Full existing 550MB-class files checked on GPU host, using original schema/finite/hash validator; declared metadata is not chain/HF authentication. Existing registration file hashes still enforced. No models created or modified."
+        },
         "cost_parameters_changed": false,
         "scope": "Synthetic BF16 packed QKV; original full production selector plus four legal mask probes, not necessarily realizable submitted projections. Original evaluator with live cost shape and optimistic per-geometry scales on the same measurements; not preregistered fit or independent confirmation, not all50 layers or whole-model throughput. All four observed geometry gates failed."
       },
@@ -363,6 +380,16 @@
           "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/independent-review.json",
           "sha256": "8a2f54a43b4ce3f332f8acff63f74ee8090791e41f5d5d2781b36ee9efa2b857",
           "scope": "Root independently rehashed result/raw/registration and recomputed all 120 aggregates and observed fixed-shape cost errors with original analysis helper; not independent GPU cohort or complete allocation-proof reconstruction"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/sensitivity-result.json",
+          "sha256": "17097f2f9912eeb36160281bc1ab9003ebafc6bda75922b25418f939410e5977",
+          "scope": "Original video bound across all40 observed cost curves; no fixed-control outcome flips. Analytic three-budget AUC sensitivity bounds the recorded exact gate. First report-only attribute error preserved; corrected CPU execution requires every lower bound bit-identical to its first-run raw, no GPU rerun or favorable-outcome selection."
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/control-preflight-result.json",
+          "sha256": "a2d3f44e1824e0b0282f6394455def783b16f5a20a89fd45cb89d773b15110c3",
+          "scope": "Actual frozen 860 runtime on GPU host: official baseline plus two owner-bearing fixed controls, original anonymous-only failure reproduced then full schema/finite/file and tensor digest validation through corrected benchmark helper; no GPU allocation, new models or miner ownership claim."
         }
       ],
       "release_blocker": false,
