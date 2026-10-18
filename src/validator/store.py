@@ -506,7 +506,7 @@ class ChallengeStore:
         return int(self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0])
 
     def has_season_slot(self, identifier: str) -> bool:
-        """Return whether one admission-eligible challenge consumed a season slot."""
+        """Return whether a challenge reserves or permanently consumed a season slot."""
 
         return (
             self._connection.execute(

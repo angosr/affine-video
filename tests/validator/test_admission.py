@@ -667,6 +667,8 @@ def test_archive_failure_defers_without_consuming_the_submission(tmp_path) -> No
         challenge = store.get_challenge(identifier)
         assert challenge.state is ChallengeState.SYSTEM_DEFERRED
         assert challenge.error_code == "MODEL_ARCHIVE_UNAVAILABLE"
+        assert store.has_season_slot(identifier)
+        assert store.effective_challenge_count() == 1
         assert store.leaderboard() == []
         assert alerts == [
             (
