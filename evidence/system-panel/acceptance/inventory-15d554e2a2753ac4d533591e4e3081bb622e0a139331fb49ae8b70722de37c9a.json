@@ -1,0 +1,247 @@
+{
+  "constraints": [
+    "No independent SCREEN stage; E17 measures exact gate retention of full-video top models.",
+    "Pilot thresholds must be registered before disjoint confirmation.",
+    "Canonical dense dfd6cbc evidence is complete; reference and verify it instead of regenerating it.",
+    "No formal panel or public v2 switch while release blockers remain."
+  ],
+  "design_sha256": "c2584eb4d706e25585787766a3b86d10de89602c3fe3c7decca24622d1df13a2",
+  "experiments": [
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "full-mask 与 dense 的相对 L2 误差、最大绝对误差均低于清单门槛；否则修实现",
+      "actual_values": null,
+      "id": "E1",
+      "method": "逐层比较在线 hook、独立 dense reference 与稀疏 kernel 在 full-mask 下的 Q/K/V 和输出",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "截取点与参考实现"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "排名 Spearman ≥0.999，缓存引入的输出 RSE ≤1e-3，Top k 一致率达到清单门槛",
+      "actual_values": null,
+      "id": "E2",
+      "method": "对 float32 在线结果、候选缓存 dtype 和缓存重放做逐项及排名比较",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "缓存数值忠实度"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "混合轨迹相关性的 bootstrap 95% 下界 ≥0.8，且不比稠密轨迹下降超过 0.02；失败则扩充轨迹，或仅在 E18 证明全量 rollout 可负担时取消缓存排名",
+      "actual_values": null,
+      "id": "E3",
+      "method": "用至少 30 个好坏覆盖的 checkpoint，比较稠密轨迹缓存与混合轨迹缓存对完整 rollout 排名的预测",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "轨迹分布偏移"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "正式预算内基线不饱和，Oracle 有稳定可测优势，允许输入上限代理未显示输入摘要构成主要瓶颈；否则改输入、tile 或预算",
+      "actual_values": null,
+      "id": "E4",
+      "method": "比较随机、平均池化、Veda 风格基线、训练基线、特权 Oracle、精确小 Oracle 和允许输入上限代理",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "可竞争空间"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "pilot 选择局部误差、视频质量与 GPU 延迟共同占优的方案，confirmation 只验收该方案；无稳定优势时选规则更少的无锚点方案",
+      "actual_values": null,
+      "id": "E5",
+      "method": "比较统一 tiling、head-aware tiling，以及强制锚点和无约束 Top k",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "tile 与锚点"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "pilot 中若分析模型或新增统计稳定降低误差且开销合格，则先修改固定结构；confirmation 只验收冻结结构",
+      "actual_values": null,
+      "id": "E6",
+      "method": "比较 TripPool、额外低成本统计、正式结构和 2–4 倍参数分析模型",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "选块器容量与输入"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "至少三个预算通过预注册的异常率、时间一致性和盲评非劣门槛；否则提高预算或更换基础模型",
+      "actual_values": null,
+      "id": "E7",
+      "method": "冻结 backbone，以训练基线和特权 Oracle 在全部候选预算生成配对视频",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "只训练选块器是否可行"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "只保留基线可用、方法可分、Oracle 仍有余量的连续区间，至少三个点",
+      "actual_values": null,
+      "id": "E8",
+      "method": "扫描 k，绘制基线、上限代理与视频质量曲线",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "正式预算区间"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "不影响第一版；只有均值、P95、视频质量和延迟均通过预注册优势门槛才建立独立赛道",
+      "actual_values": null,
+      "id": "E9",
+      "method": "在相同选块数和实测延迟下比较固定 Top k、普通全局排序和边际收益分配",
+      "pass": null,
+      "raw_evidence": [],
+      "release_blocker": false,
+      "status": "out_of_first_release_scope",
+      "subject": "自适应块数"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "预测延迟 Spearman ≥0.95，中位相对误差 ≤5%，P95 ≤10%；否则改用可校准的规则布局或 kernel 后重测，第一版不承担逐提交全量计时",
+      "actual_values": null,
+      "id": "E10",
+      "method": "在目标 GPU 上覆盖 k、tile 几何、mask 模式和序列长度，测 kernel 与端到端延迟",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "成本模型"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "全部计入端到端成本；若非 attention 开销超过被加速层耗时 10%，调整预算或取消赛道",
+      "actual_values": null,
+      "id": "E11",
+      "method": "分离测量 TripPool、残差投影、稳定 Top k、mask 准备和稀疏 attention",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "选择开销"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "局部对视频主指标的 Spearman bootstrap 95% 下界 ≥0.8，且前列无集中结构性伪影；否则修改缓存/分数，或仅在 E18 证明扩大完整视频评测可负担时发布",
+      "actual_values": null,
+      "id": "E12",
+      "method": "比较 \\(S_{local}\\)、自动视频指标和盲法配对结果",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "局部分数有效性"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "前列入围召回率 ≥95%，且无单一层/head/时间步出现预注册的灾难性尾误差",
+      "actual_values": null,
+      "id": "E13",
+      "method": "改变预算网格、\\(\\lambda\\)、分层权重和样本子集并 bootstrap",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "聚合与分层稳健性"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "来源组零交叉；重复提交不能从公开反馈重建逐样本或逐层标签；否则收紧反馈与频率",
+      "actual_values": null,
+      "id": "E14",
+      "method": "近重复检测、分组审计、记忆型基线和模拟重复提交",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "数据泄漏与榜单探测"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "95% 区间宽度小于 pilot 前两名差距的三分之一，并满足 E13 入围召回率",
+      "actual_values": null,
+      "id": "E15",
+      "method": "对候选规模逐级 bootstrap，估计置信区间和排名翻转",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "样本量"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "mask 完全一致；分数差 ≤1e-6；所有非法输入按固定错误码拒绝",
+      "actual_values": null,
+      "id": "E16",
+      "method": "同机复跑、同型号跨卡、并列 logits、极值、padding、NaN/Inf、超时和损坏文件",
+      "pass": false,
+      "prior_mechanism_evidence": [
+        {
+          "actual_values": {
+            "mask_mismatches_per_budget": [
+              32,
+              32,
+              32
+            ]
+          },
+          "pass": false,
+          "path": "evidence/system-panel/review-0753/tied-mask-5d52463.json",
+          "runtime": "5d52463 intermediate; replacement validation required",
+          "sha256": "d402964171ba605536bd44d378bc855361fac1fce1eda81505ac4d9c5942ef11"
+        }
+      ],
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "确定性与异常输入"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "完整视频真实 Top k 的精确阶段保留率 ≥99%，否则扩大精确缓存、调整晋级门或取消该低成本门",
+      "actual_values": null,
+      "id": "E17",
+      "method": "对代表性 checkpoint 同时运行精确评分与完整视频确认",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "精确晋级误杀"
+    },
+    {
+      "acceptance_manifest": null,
+      "acceptance_rule": "按预计峰值参赛量可在时限内完成，并保留 ≥30% 算力、存储和重试余量",
+      "actual_values": null,
+      "id": "E18",
+      "method": "压测上传校验、轻量缓存、精确缓存、完整视频、重试和故障恢复",
+      "pass": false,
+      "raw_evidence": [],
+      "release_blocker": true,
+      "status": "not_final_runtime_verified",
+      "subject": "评测容量"
+    }
+  ],
+  "format": "veda-release-acceptance-inventory-v1",
+  "release_accepted": false,
+  "review_sha256": "3e91ce72a9b9b31b3eacb39c3968888d26c000a92e58b35479e80a929cb506ff",
+  "runtime_contract_sha256": null,
+  "scope": "requirements_and_gap_inventory_not_acceptance"
+}

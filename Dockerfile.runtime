@@ -23,5 +23,24 @@ COPY . /tmp/veda
 RUN python -m pip install --no-cache-dir "/tmp/veda[storage]" \
     && rm -rf /tmp/veda
 
+# The pinned Miowtion Top-k did not specify tie order. Match the authoritative
+# scorer's ascending key-index tie break; these installed bytes are bound by
+# both the source bundle and the dependency lock generated inside this image.
+RUN python - <<'PY'
+from pathlib import Path
+from miowtion.veda import mask
+
+path = Path(mask.__file__)
+source = path.read_text()
+old = "        vals, idx = torch.topk(s, k_hi, dim=-1, sorted=True)"
+new = (
+    "        idx = torch.argsort(s, dim=-1, descending=True, stable=True)[..., :k_hi]\n"
+    "        vals = torch.gather(s, -1, idx)"
+)
+if source.count(old) != 1:
+    raise RuntimeError("pinned Miowtion mask source differs from the audited patch target")
+path.write_text(source.replace(old, new))
+PY
+
 WORKDIR /work
 ENTRYPOINT ["veda"]
