@@ -588,8 +588,9 @@ class AttemptObjects:
         return self.get(name)
 
 
-def test_gpu_local_ready_regeneration_preserves_binding_and_blocks_changed_bytes(
-    tmp_path, monkeypatch,
+@pytest.mark.parametrize("interruption_reason", ["REGENERATION_MISMATCH", "REGENERATION_EXHAUSTED"])
+def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_bytes(
+    tmp_path, monkeypatch, interruption_reason,
 ) -> None:
     """Storage/orchestration regression, not GPU determinism or score evidence."""
 
@@ -674,6 +675,8 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_blocks_changed_bytes
     assert objects.get("plans/120.json") == immutable_ready
     assert not service._needs_regeneration(ready)
     shutil.rmtree(service.content.root)
+    if interruption_reason == "REGENERATION_EXHAUSTED":
+        service._interrupt(ready, interruption_reason)
     payload[0] = b"non-reproducible replacement"
     with pytest.raises(RuntimeError, match="SYSTEM_BLOCKED"):
         service._execute(
@@ -681,8 +684,26 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_blocks_changed_bytes
         )
     assert objects.get("plans/120.json") == immutable_ready
     assert objects.get("stages/challenge/SCORING.json").body == b"immutable scored result"
-    assert objects.get_optional(f"interruptions/{plan.plan_digest}.json") is not None
-    assert not service._needs_regeneration(ready)  # durable stop, not an endless GPU retry
+    interruption = objects.get(f"interruptions/{plan.plan_digest}.json")
+    assert json.loads(interruption.body)["reason"] == interruption_reason
+    assert service._needs_regeneration(ready)  # the existing attempt cooldown bounds later probes
+    source = ReadyBatchSource(
+        track=service.track, objects=objects, cache_dir=tmp_path / "restored",
+        batch_dir=service.content.root,
+    )
+    monkeypatch.setattr(source, "_plans", lambda: (("plans/120.json", ready),))
+    with pytest.raises(production_service.StorageError):
+        source._plan_for("challenge", confirmation=False)
+    payload[0] = b"deterministic exact fixture"
+    recovered = service._execute(
+        "plans/120.json", immutable_ready, ready, Workers(), deadline=time.monotonic() + 30,
+    )
+    assert recovered.encode() == immutable_ready.body
+    assert source._plan_for("challenge", confirmation=False) == ready
+    assert not service._needs_regeneration(ready)
+    assert objects.get(f"interruptions/{plan.plan_digest}.json") == interruption
+    assert objects.get("plans/120.json") == immutable_ready
+    assert objects.get("stages/challenge/SCORING.json").body == b"immutable scored result"
 
 
 @pytest.mark.parametrize("state", ["PLANNED", "READY"])

@@ -597,10 +597,9 @@ class ReadyBatchSource:
         if matches and matches[0].state == "READY":
             interruption = f"interruptions/{matches[0].plan_digest}.json"
             if self.objects.get_optional(interruption) is not None:
-                raise RuntimeError(
-                    "SYSTEM_INTERRUPTED: original READY cannot be restored; "
-                    "challenge remains in FIFO awaiting verifiable replacement data"
-                )
+                # A past failure stays immutable; matching restored bytes clear its live fence.
+                for item in ready_objects(matches[0]):
+                    self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)
             return matches[0]
         if matches:
             raise RuntimeError("challenge batch is not READY")

@@ -678,8 +678,6 @@ class ProducerService:
     def _needs_regeneration(self, plan: BatchPlan) -> bool:
         if self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is not None:
             return False
-        if self.objects.get_optional(f"interruptions/{plan.plan_digest}.json") is not None:
-            return False
         try:
             for item in ready_objects(plan):
                 self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)

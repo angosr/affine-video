@@ -201,7 +201,10 @@ revisions or verified off-host copies; duplicating every recoverable asset is no
 Unrevealed videos, exact QKV, dense latents and selected per-batch inputs stay on the GPU in one
 content-addressed directory shared by producer and evaluator. They are not mirrored to private S3
 before scoring. After GPU loss, resume generation from the durable plan and verify every output
-against its immutable READY hash. Byte-mismatched regeneration remains an explicit system
+against its immutable READY hash. Recovery probes retain the bounded retry cooldown even after an
+interruption; restoring every original byte clears the live fence without deleting the immutable
+failure record. Dense MP4 artifacts contain video only; the joint model's audio latents remain in
+the lossless trajectory file. Byte-mismatched regeneration remains an explicit system
 interruption: automatic reassignment to replacement data is not implemented. A final-runtime
 cross-card probe reproduced identical QKV and latent bytes but different MP4 bytes; a decoded-stream
 comparison traced one such mismatch to audio, with identical video frames. MP4 regeneration is

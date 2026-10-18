@@ -460,7 +460,7 @@ class DenseRolloutRuntime:
         rollout_id: str,
         directory: str | Path,
     ) -> DenseOutputFiles:
-        """Persist lossless final latents and a decoded dense MP4 atomically."""
+        """Persist lossless joint latents and a video-only dense MP4 atomically."""
 
         from miowtion.infer import decode
         from safetensors.numpy import save_file
@@ -505,14 +505,13 @@ class DenseRolloutRuntime:
                 )
             started = time.monotonic()
             frames = self.decoder.video(self.torch.from_numpy(capture.video_rows), parsed_geometry)
-            audio = self.decoder.audio(self.torch.from_numpy(capture.audio_rows))
             if frames.dtype != np.uint8 or frames.ndim != 4 or frames.shape[-1] != 3:
                 raise RuntimeError("dense video decoder returned invalid frames")
             black_fraction = float(np.mean(frames.mean(axis=(1, 2, 3)) <= 1.0))
             decode.write_mp4(
                 str(video_temporary),
                 frames,
-                [(audio, "Dense reference")],
+                [],
                 self.decoder.sample_rate,
             )
             _fsync(video_temporary)
