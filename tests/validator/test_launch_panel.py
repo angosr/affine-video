@@ -85,3 +85,213 @@ def test_intermediate_runtime_binding_cannot_launch(tmp_path):
 
 def test_panel_interval_percentile_and_two_stage_self_checks():
     panel.self_test()
+
+
+@pytest.fixture
+def cost_evidence(tmp_path, monkeypatch):
+    """Synthetic reports exercise launch gating; they are never acceptance evidence."""
+    from copy import deepcopy
+
+    from scoring.spec import parse_track_spec
+    from tests.validator.test_cost_calibration import analysis
+    from validator.system_matches import _evidence_contract_digest
+
+    registration = json.loads(
+        (PANEL.parents[1] / "cost-3466b72/registration-implicit-rows.json").read_text()
+    )
+    costs = {
+        str(b["target_blocks"]): b["calibrated_cost"]
+        for b in registration["calibration_track_document"]["scoring"]["budgets"]
+    }
+    document, digest = analysis.derive_track(registration["calibration_track_document"], costs)
+    track = parse_track_spec(document)
+    contexts = {
+        f"{g}/{t}" for g in registration["geometries"] for t in registration["text_token_counts"]
+    }
+    report = {
+        "format": "veda-h200-cost-fit-v2",
+        "source_sha256": "source",
+        "environment_sha256": "environment",
+        "costs": costs,
+        "scales": dict.fromkeys(contexts, 1.0),
+        "provisional_cost_track_document": document,
+        "provisional_cost_track_spec_digest": digest,
+        "cost_independent_track_sha256": registration["cost_independent_track_sha256"],
+        "confirmed_evidence_contract_sha256": _evidence_contract_digest(track),
+        "model_identities": registration["model_identities"],
+        "predictor_bundle_sha256": registration["predictor_bundle_sha256"],
+    }
+    documents = {"registration": registration}
+    binding = {}
+    for phase in ("calibration", "confirmation"):
+        value = deepcopy(report)
+        value.update(
+            phase=phase,
+            e10_confirmation_pass=phase == "confirmation",
+            e11_confirmation_pass=phase == "confirmation",
+        )
+        value["raw_evidence"] = [
+            {"protocol_sha256": f"{seed:064x}", "summary_sha256": f"{seed + 1:064x}"}
+            for seed in registration["seeds"][phase]
+        ]
+        value["gates"] = {}
+        for context in contexts:
+            for model in [None, *registration["models"]]:
+                curves = len(registration["layers"]) * len(registration["seeds"][phase])
+                curves *= len(registration["models"]) if model is None else 1
+                group = context if model is None else f"{context}/{model}"
+                value["gates"][group] = {
+                    "row_count": curves * 3,
+                    "matched_curve_count": curves,
+                    "minimum_matched_curve_spearman": 1.0,
+                    "minimum_overhead_fraction": 0.04,
+                    "maximum_overhead_fraction": 0.06,
+                    "median_relative_error": 0.01,
+                    "p95_relative_error": 0.02,
+                    "e10_pass": True,
+                    "e11_pass": True,
+                    "budget_error_gates": {
+                        str(b): {"median_relative_error": 0.01, "p95_relative_error": 0.02}
+                        for b in registration["budgets"]
+                    },
+                }
+        documents[phase] = value
+
+    def persist():
+        for name in ("registration", "calibration", "confirmation"):
+            value = documents[name]
+            if name != "registration":
+                value["registration_sha256"] = binding["registration"]["sha256"]
+                value["fit_sha256"] = (
+                    None if name == "calibration" else binding["calibration"]["sha256"]
+                )
+            path = tmp_path / f"{name}.json"
+            path.write_text(json.dumps(value))
+            binding[name] = {"path": str(path), "sha256": panel.sha256(path)}
+
+    persist()
+    monkeypatch.setattr(panel, "COST_BINDING", binding)
+    monkeypatch.setattr(panel, "RUNTIME_CONTRACT", registration["runtime_contract_sha256"])
+    return track, documents, persist
+
+
+def verify_cost(track):
+    panel._verify_cost_confirmation(track, source_sha256="source", environment_sha256="environment")
+
+
+def test_cost_gate_accepts_only_confirmed_costs_and_allows_later_manifest(cost_evidence):
+    from dataclasses import replace
+
+    track, _, _ = cost_evidence
+    verify_cost(track)
+    verify_cost(replace(track, artifact_manifest_sha256="f" * 64))
+    with pytest.raises(ValueError, match="registered phase track"):
+        verify_cost(replace(track, track_start_block=track.track_start_block + 1))
+    budget = replace(track.scoring.budgets[0], calibrated_cost=0.041)
+    with pytest.raises(ValueError, match="registered phase track"):
+        verify_cost(
+            replace(
+                track, scoring=replace(track.scoring, budgets=(budget, *track.scoring.budgets[1:]))
+            )
+        )
+
+
+@pytest.mark.parametrize("phase", ["calibration", "confirmation"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "group",
+        "budget",
+        "count",
+        "error",
+        "overhead",
+        "nan",
+        "source",
+        "environment",
+        "failed",
+        "raw",
+    ],
+)
+def test_cost_gate_rejects_incomplete_or_failed_reports_even_if_rehashed(
+    cost_evidence, phase, mutation
+):
+    track, documents, persist = cost_evidence
+    report = documents[phase]
+    group = next(iter(report["gates"]))
+    gate = report["gates"][group]
+    if mutation == "group":
+        del report["gates"][group]
+    elif mutation == "budget":
+        del gate["budget_error_gates"]["16"]
+    elif mutation == "count":
+        gate["row_count"] -= 1
+    elif mutation == "error":
+        gate["budget_error_gates"]["16"]["p95_relative_error"] = 0.101
+    elif mutation == "overhead":
+        gate["maximum_overhead_fraction"] = 0.101
+    elif mutation == "nan":
+        gate["minimum_matched_curve_spearman"] = float("nan")
+    elif mutation in ("source", "environment"):
+        report[f"{mutation}_sha256"] = "different"
+    elif mutation == "raw":
+        report["raw_evidence"] = []
+    else:
+        gate["e10_pass"] = False
+    persist()
+    with pytest.raises(RuntimeError, match="cost"):
+        verify_cost(track)
+
+
+def test_cost_gate_checks_content_hash_and_requires_confirmation(cost_evidence, monkeypatch):
+    track, _, _ = cost_evidence
+    Path(panel.COST_BINDING["confirmation"]["path"]).write_text("{}")
+    with pytest.raises(RuntimeError, match="hash changed"):
+        verify_cost(track)
+    monkeypatch.setattr(panel, "COST_BINDING", {})
+    with pytest.raises(RuntimeError, match="requires registered cost"):
+        verify_cost(track)
+
+
+def test_frozen_flag_alone_does_not_authorize_panel_launch(tmp_path):
+    binding = tmp_path / "binding.json"
+    binding.write_text(json.dumps({"format": "veda-panel-launch-binding-v1", "frozen": True}))
+    with pytest.raises(RuntimeError, match="requires registered cost"):
+        panel.configure(binding)
+
+
+def test_producer_rejects_missing_cost_evidence_before_loading_private_sources(
+    cost_evidence, tmp_path, monkeypatch
+):
+    import scoring.spec
+    import validator.production.commitment as commitment
+    import validator.production.config as config
+    import validator.production.environment as environment
+    import validator.system_matches as matches
+
+    track, _, _ = cost_evidence
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    monkeypatch.setattr(panel, "MANIFEST", manifest)
+    monkeypatch.setattr(panel, "COST_BINDING", {})
+    monkeypatch.setattr(panel, "EVIDENCE_CONTRACT", matches._evidence_contract_digest(track))
+    monkeypatch.setattr(scoring.spec, "load_track_spec", lambda _: track)
+    monkeypatch.setattr(
+        config, "load_producer_config", lambda _: SimpleNamespace(verify_manifest=lambda _: None)
+    )
+    monkeypatch.setattr(
+        commitment.ArtifactManifest,
+        "decode",
+        lambda _: SimpleNamespace(digest=track.artifact_manifest_sha256),
+    )
+    monkeypatch.setattr(matches, "_evidence_runtime_digest", lambda _: panel.RUNTIME_CONTRACT)
+    monkeypatch.setattr(environment, "evaluation_source_digest", lambda: "source")
+    monkeypatch.setattr(environment, "evaluation_environment_digest", lambda: "environment")
+    monkeypatch.setattr(
+        commitment,
+        "load_bound_source_pool",
+        lambda *a, **k: pytest.fail(
+            "private sources must not be consumed before cost confirmation"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="requires registered cost"):
+        panel.load_producer_context()

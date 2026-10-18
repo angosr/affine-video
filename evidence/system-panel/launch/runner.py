@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import time
@@ -20,6 +21,7 @@ SOURCE_POOL = ROOT
 SOURCE_BINDING = ROOT
 EVIDENCE_CONTRACT = ""
 RUNTIME_CONTRACT = ""
+COST_BINDING = {}
 PRODUCTION_EXACT = 10
 PRODUCTION_CONFIRMATION = 5
 AUDIT_EXACT = 8
@@ -118,11 +120,14 @@ CONTROLS = {name: ROOT / "controls" / f"{name}.safetensors" for name in EXPECTED
 
 def configure(binding_path: Path) -> None:
     global ROOT, RELEASE, TRACK, MANIFEST, CONFIG, SOURCE_POOL, SOURCE_BINDING
-    global EVIDENCE_CONTRACT, RUNTIME_CONTRACT, CONTROLS
+    global EVIDENCE_CONTRACT, RUNTIME_CONTRACT, CONTROLS, COST_BINDING
 
     binding = json.loads(binding_path.read_text())
     if binding.get("format") != "veda-panel-launch-binding-v1" or binding.get("frozen") is not True:
         raise RuntimeError("panel requires an explicitly frozen final runtime binding")
+    if set(binding.get("cost_confirmation", {})) != {"registration", "calibration", "confirmation"}:
+        raise RuntimeError("panel requires registered cost calibration and confirmation")
+    COST_BINDING = binding["cost_confirmation"]
     ROOT = Path(binding["evidence_root"])
     RELEASE = Path(binding["release_root"])
     TRACK = RELEASE / "track.candidate.json"
@@ -164,6 +169,123 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _verify_cost_confirmation(track, *, source_sha256, environment_sha256):
+    """Check hash-bound registered analysis results before consuming panel sources.
+
+    The registered analyzer remains the sole raw-measurement replay/fit path.
+    This gate checks its bounded reports, all dimensions and their numerical
+    gates, and the exact active track/runtime. Full run digests remain provenance.
+    """
+    from scoring.spec import track_spec_dict
+    from validator.system_matches import _evidence_contract_digest
+
+    if set(COST_BINDING) != {"registration", "calibration", "confirmation"}:
+        raise RuntimeError("panel requires registered cost calibration and confirmation")
+    documents = {}
+    for name, reference in COST_BINDING.items():
+        path = Path(reference["path"])
+        if sha256(path) != reference["sha256"]:
+            raise RuntimeError(f"cost evidence hash changed: {name}")
+        documents[name] = json.loads(path.read_text())
+    registration, fit, confirmation = (
+        documents[name] for name in ("registration", "calibration", "confirmation")
+    )
+    analysis_path = Path(__file__).with_name("cost_analysis.py")
+    if (
+        registration["format"] != "veda-h200-cost-registration-v2"
+        or registration["runtime_contract_sha256"] != RUNTIME_CONTRACT
+        or sha256(analysis_path) != registration["analysis_script_sha256"]
+        or sha256(analysis_path.with_name("cost_patterns.py"))
+        != registration["pattern_script_sha256"]
+        or set(registration["seeds"]["calibration"]) & set(registration["seeds"]["confirmation"])
+    ):
+        raise RuntimeError("cost registration differs from the frozen runtime/protocol")
+    spec = importlib.util.spec_from_file_location("registered_cost_analysis", analysis_path)
+    assert spec and spec.loader
+    analysis = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(analysis)
+    analysis.verify_phase_track(registration, track_spec_dict(track), "confirmation", fit)
+    contexts = {
+        f"{geometry}/{text}"
+        for geometry in registration["geometries"]
+        for text in registration["text_token_counts"]
+    }
+    expected_groups = {context: len(registration["models"]) for context in contexts}
+    expected_groups.update(
+        {f"{context}/{model}": 1 for context in contexts for model in registration["models"]}
+    )
+    if set(fit["scales"]) != contexts or any(
+        not isfinite(value) or value <= 0 for value in fit["scales"].values()
+    ):
+        raise RuntimeError("cost fit omits a scale or contains an invalid scale")
+    for phase, report in (("calibration", fit), ("confirmation", confirmation)):
+        if (
+            report["format"] != "veda-h200-cost-fit-v2"
+            or report["phase"] != phase
+            or report["registration_sha256"] != COST_BINDING["registration"]["sha256"]
+            or report["fit_sha256"]
+            != (None if phase == "calibration" else COST_BINDING["calibration"]["sha256"])
+            or report["source_sha256"] != source_sha256
+            or report["environment_sha256"] != environment_sha256
+            or report["model_identities"] != registration["model_identities"]
+            or report["predictor_bundle_sha256"] != registration["predictor_bundle_sha256"]
+            or report["cost_independent_track_sha256"]
+            != registration["cost_independent_track_sha256"]
+            or report["confirmed_evidence_contract_sha256"] != _evidence_contract_digest(track)
+            or report["costs"] != fit["costs"]
+            or report["scales"] != fit["scales"]
+            or set(report["gates"]) != set(expected_groups)
+            or report["e10_confirmation_pass"] is not (phase == "confirmation")
+            or report["e11_confirmation_pass"] is not (phase == "confirmation")
+        ):
+            raise RuntimeError(f"cost {phase} is incomplete or bound to another contract")
+        references = report.get("raw_evidence", [])
+        if (
+            len(references) < len(registration["seeds"][phase])
+            or any(set(row) != {"protocol_sha256", "summary_sha256"} for row in references)
+            or any(
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+                for row in references
+                for digest in row.values()
+            )
+            or any(
+                len({row[key] for row in references}) != len(references)
+                for key in ("protocol_sha256", "summary_sha256")
+            )
+        ):
+            raise RuntimeError(f"cost {phase} omits unique raw protocol/summary bindings")
+        for group, models in expected_groups.items():
+            gate = report["gates"][group]
+            curves = models * len(registration["layers"]) * len(registration["seeds"][phase])
+            if (
+                gate["row_count"] != curves * len(registration["budgets"])
+                or gate["matched_curve_count"] != curves
+                or set(gate["budget_error_gates"]) != {str(b) for b in registration["budgets"]}
+                or gate["e10_pass"] is not True
+                or gate["e11_pass"] is not True
+            ):
+                raise RuntimeError(f"cost {phase} group is incomplete or failed: {group}")
+            metrics = [
+                (gate["minimum_matched_curve_spearman"], 0.95, 1.0),
+                (gate["minimum_overhead_fraction"], 0.0, 0.1),
+                (gate["maximum_overhead_fraction"], gate["minimum_overhead_fraction"], 0.1),
+            ]
+            for errors in (gate, *gate["budget_error_gates"].values()):
+                metrics.extend(
+                    (
+                        (errors["median_relative_error"], 0.0, 0.05),
+                        (errors["p95_relative_error"], 0.0, 0.10),
+                    )
+                )
+            if any(
+                not isfinite(value) or not lower <= value <= upper
+                for value, lower, upper in metrics
+            ):
+                raise RuntimeError(f"cost {phase} numerical gate failed: {group}")
 
 
 def canonical(value: object) -> bytes:
@@ -310,6 +432,10 @@ def load_runtime_context(*, evaluator: bool):
     from scoring.spec import load_track_spec
     from validator.production.commitment import ArtifactManifest
     from validator.production.config import load_producer_config
+    from validator.production.environment import (
+        evaluation_environment_digest,
+        evaluation_source_digest,
+    )
 
     config = load_producer_config(CONFIG)
     track = load_track_spec(TRACK)
@@ -327,6 +453,11 @@ def load_runtime_context(*, evaluator: bool):
         config.verify_evaluator_manifest(manifest)
     else:
         config.verify_manifest(manifest)
+    _verify_cost_confirmation(
+        track,
+        source_sha256=evaluation_source_digest(),
+        environment_sha256=evaluation_environment_digest(),
+    )
     return config, track, manifest
 
 
