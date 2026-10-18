@@ -70,7 +70,7 @@ def test_seven_assets_verify_both_selector_identities(assets):
 
 
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "predictor", "selector", "model"])
-def test_incomplete_or_corrupted_control_mirror_is_rejected(assets, mutation):
+def test_incomplete_or_corrupted_control_mirror_is_rejected(assets, mutation, monkeypatch):
     root, _, _ = assets
     sums = root / "SHA256SUMS"
     if mutation == "missing":
@@ -82,6 +82,13 @@ def test_incomplete_or_corrupted_control_mirror_is_rejected(assets, mutation):
     elif mutation == "selector":
         (root / "controls/baseline_self.safetensors").write_bytes(b"corrupted")
     else:
-        mirror.panel.EXPECTED_IDENTITIES["baseline_self"]["model_digest"] = "0" * 64
+        monkeypatch.setitem(
+            mirror.panel.EXPECTED_IDENTITIES,
+            "baseline_self",
+            {
+                **mirror.panel.EXPECTED_IDENTITIES["baseline_self"],
+                "model_digest": "0" * 64,
+            },
+        )
     with pytest.raises(ValueError):
         mirror.verify(*assets)
