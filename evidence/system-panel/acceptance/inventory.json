@@ -417,6 +417,16 @@
           "cached_cases_above_fixed_threshold": 26,
           "production_adopted": false,
           "scope": "New paired no_grad cohort, same context as formal video runtime, not a relabeling of prior inference_mode timings. Small warm-path benefit does not meet full E11; cache state not added to production."
+        },
+        "stateless_threshold_topk_probe": {
+          "cpu_cases": 306,
+          "paired_gpu_cases": 120,
+          "mask_and_output_mismatches": 0,
+          "median_candidate_over_original_wall_ratio": 1.0092977379410357,
+          "candidate_max_nonattention_fraction": 0.11431247269595668,
+          "candidate_cases_above_fixed_threshold": 30,
+          "production_adopted": false,
+          "scope": "New no_grad paired synthetic cohort. Candidate is slower, so retain the original stable sort; no production source or formal scoring change."
         }
       },
       "id": "E11",
@@ -432,6 +442,11 @@
           "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/layout-cache-independent-review.json",
           "sha256": "3bc320972daa4e67c37d2d215a8747e85b4319f778d86164e9f6ba5cb7839de2",
           "scope": "120 paired original/prototype cases, strict native GPU mask/output equality and independently recomputed timings; 26 cached cases still exceed unchanged10% threshold. Prototype not adopted, no deployed or all50-layer claim."
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/threshold-topk-independent-review.json",
+          "sha256": "8d788b3c58f86db50819c4de6c0824e0ceb9842d2820e4e5480e1b0db995512d",
+          "scope": "CPU306 plus GPU120 original/prototype parity records and independently recomputed wall medians/P95, components and fixed10% misses. Prototype rejected rather than adding slower selection logic; not all50-layer or full-model acceptance."
         }
       ],
       "release_blocker": false,
@@ -499,6 +514,19 @@
         "all_terminal_disclosure_file_count": 35,
         "actual_gpu_files_sha_verified_by_native_run": true,
         "root_actual_s3_ready_and_derived_mapping_verified": true,
+        "fixed_source_lexical_audit": {
+          "sources": 1120,
+          "production_sources": 960,
+          "audit_sources": 160,
+          "raw_or_normalized_prompt_duplicates": 0,
+          "word_5gram_pairs_checked": 626640,
+          "maximum_pair_jaccard": 0.8428571428571429,
+          "median_nearest_neighbor_jaccard": 0.8181818181818182,
+          "pairs_at_or_above_0_9": 0,
+          "source_pool_binding_verified": true,
+          "prompts_or_identifiers_exported": false,
+          "scope": "Exact and literal near-copy screening only. High background lexical overlap remains; this does not establish semantic family independence, licensing, generalization or complete privacy acceptance."
+        },
         "public_s3_writes": false,
         "scope": "Original Reader and real READY content; controlled admissions and terminal states, not real HF ownership or scoring. Native verified full payload SHA; root independently verified metadata and zero/either-one-terminal guards. Not full source-family similarity/privacy audit, IAM acceptance or whole-host recovery."
       },
@@ -515,6 +543,11 @@
           "path": "private/production-plan-860-20261019-0205/shared-group/controller-independent-check.json",
           "sha256": "c76eb3ecd2b8de46d3aa602cc7439a7d11ccb553be4396f81706b6820588a1a8",
           "scope": "Root actual TLS S3 read, original zero/either-one-terminal Reader guard with zero payload calls, all 35 public mapping identities derived exactly from READY; no hidden bulk copied or public writes"
+        },
+        {
+          "path": "private/source-v7-clean-candidate/source-lexical-audit.json",
+          "sha256": "1642c1cecae36df015a41b44b5f52900a3ea255dbf58413577783d10321b5893",
+          "scope": "Actual frozen private1120-source pool, canonical SourcePool/Merkle and SHA binding rechecked; counts only, no prompts, identifiers, nonces or unsalted text hashes disclosed. Not semantic similarity acceptance."
         }
       ],
       "release_blocker": false,
@@ -681,6 +714,17 @@
       "actual_values": {
         "current_track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
         "current_runtime_source_commit": "b81bfa8",
+        "current_assembly_interruption": {
+          "real_assembler_sigkill": true,
+          "interrupted_temporary_file_bytes": 11827811,
+          "new_process_after_ready_cas_response_loss": true,
+          "complete_regenerated_npz_byte_equal": true,
+          "ready_body_and_etag_unchanged": true,
+          "runtime_source_commit": "b81bfa8",
+          "temporary_cleanup_passed": false,
+          "scoring_opportunity_preserved": true,
+          "scope": "Actual SIGKILL and off-GPU S3 READY commit with injected response loss. Recovery succeeded but a retained-plan batch temp survived normal pruning. Candidate cleanup fix is not deployed or counted as passing; no CUDA dense revalidation, real scoring or whole-host recovery claim."
+        },
         "current_production_plan_lifecycle": {
           "videos": 16,
           "exact_cases": 384,
@@ -796,6 +840,16 @@
           "path": "private/production-plan-860-20261019-0205/ready-regeneration/controller-independent-check.json",
           "sha256": "8e728d9c32269f083afa207725f4cf7948dd2b77fbf035d6f0a3949714e05d17",
           "scope": "Root actual TLS S3 GET/List of all4 small objects, READY/attempt equality, all48 recorded bindings and empty SQLite integrity; no hidden bulk copied/rehashed. First observer SCORING-row expectation corrected to the actual intentionally empty recovery DB, no GPU rerun or state modification."
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/assembly-interruption-20261019-0405/gpu-small/result.json",
+          "sha256": "84a2125db599f11a2fa21ccf311f8743e2361e9d2d461d8c3a18e87c68b4625b",
+          "scope": "Original frozen runtime actual assembler interruption, complete byte-identical recovery and preserved SQLite opportunity, with temporary_cleanup_passed=false. CPU-only component reused the original16 actual units, no new videos or public writes."
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/assembly-interruption-20261019-0405/controller-component-review.json",
+          "sha256": "c01e9a460b39904bb051e7e9443a1226079310ff004f64a3895455d7f5da3160",
+          "scope": "Native controller actual TLS S3 metadata and SQLite integrity review, preserving the failed cleanup finding; not an independent re-read of bulk NPZ or whole-host acceptance."
         }
       ],
       "release_blocker": false,

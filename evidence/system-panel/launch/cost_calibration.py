@@ -274,6 +274,7 @@ def run(arguments):
         "repeats": arguments.repeats,
         "profile_repeats": arguments.profile_repeats,
         "input": "seeded synthetic BF16 full packed QKV; no hidden source families",
+        "execution_mode": "torch.no_grad, matching formal sparse rollout",
         "layers": registration["layers"],
         "text_token_counts": registration["text_token_counts"],
         "geometries": sorted(arguments.geometries),
@@ -301,7 +302,7 @@ def run(arguments):
     write_once(arguments.output / "protocol.json", protocol)
     device = torch.device("cuda:0")
     rows = []
-    with torch.inference_mode():
+    with torch.no_grad():
         for geometry_name in protocol["geometries"]:
             geometry = parse_geometry(geometry_name)
             plan = plans.select(geometry)

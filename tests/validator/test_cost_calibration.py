@@ -1,5 +1,6 @@
 """Cost acceptance must use a frozen fit, complete dimensions and dense denominator."""
 
+import ast
 import importlib.util
 import json
 from itertools import product
@@ -25,6 +26,26 @@ MEASUREMENT_SPEC = importlib.util.spec_from_file_location(
 assert MEASUREMENT_SPEC and MEASUREMENT_SPEC.loader
 measurement = importlib.util.module_from_spec(MEASUREMENT_SPEC)
 MEASUREMENT_SPEC.loader.exec_module(measurement)
+
+
+def test_cost_measurement_preserves_formal_tensor_version_tracking():
+    """Inference tensors change layout bookkeeping and are not the live workload."""
+
+    tree = ast.parse(Path(measurement.__file__).read_text())
+    run = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run"
+    )
+    modes = [
+        call.func.attr
+        for node in ast.walk(run) if isinstance(node, ast.With)
+        for item in node.items
+        if isinstance(call := item.context_expr, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "torch"
+        and call.func.attr in {"no_grad", "inference_mode"}
+    ]
+    assert modes == ["no_grad"]
 
 
 @pytest.mark.parametrize("metadata", [None, {"hotkey": "fixed-control-owner"}])
