@@ -676,7 +676,6 @@ def _environment_client(endpoint: str, access_key: str, secret_key: str) -> Any:
         endpoint_url=endpoint,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
-        region_name="auto",
         config=client_config(),
     )
 

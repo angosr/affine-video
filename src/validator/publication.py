@@ -659,7 +659,6 @@ class S3Repository:
             endpoint_url=endpoint,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            region_name="auto",
             config=client_config(),
         )
         return cls(

@@ -16,6 +16,7 @@ from validator.production.storage import (
     evaluator_iam_policy,
     verify_evaluator_iam_policy,
 )
+from validator.publication import S3Repository
 from validator.s3 import client_config
 
 
@@ -289,11 +290,55 @@ def test_injected_store_client_cannot_be_serialized() -> None:
         pickle.dumps(store)
 
 
-def test_supabase_transport_disables_unsupported_optional_checksums() -> None:
+def test_s3_transport_disables_unsupported_optional_checksums() -> None:
     client = client_config()
 
     assert client.request_checksum_calculation == "when_required"
     assert client.response_checksum_validation == "when_required"
+
+
+@pytest.mark.parametrize("region", [None, "", "us-east-1", "eu-central-1", "auto"])
+def test_s3_transport_uses_standard_region_configuration(monkeypatch, region) -> None:
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    if region is not None:
+        monkeypatch.setenv("AWS_DEFAULT_REGION", region)
+
+    assert client_config().region_name == (region or "auto")
+
+
+@pytest.mark.parametrize("role", ["public", "producer", "evaluator"])
+def test_environment_clients_share_s3_region_without_changing_object_paths(monkeypatch, role):
+    import boto3
+
+    captured = []
+
+    def client(service, **arguments):
+        assert service == "s3"
+        captured.append(arguments)
+        return MemoryS3()
+
+    monkeypatch.setattr(boto3, "client", client)
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-central-1")
+    for prefix in ("", "PRIVATE_", "EVALUATOR_PRIVATE_"):
+        monkeypatch.setenv(f"{prefix}STORAGE_URL", "https://s3.eu-central-1.amazonaws.com")
+        monkeypatch.setenv(f"{prefix}ACCESS_KEY", "access")
+        monkeypatch.setenv(f"{prefix}SECRET_ACCESS_KEY", "secret")
+    monkeypatch.delenv("VEDA_RELEASE_ACCEPTANCE", raising=False)
+    monkeypatch.delenv("VEDA_COORDINATED_RELEASE_DIGEST", raising=False)
+    if role == "public":
+        store = S3Repository.from_environment(bucket="public", prefix="tracks/main")
+    elif role == "evaluator":
+        store = PrivateObjectStore.from_evaluator_environment(
+            bucket="private", prefix="tracks/main"
+        )
+    else:
+        store = PrivateObjectStore.from_environment(bucket="private", prefix="tracks/main")
+
+    assert len(captured) == 1
+    arguments = captured[0]
+    assert arguments.get("region_name", arguments["config"].region_name) == "eu-central-1"
+    assert arguments["endpoint_url"] == "https://s3.eu-central-1.amazonaws.com"
+    assert store._prefix == "tracks/main"
 
 
 def test_content_is_chunked_and_restored_with_complete_verification(tmp_path, monkeypatch) -> None:

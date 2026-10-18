@@ -180,8 +180,9 @@ downloaded model cache are disposable execution state: after loss, finalized cha
 verified published matches reconstruct completed work, and remaining submissions can be evaluated
 again.
 
-Private R2 is the durable source for unrevealed plans, the committed source pool, the artifact
-manifest, every runtime artifact, exact batches, validated selectors, admission refusals and
+Private S3-compatible object storage is the durable source for unrevealed plans, the committed
+source pool, the artifact manifest, every runtime artifact, exact batches, validated selectors,
+admission refusals and
 recoverable scoring stages.
 Both production services verify conditional-write support before starting, seed missing immutable
 objects from a complete local runtime, and restore missing local bytes by committed size and SHA-256.
@@ -257,7 +258,7 @@ Run the evaluator:
 
 The public write endpoint must pass the conditional-create/replace probe and serve the fixed public
 read prefix. The existing Supabase S3 endpoint fails that probe for candidate production; configuring
-a private R2 store alone does not fix public publication, and changing a write endpoint does not
+a private object store alone does not fix public publication, and changing a write endpoint does not
 redirect the existing public URL. Resolve that deployment mapping and coordinate the accepted track
 digest with the external weight-setter before launch. Keep the existing URL and digest unchanged
 until that coordination is complete.
@@ -267,7 +268,7 @@ uv sync --extra storage
 export STORAGE_URL=...
 export ACCESS_KEY=...
 export SECRET_ACCESS_KEY=...
-export EVALUATOR_PRIVATE_STORAGE_URL=https://account.r2.cloudflarestorage.com
+export EVALUATOR_PRIVATE_STORAGE_URL=...
 export EVALUATOR_PRIVATE_ACCESS_KEY=...
 export EVALUATOR_PRIVATE_SECRET_ACCESS_KEY=...
 export VEDA_ALERT_WEBHOOK_URL=...
@@ -281,7 +282,13 @@ uv run --extra storage veda validator evaluate \
   --scoring-timeout-seconds 14400
 ```
 
-The evaluator variables must identify a separate least-privilege R2 role. Startup proves that the
+AWS S3 and compatible providers use the same storage implementation and object paths. Set the
+standard `AWS_DEFAULT_REGION` in both service environments when the provider requires a region;
+it defaults to `auto` for existing deployments. Provider selection never changes the public read
+URL or bypasses conditional-write and permission probes. Validators reading public weights do
+not need storage credentials or a region setting.
+
+The evaluator variables must identify a separate least-privilege storage role. Startup proves that the
 role can use plan/stage CAS and read READY-selected objects, while reads of
 `bootstrap/source_pool.json`, the `source-pool/` prefix, and the committed full source cache are
 denied, including every `<manifest>.parts/part-*` object and its list prefix. Evaluator credentials
@@ -357,7 +364,7 @@ restoration share one bounded streaming verifier for per-part and complete SHA-2
 Run the private data producer separately with the same production configuration:
 
 ```bash
-export PRIVATE_STORAGE_URL=https://account.r2.cloudflarestorage.com
+export PRIVATE_STORAGE_URL=...
 export PRIVATE_ACCESS_KEY=...
 export PRIVATE_SECRET_ACCESS_KEY=...
 
