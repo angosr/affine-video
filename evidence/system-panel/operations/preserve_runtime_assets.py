@@ -1,7 +1,8 @@
-"""Resume the frozen 067 mirror, online assets first; never alter the GPU source."""
+"""Preserve an explicit runtime manifest in one locked, resumable control-host mirror."""
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import hashlib
 import json
@@ -9,24 +10,19 @@ import os
 import shutil
 import signal
 import subprocess
-import tarfile
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from pathlib import Path
 
-EVIDENCE = Path("/home/aiuser/work/veda-evidence/evidence/system-panel")
-BOOTSTRAP = EVIDENCE / "pipeline-7cf0e10/private-bootstrap.tar.gz"
-DESTINATION = Path("/home/aiuser/work/veda-evidence/runtime-assets")
-CURRENT = EVIDENCE / "runtime-assets-preservation-task.json"
-MANIFEST_SHA256 = "4c158932ef095cd7dafb68a4fe4249bf4fead6294649b7f2757c69e12b6e22b2"
-SOURCE_COMMIT = "067aa3d11aa00e2459250cb14443f93c7b4272c7"
-OLD_SERVICE = "veda-preserve-runtime-assets-067aa3d.service"
-SERVICE = "veda-preserve-runtime-assets-067aa3d-priority.service"
+from validator.production.commitment import ArtifactManifest
+
 WORKERS = 4
 ATTEMPTS = 5
 GROUP_RATE_KIB = 6144
+RESERVE_BYTES = 64 * 1024**3
 _output_lock = threading.Lock()
 
 
@@ -35,213 +31,316 @@ def emit(event, **fields):
         print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
 
-def read_artifacts(bootstrap=BOOTSTRAP):
-    with tarfile.open(bootstrap, "r:gz") as archive:
-        payload = archive.extractfile("artifact_manifest.json").read()
-    if hashlib.sha256(payload).hexdigest() != MANIFEST_SHA256:
-        raise ValueError("frozen source manifest digest changed")
-    artifacts = [
-        row for row in json.loads(payload)["artifacts"]
-        if row["logical_name"].startswith(
-            ("veda-assets/", "veda-private/source-v6-final-candidate/")
-        )
-    ]
-    for row in artifacts:
-        name = row["logical_name"]
-        if (
-            any(part in {"", ".", ".."} for part in name.split("/"))
-            or "\0" in name or "\\" in name
-            or type(row["size_bytes"]) is not int or row["size_bytes"] <= 0
-            or len(row["sha256"]) != 64
-            or any(char not in "0123456789abcdef" for char in row["sha256"])
-        ):
-            raise ValueError("invalid frozen artifact")
+def safe_name(name):
     if (
-        len(artifacts) != 88
-        or len({row["logical_name"] for row in artifacts}) != 88
-        or sum(row["size_bytes"] for row in artifacts) != 146703809034
+        not isinstance(name, str)
+        or not name
+        or any(part in {"", ".", ".."} for part in name.split("/"))
+        or "\\" in name
+        or any(ord(char) < 32 or ord(char) == 127 for char in name)
     ):
-        raise ValueError("the preservation scope must remain exactly the same 88 artifacts")
-    return sorted(artifacts, key=lambda row: row["logical_name"])
+        raise ValueError("invalid artifact path")
+    return name
 
 
-def file_list(artifacts):
-    return b"".join(row["logical_name"].encode() + b"\0" for row in artifacts)
-
-
-def transfer_groups(artifacts):
-    """Deterministic, byte-balanced disjoint groups within each strict phase."""
-    phases = []
-    for encoder in (False, True):
-        groups = [[] for _ in range(WORKERS)]
-        sizes = [0] * WORKERS
-        selected = [
-            row for row in artifacts if ("/text_encoder/" in row["logical_name"]) == encoder
-        ]
-        for row in sorted(selected, key=lambda row: (-row["size_bytes"], row["logical_name"])):
-            index = min(range(WORKERS), key=lambda index: (sizes[index], index))
-            groups[index].append(row)
-            sizes[index] += row["size_bytes"]
-        phases.append([
-            sorted(group, key=lambda row: row["logical_name"])
-            for group in groups if group
-        ])
-    return phases
+def checked_path(path):
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("local paths must be absolute without traversal")
+    if any(part.is_symlink() for part in (path, *path.parents)):
+        raise ValueError("local paths must not contain symlinks")
+    return path
 
 
 def destination_file(destination, name):
-    target = destination / name
-    if destination.resolve() not in target.resolve().parents:
-        raise ValueError("mirror path escapes the fixed destination")
-    if any(parent.is_symlink() for parent in (target, *target.parents) if parent != destination):
-        raise ValueError("mirror must not contain symlinks")
-    return target
+    return checked_path(checked_path(destination) / safe_name(name))
 
 
-def rsync_command(destination):
+def read_artifacts(manifest_path, expected_sha256):
+    if len(expected_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in expected_sha256
+    ):
+        raise ValueError("manifest SHA-256 is invalid")
+    payload = checked_path(manifest_path).read_bytes()
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ValueError("runtime manifest digest changed")
+    artifacts = [artifact.document() for artifact in ArtifactManifest.decode(payload).artifacts]
+    for artifact in artifacts:
+        safe_name(artifact["logical_name"])
+    return artifacts
+
+
+def local_paths(artifacts, destination, reuse):
+    """Keep aliases inside the mirror writable; reuse external files read-only."""
+    aliases = {}
+    for value in reuse:
+        prefix, separator, location = value.partition("=")
+        if not separator:
+            raise ValueError("reuse must be LOGICAL_PREFIX=/absolute/local/path")
+        safe_name(prefix)
+        if any(
+            prefix == old or prefix.startswith(old + "/") or old.startswith(prefix + "/")
+            for old in aliases
+        ):
+            raise ValueError("overlapping reuse prefixes")
+        aliases[prefix] = checked_path(location)
+    paths = {}
+    used = set()
+    targets = set()
+    for artifact in artifacts:
+        name = artifact["logical_name"]
+        target = destination_file(destination, name)
+        for prefix, base in aliases.items():
+            if name == prefix or name.startswith(prefix + "/"):
+                target = checked_path(base / name[len(prefix) + 1 :]) if name != prefix else base
+                used.add(prefix)
+                break
+        if target in targets:
+            raise ValueError("different artifacts cannot share one local path")
+        targets.add(target)
+        paths[name] = target
+    if used != set(aliases):
+        raise ValueError("reuse prefix is absent from the runtime manifest")
+    return paths
+
+
+def rsync_command(artifact, target):
     return [
-        "/usr/bin/rsync", "--recursive", "--times", "--copy-links", "--relative",
-        "--from0", "--files-from=-", "--partial", "--partial-dir=.rsync-partial",
-        "--chmod=Du=rwx,Dgo=,Fu=rw,Fgo=", f"--bwlimit={GROUP_RATE_KIB}",
-        "--timeout=120", "--stats", "--itemize-changes", "-e",
+        "/usr/bin/rsync",
+        "--times",
+        "--copy-links",
+        "--protect-args",
+        "--partial",
+        "--partial-dir=.rsync-partial",
+        "--chmod=Fu=rw,Fgo=",
+        f"--bwlimit={GROUP_RATE_KIB}",
+        "--timeout=120",
+        "--stats",
+        "--itemize-changes",
+        "-e",
         "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 "
         "-o ServerAliveCountMax=3",
-        "gpu:/workspace/", str(destination) + "/",
+        "--",
+        "gpu:/workspace/" + safe_name(artifact["logical_name"]),
+        str(target),
     ]
 
 
-def transfer_group(artifacts, destination, phase, group, stopped):
+def transfer_artifact(artifact, target, stopped):
+    target = checked_path(target)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    checked_path(target.parent / ".rsync-partial" / target.name)
     for attempt in range(1, ATTEMPTS + 1):
         if stopped.is_set():
             raise RuntimeError("preservation stopped; no new transfer attempt")
-        with subprocess.Popen(rsync_command(destination), stdin=subprocess.PIPE) as process:
-            emit("TRANSFER_STARTED", phase=phase, group=group, attempt=attempt, pid=process.pid,
-                 files=len(artifacts), bytes=sum(row["size_bytes"] for row in artifacts))
-            process.communicate(file_list(artifacts))
-            code = process.returncode
+        with subprocess.Popen(rsync_command(artifact, target), start_new_session=True) as process:
+            emit(
+                "TRANSFER_STARTED",
+                logical_name=artifact["logical_name"],
+                attempt=attempt,
+                pid=process.pid,
+                target=str(target),
+                size_bytes=artifact["size_bytes"],
+            )
+            try:
+                while True:
+                    if stopped.is_set():
+                        raise RuntimeError("preservation stopped during transfer")
+                    try:
+                        code = process.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+            finally:
+                if process.poll() is None:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        with suppress(ProcessLookupError):
+                            os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
         if code == 0:
-            emit("TRANSFER_FINISHED", phase=phase, group=group, attempt=attempt)
+            verify_artifact(target, artifact, stopped=stopped)
+            emit("TRANSFER_FINISHED", logical_name=artifact["logical_name"], attempt=attempt)
             return
-        emit("TRANSFER_RETRY", phase=phase, group=group, attempt=attempt, exit_code=code)
-        if stopped.wait(min(60, 5 * 2 ** (attempt - 1))):
+        emit(
+            "TRANSFER_RETRY", logical_name=artifact["logical_name"], attempt=attempt, exit_code=code
+        )
+        if attempt < ATTEMPTS and stopped.wait(min(60, 5 * 2 ** (attempt - 1))):
             raise RuntimeError("preservation stopped during transfer backoff")
-    raise RuntimeError(f"bounded transfer attempts exhausted: phase={phase} group={group}")
+    raise RuntimeError("bounded transfer attempts exhausted: " + artifact["logical_name"])
 
 
-def verify_artifact(destination, artifact):
-    target = destination_file(destination, artifact["logical_name"])
-    if not target.is_file() or target.stat().st_size != artifact["size_bytes"]:
-        raise ValueError(f"missing or wrong-size preserved artifact: {artifact['logical_name']}")
+def verify_artifact(target, artifact, *, readonly=False, stopped=None):
+    target = checked_path(target)
+    before = target.stat()
+    if not target.is_file() or before.st_size != artifact["size_bytes"]:
+        raise ValueError("missing or wrong-size preserved artifact: " + artifact["logical_name"])
+    digest = hashlib.sha256()
     with target.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    if digest != artifact["sha256"]:
-        raise ValueError(f"preserved artifact hash mismatch: {artifact['logical_name']}")
-    target.chmod(0o400)
-    return digest
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            if stopped is not None and stopped.is_set():
+                raise RuntimeError("preservation stopped during verification")
+            digest.update(chunk)
+    after = target.stat()
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    if (
+        any(getattr(before, field) != getattr(after, field) for field in fields)
+        or digest.hexdigest() != artifact["sha256"]
+    ):
+        raise ValueError(
+            "preserved artifact hash mismatch or changed file: " + artifact["logical_name"]
+        )
+    if not readonly:
+        target.chmod(0o400)
+    return digest.hexdigest()
 
 
-def save_current(document):
-    fd, temporary = tempfile.mkstemp(prefix=".preservation-", dir=CURRENT.parent)
+def save_current(current, document):
+    fd, temporary = tempfile.mkstemp(prefix=".preservation-", dir=current.parent)
     try:
         with os.fdopen(fd, "w") as stream:
             json.dump(document, stream, sort_keys=True, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, CURRENT)
+        os.replace(temporary, current)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
 
-def run():
-    old_state = subprocess.check_output(
-        ["systemctl", "--user", "show", OLD_SERVICE, "-p", "ActiveState", "--value"], text=True,
-    ).strip()
-    if old_state not in {"inactive", "failed"}:
-        raise RuntimeError("old writer is not retired; refusing concurrent destination writes")
-    artifacts = read_artifacts()
-    if not DESTINATION.is_dir() or DESTINATION.is_symlink():
-        raise ValueError("resume requires the original real mirror directory")
-    phases = transfer_groups(artifacts)
+def run(args):
+    artifacts = read_artifacts(args.manifest, args.manifest_sha256)
+    destination = checked_path(args.destination)
+    current = checked_path(args.current)
+    if not destination.is_dir() or not current.parent.is_dir():
+        raise ValueError("resume requires existing mirror and task directories")
+    paths = local_paths(artifacts, destination, args.reuse)
     stopped = threading.Event()
+    interrupted = threading.Event()
+
+    def request_stop(_signum, _frame):
+        interrupted.set()
+        stopped.set()
+
+    previous_handlers = {}
     for signum in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(signum, lambda _signum, _frame: stopped.set())
-    with (DESTINATION / ".preservation.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        pending_bytes = 0
-        for artifact in artifacts:
-            target = destination_file(DESTINATION, artifact["logical_name"])
-            if not target.is_file() or target.stat().st_size != artifact["size_bytes"]:
-                pending_bytes += artifact["size_bytes"]
-        # Completed files already occupy disk. The reserve also covers four
-        # simultaneous replacement temporaries; size does not waive SHA checks.
-        required_free = pending_bytes + 64 * 1024**3
-        if shutil.disk_usage(DESTINATION).free < required_free:
-            raise ValueError("insufficient free disk for a recoverable resumed transfer")
-        document = {
-            "format": "veda-off-gpu-runtime-preservation-task-v1",
-            "state": "RUNNING_NOT_VERIFIED", "service": SERVICE, "main_pid": os.getpid(),
-            "source_runtime_commit": SOURCE_COMMIT, "artifact_manifest_sha256": MANIFEST_SHA256,
-            "selected_file_list_sha256": hashlib.sha256(file_list(artifacts)).hexdigest(),
-            "selected_artifact_count": len(artifacts),
-            "selected_bytes": sum(row["size_bytes"] for row in artifacts),
-            "destination": str(DESTINATION), "strategy": "non-encoder-first-four-way",
-            "operations_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-            "cpu_quota_percent": 100, "memory_high_bytes": 384 * 1024**2,
-            "memory_max_bytes": 768 * 1024**2, "service_runtime_limit_hours": 48,
-            "maximum_transfer_attempts_per_group": ATTEMPTS,
-            "aggregate_rate_limit_kib_per_second": WORKERS * GROUP_RATE_KIB,
-            "retired_service": OLD_SERVICE, "started_unix_seconds": time.time(),
-            "verified_files": 0, "verified_bytes": 0, "private_credentials_copied": False,
-            "gpu_requested": False, "target_r2_proven": False, "release_accepted": False,
-            "groups": [[{
-                "files": [row["logical_name"] for row in group],
-                "bytes": sum(row["size_bytes"] for row in group),
-                "file_list_sha256": hashlib.sha256(file_list(group)).hexdigest(),
-            } for group in phase] for phase in phases],
-        }
-        try:
-            save_current(document)
-            emit("STARTED", **document)
-            for phase, groups in enumerate(phases):
-                document["phase"] = "ENCODER" if phase else "NON_ENCODER"
-                save_current(document)
+        previous_handlers[signum] = signal.signal(signum, request_stop)
+    try:
+        lock_path = destination_file(destination, ".preservation.lock")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            pending = []
+            external = set()
+            for artifact in artifacts:
+                target = paths[artifact["logical_name"]]
+                if destination not in target.parents:
+                    external.add(artifact["logical_name"])
+                    if not target.is_file() or target.stat().st_size != artifact["size_bytes"]:
+                        raise ValueError("external reuse requires an existing complete local file")
+                elif not target.is_file() or target.stat().st_size != artifact["size_bytes"]:
+                    pending.append(artifact)
+            required_free = sum(row["size_bytes"] for row in pending) + RESERVE_BYTES
+            if shutil.disk_usage(destination).free < required_free:
+                raise ValueError("insufficient free disk for a recoverable resumed transfer")
+            document = {
+                "format": "veda-off-gpu-runtime-preservation-task-v1",
+                "state": "RUNNING_NOT_VERIFIED",
+                "main_pid": os.getpid(),
+                "artifact_manifest_sha256": args.manifest_sha256,
+                "manifest_path": str(args.manifest),
+                "destination": str(destination),
+                "operations_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "selected_artifact_count": len(artifacts),
+                "selected_bytes": sum(row["size_bytes"] for row in artifacts),
+                "pending_transfer_files": len(pending),
+                "pending_transfer_bytes": sum(row["size_bytes"] for row in pending),
+                "maximum_parallel_transfers": WORKERS,
+                "maximum_transfer_attempts_per_file": ATTEMPTS,
+                "aggregate_rate_limit_kib_per_second": WORKERS * GROUP_RATE_KIB,
+                "started_unix_seconds": time.time(),
+                "verified_files": 0,
+                "verified_bytes": 0,
+                "local_paths": {name: str(path) for name, path in paths.items()},
+                "read_only_reuse_names": sorted(external),
+            }
+
+            def verified(artifact):
+                document["verified_files"] += 1
+                document["verified_bytes"] += artifact["size_bytes"]
+                save_current(current, document)
+                emit(
+                    "ASSET_VERIFIED",
+                    logical_name=artifact["logical_name"],
+                    sha256=artifact["sha256"],
+                    size_bytes=artifact["size_bytes"],
+                    verified_files=document["verified_files"],
+                )
+
+            try:
+                save_current(current, document)
+                emit("STARTED", **document)
                 with ThreadPoolExecutor(max_workers=WORKERS) as workers:
-                    futures = [
-                        workers.submit(transfer_group, group, DESTINATION, phase, index, stopped)
-                        for index, group in enumerate(groups)
-                    ]
-                    for future in as_completed(futures):
-                        future.result()
-                for group in groups:
-                    for artifact in group:
-                        if stopped.is_set():
-                            raise RuntimeError("preservation stopped before verification completed")
-                        digest = verify_artifact(DESTINATION, artifact)
-                        document["verified_files"] += 1
-                        document["verified_bytes"] += artifact["size_bytes"]
-                        save_current(document)
-                        emit(
-                            "ASSET_VERIFIED", logical_name=artifact["logical_name"], sha256=digest,
-                            size_bytes=artifact["size_bytes"],
-                            verified_files=document["verified_files"],
-                        )
-                emit("PHASE_VERIFIED", phase=phase, verified_files=document["verified_files"],
-                     verified_bytes=document["verified_bytes"])
-            document["state"] = "COMPLETED_VERIFIED"
-            document["all_selected_file_hashes_verified"] = True
-            document["completed_unix_seconds"] = time.time()
-            save_current(document)
-            emit("COMPLETED", **document)
-        except BaseException as exc:
-            document["state"] = (
-                "STOPPED_NOT_VERIFIED" if stopped.is_set() else "FAILED_NOT_VERIFIED"
-            )
-            document["error"] = str(exc) or type(exc).__name__
-            save_current(document)
-            emit("FAILED", **document)
-            raise
+                    try:
+                        futures = {}
+                        for row in sorted(
+                            pending, key=lambda row: (-row["size_bytes"], row["logical_name"])
+                        ):
+                            future = workers.submit(
+                                transfer_artifact, row, paths[row["logical_name"]], stopped
+                            )
+                            futures[future] = row
+                        pending_names = {row["logical_name"] for row in pending}
+                        for artifact in artifacts:
+                            name = artifact["logical_name"]
+                            if name not in pending_names:
+                                verify_artifact(
+                                    paths[name],
+                                    artifact,
+                                    readonly=name in external,
+                                    stopped=stopped,
+                                )
+                                verified(artifact)
+                        for future in as_completed(futures):
+                            future.result()
+                            verified(futures[future])
+                    finally:
+                        stopped.set()
+                document["state"] = "COMPLETED_VERIFIED"
+                document["all_selected_file_hashes_verified"] = True
+                document["completed_unix_seconds"] = time.time()
+                save_current(current, document)
+                emit("COMPLETED", **document)
+            except BaseException as exc:
+                document["state"] = (
+                    "STOPPED_NOT_VERIFIED" if interrupted.is_set() else "FAILED_NOT_VERIFIED"
+                )
+                document["error"] = str(exc) or type(exc).__name__
+                save_current(current, document)
+                emit("FAILED", **document)
+                raise
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--manifest-sha256", required=True)
+    parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--current", type=Path, required=True)
+    parser.add_argument(
+        "--reuse",
+        action="append",
+        default=[],
+        help="LOGICAL_PREFIX=/absolute/local/path; outside mirror is read-only",
+    )
+    run(parser.parse_args())
 
 
 if __name__ == "__main__":
-    run()
+    main()

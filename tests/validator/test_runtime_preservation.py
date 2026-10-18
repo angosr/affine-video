@@ -1,13 +1,17 @@
 import hashlib
 import importlib.util
-import io
 import json
-import tarfile
+import re
+import signal
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from validator.production.commitment import canonical_json
 
 path = (
     Path(__file__).resolve().parents[2]
@@ -19,77 +23,185 @@ spec.loader.exec_module(preservation)
 
 
 def artifact(name, payload=b"frozen"):
-    return {"logical_name": name, "size_bytes": len(payload),
-            "sha256": hashlib.sha256(payload).hexdigest()}
+    digest = hashlib.sha256(payload).hexdigest()
+    return {
+        "logical_name": name,
+        "size_bytes": len(payload),
+        "sha256": digest,
+        "object_key": "artifacts/" + digest,
+    }
 
 
-def test_groups_cover_every_file_once_and_never_mix_encoder_phases():
-    rows = [artifact(f"veda-assets/transformer/{i}", b"x" * (i + 1)) for i in range(9)]
-    rows += [artifact(f"veda-assets/text_encoder/{i}", b"x" * (i + 1)) for i in range(7)]
-    phases = preservation.transfer_groups(rows)
-    assert phases == preservation.transfer_groups(list(reversed(rows)))
-    assert [len(phase) for phase in phases] == [4, 4]
-    names = [row["logical_name"] for phase in phases for group in phase for row in group]
-    assert len(names) == len(set(names)) == len(rows)
-    assert set(names) == {row["logical_name"] for row in rows}
-    for phase, groups in enumerate(phases):
-        assert all(("/text_encoder/" in row["logical_name"]) == bool(phase)
-                   for group in groups for row in group)
+def arguments(tmp_path, rows, reuse=()):
+    manifest = tmp_path / "manifest.json"
+    raw = canonical_json({"format": "veda-artifact-manifest-v1", "artifacts": rows})
+    manifest.write_bytes(raw)
+    destination = tmp_path / "mirror"
+    destination.mkdir(exist_ok=True)
+    return SimpleNamespace(
+        manifest=manifest,
+        manifest_sha256=hashlib.sha256(raw).hexdigest(),
+        destination=destination,
+        current=tmp_path / "task.json",
+        reuse=list(reuse),
+    )
 
 
-def test_scope_is_pinned_to_the_same_manifest_count_size_and_safe_paths(tmp_path, monkeypatch):
-    rows = [artifact(f"veda-assets/file-{i}", b"x") for i in range(88)]
-    rows[-1]["size_bytes"] = 146703809034 - 87
+def transfer(group, target, stopped):
+    assert not stopped.is_set()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"frozen")
+    preservation.verify_artifact(target, group, stopped=stopped)
 
-    def load(values):
-        raw = json.dumps({"artifacts": values}).encode()
-        bootstrap = tmp_path / "bootstrap.tar.gz"
-        with tarfile.open(bootstrap, "w:gz") as archive:
-            info = tarfile.TarInfo("artifact_manifest.json")
-            info.size = len(raw)
-            archive.addfile(info, io.BytesIO(raw))
-        monkeypatch.setattr(preservation, "MANIFEST_SHA256", hashlib.sha256(raw).hexdigest())
-        return preservation.read_artifacts(bootstrap)
 
-    assert len(load(rows)) == 88
-    for changed in (
-        rows[:-1],
-        [*rows[:-1], dict(rows[-1], logical_name=rows[0]["logical_name"])],
-        [*rows[:-1], dict(rows[-1], size_bytes=1)],
-        [*rows[:-1], dict(rows[-1], logical_name="veda-assets/../escape")],
+def test_scope_is_exactly_the_authenticated_manifest_not_an_old_prefix_or_file_count(tmp_path):
+    rows = [artifact("new/model"), artifact("other/cache")]
+    args = arguments(tmp_path, rows)
+    assert preservation.read_artifacts(args.manifest, args.manifest_sha256) == rows
+    with pytest.raises(ValueError, match="digest changed"):
+        preservation.read_artifacts(args.manifest, "0" * 64)
+    with pytest.raises(ValueError, match="SHA-256"):
+        preservation.read_artifacts(args.manifest, "Z" * 64)
+    args = arguments(tmp_path, [*rows, rows[0]])
+    with pytest.raises(ValueError, match="unique"):
+        preservation.read_artifacts(args.manifest, args.manifest_sha256)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "/absolute",
+        "../escape",
+        "x/../y",
+        "x//y",
+        "x/./y",
+        "x/",
+        "x\\y",
+        "x\x00y",
+        "x\ny",
+        "x\ty",
+    ],
+)
+def test_manifest_and_destination_reject_unsafe_paths(tmp_path, name):
+    args = arguments(tmp_path, [artifact(name)])
+    with pytest.raises(ValueError):
+        preservation.read_artifacts(args.manifest, args.manifest_sha256)
+    with pytest.raises(ValueError):
+        preservation.destination_file(args.destination, name)
+
+
+@pytest.mark.parametrize(
+    "changed", [{"size_bytes": 0}, {"size_bytes": True}, {"sha256": "A" * 64}, {"sha256": "0" * 63}]
+)
+def test_manifest_rejects_invalid_identity_fields(tmp_path, changed):
+    args = arguments(tmp_path, [{**artifact("x"), **changed}])
+    with pytest.raises(ValueError):
+        preservation.read_artifacts(args.manifest, args.manifest_sha256)
+
+
+def test_aliases_preserve_old_partial_paths_without_adding_old_artifacts(tmp_path, monkeypatch):
+    args = arguments(tmp_path, [artifact("current/model"), artifact("runtime/image")])
+    old = args.destination / "old/model"
+    partial = old.parent / ".rsync-partial/model"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"fro")
+    extra = args.destination / "old/text_encoder"
+    extra.write_bytes(b"historical-extra")
+    image = tmp_path / "image"
+    image.write_bytes(b"frozen")
+    image.chmod(0o600)
+    args.reuse = [f"current={old.parent}", f"runtime/image={image}"]
+    calls = []
+
+    def record(row, target, stopped):
+        calls.append((row["logical_name"], target))
+        assert partial.read_bytes() == b"fro"
+        transfer(row, target, stopped)
+
+    monkeypatch.setattr(preservation, "transfer_artifact", record)
+    preservation.run(args)
+    result = json.loads(args.current.read_text())
+    assert calls == [("current/model", old)]
+    assert result["selected_artifact_count"] == result["verified_files"] == 2
+    assert result["pending_transfer_files"] == 1
+    assert result["read_only_reuse_names"] == ["runtime/image"]
+    assert result["local_paths"] == {"current/model": str(old), "runtime/image": str(image)}
+    assert result["state"] == "COMPLETED_VERIFIED"
+    assert result["all_selected_file_hashes_verified"] is True
+    assert not (
+        {"target_r2_proven", "source_runtime_commit", "phase", "retired_service"} & result.keys()
+    )
+    assert image.stat().st_mode & 0o777 == 0o600  # Reuse never chmods shared external files.
+    assert partial.read_bytes() == b"fro" and extra.read_bytes() == b"historical-extra"
+    assert not (args.destination / "current").exists()
+
+
+@pytest.mark.parametrize("reuse", ["x", "x=relative", "../x=/tmp/x", "absent=/tmp/x"])
+def test_bad_or_unused_alias_is_rejected(tmp_path, reuse):
+    args = arguments(tmp_path, [artifact("x/model")])
+    with pytest.raises(ValueError):
+        preservation.local_paths([artifact("x/model")], args.destination, [reuse])
+
+
+def test_aliases_cannot_overlap_collide_or_follow_symlinks(tmp_path):
+    args = arguments(tmp_path, [artifact("x/a"), artifact("y/b")])
+    for reuse in (
+        [f"x={tmp_path}/a", f"x/a={tmp_path}/b"],
+        [f"x/a={tmp_path}/same", f"y/b={tmp_path}/same"],
     ):
         with pytest.raises(ValueError):
-            load(changed)
+            preservation.local_paths([artifact("x/a"), artifact("y/b")], args.destination, reuse)
+    link = tmp_path / "link"
+    link.symlink_to(args.destination, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        preservation.local_paths([artifact("x/a")], args.destination, [f"x={link}"])
+    (args.destination / "alias").symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        preservation.destination_file(args.destination, "alias/model")
 
 
-def test_verification_is_streaming_and_fail_closed_preserving_partial_data(tmp_path):
-    row = artifact("veda-assets/model")
-    target = tmp_path / row["logical_name"]
-    target.parent.mkdir()
+def test_external_reuse_missing_or_corrupt_never_downloads_or_changes_it(tmp_path, monkeypatch):
+    external = tmp_path / "external"
+    args = arguments(tmp_path, [artifact("x")], [f"x={external}"])
+    calls = []
+    monkeypatch.setattr(preservation, "transfer_artifact", lambda *_args: calls.append(True))
+    with pytest.raises(ValueError, match="existing complete"):
+        preservation.run(args)
+    assert not calls and not args.current.exists()
+    external.write_bytes(b"broken")
+    external.chmod(0o600)
+    with pytest.raises(ValueError, match="hash mismatch"):
+        preservation.run(args)
+    assert not calls and external.read_bytes() == b"broken"
+    assert external.stat().st_mode & 0o777 == 0o600
+    assert json.loads(args.current.read_text())["state"] == "FAILED_NOT_VERIFIED"
+
+
+def test_verification_is_streaming_and_preserves_partial_and_corrupt_bytes(tmp_path, monkeypatch):
+    row = artifact("model")
+    target = tmp_path / "model"
     target.write_bytes(b"frozen")
-    partial = target.parent / ".rsync-partial/model"
+    partial = tmp_path / ".rsync-partial/model"
     partial.parent.mkdir()
     partial.write_bytes(b"partial")
-    assert preservation.verify_artifact(tmp_path, row) == row["sha256"]
+    monkeypatch.setattr(Path, "read_bytes", lambda _p: pytest.fail("must stream artifact bytes"))
+    assert preservation.verify_artifact(target, row) == row["sha256"]
     assert target.stat().st_mode & 0o777 == 0o400
     for invalid in (dict(row, size_bytes=999), dict(row, sha256="0" * 64)):
         with pytest.raises(ValueError):
-            preservation.verify_artifact(tmp_path, invalid)
-    assert target.read_bytes() == b"frozen"
-    assert partial.read_bytes() == b"partial"
-    (tmp_path / "alias").symlink_to(target.parent, target_is_directory=True)
-    with pytest.raises(ValueError):
-        preservation.destination_file(tmp_path, "alias/model")
+            preservation.verify_artifact(target, invalid)
+    assert partial.stat().st_size == 7 and target.stat().st_size == 6
 
 
-def test_transfer_has_bounded_retries_and_preserves_rsync_resume_flags(tmp_path, monkeypatch):
+def test_transfer_has_bounded_retries_and_keeps_exact_partial_destination(tmp_path, monkeypatch):
     calls = []
 
     class Process:
         pid = 123
-        returncode = 12
 
         def __init__(self, command, **kwargs):
+            assert kwargs == {"start_new_session": True}
             calls.append(command)
 
         def __enter__(self):
@@ -98,104 +210,218 @@ def test_transfer_has_bounded_retries_and_preserves_rsync_resume_flags(tmp_path,
         def __exit__(self, *_args):
             return None
 
-        def communicate(self, data):
-            assert data == b"veda-assets/model\0"
+        def wait(self, **_kwargs):
+            return 12
+
+        def poll(self):
+            return 12
 
     monkeypatch.setattr(preservation.subprocess, "Popen", Process)
     stopped = SimpleNamespace(is_set=lambda: False, wait=lambda _seconds: False)
+    target = tmp_path / "old/model"
     with pytest.raises(RuntimeError, match="bounded"):
-        preservation.transfer_group([artifact("veda-assets/model")], tmp_path, 0, 0, stopped)
+        preservation.transfer_artifact(artifact("new/model"), target, stopped)
     assert len(calls) == 5
-    assert "--partial" in calls[0] and "--partial-dir=.rsync-partial" in calls[0]
+    assert calls[0][-2:] == ["gpu:/workspace/new/model", str(target)]
+    assert "--partial-dir=.rsync-partial" in calls[0] and "--protect-args" in calls[0]
     assert "--bwlimit=6144" in calls[0] and "--timeout=120" in calls[0]
     assert not any("delete" in option or "inplace" in option for option in calls[0])
     event = threading.Event()
     event.set()
     with pytest.raises(RuntimeError, match="stopped"):
-        preservation.transfer_group([artifact("veda-assets/model")], tmp_path, 0, 0, event)
+        preservation.transfer_artifact(artifact("new/model"), target, event)
     assert len(calls) == 5
 
 
-def test_run_refuses_an_active_previous_writer(monkeypatch):
-    monkeypatch.setattr(preservation.subprocess, "check_output", lambda *_a, **_k: "active\n")
-    with pytest.raises(RuntimeError, match="not retired"):
-        preservation.run()
+def test_partial_symlinks_are_rejected_before_spawning_rsync(tmp_path, monkeypatch):
+    (tmp_path / ".rsync-partial").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    monkeypatch.setattr(preservation.subprocess, "Popen", lambda *_a, **_k: pytest.fail("spawned"))
+    with pytest.raises(ValueError, match="symlink"):
+        preservation.transfer_artifact(artifact("model"), tmp_path / "model", threading.Event())
 
 
-def test_resume_disk_budget_excludes_completed_files_but_keeps_partial_and_reserve(
-    tmp_path, monkeypatch,
-):
-    rows = [artifact(f"veda-assets/{name}") for name in ("complete", "partial", "missing")]
-    destination = tmp_path / "mirror"
-    destination.mkdir()
-    completed = destination / rows[0]["logical_name"]
-    completed.parent.mkdir()
-    completed.write_bytes(b"frozen")
-    partial = completed.parent / ".rsync-partial/partial"
+def test_same_destination_lock_rejects_a_second_real_process_writer(tmp_path, monkeypatch):
+    args = arguments(tmp_path, [artifact("model")])
+    lock = args.destination / ".preservation.lock"
+    code = (
+        "import fcntl,sys; f=open(sys.argv[1],'a'); "
+        "fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); sys.stdin.read()"
+    )
+    monkeypatch.setattr(preservation, "transfer_artifact", lambda *_a: pytest.fail("second writer"))
+    with subprocess.Popen(
+        [sys.executable, "-c", code, str(lock)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as writer:
+        assert writer.stdout.readline() == "locked\n"
+        try:
+            with pytest.raises(BlockingIOError):
+                preservation.run(args)
+            assert not args.current.exists()
+        finally:
+            writer.communicate("")
+
+
+def test_resume_disk_budget_keeps_partial_and_reserve_but_excludes_complete(tmp_path, monkeypatch):
+    rows = [artifact(name) for name in ("complete", "missing", "partial")]
+    args = arguments(tmp_path, rows)
+    (args.destination / "complete").write_bytes(b"frozen")
+    partial = args.destination / ".rsync-partial/partial"
     partial.parent.mkdir()
     partial.write_bytes(b"fro")
-    current = tmp_path / "task.json"
-    monkeypatch.setattr(preservation, "CURRENT", current)
-    monkeypatch.setattr(preservation, "DESTINATION", destination)
-    monkeypatch.setattr(preservation, "read_artifacts", lambda: rows)
-    monkeypatch.setattr(preservation.subprocess, "check_output", lambda *_a, **_k: "inactive\n")
-    monkeypatch.setattr(preservation.signal, "signal", lambda *_a: None)
-    required_free = 64 * 1024**3 + 2 * len(b"frozen")
-    free = SimpleNamespace(free=required_free - 1)
+    free = SimpleNamespace(free=preservation.RESERVE_BYTES + 11)
     monkeypatch.setattr(preservation.shutil, "disk_usage", lambda _p: free)
-    calls = []
-
-    def transfer(group, root, *_args):
-        calls.append(group)
-        for row in group:
-            (root / row["logical_name"]).write_bytes(b"frozen")
-
-    monkeypatch.setattr(preservation, "transfer_group", transfer)
+    monkeypatch.setattr(preservation, "transfer_artifact", transfer)
     with pytest.raises(ValueError, match="insufficient free disk"):
-        preservation.run()
-    assert not calls and not current.exists()
-    assert partial.read_bytes() == b"fro"
-    free.free = required_free
-    preservation.run()
-    result = json.loads(current.read_text())
+        preservation.run(args)
+    assert not args.current.exists()
+    free.free += 1
+    preservation.run(args)
+    result = json.loads(args.current.read_text())
+    assert result["verified_files"] == 3 and result["pending_transfer_bytes"] == 12
     assert result["state"] == "COMPLETED_VERIFIED"
-    assert result["verified_files"] == 3  # Existing files still require their SHA check.
-    assert partial.read_bytes() == b"fro"
+    assert partial.read_bytes() == b"fro" and not list(tmp_path.glob(".preservation-*"))
 
 
-@pytest.mark.parametrize("corrupt", [False, True])
-def test_resumed_run_verifies_online_phase_before_encoder_and_never_accepts_corruption(
-    tmp_path, monkeypatch, corrupt,
-):
-    rows = [artifact("veda-assets/transformer/model"), artifact("veda-assets/text_encoder/model")]
-    current = tmp_path / "task.json"
-    destination = tmp_path / "mirror"
-    destination.mkdir()
-    events = []
-    monkeypatch.setattr(preservation, "CURRENT", current)
-    monkeypatch.setattr(preservation, "DESTINATION", destination)
-    monkeypatch.setattr(preservation, "read_artifacts", lambda: rows)
-    monkeypatch.setattr(preservation.subprocess, "check_output", lambda *_a, **_k: "inactive\n")
-    monkeypatch.setattr(preservation.shutil, "disk_usage", lambda _p: SimpleNamespace(free=10**15))
-    monkeypatch.setattr(preservation.signal, "signal", lambda *_a: None)
-    monkeypatch.setattr(preservation, "emit", lambda event, **kw: events.append((event, kw)))
+def test_corrupt_transfer_cannot_be_counted_as_completed(tmp_path, monkeypatch):
+    args = arguments(tmp_path, [artifact("model")])
 
-    def transfer(group, root, phase, index, stopped):
-        if phase:
-            assert json.loads(current.read_text())["verified_files"] == 1
-        for row in group:
-            target = root / row["logical_name"]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"broken" if corrupt else b"frozen")
+    def corrupt(row, target, stopped):
+        target.write_bytes(b"broken")
+        preservation.verify_artifact(target, row, stopped=stopped)
 
-    monkeypatch.setattr(preservation, "transfer_group", transfer)
-    if corrupt:
-        with pytest.raises(ValueError, match="hash mismatch"):
-            preservation.run()
-    else:
-        preservation.run()
-    result = json.loads(current.read_text())
-    assert result["state"] == ("FAILED_NOT_VERIFIED" if corrupt else "COMPLETED_VERIFIED")
-    assert result.get("all_selected_file_hashes_verified", False) is (not corrupt)
-    assert result["verified_files"] == (0 if corrupt else 2)
-    assert not list(tmp_path.glob(".preservation-*"))
+    monkeypatch.setattr(preservation, "transfer_artifact", corrupt)
+    with pytest.raises(ValueError, match="hash mismatch"):
+        preservation.run(args)
+    result = json.loads(args.current.read_text())
+    assert result["state"] == "FAILED_NOT_VERIFIED" and result["verified_files"] == 0
+    assert not result.get("all_selected_file_hashes_verified", False)
+
+
+def test_stop_terminates_only_its_private_transfer_process_group(tmp_path, monkeypatch):
+    stopped = threading.Event()
+    killed = []
+
+    class Process:
+        pid = 31415
+        done = False
+
+        def __init__(self, *_a, **_k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return None
+
+        def wait(self, **_kwargs):
+            if self.done:
+                return -15
+            stopped.set()
+            raise subprocess.TimeoutExpired("test-rsync", 1)
+
+        def poll(self):
+            return -15 if self.done else None
+
+    def kill(pid, signum):
+        killed.append((pid, signum))
+        Process.done = True
+
+    monkeypatch.setattr(preservation.subprocess, "Popen", Process)
+    monkeypatch.setattr(preservation.os, "killpg", kill)
+    with pytest.raises(RuntimeError, match="stopped during transfer"):
+        preservation.transfer_artifact(artifact("model"), tmp_path / "model", stopped)
+    assert killed == [(31415, signal.SIGTERM)]
+
+
+def test_real_rsync_resumes_the_existing_partial_in_the_same_mirror(tmp_path, monkeypatch, capfd):
+    payload = b"frozen-weights-0123456789" * 131072
+    source = tmp_path / "source"
+    source.write_bytes(payload)
+    target = tmp_path / "old/model"
+    partial = target.parent / ".rsync-partial/model"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(payload[: 1024 * 1024])
+    row = artifact("current/model", payload)
+    original = preservation.rsync_command
+
+    def local_command(artifact, destination):
+        command = original(artifact, destination)
+        command[-2] = str(source)
+        command.insert(1, "--no-whole-file")  # Remote transfers already use delta by default.
+        return command
+
+    monkeypatch.setenv("LC_ALL", "C")
+    monkeypatch.setattr(preservation, "rsync_command", local_command)
+    preservation.transfer_artifact(row, target, threading.Event())
+    assert target.read_bytes() == payload
+    matched = re.search(r"Matched data: ([\d,]+)", capfd.readouterr().out)
+    assert matched is not None and int(matched.group(1).replace(",", "")) > 0
+
+
+def test_lock_symlink_is_rejected_without_touching_external_file(tmp_path):
+    args = arguments(tmp_path, [artifact("model")])
+    external = tmp_path / "external"
+    external.write_bytes(b"unchanged")
+    (args.destination / ".preservation.lock").symlink_to(external)
+    with pytest.raises(ValueError, match="symlink"):
+        preservation.run(args)
+    assert external.read_bytes() == b"unchanged" and not args.current.exists()
+
+
+def test_second_submit_failure_stops_and_joins_the_first_transfer(tmp_path, monkeypatch):
+    args = arguments(tmp_path, [artifact("a"), artifact("b")])
+    real_executor = preservation.ThreadPoolExecutor
+    started = threading.Event()
+    joined = threading.Event()
+
+    class Executor:
+        submissions = 0
+
+        def __init__(self, **kwargs):
+            self.executor = real_executor(**kwargs)
+
+        def __enter__(self):
+            self.executor.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.executor.__exit__(*args)
+
+        def submit(self, *args):
+            self.submissions += 1
+            if self.submissions == 2:
+                assert started.wait(2)
+                raise RuntimeError("injected second submit failure")
+            return self.executor.submit(*args)
+
+    def waiting(_row, _target, stopped):
+        started.set()
+        assert stopped.wait(2)
+        joined.set()
+
+    monkeypatch.setattr(preservation, "ThreadPoolExecutor", Executor)
+    monkeypatch.setattr(preservation, "transfer_artifact", waiting)
+    with pytest.raises(RuntimeError, match="injected second submit"):
+        preservation.run(args)
+    assert joined.is_set()
+    assert json.loads(args.current.read_text())["state"] == "FAILED_NOT_VERIFIED"
+
+
+def test_signal_stop_is_recorded_as_stopped_not_success(tmp_path, monkeypatch):
+    args = arguments(tmp_path, [artifact("model")])
+    target = args.destination / "model"
+    target.write_bytes(b"frozen")
+
+    def interrupted(*_args, **_kwargs):
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        raise RuntimeError("controlled stop")
+
+    monkeypatch.setattr(preservation, "verify_artifact", interrupted)
+    before = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(RuntimeError, match="controlled stop"):
+        preservation.run(args)
+    assert json.loads(args.current.read_text())["state"] == "STOPPED_NOT_VERIFIED"
+    assert signal.getsignal(signal.SIGTERM) is before
