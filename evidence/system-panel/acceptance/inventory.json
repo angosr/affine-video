@@ -21,15 +21,37 @@
       "subject": "截取点与参考实现"
     },
     {
-      "acceptance_manifest": null,
+      "acceptance_manifest": {
+        "path": "evidence/system-panel/acceptance-d1b38764/e2-cache-fidelity.json",
+        "sha256": "ac9535eac666b59cb382e92b31749a95a20422388e76788e4cc3c22953456224"
+      },
       "acceptance_rule": "排名 Spearman ≥0.999，缓存引入的输出 RSE ≤1e-3，Top k 一致率达到清单门槛",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "d1b387642e1da0fa35411c6d7ebfa830567a14e84be8c6163e2062afe4257260",
+        "runtime_source_commit": "18e9c5c",
+        "cases": 96,
+        "independent_source_videos": 4,
+        "geometries": 4,
+        "routes": 8,
+        "controls": 3,
+        "budgets": [16, 32, 64],
+        "mask_mismatches": 0,
+        "max_sparse_output_rse": 7.414164965213606e-18,
+        "minimum_per_case_budget_spearman": 1.0,
+        "global_spearman": 0.999999981394532
+      },
       "id": "E2",
       "method": "对 float32 在线结果、候选缓存 dtype 和缓存重放做逐项及排名比较",
-      "pass": false,
-      "raw_evidence": [],
+      "pass": true,
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/runtime-checks-gpu6.raw.log",
+          "sha256": "c5f85ed2ea44bdc5d137004ab2b0fb2f0bb2e54a29bd0dcdede95d435a030aeb",
+          "scope": "Final-runtime FP32 teacher recapture versus FP16 cache for fixed controls; historical inputs, not future official batch eligibility or general model ranking validation"
+        }
+      ],
       "release_blocker": true,
-      "status": "not_final_runtime_verified",
+      "status": "registered_cache_fidelity_checks_passed",
       "subject": "缓存数值忠实度"
     },
     {
