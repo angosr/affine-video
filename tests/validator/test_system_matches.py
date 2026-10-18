@@ -1,10 +1,13 @@
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scoring.spec import load_track_spec
+from validator import publication as publication_module
 from validator import system_matches as system_matches_module
 from validator.production.commitment import Artifact, ArtifactManifest
 from validator.system_matches import (
@@ -13,6 +16,7 @@ from validator.system_matches import (
     system_match_artifacts,
     system_match_summaries,
 )
+from validator.weights import WeightChainState
 
 
 def _runtime_manifest(
@@ -89,6 +93,93 @@ def test_runtime_evidence_contract_is_computed_once(monkeypatch) -> None:
     system_matches_module._evidence_runtime_digest.cache_clear()
 
 
+def test_repeated_publication_reuses_one_runtime_environment_scan(monkeypatch) -> None:
+    track = load_track_spec(Path(__file__).parents[2] / "track.json")
+    runtime_manifest = _runtime_manifest()
+    track = replace(
+        track,
+        artifact_manifest_sha256=hashlib.sha256(runtime_manifest).hexdigest(),
+    )
+    calls = {"artifacts": 0, "environment": 0, "source": 0}
+
+    def environment_digest() -> str:
+        calls["environment"] += 1
+        return "12" * 32
+
+    def source_digest() -> str:
+        calls["source"] += 1
+        return "34" * 32
+
+    system_matches_module._evidence_runtime_digest.cache_clear()
+    monkeypatch.setattr(
+        system_matches_module,
+        "evaluation_environment_digest",
+        environment_digest,
+    )
+    monkeypatch.setattr(system_matches_module, "evaluation_source_digest", source_digest)
+    monkeypatch.setattr(
+        system_matches_module,
+        "PRODUCTION_EVIDENCE_CONTRACT_DIGEST",
+        system_matches_module._evidence_contract_digest(track),
+    )
+    runtime_digest = system_matches_module._evidence_runtime_digest(runtime_manifest)
+    monkeypatch.setattr(
+        system_matches_module,
+        "PRODUCTION_EVIDENCE_RUNTIME_DIGEST",
+        runtime_digest,
+    )
+    system_matches_module._evidence_runtime_digest.cache_clear()
+    calls["environment"] = calls["source"] = 0
+    real_artifacts = system_matches_module.system_match_artifacts
+
+    def counted_artifacts(track, manifest):
+        calls["artifacts"] += 1
+        return real_artifacts(track, manifest)
+
+    monkeypatch.setattr(publication_module, "system_match_artifacts", counted_artifacts)
+    monkeypatch.setattr(
+        publication_module,
+        "_verify_candidate_release",
+        lambda _track, _manifest, _approval: None,
+    )
+    store = SimpleNamespace(
+        chain_cursor=lambda: (track.track_start_block, "0x" + "12" * 32),
+        public_snapshot=lambda: {"challenges": []},
+        active_competitors=lambda _mapping: [],
+    )
+    chain = WeightChainState(
+        track.track_start_block,
+        {track.initial_champion.hotkey: 0},
+        1,
+        1.0,
+        10,
+        {track.initial_champion.hotkey: 0},
+    )
+
+    try:
+        first = publication_module.build_public_artifacts(
+            store,
+            track,
+            chain,
+            version_key=0,
+            runtime_manifest=runtime_manifest,
+        )
+        second = publication_module.build_public_artifacts(
+            store,
+            track,
+            chain,
+            version_key=0,
+            runtime_manifest=runtime_manifest,
+        )
+
+        assert first is not None and second is not None
+        assert len(first.system_matches) == len(second.system_matches) == 3
+        assert len(json.loads(first.status)["system_matches"]) == 3
+        assert calls == {"artifacts": 2, "environment": 1, "source": 1}
+    finally:
+        system_matches_module._evidence_runtime_digest.cache_clear()
+
+
 def test_production_system_matches_are_complete_and_separate_from_rewards(monkeypatch) -> None:
     track = load_track_spec(Path(__file__).parents[2] / "track.json")
     runtime_manifest = _runtime_manifest()
@@ -128,12 +219,7 @@ def test_production_system_matches_are_complete_and_separate_from_rewards(monkey
         batch["reference_gain_lower_bound"] > 0.005
         for batch in documents[1]["evaluation"]["batches"]
     )
-    assert (
-        len(
-            system_match_summaries(track, runtime_manifest)
-        )
-        == 3
-    )
+    assert len(system_match_summaries(artifacts)) == 3
 
 
 def test_candidate_track_keeps_the_exact_runtime_schedule() -> None:

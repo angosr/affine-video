@@ -189,7 +189,7 @@ def build_public_artifacts(
         store.active_competitors(chain.uid_by_hotkey),
         snapshot["challenges"],
         track_aborted=aborted,
-        system_matches=system_match_summaries(track, runtime_manifest),
+        system_matches=system_match_summaries(system_matches),
     )
     files: dict[str, PublicFile] = {}
     batch_groups: dict[str, bytes] = {}
@@ -330,7 +330,7 @@ def build_genesis_artifacts(
                 tournament,
                 [],
                 [],
-                system_matches=system_match_summaries(track, runtime_manifest),
+                system_matches=system_match_summaries(system_matches),
             )
         ),
         system_matches=system_matches,

@@ -52,13 +52,12 @@ def system_match_artifacts(
 
 
 def system_match_summaries(
-    track: TrackSpec,
-    runtime_manifest: bytes | None,
+    artifacts: tuple[tuple[str, bytes], ...],
 ) -> list[dict[str, Any]]:
-    """Return compact launch-check rows for the live status document."""
+    """Return compact status rows from already verified immutable artifacts."""
 
     summaries = []
-    for name, payload in system_match_artifacts(track, runtime_manifest):
+    for name, payload in artifacts:
         document = json.loads(payload)
         summaries.append(
             {
