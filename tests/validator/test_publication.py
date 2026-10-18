@@ -1152,6 +1152,20 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         {ready.plan_digest}
     )
 
+    tampered = json.loads(record)
+    tampered["public_selected_inputs"]["index"]["sha256"] = "ff" * 32
+    tampered_client = MemoryS3()
+    tampered_client.objects = dict(client.objects)
+    tampered_client.metadata = dict(client.metadata)
+    disclosure_key = f"tracks/test/batch_groups/{ready.plan_digest}.json"
+    tampered_client.objects[disclosure_key] = canonical_json(tampered)
+    with pytest.raises(PublicArtifactError, match="not canonical"):
+        S3Repository(
+            tampered_client,
+            bucket="public-data",
+            prefix="tracks/test",
+        )._load_batch_disclosures(track, (match,))
+
     wrong_boundary = SimpleNamespace(
         challenge_id="challenge",
         document={

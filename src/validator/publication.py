@@ -18,7 +18,7 @@ import httpx
 
 from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
 from validator.chunks import ChunkManifest, build_chunk_manifest, chunk_object_name, read_part
-from validator.production.batches import BatchDisclosure
+from validator.production.batches import BatchDisclosure, public_selected_inputs_document
 from validator.production.commitment import verify_source_proof
 from validator.production.plan import (
     BatchPlan,
@@ -1142,21 +1142,18 @@ class S3Repository:
                 public_references.append(public)
             if plan.sample_cache is None:
                 raise PublicArtifactError("public READY plan omitted selected source inputs")
-            public_inputs = {}
+            public_inputs = public_selected_inputs_document(plan.sample_cache)
             for kind, item in (
                 ("index", plan.sample_cache.index),
                 ("text", plan.sample_cache.text),
                 ("condition", plan.sample_cache.condition),
             ):
                 if item is None:
-                    public_inputs[kind] = None
                     continue
-                object_name = f"batch_inputs/{item.sha256}/manifest.json"
-                public_inputs[kind] = {
-                    "object": object_name,
-                    "sha256": item.sha256,
-                    "size_bytes": item.size_bytes,
-                }
+                public = public_inputs[kind]
+                assert public is not None
+                object_name = public["object"]
+                assert isinstance(object_name, str)
                 files.append((object_name, item.sha256, item.size_bytes))
             expected = {
                 "format": "veda-batch-disclosure-v1",

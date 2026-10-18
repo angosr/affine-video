@@ -8,7 +8,6 @@ import os
 import queue
 import time
 from collections.abc import Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +19,7 @@ from scoring.video import VideoCell, VideoFidelityMetric, paired_video_gain_boun
 from validator.production.batches import ConfirmationBatch
 from validator.production.config import ProducerConfig
 from validator.production.runtime import SparseOutputInvalid
+from validator.production.workers import close_workers
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,12 +57,12 @@ class ConfirmationWorkerPool:
         self._processes = []
         for gpu_id in self.config.evaluation_gpu_ids:
             tasks = context.Queue()
+            self._queues.append(tasks)
             process = context.Process(
                 target=_confirmation_worker,
                 args=(gpu_id, self.config, self.track, tasks, self._result),
                 name=f"veda-confirmation-gpu-{gpu_id}",
             )
-            self._queues.append(tasks)
             self._processes.append(process)
             process.start()
 
@@ -152,46 +152,7 @@ class ConfirmationWorkerPool:
         queues, self._queues = self._queues, []
         processes, self._processes = self._processes, []
         result, self._result = self._result, None
-        signal_failed: set[int] = set()
-        for index, tasks in enumerate(queues):
-            try:
-                tasks.put(None)
-            except Exception:  # cleanup must survive a broken multiprocessing queue
-                signal_failed.add(index)
-        for index, process in enumerate(processes):
-            if index in signal_failed:
-                _terminate_process(process)
-                continue
-            with suppress(Exception):  # includes a Process which failed before start()
-                process.join(timeout=30)
-            try:
-                alive = process.is_alive()
-            except Exception:
-                alive = False
-            if alive:
-                _terminate_process(process)
-        for tasks in queues:
-            _dispose_queue(tasks)
-        if result is not None:
-            _dispose_queue(result)
-
-
-def _terminate_process(process: Any) -> None:
-    try:
-        process.terminate()
-    except Exception:
-        return
-    with suppress(Exception):
-        process.join(timeout=5)
-
-
-def _dispose_queue(value: Any) -> None:
-    try:
-        value.close()
-    except Exception:
-        return
-    with suppress(Exception):
-        value.join_thread()
+        close_workers(queues, processes, result)
 
 
 def _confirmation_worker(

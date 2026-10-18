@@ -26,6 +26,7 @@ from validator.production.commitment import canonical_json, verify_source_proof
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
+    ReadySampleCache,
     build_plan,
     select_query_tiles,
     validate_source_selection_sequence,
@@ -61,6 +62,28 @@ class BatchDisclosure:
     record_name: str
     record_payload: bytes
     files: tuple[DisclosureFile, ...]
+
+
+def public_selected_inputs_document(
+    selected: ReadySampleCache,
+) -> dict[str, dict[str, object] | None]:
+    """Derive the one public mapping for the private READY input references."""
+
+    result: dict[str, dict[str, object] | None] = {}
+    for kind, item in (
+        ("index", selected.index),
+        ("text", selected.text),
+        ("condition", selected.condition),
+    ):
+        if item is None:
+            result[kind] = None
+            continue
+        result[kind] = {
+            "object": f"batch_inputs/{item.sha256}/manifest.json",
+            "sha256": item.sha256,
+            "size_bytes": item.size_bytes,
+        }
+    return result
 
 
 class ReadyBatchSource:
@@ -395,24 +418,21 @@ class ReadyBatchSource:
                 }
             references.append(public)
         selected_inputs = self._restore_sample_cache(plan)
-        public_inputs = {}
         assert plan.sample_cache is not None
+        public_inputs = public_selected_inputs_document(plan.sample_cache)
         for kind, item, name in (
             ("index", plan.sample_cache.index, "index.json"),
             ("text", plan.sample_cache.text, "text.safetensors"),
             ("condition", plan.sample_cache.condition, "cond.safetensors"),
         ):
             if item is None:
-                public_inputs[kind] = None
                 continue
             path = selected_inputs / name
-            object_name = f"batch_inputs/{item.sha256}/manifest.json"
+            public = public_inputs[kind]
+            assert public is not None
+            object_name = public["object"]
+            assert isinstance(object_name, str)
             files.append(DisclosureFile(object_name, path, item.sha256))
-            public_inputs[kind] = {
-                "object": object_name,
-                "sha256": item.sha256,
-                "size_bytes": item.size_bytes,
-            }
         record = canonical_json(
             {
                 "format": "veda-batch-disclosure-v1",

@@ -51,6 +51,7 @@ from validator.production.plan import (
 )
 from validator.production.runtime import trajectory_tensor_key
 from validator.production.storage import PreconditionFailed, PrivateObjectStore, StoredObject
+from validator.production.workers import close_workers
 from validator.queue import TERMINAL_STATES, ChallengeState
 from validator.store import ChallengeStore
 
@@ -312,14 +313,14 @@ class WorkerPool:
         try:
             for gpu_id in config.gpu_ids:
                 tasks = context.Queue()
+                self._queues.append(tasks)
                 process = context.Process(
                     target=_worker_loop,
                     args=(gpu_id, config, track, tasks, self._result),
                     name=f"veda-producer-gpu-{gpu_id}",
                 )
-                process.start()
-                self._queues.append(tasks)
                 self._processes.append(process)
+                process.start()
         except Exception:
             self.close()
             raise
@@ -362,13 +363,10 @@ class WorkerPool:
         return tuple(results[rollout.rollout_id] for rollout in plan.rollouts)
 
     def close(self) -> None:
-        for tasks in self._queues:
-            tasks.put(None)
-        for process in self._processes:
-            process.join(timeout=30)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
+        queues, self._queues = self._queues, []
+        processes, self._processes = self._processes, []
+        result, self._result = self._result, None
+        close_workers(queues, processes, result)
 
 
 class ProducerService:

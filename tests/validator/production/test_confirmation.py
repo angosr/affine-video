@@ -88,6 +88,94 @@ def test_full_video_cell_hash_binds_raw_sparse_outputs() -> None:
     assert first_hash != second_hash
 
 
+def test_confirmation_setup_uses_only_the_ready_selected_cache(tmp_path, monkeypatch) -> None:
+    """Exercise the worker setup after the evaluator's hidden-pool reads are denied."""
+
+    selected_cache = tmp_path / "ready-inputs"
+    selected_cache.mkdir()
+    evaluator_root = tmp_path / "evaluator-runtime"
+    evaluator_root.mkdir()
+    initialized = []
+
+    class Runtime:
+        def __init__(self, **kwargs):
+            initialized.append(kwargs)
+
+        def verify_trajectory_schedule(self, sigmas):
+            assert sigmas == (1.0, 0.0)
+
+    class Metric:
+        def __init__(self, path, *, expected_sha256, device):
+            assert path == evaluator_root / "weights/feature.safetensors"
+            assert expected_sha256 == "12" * 32
+            assert device == "cuda:0"
+
+    class Tasks:
+        def __init__(self):
+            self.values = [
+                (
+                    "challenger",
+                    "selector.safetensors",
+                    SimpleNamespace(
+                        sample_cache_path=selected_cache,
+                        latent_paths=(),
+                        plan=SimpleNamespace(rollouts=(), selected_steps=()),
+                    ),
+                ),
+                None,
+            ]
+
+        def get(self):
+            return self.values.pop(0)
+
+    class Results:
+        def __init__(self):
+            self.values = []
+
+        def put(self, value):
+            self.values.append(value)
+
+    runtime = SimpleNamespace(
+        model_root="weights/model",
+        adapter="weights/adapter.safetensors",
+        predictor="weights/predictor.safetensors",
+        sample_cache="samples/production",
+        feature_model="weights/feature.safetensors",
+        offload_blocks=0,
+        prefetch=1,
+        mlp_chunk_rows=128,
+    )
+
+    def hidden_artifact_path(_logical_name):
+        pytest.fail("confirmation must not resolve the producer's hidden artifact root")
+
+    def evaluator_artifact_path(logical_name):
+        assert not logical_name.startswith("samples/")
+        assert not logical_name.startswith("audit/")
+        return evaluator_root / logical_name
+
+    config = SimpleNamespace(
+        runtime=runtime,
+        artifact_path=hidden_artifact_path,
+        evaluator_artifact_path=evaluator_artifact_path,
+    )
+    candidate_track = SimpleNamespace(
+        scoring=SimpleNamespace(
+            trajectory_schedule=SimpleNamespace(sigmas=(1.0, 0.0))
+        ),
+        full_video=SimpleNamespace(feature_model_sha256="12" * 32),
+    )
+    results = Results()
+    monkeypatch.setattr("validator.production.runtime.DenseRolloutRuntime", Runtime)
+    monkeypatch.setattr(confirmation, "VideoFidelityMetric", Metric)
+
+    confirmation._confirmation_worker(0, config, candidate_track, Tasks(), results)
+
+    assert len(initialized) == 1
+    assert initialized[0]["sample_cache"] == str(selected_cache)
+    assert results.values == [("ok", "challenger", ())]
+
+
 def test_partial_worker_start_is_cleaned_up_and_pool_can_be_reused(monkeypatch) -> None:
     cells = (VideoCell("wide", "rollout", 16, 0.5),)
 
