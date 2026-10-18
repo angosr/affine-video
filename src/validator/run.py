@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AsyncExitStack, suppress
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from math import ceil
 from pathlib import Path
@@ -447,8 +447,15 @@ async def run_evaluator(
 
         def start_publication() -> asyncio.Task[PublicArtifacts]:
             assert pending_artifacts is not None
+            artifacts = pending_artifacts
+            if publication is not None and publication.abort is not None:
+                # Finish historical uploads behind the irreversible null-weight
+                # fence; never retry them as a request to resume the track.
+                artifacts = replace(
+                    artifacts, abort=publication.abort, weights=publication.weights,
+                )
             return asyncio.create_task(_stage_publication(
-                pending_artifacts,
+                artifacts,
                 terminal_ids=frozenset(
                     item["challenge_id"] for item in store.public_snapshot()["challenges"]
                     if item["state"] in TERMINAL_STATES
@@ -460,8 +467,17 @@ async def run_evaluator(
         async def finish_publication() -> None:
             work.allowed = False
             if publication_task is not None:
-                with suppress(Exception):
+                try:
                     await asyncio.shield(publication_task)
+                except Exception as exc:
+                    _record_publication_failure(store, alert, exc)
+                    # One bounded shutdown attempt handles a lost PUT response.
+                    # Persistent outages remain recorded for restart recovery.
+                    if publication is not None and publication.abort is not None:
+                        try:
+                            await asyncio.shield(start_publication())
+                        except Exception as retry_exc:
+                            _record_publication_failure(store, alert, retry_exc)
 
         resources.push_async_callback(finish_publication)
         consecutive_cycle_errors = 0
@@ -515,14 +531,6 @@ async def run_evaluator(
                         before_block=track.track_start_block - 1,
                     )
                     while True:
-                        if (
-                            track_aborted and publication_task is not None
-                            and publication_task.done()
-                        ):
-                            with suppress(Exception):
-                                publication_task.result()
-                            publication_task = None
-                            pending_artifacts = None
                         await _refresh_seed_block_hashes(client, evaluator)
                         result = await process_cycle(
                             client,
@@ -551,8 +559,7 @@ async def run_evaluator(
                         recovery_index += result.restored_matches
                         cursor = store.chain_cursor()
                         if (
-                            not track_aborted
-                            and cursor is not None
+                            cursor is not None
                             and cursor[0] == result.finalized_block
                             and result.finalized_block >= ledger.required_finalized_block
                         ):
@@ -566,7 +573,7 @@ async def run_evaluator(
                                 if (
                                     publication_task is not None and publication_task.done()
                                     and (
-                                        publication is None
+                                        track_aborted or publication is None
                                         or chain.finalized_block > publication.source_block
                                     )
                                 ):
@@ -613,7 +620,7 @@ async def run_evaluator(
                                                 len(candidate.matches) > published_match_count
                                                 or reconcile_publication
                                             )
-                                            and candidate.abort is None
+                                            and (candidate.abort is None or track_aborted)
                                         ):
                                             pending_artifacts = candidate
                                             reconcile_publication = False
@@ -636,7 +643,12 @@ async def run_evaluator(
                                     publication = None
                                     continue
                                 artifacts = publication
-                                if artifacts is not None:
+                                if artifacts is not None and track_aborted:
+                                    # Aborted tracks may finish immutable history,
+                                    # but must never refresh mutable reward pointers.
+                                    if pending_artifacts is not None and publication_task is None:
+                                        publication_task = start_publication()
+                                elif artifacts is not None:
                                     await publisher.publish(artifacts)
                                     # publish() completes the full continuous match prefix,
                                     # disclosures and fenced pointers before clearing this gate.

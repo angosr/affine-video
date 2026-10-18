@@ -461,7 +461,8 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
 
 @pytest.mark.parametrize("mode", [
     "success", "prepare_retry", "retry", "retry_exhaustion", "abort", "restart", "group_restart",
-    "abort_restart",
+    "abort_restart", "abort_lost_response", "abort_restart_lost_response",
+    "abort_running_lost_response",
 ])
 def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     pending_evaluation, monkeypatch, tmp_path, mode,
@@ -479,6 +480,11 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     )
 
     case = pending_evaluation
+    lost_response = mode.endswith("_lost_response")
+    mode = mode.removesuffix("_lost_response")
+    keep_running = mode == "abort_running"
+    if keep_running:
+        mode = "abort"
     blocks = {height: empty_chain_block(height) for height in range(100, 1201)}
     blocks[100] = chain_block(ModelSubmission("owner/model", "12" * 20).encode(), 100)
     second = chain_block(ModelSubmission("owner/second", "34" * 20).encode(), 402)
@@ -651,6 +657,20 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
 
     transport = MemoryS3()
     transport.before_put = slow_upload
+    response_lost = False
+    original_put = transport.put_object
+
+    def put_with_lost_response(**arguments):
+        nonlocal response_lost
+        original_put(**arguments)
+        if (
+            lost_response and not response_lost and "/models/" in arguments["Key"]
+            and arguments["Key"].endswith("/part-00000")
+        ):
+            response_lost = True
+            raise OSError("response lost after durable model chunk PUT")
+
+    monkeypatch.setattr(transport, "put_object", put_with_lost_response)
     publisher = S3Repository(transport, bucket="test", prefix="isolated/slow-disclosure")
     database = case.work.database
 
@@ -667,6 +687,11 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
             assert weights.track_aborted and weights.plan is None
             prepare_release.set()
             upload_release.set()
+            if keep_running and not all(
+                f"isolated/slow-disclosure/batch_groups/{plan.plan_digest}.json"
+                in transport.objects for plan in plans.values()
+            ):
+                return
             raise StopLoop
         if weights.match_sequence == 1:
             assert weights.plan.uids == (1,)
@@ -734,6 +759,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         prepare_release.set()
         upload_release.set()
     assert not failures
+    assert response_lost is lost_response
     assert len(preparation_heads) == len(upload_heads) == 3
     assert len(set(preparation_heads)) == len(set(upload_heads)) == 3
     if mode == "prepare_retry":
