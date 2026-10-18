@@ -493,6 +493,7 @@ class DenseRolloutRuntime:
                 latent_temporary,
                 metadata={"geometry": geometry, "rollout_id": rollout_id},
             )
+            _canonicalize_safetensors_header(latent_temporary)
             _fsync(latent_temporary)
             os.replace(latent_temporary, latent_path)
             parsed_geometry = self.data.parse_geometry(geometry)
@@ -762,6 +763,33 @@ def _pool_layout(counts: np.ndarray, device: Any, torch: Any) -> Any:
         partial_tiles=torch.nonzero(valid_count < 128, as_tuple=False).flatten(),
         kv_ok=valid_count > 0,
     )
+
+
+def _canonicalize_safetensors_header(path: Path) -> None:
+    """Normalize generated header ordering without reading or changing tensor payloads."""
+
+    with path.open("r+b") as handle:
+        prefix = handle.read(8)
+        header_size = int.from_bytes(prefix, "little")
+        if (
+            len(prefix) != 8
+            or not 0 < header_size <= 1024 * 1024
+            or header_size > os.fstat(handle.fileno()).st_size - 8
+        ):
+            raise RuntimeError("generated safetensors header size is invalid")
+        try:
+            header = json.loads(handle.read(header_size))
+        except ValueError as exc:
+            raise RuntimeError("generated safetensors header is invalid") from exc
+        if not isinstance(header, dict):
+            raise RuntimeError("generated safetensors header must be an object")
+        canonical = json.dumps(
+            header, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+        if len(canonical) > header_size:
+            raise RuntimeError("canonical safetensors header exceeds its reserved size")
+        handle.seek(8)
+        handle.write(canonical.ljust(header_size, b" "))
 
 
 def _fsync(path: Path) -> None:
