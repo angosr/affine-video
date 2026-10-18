@@ -22,7 +22,12 @@ from scoring.spec import (
     TrajectoryScheduleSpec,
 )
 from validator.production.batches import ReadyBatchSource, _validate_plan_case_binding
-from validator.production.commitment import SourceLeaf, SourcePool, verify_source_proof
+from validator.production.commitment import (
+    SourceLeaf,
+    SourcePool,
+    canonical_json,
+    verify_source_proof,
+)
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
@@ -578,7 +583,9 @@ class AttemptObjects:
         return self.get(name)
 
 
-def test_producer_retry_ceiling_survives_process_and_host_loss(monkeypatch) -> None:
+def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
+    monkeypatch, tmp_path,
+) -> None:
     plan = build_plan(
         track_spec_digest="ab" * 32,
         generation_block=120,
@@ -596,11 +603,13 @@ def test_producer_retry_ceiling_survives_process_and_host_loss(monkeypatch) -> N
 
     for expected in range(1, 6):
         objects = AttemptObjects(durable)
-        assert _reserve_plan_attempt(objects, plan) == expected
+        assert _reserve_plan_attempt(objects, plan, now_ms=100) == expected
         assert _plan_attempt_count(AttemptObjects(durable), plan) == expected
 
-    assert _reserve_plan_attempt(AttemptObjects(durable), plan) == 5
+    assert _reserve_plan_attempt(AttemptObjects(durable), plan, now_ms=3_600_099) is None
     assert len(durable) == 5
+    assert _reserve_plan_attempt(AttemptObjects(durable), plan, now_ms=3_600_100) == 6
+    assert _reserve_plan_attempt(AttemptObjects(durable), plan, now_ms=3_600_101) is None
 
     class Store:
         def __enter__(self):
@@ -620,8 +629,10 @@ def test_producer_retry_ceiling_survives_process_and_host_loss(monkeypatch) -> N
             return (("plans/120.json", StoredObject(plan.encode(), "etag"), plan),)
 
     service = object.__new__(ProducerService)
-    service.config = SimpleNamespace(validator_database="unused.db", poll_seconds=0.01)
-    service.track = SimpleNamespace(digest=plan.track_spec_digest)
+    service.config = SimpleNamespace(
+        validator_database="unused.db", poll_seconds=0.01, work_dir=tmp_path,
+    )
+    service.track = SimpleNamespace(digest=plan.track_spec_digest, track_close_block=200)
     service.objects = AttemptObjects(durable)
     service.pool = None
     service.alert = None
@@ -629,8 +640,59 @@ def test_producer_retry_ceiling_survives_process_and_host_loss(monkeypatch) -> N
         production_service, "ChallengeStore", lambda *_args, **_kwargs: Store()
     )
     monkeypatch.setattr(production_service, "PlanCoordinator", Coordinator)
-    with pytest.raises(RuntimeError, match="retry ceiling"):
+    monkeypatch.setattr(Store, "chain_cursor", lambda _self: (120, "0x" + "cd" * 32),
+                        raising=False)
+    monkeypatch.setattr(production_service.time, "time_ns", lambda: 3_600_101 * 1_000_000)
+    with pytest.raises(RuntimeError, match="retry cooldown"):
         service._run_locked(once=True)
+    clock = [3_600_101]
+    closed = []
+    completed = []
+    sleeps = []
+    probes = []
+    alerts = []
+    service.alert = lambda *args: alerts.append(args)
+    service.attempt_timeout_seconds = 10
+    monkeypatch.setattr(production_service.time, "time_ns", lambda: clock[0] * 1_000_000)
+    monkeypatch.setattr(
+        Store, "chain_cursor",
+        lambda _self: (201 if completed else 120, "0x" + "cd" * 32),
+    )
+    monkeypatch.setattr(
+        production_service, "WorkerPool",
+        lambda *_args: SimpleNamespace(close=lambda: closed.append(True)),
+    )
+
+    def elapsed(seconds):
+        assert seconds <= 60
+        sleeps.append(seconds)
+        clock[0] += 3_600_000
+
+    def execute(*_args, **_kwargs):
+        probes.append(True)
+        if len(probes) == 1:
+            raise RuntimeError("synthetic ongoing producer outage")
+        completed.append(True)
+        return SimpleNamespace(generation_block=120)
+
+    monkeypatch.setattr(production_service.time, "sleep", elapsed)
+    service._execute = execute
+    service._run_locked(once=False)
+    assert completed == [True] and closed == [True, True]
+    assert sleeps
+    assert _plan_attempt_count(AttemptObjects(durable), plan) == 8
+    assert alerts[0][0] == "PRODUCER_PLAN_FAILURE" and alerts[0][1]["attempt"] == 7
+
+    class RacingObjects(AttemptObjects):
+        def create_plan(self, name, payload):
+            winner = json.loads(payload)
+            winner["reservation"] = "0" * 32
+            super().create_plan(name, canonical_json(winner))
+            return super().create_plan(name, payload)
+
+    # Two hosts reaching the same due probe cannot both reserve its ordinal.
+    assert _reserve_plan_attempt(RacingObjects(durable), plan, now_ms=clock[0]) is None
+    assert _plan_attempt_count(AttemptObjects(durable), plan) == 9
 
 
 @pytest.mark.parametrize("failure", ["configuration", "restore", "timeout"])
@@ -804,7 +866,7 @@ def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch) -> 
     alerts = []
     service = object.__new__(ProducerService)
     service.config = SimpleNamespace(validator_database="unused.db", poll_seconds=0.01)
-    service.track = SimpleNamespace(digest=plan.track_spec_digest)
+    service.track = SimpleNamespace(digest=plan.track_spec_digest, track_close_block=200)
     service.objects = objects
     service.pool = None
     service.alert = lambda event, details: alerts.append((event, details))
@@ -815,7 +877,9 @@ def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch) -> 
     monkeypatch.setattr(production_service, "PlanCoordinator", Coordinator)
     monkeypatch.setattr(production_service, "WorkerPool", failed_pool)
 
-    with pytest.raises(RuntimeError, match="retry ceiling"):
+    monkeypatch.setattr(Store, "chain_cursor", lambda _self: (120, "0x" + "cd" * 32),
+                        raising=False)
+    with pytest.raises(RuntimeError, match="producer attempt failed"):
         service._run_locked(once=True)
 
     assert _plan_attempt_count(objects, plan) == 1

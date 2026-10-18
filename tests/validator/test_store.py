@@ -1030,6 +1030,7 @@ def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -
             confirming.lease_token,
             error_code="CONFIRMATION_BATCH_UNAVAILABLE",
             error_summary="generator requires operator repair",
+            retry_after_ms=30,
             occurred_at_ms=21,
         )
         assert store.confirmation_challenge_ids(150, 150) == (identifier,)
@@ -1070,6 +1071,7 @@ def test_pending_season_reservation_survives_database_restart(tmp_path, blocked)
         if blocked:
             store.block_leased(
                 identifier, task.lease_token, error_code="OUTAGE", error_summary="outage",
+                retry_after_ms=30,
                 occurred_at_ms=3,
             )
     with ChallengeStore(path) as restored:

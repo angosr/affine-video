@@ -304,16 +304,21 @@ producer work directory.
 Configure `VEDA_ALERT_WEBHOOK_URL` in both service environments before continuous operation.
 It must be an absolute HTTPS endpoint without URL credentials or fragments. Producer bootstrap,
 scoring stages and complete producer attempts each have a four-hour wall-clock limit; bootstrap
-failures emit a separate startup alert. Admission has five attempts; scoring and full-video
-confirmation allow nine attempts with bounded exponential delays.
-Production reserves each plan attempt in private object storage before GPU work, retries at most
-five times even across process or GPU-host loss, and sends a push alert on the first and final
-reported failure. Admission and
-scoring do the same. Waiting for a finalized batch boundary or normal producer lag does not consume
+failures emit a separate startup alert. Admission has five fast attempts; scoring and full-video
+confirmation allow nine fast attempts with bounded exponential delays.
+Production reserves each plan attempt in private object storage before GPU work. After five fast
+attempts, it automatically probes at most once per hour, even across process or GPU-host loss,
+and alerts on the first failure, the fifth failure and each failed probe. It stops once finalized
+scanning passes the track close block. Admission and scoring alert on the first failure and when
+their fast retry budget is exhausted. Waiting for a finalized batch boundary or normal producer lag
+does not consume
 an attempt; a batch still missing one complete generation interval after its scheduled block enters
-bounded scoring retries and sends the same first/final alerts. Scoring
-exhaustion enters visible `SYSTEM_BLOCKED` state without becoming a Miner loss; after repairing the
-cause, resume its original stage with:
+bounded scoring retries. Exhaustion enters visible `SYSTEM_BLOCKED` cooldown without becoming a
+Miner loss. Admission
+automatically probes again every 30 minutes; scoring and confirmation every hour, with another
+push alert on a failed probe. Retry counts and deadlines survive local state loss. FIFO order is
+preserved, and recovery resumes the original stage without an operator reset. To request an earlier
+retry after repairing the cause:
 
 ```bash
 veda validator retry <challenge-id> --database /data/validator.db \

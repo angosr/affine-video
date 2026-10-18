@@ -13,16 +13,14 @@ from validator.store import ChallengeStore, LeasedChallenge
 class RetryCheckpoint:
     attempts: int
     blocked: bool
-    retry_after_ms: int | None
+    retry_after_ms: int
     error_code: str
     error_summary: str
 
     def __post_init__(self) -> None:
         if self.attempts <= 0:
             raise ValueError("retry attempts must be positive")
-        if self.blocked != (self.retry_after_ms is None):
-            raise ValueError("blocked retry state must not have a retry time")
-        if self.retry_after_ms is not None and self.retry_after_ms < 0:
+        if type(self.retry_after_ms) is not int or self.retry_after_ms < 0:
             raise ValueError("retry time must be non-negative")
         if not self.error_code or not self.error_summary:
             raise ValueError("retry error identity cannot be empty")
@@ -48,7 +46,7 @@ def prepare_durable_retry(
     checkpoint = restore(task, stage)
     if checkpoint is None:
         return task, None
-    if checkpoint.blocked:
+    if checkpoint.blocked and checkpoint.retry_after_ms > now_ms:
         store.synchronize_leased_attempts(
             task.challenge_id,
             task.lease_token,
@@ -59,10 +57,10 @@ def prepare_durable_retry(
             task.lease_token,
             error_code=checkpoint.error_code,
             error_summary=checkpoint.error_summary,
+            retry_after_ms=checkpoint.retry_after_ms,
             occurred_at_ms=now_ms,
         )
         return None, checkpoint
-    assert checkpoint.retry_after_ms is not None
     ordinal = checkpoint.attempts + 1
     store.synchronize_leased_attempts(
         task.challenge_id,

@@ -486,6 +486,8 @@ def _defer_or_fail(
     attempts = task.attempts
     multiplier = 1 << min(max(attempts - 1, 0), 20)
     delay = min(settings.retry_max_ms, settings.retry_base_ms * multiplier)
+    if attempts >= settings.max_attempts:
+        delay = settings.retry_max_ms
     checkpoint = persist_retry_failure(
         task,
         stage="ADMISSION",
@@ -503,24 +505,23 @@ def _defer_or_fail(
             {"challenge_id": task.challenge_id, "attempts": attempts, "code": error.code},
         )
     blocked = checkpoint.blocked if checkpoint is not None else attempts >= settings.max_attempts
+    retry_after_ms = now_ms + delay if checkpoint is None else checkpoint.retry_after_ms
     if blocked:
         store.block_leased(
             task.challenge_id,
             task.lease_token,
             error_code=error.code,
             error_summary=str(error),
+            retry_after_ms=retry_after_ms,
             occurred_at_ms=now_ms,
         )
         if settings.alert is not None:
             settings.alert(
                 "ADMISSION_RETRY_EXHAUSTED",
-                {"challenge_id": task.challenge_id, "attempts": attempts, "code": error.code},
+                {"challenge_id": task.challenge_id, "attempts": attempts, "code": error.code,
+                 "retry_after_ms": retry_after_ms},
             )
         return AdmissionStatus.BLOCKED
-    retry_after_ms = now_ms + delay
-    if checkpoint is not None:
-        assert checkpoint.retry_after_ms is not None
-        retry_after_ms = checkpoint.retry_after_ms
     store.defer_leased(
         task.challenge_id,
         task.lease_token,

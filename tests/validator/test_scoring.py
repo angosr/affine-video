@@ -1093,7 +1093,7 @@ def test_overdue_batch_uses_bounded_retries_and_push_alerts(tmp_path) -> None:
         ]
 
 
-def test_scoring_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
+def test_scoring_retry_ceiling_cools_down_then_recovers_automatically(tmp_path) -> None:
     alerts = []
     settings = ScoringSettings(
         max_attempts=1,
@@ -1125,14 +1125,10 @@ def test_scoring_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
                     "attempts": 1,
                     "code": "SCORING_UNAVAILABLE",
                     "stage": "SCORING",
+                    "retry_after_ms": 3_600_020,
                 },
             )
         ]
-
-        assert store.resume_blocked(identifier, occurred_at_ms=30) is ChallengeState.SCORING
-        resumed = store.get_challenge(identifier)
-        assert resumed.state is ChallengeState.SCORING
-        assert resumed.attempts == 1
 
         success = process_next_scoring(
             store,
@@ -1140,7 +1136,7 @@ def test_scoring_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
             current_finalized_block=100,
             settings=settings,
             evaluator=lambda _task: StageOutcome(0.7, {"stage": "scoring"}),
-            now_ms=40,
+            now_ms=3_600_020,
         )
         assert success is not None and success.state is ChallengeState.SUCCEEDED
 
@@ -1165,7 +1161,7 @@ def test_scoring_retry_ceiling_survives_total_local_state_loss(tmp_path) -> None
         record_retry=retries.record_failure,
     )
     outcomes = []
-    for index, now in enumerate((20, 30, 1_000), start=1):
+    for index, now in enumerate((20, 30, 35), start=1):
         with ChallengeStore(tmp_path / f"validator-{index}.db") as store:
             identifier = ready_for_scoring(store)
             outcomes.append(
@@ -1187,3 +1183,60 @@ def test_scoring_retry_ceiling_survives_total_local_state_loss(tmp_path) -> None
         ChallengeState.SYSTEM_BLOCKED,
     ]
     assert calls == 2
+    with ChallengeStore(tmp_path / "validator-recovered.db") as store:
+        identifier = ready_for_scoring(store)
+        recovered = process_next_scoring(
+            store, worker_id="recovered", current_finalized_block=100, settings=settings,
+            evaluator=lambda _task: StageOutcome(0.7, {}), now_ms=40,
+        )
+        assert recovered is not None and recovered.state is ChallengeState.SUCCEEDED
+        assert store.get_challenge(identifier).state is ChallengeState.SUCCEEDED
+
+
+@pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
+def test_cooldown_probe_keeps_fifo_and_resumes_original_stage(tmp_path, stage):
+    calls = []
+    alerts = []
+    configured = ScoringSettings(
+        max_attempts=1, retry_base_ms=10, retry_max_ms=100,
+        alert=lambda *args: alerts.append(args),
+    )
+
+    def unavailable(task):
+        calls.append((task.challenge_id, task.state))
+        raise TemporaryScoringError("GPU_DOWN", "temporary worker failure")
+
+    def recovered(task):
+        calls.append((task.challenge_id, task.state))
+        return StageOutcome(0.7, {})
+
+    with ChallengeStore(tmp_path / "fifo.db") as store:
+        first = ready_for_scoring(store)
+        if stage is ChallengeState.CONFIRMING:
+            store.transition(first, stage, occurred_at_ms=14)
+        later, _ = store.add_submission(
+            replace(submission_at(101), hotkey="later-hotkey"), occurred_at_ms=15,
+        )
+        for state in (ChallengeState.FETCHING, ChallengeState.VALIDATING, ChallengeState.SCORING):
+            store.transition(later, state, occurred_at_ms=16)
+        blocked = process_next_scoring(
+            store, worker_id="worker", settings=configured,
+            current_finalized_block=200, evaluator=unavailable, now_ms=20,
+        )
+        assert blocked is not None and blocked.state is ChallengeState.SYSTEM_BLOCKED
+        assert process_next_scoring(
+            store, worker_id="worker", settings=configured,
+            current_finalized_block=200, evaluator=recovered, now_ms=119,
+        ) is None
+        first_result = process_next_scoring(
+            store, worker_id="worker", settings=configured,
+            current_finalized_block=200, evaluator=recovered, now_ms=120,
+        )
+        assert first_result is not None and first_result.state is ChallengeState.SUCCEEDED
+        later_result = process_next_scoring(
+            store, worker_id="worker", settings=configured,
+            current_finalized_block=200, evaluator=recovered, now_ms=121,
+        )
+        assert later_result is not None and later_result.state is ChallengeState.SUCCEEDED
+        assert calls == [(first, stage), (first, stage), (later, ChallengeState.SCORING)]
+        assert alerts[0][1]["retry_after_ms"] == 120

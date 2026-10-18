@@ -50,6 +50,7 @@ class _StoredRetry:
         if self.state == "ACTIVE":
             return None
         assert self.error_code is not None and self.error_summary is not None
+        assert self.retry_after_ms is not None
         return RetryCheckpoint(
             self.attempts,
             self.state == "BLOCKED",
@@ -99,7 +100,7 @@ class PrivateRetryStore:
             else:
                 current = self._decode(stored.body, task=task, stage=stage)
                 checkpoint = current.checkpoint()
-                if current.last_attempt == attempt_token or current.state == "BLOCKED":
+                if current.last_attempt == attempt_token:
                     if checkpoint is None:
                         raise RuntimeError("active retry state retained a failed attempt token")
                     return checkpoint
@@ -112,7 +113,7 @@ class PrivateRetryStore:
                 attempts=attempts,
                 generation=generation,
                 state="BLOCKED" if blocked else "DEFERRED",
-                retry_after_ms=None if blocked else retry_after_ms,
+                retry_after_ms=retry_after_ms,
                 error_code=code[:100],
                 error_summary=summary[:1000],
                 last_attempt=attempt_token,
@@ -226,18 +227,10 @@ class PrivateRetryStore:
                 and summary is None
                 and last_attempt is None
             )
-        elif state == "DEFERRED":
-            valid_state = (
-                attempts > 0
-                and retry_after is not None
-                and code is not None
-                and summary is not None
-                and last_attempt is not None
-            )
         else:
             valid_state = (
                 attempts > 0
-                and retry_after is None
+                and retry_after is not None
                 and code is not None
                 and summary is not None
                 and last_attempt is not None

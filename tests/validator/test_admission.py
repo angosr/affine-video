@@ -984,7 +984,7 @@ def test_corrupted_cached_model_is_recovered_instead_of_blaming_participant(tmp_
         assert challenge.error_code == "DOWNLOAD_TEMPORARY_FAILURE"
 
 
-def test_admission_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
+def test_admission_retry_ceiling_cools_down_then_recovers_automatically(tmp_path) -> None:
     alerts = []
 
     def unavailable(*_args, **_kwargs):
@@ -1010,7 +1010,7 @@ def test_admission_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
         assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_BLOCKED
         assert (
             store.claim_next_admission(
-                "other", lease_ms=1_000, ready_through_block=10_000, now_ms=1_000_000
+                "other", lease_ms=1_000, ready_through_block=10_000, now_ms=120_099
             )
             is None
         )
@@ -1021,9 +1021,19 @@ def test_admission_retry_ceiling_blocks_and_pushes_an_alert(tmp_path) -> None:
                     "challenge_id": identifier,
                     "attempts": 1,
                     "code": "DOWNLOAD_TEMPORARY_FAILURE",
+                    "retry_after_ms": 120_100,
                 },
             )
         ]
+        model = tmp_path / "repaired.safetensors"
+        write_model(model, "hk1")
+        recovered = process_next_admission(
+            store, worker_id="recovered", settings=configured,
+            current_finalized_block=10_000, now_ms=120_100,
+            downloader=model_downloader(model),
+        )
+        assert recovered is not None and recovered.status is AdmissionStatus.ACCEPTED
+        assert store.get_challenge(identifier).state is ChallengeState.SCORING
 
 
 def test_admission_retry_ceiling_survives_total_local_state_loss(tmp_path) -> None:
@@ -1046,7 +1056,7 @@ def test_admission_retry_ceiling_survives_total_local_state_loss(tmp_path) -> No
     )
     submission = submission_at(100, "hk1")
     outcomes = []
-    for index, now in enumerate((100, 30_100, 1_000_000), start=1):
+    for index, now in enumerate((100, 30_100, 40_100), start=1):
         with ChallengeStore(tmp_path / f"validator-{index}.db") as store:
             identifier, _ = store.add_submission(submission, occurred_at_ms=1)
             outcomes.append(
@@ -1068,6 +1078,16 @@ def test_admission_retry_ceiling_survives_total_local_state_loss(tmp_path) -> No
         AdmissionStatus.BLOCKED,
     ]
     assert calls == 2
+    model = tmp_path / "repaired.safetensors"
+    write_model(model, "hk1")
+    with ChallengeStore(tmp_path / "validator-recovered.db") as store:
+        store.add_submission(submission, occurred_at_ms=1)
+        outcome = process_next_admission(
+            store, worker_id="recovered", settings=configured,
+            current_finalized_block=10_000, now_ms=150_100,
+            downloader=model_downloader(model),
+        )
+        assert outcome is not None and outcome.status is AdmissionStatus.ACCEPTED
 
 
 def test_disk_full_during_download_preparation_uses_durable_retry_ceiling(
@@ -1106,7 +1126,7 @@ def test_disk_full_during_download_preparation_uses_durable_retry_ceiling(
     submission = submission_at(100, "hk1")
     outcomes = []
     states = []
-    for index, now in enumerate((100, 30_100, 1_000_000), start=1):
+    for index, now in enumerate((100, 30_100, 40_100), start=1):
         with ChallengeStore(tmp_path / f"disk-full-{index}.db") as store:
             identifier, _ = store.add_submission(submission, occurred_at_ms=1)
             outcome = process_next_admission(

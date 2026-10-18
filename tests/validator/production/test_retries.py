@@ -60,12 +60,18 @@ def test_retry_state_is_cas_idempotent_blocking_and_resettable() -> None:
     assert first == repeated
     assert first.attempts == 1 and not first.blocked
     assert blocked.attempts == 2 and blocked.blocked
+    assert blocked.retry_after_ms == 300
     assert retries.restore(replace(second_task, lease_token="lease-3"), "SCORING") == blocked
     assert {
         name for bucket, name in client.objects if bucket == "private"
     } == {
         f"tracks/abc/{RETRY_STATE_NAMESPACE}/{second_task.challenge_id}/scoring.json"
     }
+    probe = retries.record_failure(
+        replace(second_task, lease_token="automatic-probe", attempts=3), "SCORING",
+        code="GPU_DOWN", summary="still unavailable", retry_after_ms=400, max_attempts=2,
+    )
+    assert probe.blocked and probe.attempts == 3 and probe.retry_after_ms == 400
 
     retries.reset(second_task.challenge_id, "SCORING")
     assert retries.restore(replace(second_task, lease_token="lease-3"), "SCORING") is None

@@ -8,6 +8,7 @@ import json
 import multiprocessing
 import os
 import queue
+import secrets
 import shutil
 import signal
 import subprocess
@@ -67,7 +68,8 @@ from validator.production.workers import close_workers
 from validator.queue import TERMINAL_STATES, ChallengeState
 from validator.store import ChallengeStore
 
-_MAX_PLAN_ATTEMPTS = 5
+_FAST_PLAN_ATTEMPTS = 5
+_PLAN_PROBE_INTERVAL_MS = 60 * 60 * 1000
 _PRODUCER_ATTEMPT_TIMEOUT_SECONDS = 4 * 60 * 60
 
 
@@ -439,6 +441,9 @@ class ProducerService:
                     self.config.validator_database,
                     track_spec_digest=self.track.digest,
                 ) as store:
+                    cursor = store.chain_cursor()
+                    if cursor is not None and cursor[0] > self.track.track_close_block:
+                        return
                     coordinator = PlanCoordinator(
                         track=self.track,
                         store=store,
@@ -454,13 +459,14 @@ class ProducerService:
                 ready_block = None
                 if pending is not None:
                     plan = pending[2]
-                    attempts = _plan_attempt_count(self.objects, plan)
-                    if attempts >= _MAX_PLAN_ATTEMPTS:
-                        raise RuntimeError(
-                            f"producer retry ceiling reached for block "
-                            f"{plan.generation_block}"
-                        )
                     attempt = _reserve_plan_attempt(self.objects, plan)
+                    if attempt is None:
+                        if once:
+                            raise RuntimeError(
+                                f"producer retry cooldown for block {plan.generation_block}"
+                            )
+                        time.sleep(min(60.0, self.config.poll_seconds))
+                        continue
                     deadline = time.monotonic() + self.attempt_timeout_seconds
                     try:
                         if workers is None:
@@ -472,7 +478,9 @@ class ProducerService:
                         if workers is not None:
                             workers.close()
                         workers = None
-                        if self.alert is not None and attempt in {1, _MAX_PLAN_ATTEMPTS}:
+                        if self.alert is not None and (
+                            attempt == 1 or attempt >= _FAST_PLAN_ATTEMPTS
+                        ):
                             self.alert(
                                 "PRODUCER_PLAN_FAILURE",
                                 {
@@ -482,12 +490,14 @@ class ProducerService:
                                     "error": (str(exc) or type(exc).__name__)[:500],
                                 },
                             )
-                        if once or attempt >= _MAX_PLAN_ATTEMPTS:
+                        if once:
                             raise RuntimeError(
-                                f"producer retry ceiling reached for block "
+                                f"producer attempt failed for block "
                                 f"{plan.generation_block}: {exc}"
                             ) from exc
-                        time.sleep(min(300.0, self.config.poll_seconds * (2 ** (attempt - 1))))
+                        time.sleep(min(
+                            60.0, self.config.poll_seconds * (2 ** min(attempt - 1, 20)),
+                        ))
                         continue
                     ready_block = ready.generation_block
                 _prune_local_work(self.config.work_dir, retained)
@@ -1002,6 +1012,8 @@ def _plan_attempt_count(objects: PrivateObjectStore, plan: BatchPlan) -> int:
         "generation_block",
         "plan_digest",
         "track_spec_digest",
+        "started_at_ms",
+        "reservation",
     }
     for name in names:
         suffix = name.removeprefix(prefix)
@@ -1023,25 +1035,37 @@ def _plan_attempt_count(objects: PrivateObjectStore, plan: BatchPlan) -> int:
             or document.get("generation_block") != plan.generation_block
             or document.get("plan_digest") != plan.plan_digest
             or document.get("track_spec_digest") != plan.track_spec_digest
+            or type(document.get("started_at_ms")) is not int
+            or document["started_at_ms"] < 0
+            or not isinstance(document.get("reservation"), str)
+            or len(document["reservation"]) != 32
+            or any(char not in "0123456789abcdef" for char in document["reservation"])
         ):
             raise RuntimeError("private producer attempt fact is invalid")
         attempts.append(attempt)
     attempts.sort()
     if attempts != list(range(1, len(attempts) + 1)):
         raise RuntimeError("private producer attempt sequence is invalid")
-    if len(attempts) > _MAX_PLAN_ATTEMPTS:
-        raise RuntimeError("private producer attempt sequence exceeds its ceiling")
     return len(attempts)
 
 
 def _reserve_plan_attempt(
     objects: PrivateObjectStore,
     plan: BatchPlan,
-) -> int:
-    while True:
+    *,
+    now_ms: int | None = None,
+) -> int | None:
+    for _ in range(8):
         attempts = _plan_attempt_count(objects, plan)
-        if attempts >= _MAX_PLAN_ATTEMPTS:
-            return attempts
+        now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
+        if type(now) is not int or now < 0:
+            raise ValueError("producer retry time must be non-negative")
+        if attempts >= _FAST_PLAN_ATTEMPTS:
+            previous = decode_canonical_json(objects.get(
+                f"attempts/{plan.plan_digest}/{attempts}.json"
+            ).body)
+            if now < previous["started_at_ms"] + _PLAN_PROBE_INTERVAL_MS:
+                return None
         attempt = attempts + 1
         payload = canonical_json(
             {
@@ -1050,6 +1074,8 @@ def _reserve_plan_attempt(
                 "generation_block": plan.generation_block,
                 "plan_digest": plan.plan_digest,
                 "track_spec_digest": plan.track_spec_digest,
+                "started_at_ms": now,
+                "reservation": secrets.token_hex(16),
             }
         )
         try:
@@ -1060,6 +1086,7 @@ def _reserve_plan_attempt(
         except PreconditionFailed:
             continue
         return attempt
+    raise RuntimeError("producer attempt reservations changed repeatedly")
 
 
 def _require_before_deadline(deadline: float) -> None:
