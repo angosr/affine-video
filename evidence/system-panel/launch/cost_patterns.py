@@ -141,26 +141,35 @@ class NativePattern:
         if self.mode != "pending_verification":
             raise RuntimeError("no complete pattern operation to verify")
         for actual, entry in zip(self.observed, self.entries, strict=True):
-            if not self.torch.equal(actual, entry["rows"]):
+            if actual is None and entry["implicit_full_rows"]:
+                continue
+            if actual is None or not self.torch.equal(actual, entry["rows"]):
                 raise RuntimeError("timed operation changed primed query-row sequence")
         self.mode = "ready"
 
     def __call__(self, logits, layout, blocks, rows=None, **kwargs):
-        if rows is None:
-            raise ValueError("production SparseStudent must supply explicit query rows")
+        native_rows = rows
+        implicit_full_rows = rows is None
         if len(blocks) != 1 or blocks[0].start != 0 or kwargs.get("rule", "topk") != "topk":
             raise ValueError("pattern probe requires production target-only fixed Top-k")
         budget = blocks[0].budget.tiles
         if budget is None or budget != int(budget):
             raise ValueError("pattern probe requires integer block budget")
-        identity = (id(layout), tuple(logits.shape), int(budget), tuple(rows.shape))
+        identity = (
+            id(layout),
+            tuple(logits.shape),
+            int(budget),
+            None if implicit_full_rows else tuple(rows.shape),
+        )
         if self.mode == "prime":
+            if implicit_full_rows:
+                rows = self.torch.arange(layout.n_video_tiles, device=logits.device)
             counts = layout.valid_count[: layout.n_video_tiles].cpu().numpy()
             query_rows = rows.detach().cpu().numpy()
             rows_digest = hashlib.sha256(query_rows.tobytes()).hexdigest()
             values = scores(self.name, counts, query_rows, int(budget), logits.shape[0])
             gpu_values = self.torch.from_numpy(values).to(logits.device)
-            selection = self.native(gpu_values, layout, blocks, rows, **kwargs)
+            selection = self.native(gpu_values, layout, blocks, native_rows, **kwargs)
             proof = selection_proof(
                 selection.index.cpu().numpy(),
                 selection.keep.cpu().numpy(),
@@ -173,10 +182,12 @@ class NativePattern:
                 pattern=self.name,
                 rows_sha256=rows_digest,
                 sequence_index=len(self.entries),
+                implicit_full_rows=implicit_full_rows,
             )
             self.entries.append(
                 {
                     "identity": identity,
+                    "implicit_full_rows": implicit_full_rows,
                     "logits": gpu_values,
                     "rows": rows.clone(),
                     "rows_sha256": rows_digest,
@@ -190,8 +201,8 @@ class NativePattern:
         if identity != entry["identity"]:
             raise RuntimeError("timed selector signature differs from primed sequence")
         self.cursor += 1
-        self.observed.append(rows)
-        return self.native(entry["logits"], layout, blocks, rows, **kwargs)
+        self.observed.append(native_rows)
+        return self.native(entry["logits"], layout, blocks, native_rows, **kwargs)
 
 
 def native_self_test(device="cpu"):
@@ -258,6 +269,43 @@ def native_self_test(device="cpu"):
                         raise
                 else:
                     raise AssertionError("different-row replay order was accepted")
+            implicit = NativePattern(torch, mask.select_video_blocks, name)
+            full_logits = torch.zeros(2, len(counts), len(counts), device=device)
+            # Use nonempty rows in this test's full production layout. Empty keys
+            # remain covered by the explicit-row cases above.
+            full_counts = counts.clamp(min=1)
+            full_layout = SimpleNamespace(
+                n_video_tiles=len(counts), valid_count=full_counts, kv_ok=full_counts > 0
+            )
+
+            def full_operation(
+                implicit=implicit, full_logits=full_logits, full_layout=full_layout, blocks=blocks
+            ):
+                return implicit(full_logits, full_layout, blocks)
+
+            implicit.prime(full_operation)
+            verify_proof(implicit.proofs[0])
+            replay_full = implicit.replay(full_operation)
+            with (
+                patch.object(
+                    torch.Tensor, "cpu", side_effect=AssertionError("timed host transfer")
+                ),
+                patch.object(
+                    torch.Tensor, "numpy", side_effect=AssertionError("timed host conversion")
+                ),
+            ):
+                for _ in range(3):
+                    replay_full()
+                    implicit.verify_replay()
+            results.append(
+                {
+                    "pattern": name,
+                    "budget": budget,
+                    "index_width": implicit.proofs[0]["shape"][-1],
+                    "implicit_full_rows": True,
+                    "proof": implicit.proofs[0],
+                }
+            )
     return {
         "format": "veda-cost-native-pattern-regression-v2",
         "pass": True,

@@ -1,0 +1,17 @@
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/dsl.py:2300: UserWarning: Argument aux_data (position 17) cannot be converted to a JitArgument for function 'cutlass___call___flash_attncuteflash_fwd_sm90FlashAttentionForwardSm90_object_at__Tensorgmemoi64i64i641_Tensorgmemoi64i64i641_Tensorgmemoi64i64i641_Tensorgmemoi64i64i641_None_00883'. Its type `<class 'flash_attn.cute.utils.AuxData'>` is not supported. If the value is known at compile time, annotate it: `aux_data: Constexpr`. Otherwise, implement the `JitArgument` or `DynamicExpression` protocol for type `<class 'flash_attn.cute.utils.AuxData'>`, or register a custom argument adapter.
+  exe_args, func_types, adapted_args = self.generate_mlir_function_types(
+Traceback (most recent call last):
+  File "/scripts/cost_calibration.py", line 503, in <module>
+    run(args)
+  File "/scripts/cost_calibration.py", line 389, in run
+    pattern.prime(call)
+  File "/scripts/cost_patterns.py", line 119, in prime
+    operation()
+  File "/usr/local/lib/python3.12/dist-packages/miowtion/veda/attention.py", line 739, in __call__
+    self._attend(q, k, v, layer_index, tile_layout, heads, out)
+  File "/usr/local/lib/python3.12/dist-packages/miowtion/veda/attention.py", line 765, in _attend
+    selection = veda_mask.select_video_blocks(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scripts/cost_patterns.py", line 150, in __call__
+    raise ValueError("production SparseStudent must supply explicit query rows")
+ValueError: production SparseStudent must supply explicit query rows
