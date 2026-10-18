@@ -94,6 +94,10 @@ SOURCE_QUARANTINE_EVIDENCE = (
         "path": "provenance/source-v6-verification.json",
         "sha256": "4f79e6a0b99023ec3608c01f2aa7f38b71d313e11fb93503425e18f76f1d26b1",
     },
+    {
+        "path": "provenance/source-v6-log-scan.json",
+        "sha256": "92aa3e084d90ca1c161ad0a5d92c959a94ac37f4706e2bc76229c4bebe19069d",
+    },
 )
 PRIOR_MECHANISM_EVIDENCE = (
     {
@@ -515,6 +519,7 @@ def prepare() -> None:
     training_families = set(training["source_families"])
     source_families = {leaf.source_family_id for leaf in pool.leaves}
     quarantine = json.loads((ROOT / SOURCE_QUARANTINE_EVIDENCE[0]["path"]).read_text())
+    log_scan = json.loads((ROOT / SOURCE_QUARANTINE_EVIDENCE[2]["path"]).read_text())
     if (
         len(training_families) != TRAINING_SOURCE_MANIFEST["source_family_count"]
         or training_families & source_families
@@ -524,6 +529,7 @@ def prepare() -> None:
         or quarantine["production_audit_family_intersection"]
     ):
         raise RuntimeError("panel sources overlap calibration or shadow source families")
+    _verify_source_log_scan(log_scan, pool, sha256(SOURCE_POOL))
     commitment_digests = tuple(item.sha256 for item in track.source_commitments)
     plan_documents = {}
     for label, plan in plans.items():
@@ -576,6 +582,38 @@ def prepare() -> None:
     write_once(ROOT / "runtime-verification.json", verification)
     record_event("prepare_complete", plan_count=len(plans))
     print(json.dumps(verification, sort_keys=True))
+
+
+def _verify_source_log_scan(document, pool, source_pool_sha256: str) -> None:
+    source_ids = document.get("source_ids", [])
+    source_families = document.get("source_families", [])
+    files = document.get("files_with_source_ids", [])
+    file_source_ids = {
+        source_id for item in files for source_id in item.get("source_ids", [])
+    }
+    if (
+        document.get("format") != "veda-source-log-scan-v1"
+        or document.get("candidate_root") != pool.root
+        or document.get("candidate_source_pool_sha256") != source_pool_sha256
+        or not source_ids
+        or len(source_ids) != len(set(source_ids))
+        or document.get("source_id_count") != len(source_ids)
+        or not source_families
+        or len(source_families) != len(set(source_families))
+        or document.get("source_family_count") != len(source_families)
+        or file_source_ids != set(source_ids)
+        or document.get("candidate_source_id_intersection")
+        or document.get("candidate_family_intersection")
+    ):
+        raise RuntimeError("panel source log quarantine evidence is incomplete")
+    for item in files:
+        relative = Path(item["durable_path"])
+        if relative.is_absolute() or not relative.parts or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise RuntimeError("panel source log evidence path is unsafe")
+        if sha256(ROOT / relative) != item["sha256"]:
+            raise RuntimeError("panel source log evidence changed")
 
 
 def _ready_references(results):

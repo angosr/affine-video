@@ -87,6 +87,40 @@ def test_panel_interval_percentile_and_two_stage_self_checks():
     panel.self_test()
 
 
+def test_source_log_quarantine_binds_pool_and_durable_inputs(tmp_path, monkeypatch):
+    raw = tmp_path / "raw/source-log-scan/smoke.log"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("source-0001-123456789abc\n")
+    document = {
+        "format": "veda-source-log-scan-v1",
+        "candidate_root": "ab" * 32,
+        "candidate_source_pool_sha256": "cd" * 32,
+        "source_ids": ["source-0001-123456789abc"],
+        "source_id_count": 1,
+        "source_families": ["12" * 32],
+        "source_family_count": 1,
+        "candidate_source_id_intersection": [],
+        "candidate_family_intersection": [],
+        "files_with_source_ids": [
+            {
+                "durable_path": "raw/source-log-scan/smoke.log",
+                "sha256": panel.sha256(raw),
+                "source_ids": ["source-0001-123456789abc"],
+            }
+        ],
+    }
+    monkeypatch.setattr(panel, "ROOT", tmp_path)
+
+    panel._verify_source_log_scan(document, SimpleNamespace(root="ab" * 32), "cd" * 32)
+    document["candidate_family_intersection"] = ["12" * 32]
+    with pytest.raises(RuntimeError, match="quarantine evidence"):
+        panel._verify_source_log_scan(document, SimpleNamespace(root="ab" * 32), "cd" * 32)
+    document["candidate_family_intersection"] = []
+    raw.write_text("changed")
+    with pytest.raises(RuntimeError, match="evidence changed"):
+        panel._verify_source_log_scan(document, SimpleNamespace(root="ab" * 32), "cd" * 32)
+
+
 @pytest.fixture
 def cost_evidence(tmp_path, monkeypatch):
     """Synthetic reports exercise launch gating; they are never acceptance evidence."""
