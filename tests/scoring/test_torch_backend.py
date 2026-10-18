@@ -193,3 +193,45 @@ def test_video_attention_adapter_passes_the_shared_mask_to_the_kernel(torch):
         runtime._selector_attention(
             torch, module, SimpleNamespace(config=config), object(), projections, budget,
         )
+
+
+def test_cuda_tie_order_and_sampled_video_masks_match_independent_reference(torch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the device tie-order regression")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    values = np.random.default_rng(29).normal(size=(3, 16, 128, 128)).astype(np.float16)
+    counts = np.array([128, 3, 71, 1, 128, 51, 128, 13, 128, 2, 127, 128, 43, 7, 128, 1])
+    for tile, count in enumerate(counts):
+        values[:, tile, count:] = 100
+    gpu_counts = torch.as_tensor(counts, device="cuda:0")
+    features = trip_pool(torch, torch.as_tensor(values, device="cuda:0"), gpu_counts)
+    for head in range(3):
+        np.testing.assert_allclose(
+            features[head].cpu().numpy(), numpy_trip_pool(values[head], counts),
+            atol=1e-6, rtol=1e-6,
+        )
+    projection = torch.zeros((3, 384, 128), device="cuda:0")
+    # A legal selector cancels the residual mean, forcing every logit to tie.
+    projection[:, :128] = -torch.eye(128, device="cuda:0")
+    logits = selector_logits(
+        torch, features[:, :13], features, projection, torch.zeros_like(projection),
+    )
+    assert not logits.count_nonzero()
+    layout = SimpleNamespace(n_tiles=16, n_ref_tiles=4, n_video_tiles=13, valid_count=gpu_counts)
+    query_rows = torch.tensor([0, 3, 5, 12], device="cuda:0")
+    segments = np.array([1] * 4 + [0] * 9 + [2] * 3)
+    required = np.eye(16, dtype=np.bool_)[:13]
+    expected = numpy_top_k(
+        np.zeros((13, 16), dtype=np.float32), segments, counts,
+        target_blocks=4, reference_blocks=2, required_keys=required,
+    )
+    for _ in range(10):
+        full = runtime_block_mask(torch, logits, layout, target_blocks=4, reference_blocks=2)
+        sampled = runtime_block_mask(
+            torch, logits[:, query_rows], layout,
+            target_blocks=4, reference_blocks=2, query_rows=query_rows,
+        )
+        assert torch.equal(sampled, full[:, query_rows])
+        for head in range(3):
+            np.testing.assert_array_equal(full[head, :13].cpu().numpy(), expected)
+        assert full[:, 13:].all()
