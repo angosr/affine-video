@@ -28,7 +28,7 @@ from validator.production.commitment import ArtifactManifest
 from validator.production.config import load_producer_config
 from validator.production.confirmation import ConfirmationWorkerPool
 from validator.production.retries import PrivateRetryStore
-from validator.production.storage import PrivateObjectStore
+from validator.production.storage import ARTIFACT_MANIFEST_OBJECT, PrivateObjectStore
 from validator.publication import (
     PublicArtifacts,
     PublicLedger,
@@ -196,7 +196,7 @@ async def run_evaluator(
             prefix=f"{data_config.storage_prefix}/tracks/{track.digest}",
         )
         objects.verify_conditional_writes()
-        runtime_manifest_payload = objects.get("bootstrap/artifact_manifest.json").body
+        runtime_manifest_payload = objects.get(ARTIFACT_MANIFEST_OBJECT).body
         manifest = ArtifactManifest.decode(runtime_manifest_payload)
         if manifest.digest != track.artifact_manifest_sha256:
             raise ValueError("artifact manifest does not match the track commitment")

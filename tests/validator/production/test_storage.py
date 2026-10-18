@@ -1,12 +1,21 @@
 import hashlib
 import io
+import json
 import pickle
+from copy import deepcopy
 
 import pytest
 
 from validator import chunks
 from validator.production.commitment import Artifact, ArtifactManifest
-from validator.production.storage import PreconditionFailed, PrivateObjectStore, StorageError
+from validator.production.storage import (
+    RETRY_STATE_NAMESPACE,
+    PreconditionFailed,
+    PrivateObjectStore,
+    StorageError,
+    evaluator_iam_policy,
+    verify_evaluator_iam_policy,
+)
 from validator.s3 import client_config
 
 
@@ -76,6 +85,42 @@ def test_plan_backend_capability_probe_checks_both_conditions_and_cleans_up() ->
     store.verify_conditional_writes()
 
     assert client.objects == {}
+
+
+def test_evaluator_iam_policy_is_derived_from_runtime_namespaces() -> None:
+    policy = evaluator_iam_policy(bucket="private", prefix="evaluation/tracks/test")
+
+    verify_evaluator_iam_policy(
+        policy,
+        bucket="private",
+        prefix="evaluation/tracks/test",
+    )
+    encoded = json.dumps(policy, sort_keys=True)
+    assert f"/tracks/test/{RETRY_STATE_NAMESPACE}/*" in encoded
+    assert "/tracks/test/retries/*" not in encoded
+    assert "/tracks/test/videos/*" in encoded
+    assert "/tracks/test/bootstrap/artifact_manifest.json" in encoded
+
+
+@pytest.mark.parametrize("change", ("retired-prefix", "missing-runtime-prefix"))
+def test_evaluator_iam_policy_rejects_namespace_drift(change: str) -> None:
+    policy = evaluator_iam_policy(bucket="private", prefix="tracks/test")
+    changed = deepcopy(policy)
+    get_resources = changed["Statement"][2]["Resource"]
+    assert isinstance(get_resources, list)
+    if change == "retired-prefix":
+        get_resources.append("arn:aws:s3:::private/tracks/test/retries/*")
+    else:
+        get_resources.remove(
+            f"arn:aws:s3:::private/tracks/test/{RETRY_STATE_NAMESPACE}/*"
+        )
+
+    with pytest.raises(ValueError, match="differs from the runtime object contract"):
+        verify_evaluator_iam_policy(
+            changed,
+            bucket="private",
+            prefix="tracks/test",
+        )
 
 
 def test_environment_store_reconnects_after_cross_process_serialization(

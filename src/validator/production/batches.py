@@ -31,7 +31,14 @@ from validator.production.plan import (
     select_query_tiles,
     validate_source_selection_sequence,
 )
-from validator.production.storage import PrivateObjectStore
+from validator.production.storage import (
+    ADMISSIONS_NAMESPACE,
+    INPUTS_NAMESPACE,
+    MODELS_NAMESPACE,
+    PLANS_NAMESPACE,
+    STAGES_NAMESPACE,
+    PrivateObjectStore,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +123,7 @@ class ReadyBatchSource:
         self.objects.put_content(
             path,
             sha256=validated.file_sha256,
-            object_name=f"models/{validated.file_sha256}.safetensors",
+            object_name=f"{MODELS_NAMESPACE}/{validated.file_sha256}.safetensors",
         )
         document = {
             "format": "veda-admission-model-v1",
@@ -179,7 +186,7 @@ class ReadyBatchSource:
 
     def restore_model(self, sha256: str, size_bytes: int) -> Path:
         return self.objects.download_content(
-            f"models/{sha256}.safetensors",
+            f"{MODELS_NAMESPACE}/{sha256}.safetensors",
             self.cache_dir / "models" / f"{sha256}.safetensors",
             sha256=sha256,
             size_bytes=size_bytes,
@@ -255,11 +262,11 @@ class ReadyBatchSource:
 
     @staticmethod
     def _stage_name(challenge_id: str, stage: str) -> str:
-        return f"stages/{challenge_id}/{stage}.json"
+        return f"{STAGES_NAMESPACE}/{challenge_id}/{stage}.json"
 
     @staticmethod
     def _admission_name(challenge_id: str) -> str:
-        return f"admissions/{challenge_id}.json"
+        return f"{ADMISSIONS_NAMESPACE}/{challenge_id}.json"
 
     def exact_batch(self, challenge_id: str) -> ExactCacheBatch:
         plan = self._plan_for(challenge_id, confirmation=False)
@@ -338,7 +345,7 @@ class ReadyBatchSource:
         selected = plan.sample_cache
         if selected is None:
             raise RuntimeError("READY plan omitted its selected source inputs")
-        destination = self.cache_dir / "inputs" / plan.plan_digest
+        destination = self.cache_dir / INPUTS_NAMESPACE / plan.plan_digest
         destination.mkdir(parents=True, exist_ok=True)
         objects = (("index.json", selected.index), ("text.safetensors", selected.text))
         for name, item in objects:
@@ -484,7 +491,7 @@ class ReadyBatchSource:
             if dense.is_dir():
                 shutil.rmtree(dense)
                 removed += 1
-            inputs = self.cache_dir / "inputs" / plan.plan_digest
+            inputs = self.cache_dir / INPUTS_NAMESPACE / plan.plan_digest
             if inputs.is_dir():
                 shutil.rmtree(inputs)
                 removed += 1
@@ -514,8 +521,9 @@ class ReadyBatchSource:
 
     def _plans(self) -> tuple[tuple[str, BatchPlan], ...]:
         rows = []
-        for name in self.objects.list_names("plans/"):
-            if not name.startswith("plans/") or not name.endswith(".json"):
+        prefix = f"{PLANS_NAMESPACE}/"
+        for name in self.objects.list_names(prefix):
+            if not name.startswith(prefix) or not name.endswith(".json"):
                 raise RuntimeError("private plan index contains an unexpected object")
             plan = BatchPlan.decode(self.objects.get(name).body)
             self._validate_plan(name, plan)
@@ -532,7 +540,7 @@ class ReadyBatchSource:
         return tuple(rows)
 
     def _validate_plan(self, name: str, plan: BatchPlan) -> None:
-        if name != f"plans/{plan.generation_block}.json":
+        if name != f"{PLANS_NAMESPACE}/{plan.generation_block}.json":
             raise RuntimeError("private plan key disagrees with its generation block")
         if plan.track_spec_digest != self.track.digest:
             raise RuntimeError("private plan belongs to another track")

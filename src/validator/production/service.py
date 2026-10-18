@@ -50,7 +50,19 @@ from validator.production.plan import (
     validate_source_selection_sequence,
 )
 from validator.production.runtime import trajectory_tensor_key
-from validator.production.storage import PreconditionFailed, PrivateObjectStore, StoredObject
+from validator.production.storage import (
+    ARTIFACT_MANIFEST_OBJECT,
+    EXACT_NAMESPACE,
+    INPUTS_NAMESPACE,
+    LATENTS_NAMESPACE,
+    PLANS_NAMESPACE,
+    SOURCE_POOL_OBJECT,
+    STAGES_NAMESPACE,
+    VIDEOS_NAMESPACE,
+    PreconditionFailed,
+    PrivateObjectStore,
+    StoredObject,
+)
 from validator.production.workers import close_workers
 from validator.queue import TERMINAL_STATES, ChallengeState
 from validator.store import ChallengeStore
@@ -110,8 +122,9 @@ class PlanCoordinator:
 
     def plans(self) -> tuple[tuple[str, StoredObject, BatchPlan], ...]:
         rows = []
-        for name in self.objects.list_names("plans/"):
-            if not name.startswith("plans/") or not name.endswith(".json"):
+        prefix = f"{PLANS_NAMESPACE}/"
+        for name in self.objects.list_names(prefix):
+            if not name.startswith(prefix) or not name.endswith(".json"):
                 raise RuntimeError("private plan index contains an unexpected object")
             stored = self.objects.get(name)
             plan = BatchPlan.decode(stored.body)
@@ -207,9 +220,13 @@ class PlanCoordinator:
     def _stage_recovery_complete(self) -> bool:
         """Fence planning until every private stage fact is present in SQLite."""
 
-        for name in self.objects.list_names("stages/"):
+        for name in self.objects.list_names(f"{STAGES_NAMESPACE}/"):
             parts = name.split("/")
-            if len(parts) != 3 or parts[0] != "stages" or not parts[2].endswith(".json"):
+            if (
+                len(parts) != 3
+                or parts[0] != STAGES_NAMESPACE
+                or not parts[2].endswith(".json")
+            ):
                 raise RuntimeError("private stage index contains an unexpected object")
             challenge_id = parts[1]
             stage_name = parts[2][:-5]
@@ -387,11 +404,11 @@ class ProducerService:
         )
         self.objects.verify_conditional_writes()
         source_pool_payload = self.objects.ensure_bootstrap(
-            "bootstrap/source_pool.json", config.source_pool
+            SOURCE_POOL_OBJECT, config.source_pool
         )
         self.manifest = ArtifactManifest.decode(
             self.objects.ensure_bootstrap(
-                "bootstrap/artifact_manifest.json", config.artifact_manifest
+                ARTIFACT_MANIFEST_OBJECT, config.artifact_manifest
             )
         )
         if self.manifest.digest != self.track.artifact_manifest_sha256:
@@ -519,8 +536,8 @@ class ProducerService:
         _require_before_deadline(deadline)
         references = []
         for result in results:
-            video = _ready_file(Path(result.video_path), "videos", ".mp4")
-            latent = _ready_file(Path(result.latent_path), "latents", ".safetensors")
+            video = _ready_file(Path(result.video_path), VIDEOS_NAMESPACE, ".mp4")
+            latent = _ready_file(Path(result.latent_path), LATENTS_NAMESPACE, ".safetensors")
             self.objects.put_content(
                 result.video_path, sha256=video.sha256, object_name=video.object_key
             )
@@ -556,7 +573,7 @@ class ProducerService:
         if batch.path.stat().st_size > self.track.cache.exact_max_bytes:
             raise RuntimeError("generated exact cache exceeds the frozen track byte limit")
         exact = ReadyObject(
-            f"exact/{plan.generation_block}-{batch.sha256}.npz",
+            f"{EXACT_NAMESPACE}/{plan.generation_block}-{batch.sha256}.npz",
             batch.sha256,
             batch.path.stat().st_size,
         )
@@ -930,10 +947,10 @@ def _build_selected_sample_cache(
     index_path = destination / "index.json"
     text_path = destination / "text.safetensors"
     condition_path = destination / "cond.safetensors"
-    index = _ready_file(index_path, "inputs", ".json")
-    text = _ready_file(text_path, "inputs", ".safetensors")
+    index = _ready_file(index_path, INPUTS_NAMESPACE, ".json")
+    text = _ready_file(text_path, INPUTS_NAMESPACE, ".safetensors")
     condition = (
-        _ready_file(condition_path, "inputs", ".safetensors")
+        _ready_file(condition_path, INPUTS_NAMESPACE, ".safetensors")
         if condition_path.is_file()
         else None
     )
@@ -952,7 +969,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def _plan_name(block: int) -> str:
-    return f"plans/{block}.json"
+    return f"{PLANS_NAMESPACE}/{block}.json"
 
 
 def _plan_attempt_count(objects: PrivateObjectStore, plan: BatchPlan) -> int:

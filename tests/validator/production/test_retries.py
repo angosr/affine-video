@@ -1,7 +1,7 @@
 from dataclasses import replace
 
 from validator.production.retries import PrivateRetryStore
-from validator.production.storage import PrivateObjectStore
+from validator.production.storage import RETRY_STATE_NAMESPACE, PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState
 from validator.store import LeasedChallenge
 
@@ -26,7 +26,8 @@ def task(*, lease_token: str, attempts: int) -> LeasedChallenge:
 
 
 def test_retry_state_is_cas_idempotent_blocking_and_resettable() -> None:
-    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    client = MemoryS3()
+    objects = PrivateObjectStore(client, bucket="private", prefix="tracks/abc")
     retries = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
     first_task = task(lease_token="lease-1", attempts=1)
 
@@ -60,6 +61,11 @@ def test_retry_state_is_cas_idempotent_blocking_and_resettable() -> None:
     assert first.attempts == 1 and not first.blocked
     assert blocked.attempts == 2 and blocked.blocked
     assert retries.restore(replace(second_task, lease_token="lease-3"), "SCORING") == blocked
+    assert {
+        name for bucket, name in client.objects if bucket == "private"
+    } == {
+        f"tracks/abc/{RETRY_STATE_NAMESPACE}/{second_task.challenge_id}/scoring.json"
+    }
 
     retries.reset(second_task.challenge_id, "SCORING")
     assert retries.restore(replace(second_task, lease_token="lease-3"), "SCORING") is None

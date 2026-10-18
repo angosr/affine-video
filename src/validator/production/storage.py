@@ -21,6 +21,132 @@ from validator.chunks import (
 from validator.production.commitment import Artifact, ArtifactManifest
 from validator.s3 import client_config
 
+ADMISSIONS_NAMESPACE = "admissions"
+ARTIFACTS_NAMESPACE = "artifacts"
+CAPABILITY_PROBES_NAMESPACE = "capability-probes"
+EXACT_NAMESPACE = "exact"
+INPUTS_NAMESPACE = "inputs"
+LATENTS_NAMESPACE = "latents"
+MODELS_NAMESPACE = "models"
+PLANS_NAMESPACE = "plans"
+RETRY_STATE_NAMESPACE = "retry_state"
+STAGES_NAMESPACE = "stages"
+VIDEOS_NAMESPACE = "videos"
+ARTIFACT_MANIFEST_OBJECT = "bootstrap/artifact_manifest.json"
+SOURCE_POOL_OBJECT = "bootstrap/source_pool.json"
+
+_EVALUATOR_LIST_NAMESPACES = (PLANS_NAMESPACE,)
+_EVALUATOR_READ_NAMESPACES = (
+    ADMISSIONS_NAMESPACE,
+    ARTIFACTS_NAMESPACE,
+    CAPABILITY_PROBES_NAMESPACE,
+    EXACT_NAMESPACE,
+    INPUTS_NAMESPACE,
+    LATENTS_NAMESPACE,
+    MODELS_NAMESPACE,
+    PLANS_NAMESPACE,
+    RETRY_STATE_NAMESPACE,
+    STAGES_NAMESPACE,
+    VIDEOS_NAMESPACE,
+)
+_EVALUATOR_WRITE_NAMESPACES = (
+    ADMISSIONS_NAMESPACE,
+    CAPABILITY_PROBES_NAMESPACE,
+    MODELS_NAMESPACE,
+    RETRY_STATE_NAMESPACE,
+    STAGES_NAMESPACE,
+)
+_EVALUATOR_DELETE_NAMESPACES = (CAPABILITY_PROBES_NAMESPACE,)
+_EVALUATOR_READ_OBJECTS = (ARTIFACT_MANIFEST_OBJECT,)
+_EVALUATOR_DENIED_OBJECTS = (SOURCE_POOL_OBJECT,)
+_EVALUATOR_DENIED_NAMESPACES = ("audit", "source-pool")
+
+
+def evaluator_iam_policy(*, bucket: str, prefix: str) -> dict[str, object]:
+    """Build the exact least-privilege policy from runtime object namespaces."""
+
+    if not bucket or "/" in bucket:
+        raise ValueError("private storage bucket is invalid")
+    root = _normalize_prefix(prefix)
+    bucket_arn = f"arn:aws:s3:::{bucket}"
+
+    def object_arn(name: str) -> str:
+        return f"{bucket_arn}/{root}/{name}"
+
+    def namespace_arn(namespace: str) -> str:
+        return object_arn(f"{namespace}/*")
+
+    def list_patterns(namespaces: tuple[str, ...]) -> list[str]:
+        return [
+            pattern
+            for namespace in namespaces
+            for pattern in (f"{root}/{namespace}", f"{root}/{namespace}/*")
+        ]
+
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket"],
+                "Resource": [bucket_arn],
+                "Condition": {
+                    "StringLike": {
+                        "s3:prefix": list_patterns(_EVALUATOR_LIST_NAMESPACES),
+                    }
+                },
+            },
+            {
+                "Effect": "Deny",
+                "Action": ["s3:ListBucket"],
+                "Resource": [bucket_arn],
+                "Condition": {
+                    "StringLike": {
+                        "s3:prefix": list_patterns(_EVALUATOR_DENIED_NAMESPACES),
+                    }
+                },
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [
+                    *(namespace_arn(name) for name in _EVALUATOR_READ_NAMESPACES),
+                    *(object_arn(name) for name in _EVALUATOR_READ_OBJECTS),
+                ],
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:PutObject"],
+                "Resource": [namespace_arn(name) for name in _EVALUATOR_WRITE_NAMESPACES],
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:DeleteObject"],
+                "Resource": [namespace_arn(name) for name in _EVALUATOR_DELETE_NAMESPACES],
+            },
+            {
+                "Effect": "Deny",
+                "Action": ["s3:GetObject"],
+                "Resource": [
+                    *(namespace_arn(name) for name in _EVALUATOR_DENIED_NAMESPACES),
+                    *(object_arn(name) for name in _EVALUATOR_DENIED_OBJECTS),
+                ],
+            },
+        ],
+    }
+
+
+def verify_evaluator_iam_policy(
+    policy: object,
+    *,
+    bucket: str,
+    prefix: str,
+) -> None:
+    """Reject missing or surplus policy paths, including retired namespace aliases."""
+
+    if policy != evaluator_iam_policy(bucket=bucket, prefix=prefix):
+        raise ValueError("evaluator IAM policy differs from the runtime object contract")
+
 
 class StorageError(RuntimeError):
     """The private store failed or violated the required semantics."""
@@ -50,9 +176,7 @@ class PrivateObjectStore:
     ) -> None:
         if not bucket or "/" in bucket:
             raise ValueError("private storage bucket is invalid")
-        normalized = prefix.strip("/")
-        if not normalized or any(part in {"", ".", ".."} for part in normalized.split("/")):
-            raise ValueError("private storage prefix is invalid")
+        normalized = _normalize_prefix(prefix)
         self._client = client
         self._bucket = bucket
         self._prefix = normalized
@@ -90,7 +214,7 @@ class PrivateObjectStore:
 
         if self._credential_role != "evaluator" or not hidden_artifacts:
             raise ValueError("evaluator boundary requires hidden objects and evaluator credentials")
-        denied_objects = ["bootstrap/source_pool.json"]
+        denied_objects = [SOURCE_POOL_OBJECT]
         denied_prefixes = ["source-pool/"]
         for artifact in hidden_artifacts:
             name = artifact.object_key
@@ -172,7 +296,7 @@ class PrivateObjectStore:
     def verify_conditional_writes(self) -> None:
         """Refuse a backend that silently ignores the plan CAS contract."""
 
-        name = f"capability-probes/{uuid.uuid4().hex}.json"
+        name = f"{CAPABILITY_PROBES_NAMESPACE}/{uuid.uuid4().hex}.json"
         key = self._key(name)
         try:
             self._put(name, b'{"state":"first"}', if_none_match="*")
@@ -508,6 +632,13 @@ def _validated_endpoint(endpoint: str) -> str:
     ):
         raise ValueError("STORAGE_URL must be an HTTPS endpoint without credentials or query")
     return endpoint
+
+
+def _normalize_prefix(prefix: str) -> str:
+    normalized = prefix.strip("/")
+    if not normalized or any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise ValueError("private storage prefix is invalid")
+    return normalized
 
 
 def _environment_client(endpoint: str, access_key: str, secret_key: str) -> Any:

@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from validator.production.commitment import canonical_json, decode_canonical_json
-from validator.production.storage import PreconditionFailed, PrivateObjectStore
+from validator.production.storage import (
+    RETRY_STATE_NAMESPACE,
+    PreconditionFailed,
+    PrivateObjectStore,
+)
 from validator.retries import RetryCheckpoint
 
 _STAGES = frozenset({"ADMISSION", "SCORING", "CONFIRMING"})
@@ -273,7 +277,10 @@ class PrivateRetryStore:
     def _name(challenge_id: str, stage: str) -> str:
         if not _digest(challenge_id):
             raise ValueError("challenge ID is invalid")
-        return f"retry_state/{challenge_id}/{PrivateRetryStore._stage(stage).lower()}.json"
+        return (
+            f"{RETRY_STATE_NAMESPACE}/{challenge_id}/"
+            f"{PrivateRetryStore._stage(stage).lower()}.json"
+        )
 
     @staticmethod
     def _stage(stage: str) -> str:
