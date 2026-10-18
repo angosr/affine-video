@@ -735,8 +735,9 @@ def evaluate_next_scoring(
     recorded = store.stage_score(task.challenge_id, task.state)
     if recorded is None:
         try:
+            archived = None if settings.restore_stage is None else settings.restore_stage(task)
             batch_ready = getattr(evaluator, "batch_ready", None)
-            if batch_ready is not None and not batch_ready(task):
+            if archived is None and batch_ready is not None and not batch_ready(task):
                 deadline = getattr(evaluator, "batch_deadline_block", None)
                 deadline_block = None if deadline is None else deadline(task)
                 if deadline_block is not None and current_finalized_block > deadline_block:
@@ -769,7 +770,6 @@ def evaluate_next_scoring(
                     ChallengeState.SYSTEM_DEFERRED,
                     "EVALUATION_BATCH_PENDING",
                 )
-            archived = None if settings.restore_stage is None else settings.restore_stage(task)
             if archived is None:
                 result = evaluator(task)
                 recorded_score_block = None

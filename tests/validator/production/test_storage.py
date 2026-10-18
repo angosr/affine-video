@@ -3,10 +3,13 @@ import io
 import json
 import pickle
 from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from validator import chunks
+from validator.production import storage as storage_module
 from validator.production.commitment import Artifact, ArtifactManifest
 from validator.production.storage import (
     RETRY_STATE_NAMESPACE,
@@ -479,6 +482,70 @@ def test_local_batch_content_is_shared_without_s3_and_detects_corruption(tmp_pat
     sealed.write_bytes(b"other")
     with pytest.raises(StorageError, match="SHA-256"):
         evaluator.get(sha256=digest, size_bytes=5)
+
+
+@pytest.mark.parametrize("age_after_verification_ns", [0, 2_000_000_000])
+def test_local_batch_fresh_hash_is_not_reused_across_equal_timestamp_writes(
+    tmp_path, monkeypatch, age_after_verification_ns,
+):
+    source = tmp_path / "source"
+    source.write_bytes(b"video")
+    digest = hashlib.sha256(b"video").hexdigest()
+    sealed = LocalBatchStore(tmp_path / "content").put(source, sha256=digest, size_bytes=5)
+    timestamp = sealed.stat()
+    now = [max(timestamp.st_mtime_ns, timestamp.st_ctime_ns) + 100]
+    monkeypatch.setattr(storage_module, "time_ns", lambda: now[0], raising=False)
+    real_stat = Path.stat
+
+    def coarse_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path != sealed:
+            return result
+        # Reproduce observed same-tick writes without timing-sensitive sleeps.
+        return SimpleNamespace(
+            st_mode=result.st_mode, st_ino=result.st_ino, st_size=result.st_size,
+            st_mtime_ns=timestamp.st_mtime_ns, st_ctime_ns=timestamp.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(Path, "stat", coarse_stat)
+    evaluator = LocalBatchStore(tmp_path / "content")
+    assert evaluator.get(sha256=digest, size_bytes=5).read_bytes() == b"video"
+    sealed.write_bytes(b"other")
+    now[0] += age_after_verification_ns
+    with pytest.raises(StorageError, match="SHA-256"):
+        evaluator.get(sha256=digest, size_bytes=5)
+
+
+def test_local_batch_stable_content_reuses_hash_but_rechecks_changed_bytes(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.write_bytes(b"video")
+    digest = hashlib.sha256(b"video").hexdigest()
+    sealed = LocalBatchStore(tmp_path / "content").put(source, sha256=digest, size_bytes=5)
+    timestamp = sealed.stat()
+    monkeypatch.setattr(
+        storage_module, "time_ns",
+        lambda: max(timestamp.st_mtime_ns, timestamp.st_ctime_ns) + 2_000_000_000,
+        raising=False,
+    )
+    calls = []
+    file_digest = hashlib.file_digest
+
+    def tracked_hash(*args, **kwargs):
+        calls.append(True)
+        return file_digest(*args, **kwargs)
+
+    monkeypatch.setattr(storage_module.hashlib, "file_digest", tracked_hash)
+    evaluator = LocalBatchStore(tmp_path / "content")
+    for _ in range(10):
+        assert evaluator.get(sha256=digest, size_bytes=5) == sealed
+    assert len(calls) == 1
+    # Change inode/bytes, even if a filesystem supplies the same timestamps.
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"other")
+    replacement.replace(sealed)
+    with pytest.raises(StorageError, match="SHA-256"):
+        evaluator.get(sha256=digest, size_bytes=5)
+    assert len(calls) == 2
 
 
 def test_local_batch_loss_requires_regeneration_and_never_reads_private_s3(tmp_path):

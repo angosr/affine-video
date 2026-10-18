@@ -10,6 +10,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from time import time_ns
 from typing import Any
 from urllib.parse import urlparse
 
@@ -37,6 +38,7 @@ STAGES_NAMESPACE = "stages"
 VIDEOS_NAMESPACE = "videos"
 ARTIFACT_MANIFEST_OBJECT = "bootstrap/artifact_manifest.json"
 SOURCE_POOL_OBJECT = "bootstrap/source_pool.json"
+_CONTENT_TIMESTAMP_SETTLE_NS = 1_000_000_000
 
 _EVALUATOR_LIST_NAMESPACES = (PLANS_NAMESPACE,)
 _EVALUATOR_READ_NAMESPACES = (
@@ -186,6 +188,14 @@ class LocalBatchStore:
             identity = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
             if not path.is_file() or stat.st_size != size_bytes:
                 raise StorageError("local batch content is missing or has the wrong size")
+            # Linux can give consecutive writes identical mtime/ctime values.
+            # A hash of a freshly changed inode must not become a reusable hit,
+            # even if a later lookup happens after the timestamp tick has ended.
+            stable = time_ns() - max(stat.st_mtime_ns, stat.st_ctime_ns) >= (
+                _CONTENT_TIMESTAMP_SETTLE_NS
+            )
+            if not stable:
+                self._verified.pop(sha256, None)
             if self._verified.get(sha256) != identity:
                 with path.open("rb") as handle:
                     digest = hashlib.file_digest(handle, "sha256").hexdigest()
@@ -194,7 +204,8 @@ class LocalBatchStore:
                     after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
                 ):
                     raise StorageError("local batch content failed SHA-256 verification")
-                self._verified[sha256] = identity
+                if stable:
+                    self._verified[sha256] = identity
             return path
         except OSError as exc:
             raise StorageError(

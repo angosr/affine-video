@@ -876,6 +876,54 @@ def test_private_stage_archive_restores_without_repeating_evaluation(tmp_path) -
         assert rewrites == [(identifier, 0.8, 220)]
 
 
+@pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
+def test_private_stage_archive_resumes_fifo_without_missing_batch(tmp_path, stage) -> None:
+    class MissingBatch:
+        def batch_ready(self, _task):
+            pytest.fail("an archived result must not require lost GPU batch bytes")
+
+        def __call__(self, _task):
+            pytest.fail("an archived result must not be evaluated again")
+
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/test")
+    source = ReadyBatchSource(
+        track=SimpleNamespace(digest="ab" * 32), objects=objects,
+        cache_dir=tmp_path / "empty-cache",
+    )
+    database = tmp_path / "archived.db"
+    with ChallengeStore(database) as store:
+        identifier = ready_for_scoring(store)
+        if stage is ChallengeState.CONFIRMING:
+            store.transition(identifier, stage, occurred_at_ms=14)
+        task = store.claim_next_scoring("lost", lease_ms=10, now_ms=20)
+        assert task is not None
+        source.archive_stage(task, StageOutcome(0.0, {"cache_generated_block": 120}), 150)
+
+    # Local DB/result loss: replay the same submission, leaving only the private archive.
+    with ChallengeStore(tmp_path / "recovered.db") as store:
+        assert ready_for_scoring(store) == identifier
+        if stage is ChallengeState.CONFIRMING:
+            store.transition(identifier, stage, occurred_at_ms=14)
+        later, _ = store.add_submission(
+            replace(submission_at(101), hotkey="later-hotkey"), occurred_at_ms=15,
+        )
+        for state in (ChallengeState.FETCHING, ChallengeState.VALIDATING, ChallengeState.SCORING):
+            store.transition(later, state, occurred_at_ms=16)
+        restored = process_next_scoring(
+            store, worker_id="recover", current_finalized_block=200,
+            settings=ScoringSettings(restore_stage=source.restore_stage),
+            evaluator=MissingBatch(), now_ms=40,
+        )
+        assert restored is not None and restored.state is ChallengeState.SUCCEEDED
+        assert store.get_challenge(identifier).score_block == 150
+        assert store.get_challenge(identifier).final_score == 0.0
+        next_result = process_next_scoring(
+            store, worker_id="next", current_finalized_block=200,
+            settings=ScoringSettings(), evaluator=isolated_success, now_ms=41,
+        )
+        assert next_result is not None and next_result.challenge_id == later
+
+
 def test_private_stage_archive_waits_for_a_chain_head_that_covers_its_decision(tmp_path) -> None:
     archived = ArchivedStage(
         0.8,
@@ -964,6 +1012,136 @@ def test_repeated_infrastructure_failure_remains_retryable(tmp_path) -> None:
                 },
             )
         ]
+
+
+def test_finite_overflowing_selector_finishes_once_and_releases_fifo(tmp_path) -> None:
+    from tests.scoring.test_exact import exact_case
+
+    architecture = SelectorArchitecture(1, 1, 2, "float32")
+    paths = {}
+    validated = {}
+    for name, hotkey, value in (
+        ("bad", "hk1", np.finfo(np.float32).max),
+        ("baseline", None, 0.0),
+        ("later", "later-hotkey", 0.0),
+    ):
+        paths[name] = tmp_path / f"{name}.safetensors"
+        save_file(
+            {key: np.full(spec.shape, value, dtype=np.float32)
+             for key, spec in architecture.tensor_schema.items()},
+            paths[name], metadata=None if hotkey is None else {"hotkey": hotkey},
+        )
+        validated[name] = validate_model(
+            paths[name], schema=architecture.tensor_schema, max_bytes=10_000,
+            expected_hotkey=hotkey,
+        )
+    cases = []
+    for index in range(4):
+        case = exact_case(index)
+        q, k = np.ones_like(case.q, dtype=np.float16), np.ones_like(case.k, dtype=np.float16)
+        v = case.v.astype(np.float16)
+        cases.append(replace(
+            case, q=q, k=k, v=v,
+            dense=canonical_dense_reference(
+                q, k, v, case.query_valid_counts, case.key_valid_counts,
+            ),
+        ))
+    batch = write_exact_cache_batch(
+        tmp_path / "batch", tuple(cases), generated_block=120,
+        seed_block_hash="0x" + "ab" * 32, plan_digest="12" * 32,
+        track_spec_digest="34" * 32, artifact_manifest_sha256="56" * 32,
+        source_pool_merkle_root="78" * 32, source_proofs=(), dense_references=(), sample_cache={},
+    )
+    track = SimpleNamespace(
+        model=SimpleNamespace(selector=architecture),
+        scoring=scoring_spec(routes=1, rollouts=4),
+        cache=SimpleNamespace(exact_max_bytes=1_000_000), match_confidence=0.95,
+    )
+    incumbent = replace(
+        sample_task(), challenge_id="genesis", model_path=str(paths["baseline"]),
+        file_sha256=validated["baseline"].file_sha256,
+    )
+    paired = FilePairedEvaluator(track, str(batch.path), batch.sha256, incumbent)
+    with ChallengeStore(tmp_path / "overflow.db") as store:
+        first = ready_for_scoring(store)
+        later, _ = store.add_submission(
+            submission_at(101, hotkey="later-hotkey"), occurred_at_ms=15,
+        )
+        for state in (ChallengeState.FETCHING, ChallengeState.VALIDATING, ChallengeState.SCORING):
+            store.transition(later, state, occurred_at_ms=16)
+
+        def evaluate(task):
+            name = "bad" if task.challenge_id == first else "later"
+            return paired(replace(
+                task, model_path=str(paths[name]), file_sha256=validated[name].file_sha256,
+            ))
+
+        result = process_next_scoring(
+            store, worker_id="worker", current_finalized_block=120,
+            settings=ScoringSettings(max_attempts=1), evaluator=evaluate, now_ms=20,
+        )
+        assert result is not None and result.state is ChallengeState.SUCCEEDED
+        failed_quality = store.get_challenge(first)
+        assert failed_quality.final_score == 0.0 and failed_quality.attempts == 1
+        assert store.stage_score(first, ChallengeState.SCORING).metrics["incumbent_score"] > 0
+        following = process_next_scoring(
+            store, worker_id="worker", current_finalized_block=120,
+            settings=ScoringSettings(max_attempts=1), evaluator=evaluate, now_ms=21,
+        )
+        assert following is not None and following.challenge_id == later
+        assert following.state is ChallengeState.SUCCEEDED
+        assert store.get_challenge(later).final_score > 0.0
+
+
+@pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
+def test_persistent_infrastructure_probes_preserve_opportunity_and_fifo(tmp_path, stage):
+    retries = PrivateRetryStore(
+        PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/test"),
+        track_spec_digest="ab" * 32,
+    )
+    settings = ScoringSettings(
+        max_attempts=1, retry_base_ms=10, retry_max_ms=100,
+        restore_retry=retries.restore, record_retry=retries.record_failure,
+    )
+    calls = []
+
+    def unavailable(task):
+        calls.append(task.challenge_id)
+        raise TemporaryScoringError("GPU_UNAVAILABLE", "persistent infrastructure outage")
+
+    with ChallengeStore(tmp_path / "outage.db") as store:
+        first = ready_for_scoring(store)
+        if stage is ChallengeState.CONFIRMING:
+            store.transition(first, stage, occurred_at_ms=14)
+        later, _ = store.add_submission(submission_at(101, hotkey="later"), occurred_at_ms=15)
+        for state in (ChallengeState.FETCHING, ChallengeState.VALIDATING, ChallengeState.SCORING):
+            store.transition(later, state, occurred_at_ms=16)
+        for attempt in range(8):
+            now = 20 + attempt * 100
+            result = process_next_scoring(
+                store, worker_id="worker", current_finalized_block=200,
+                settings=settings, evaluator=unavailable, now_ms=now,
+            )
+            assert result is not None and result.state is ChallengeState.SYSTEM_BLOCKED
+            assert store.get_challenge(first).score_block is None
+            assert store.get_challenge(first).final_score is None
+            assert store.get_challenge(later).attempts == 0
+            assert process_next_scoring(
+                store, worker_id="worker", current_finalized_block=200,
+                settings=settings, evaluator=unavailable, now_ms=now + 99,
+            ) is None
+        assert calls == [first] * 8
+        recovered = process_next_scoring(
+            store, worker_id="recovered", current_finalized_block=200,
+            settings=settings, evaluator=isolated_success, now_ms=820,
+        )
+        assert recovered is not None and recovered.challenge_id == first
+        assert recovered.state is ChallengeState.SUCCEEDED
+        following = process_next_scoring(
+            store, worker_id="next", current_finalized_block=200,
+            settings=settings, evaluator=isolated_success, now_ms=821,
+        )
+        assert following is not None and following.challenge_id == later
 
 
 def test_future_generation_boundary_is_not_claimed_as_a_scoring_attempt(tmp_path) -> None:
