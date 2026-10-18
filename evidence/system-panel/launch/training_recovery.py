@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 
@@ -23,6 +24,68 @@ def digest(path):
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def required_base_paths(config):
+    root = Path(config["checkpoint_root"])
+    variant = config["variant"]
+    index = root / variant / "transformer/model.safetensors.index.json"
+    shards = set(json.loads(index.read_text())["weight_map"].values())
+    if not shards or any(Path(name).name != name for name in shards):
+        raise ValueError("invalid base-model shard index")
+    return root, sorted(
+        {f"{variant}/transformer/{name}" for name in shards}
+        | {
+            f"{variant}/transformer/config.json",
+            f"{variant}/transformer/model.safetensors.index.json",
+            f"{variant}/model_index.json",
+        }
+    )
+
+
+def public_base_inputs(config, repository, revision):
+    if (
+        repository != "MiniMaxAI/MiniMax-H3"
+        or len(revision) != 40
+        or any(char not in "0123456789abcdef" for char in revision)
+    ):
+        raise ValueError("base model requires the public repository and an immutable revision")
+    root, paths = required_base_paths(config)
+    tree_url = f"https://huggingface.co/api/models/{repository}/tree/{revision}/{config['variant']}/transformer"
+    with urllib.request.urlopen(tree_url, timeout=60) as response:
+        tree = {row["path"]: row for row in json.load(response)}
+    records = []
+    for relative in paths:
+        url = f"https://huggingface.co/{repository}/resolve/{revision}/{relative}"
+        metadata = tree.get(relative, {})
+        if "lfs" in metadata:
+            expected = metadata["lfs"]["oid"]
+            size = metadata["lfs"]["size"]
+        else:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                content = response.read(1024 * 1024 + 1)
+            if len(content) > 1024 * 1024:
+                raise ValueError("unexpectedly large base-model metadata")
+            expected, size = hashlib.sha256(content).hexdigest(), len(content)
+        path = root / relative
+        if path.stat().st_size != size or digest(path) != expected:
+            raise ValueError(f"base model differs from pinned public revision: {relative}")
+        records.append(
+            {
+                "path": str(path),
+                "repository_path": relative,
+                "sha256": expected,
+                "bytes": size,
+                "url": url,
+            }
+        )
+    return {
+        "repository": repository,
+        "revision": revision,
+        "files": records,
+        "scope": "all transformer shards and configuration read by build_teacher; "
+        "cached text replaces the text encoder",
+    }
 
 
 def validate_resume(state, optimizer, marker):
@@ -68,6 +131,10 @@ def inspect(args):
     )
     world_size = validate_resume(state, optimizer, marker)
     config = state["config"]
+    base = public_base_inputs(config, args.base_repository, args.base_revision)
+    adapter = Path(config["teacher_adapter"])
+    if digest(adapter) != args.adapter_sha256:
+        raise ValueError("teacher adapter differs from registered identity")
     history = [json.loads(line) for line in args.history.read_text().splitlines()]
     updates = [row for row in history if "step" in row and "event" not in row]
     if [row["step"] for row in updates] != list(range(1, state["step"] + 1)):
@@ -84,7 +151,9 @@ def inspect(args):
         args.history.resolve(),
         args.config.resolve(),
         root / "manifest.json",
+        adapter,
     }
+    files.update(Path(row["path"]) for row in base["files"] if row["path"].endswith(".json"))
     for directory in (Path(config["sample_cache"]), Path(config["plan_dir"])):
         files.update(path for path in directory.rglob("*") if path.is_file())
     # Bind and preserve the complete tracked source, including submodules.
@@ -106,7 +175,7 @@ def inspect(args):
         return hashlib.sha256(tensor.cpu().numpy().tobytes()).hexdigest()
 
     return {
-        "format": "veda-training-recovery-inventory-v1",
+        "format": "veda-training-recovery-inventory-v2",
         "release_accepted": False,
         "checkpoint": str(checkpoint),
         "step": state["step"],
@@ -121,13 +190,15 @@ def inspect(args):
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "history_updates": len(updates),
+        "public_base_model": base,
+        "teacher_adapter_sha256": args.adapter_sha256,
         "inputs": inventory,
         "total_bytes": sum(row["bytes"] for row in inventory),
     }
 
 
 def validate_inventory(document):
-    if document.get("format") != "veda-training-recovery-inventory-v1":
+    if document.get("format") != "veda-training-recovery-inventory-v2":
         raise ValueError("unsupported recovery inventory")
     seen = set()
     for row in document["inputs"]:
@@ -141,6 +212,19 @@ def validate_inventory(document):
             raise ValueError("invalid input digest")
     if not seen or document["total_bytes"] != sum(row["bytes"] for row in document["inputs"]):
         raise ValueError("empty inventory or incorrect total bytes")
+    base = document["public_base_model"]
+    if not base["files"] or base["repository"] != "MiniMaxAI/MiniMax-H3":
+        raise ValueError("missing recoverable public base model")
+    for row in base["files"]:
+        expected = f"https://huggingface.co/{base['repository']}/resolve/{base['revision']}/{row['repository_path']}"
+        if row["url"] != expected or len(row["sha256"]) != 64:
+            raise ValueError("invalid public base-model recovery binding")
+    adapter = document["configuration"]["teacher_adapter"]
+    if not any(
+        row["path"] == adapter and row["sha256"] == document["teacher_adapter_sha256"]
+        for row in document["inputs"]
+    ):
+        raise ValueError("teacher adapter is absent from the durable mirror")
 
 
 def mirror(args):
@@ -195,7 +279,7 @@ def mirror(args):
         "bytes": document["total_bytes"],
         "verified": True,
     }
-    path = args.output / "receipt.json"
+    path = args.output / f"receipt-{args.inventory_sha256}.json"
     payload = canonical(receipt)
     if path.exists():
         if path.read_bytes() != payload:
@@ -213,6 +297,8 @@ def main():
     inspect_parser = sub.add_parser("inspect")
     for name in ("root", "checkpoint", "source", "history", "config"):
         inspect_parser.add_argument("--" + name, type=Path, required=True)
+    for name in ("base-repository", "base-revision", "adapter-sha256"):
+        inspect_parser.add_argument("--" + name, required=True)
     mirror_parser = sub.add_parser("mirror")
     mirror_parser.add_argument("--host", required=True)
     mirror_parser.add_argument("--inventory", type=Path, required=True)

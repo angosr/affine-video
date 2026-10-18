@@ -1,0 +1,248 @@
+{
+  "allocated_gpus": [
+    4,
+    5
+  ],
+  "checkpoint_step": 28,
+  "configuration": {
+    "abort_max_drop": 0.05,
+    "abort_metric": "kept_over_ceiling",
+    "abort_patience": 20,
+    "abort_window": 8,
+    "accum": 4,
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "bootstrap_shape": "4x8x4",
+    "checkpoint_root": "/workspace/veda-assets/weights/MiniMax-H3",
+    "count_term": false,
+    "dense_backend": "auto",
+    "ema": 0.995,
+    "freeze_count_gain": false,
+    "freeze_second_order": false,
+    "gauge_kl_weight": 0.0,
+    "geometries": [
+      "16:9@37",
+      "1:1@72",
+      "4:3@102",
+      "9:16@37"
+    ],
+    "geometry_sampling": "cycle",
+    "grad_clip": 1.0,
+    "heat_reduce": "max",
+    "init_drop_prefixes": [],
+    "init_from": null,
+    "keep_optimizer": 1,
+    "keep_ratio": 0.1,
+    "keep_tiles": null,
+    "kl_direction": "forward",
+    "kl_weight": 1.0,
+    "lora_rank": 64,
+    "lr": 0.001,
+    "lr_decay": "cosine",
+    "lr_min_ratio": 0.1,
+    "mlp_chunk_rows": 8192,
+    "monitor_updates": true,
+    "muon_aux_lr_scale": 0.1,
+    "muon_momentum": 0.95,
+    "muon_rms": 0.2,
+    "num_steps": 8,
+    "offload_blocks": 0,
+    "offload_optimizer": false,
+    "optimizer": "adamw",
+    "out_dir": "/workspace/veda-dev/training-runs",
+    "persistent_dir": "/workspace/veda-private/calibration-training-v1/independent-seed-checkpoints",
+    "plan_dir": "/workspace/veda-private/calibration-training-v1/release-plans",
+    "prefetch": 1,
+    "random_text_len": 589,
+    "random_weights_seed": null,
+    "recall_every": 1,
+    "ref_keep_ratio": null,
+    "ref_keep_tiles": null,
+    "run_name": "veda_validation_independent_seed",
+    "sample_cache": "/workspace/veda-private/calibration-training-v1/sample_cache",
+    "save_every": 20,
+    "schedule": "turbo",
+    "second_order_moments": null,
+    "second_order_rank": 0,
+    "seed": 20261019,
+    "seq_bucket": null,
+    "stage": 1,
+    "steps": 100,
+    "tasks": [
+      "t2va"
+    ],
+    "teacher_adapter": "/workspace/veda-assets/weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors",
+    "teacher_q_tiles": 1.0,
+    "tile_conditions": false,
+    "topk_weight": 0.0,
+    "trajectory_steps": null,
+    "transport_weight": 0.0,
+    "variant": "FL2VA",
+    "veda_collect_mib": 2048,
+    "warmup": 20,
+    "weight_decay": 0.0
+  },
+  "cost_gpus_unchanged": [
+    6,
+    7
+  ],
+  "format": "veda-e3-resume-binding-v2",
+  "history_replay": {
+    "continuation_script_sha256": "7d05945dff3a38a643da3269944d55cbc06835ac896f5d4f1f4df17adca09ca5",
+    "format": "veda-early-abort-continuity-v1",
+    "history_sha256": "63ba08f1d53fbf945b82c4e0e65007853e21c6af703e5408e18cc48beaf9f33b",
+    "monitor_sha256": "816d4ae04296414e032e0a8af390641fd26accadcf02bf53b5deab20d8a0f123",
+    "original_reference": 0.7771675,
+    "prefix_updates": 28,
+    "release_accepted": false,
+    "reset_baseline_counterexample": true,
+    "update_29_divergence_identical": true
+  },
+  "mirror_destination": "/home/aiuser/work/veda-evidence/private-assets/e3-step28-recovery",
+  "mirror_service": "veda-preserve-training-step28-v2.service",
+  "mirror_status_at_binding": "active_not_complete",
+  "public_base_model": {
+    "files": [
+      {
+        "bytes": 719,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/model_index.json",
+        "repository_path": "FL2VA/model_index.json",
+        "sha256": "d1113e0f123c69f79cd0de35ca1771606ebc3ec924270d257b771f96f584aa6b",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/model_index.json"
+      },
+      {
+        "bytes": 604,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/config.json",
+        "repository_path": "FL2VA/transformer/config.json",
+        "sha256": "f619093a231fcfbcc3d035bec26c50ad864e7331a500d5c519f5045dc1e50458",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/config.json"
+      },
+      {
+        "bytes": 5227812968,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00001-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00001-of-00013.safetensors",
+        "sha256": "0b3386565e476bfdea287e9ea9f269d036e5c649ed14bb9b4afac1dc4661bd2a",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00001-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578856,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00002-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00002-of-00013.safetensors",
+        "sha256": "9c98fd4579c9bc96d1b1bbf65c1243f9256df60bccd229570cecc61897773003",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00002-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578872,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00003-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00003-of-00013.safetensors",
+        "sha256": "fa484c940d4170199fb69f5016739df2daf6ecd1150631b12a297e06e3964730",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00003-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578896,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00004-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00004-of-00013.safetensors",
+        "sha256": "4a851df37cce2d14b39cb58df41def7b591b1f11b8520a32b421a5fa3e997c9f",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00004-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578896,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00005-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00005-of-00013.safetensors",
+        "sha256": "3fe6ff94dc9d3107c6776a25277d2b72b5443f88cf0f4ed835fd5b65a94ea5d4",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00005-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578896,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00006-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00006-of-00013.safetensors",
+        "sha256": "79b47e1b9ff03a2c6f06dd15a28972acf32c0867172ee34e5aa6e96b99494127",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00006-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578896,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00007-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00007-of-00013.safetensors",
+        "sha256": "6ac4d6ce639786b722a8dd99843ed56dcab48a0d174a4b0f9b8cdcbe5160fb0f",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00007-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578896,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00008-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00008-of-00013.safetensors",
+        "sha256": "03531812243fb0a333e01efa7e3d39750580bca8cbf2ba0529da419278eab736",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00008-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578896,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00009-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00009-of-00013.safetensors",
+        "sha256": "7e82a80b0d0d267026eb841b81523069cc7b956c1ebd8a18c07e462ffb262487",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00009-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578896,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00010-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00010-of-00013.safetensors",
+        "sha256": "ef0a1f6b65145232543dd2232d58d91a4d31f44b0da5084acf22cea123255481",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00010-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578896,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00011-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00011-of-00013.safetensors",
+        "sha256": "bf885b8f2f078c5499b75fded21094a26bfe0e6e00bee276e499443ecd2f298d",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00011-of-00013.safetensors"
+      },
+      {
+        "bytes": 5164578896,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00012-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00012-of-00013.safetensors",
+        "sha256": "dc717572d014ebf8527e35af815d10eb2f5a6bc87253b8a7d2f456965192db69",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00012-of-00013.safetensors"
+      },
+      {
+        "bytes": 4242305176,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model-00013-of-00013.safetensors",
+        "repository_path": "FL2VA/transformer/model-00013-of-00013.safetensors",
+        "sha256": "8bfd852d5817e9836de1d3ec8dbac1c5446b167568b717371f08282b22291aa2",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model-00013-of-00013.safetensors"
+      },
+      {
+        "bytes": 38323,
+        "path": "/workspace/veda-assets/weights/MiniMax-H3/FL2VA/transformer/model.safetensors.index.json",
+        "repository_path": "FL2VA/transformer/model.safetensors.index.json",
+        "sha256": "fb457a26ffa6294660e249b0ddd03a337f2e5393f770b5c34c8b8f90a29a7efb",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA/transformer/model.safetensors.index.json"
+      }
+    ],
+    "repository": "MiniMaxAI/MiniMax-H3",
+    "revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+    "scope": "all transformer shards and configuration read by build_teacher; cached text replaces the text encoder"
+  },
+  "recovery_inventory": {
+    "files": 705,
+    "mirrored_bytes": 5583727915,
+    "path": "/home/aiuser/work/veda-evidence/evidence/system-panel/e3-step28/recovery-inventory-v2.json",
+    "sha256": "03f1cdd6b97eede3c5e5a88a612db04dc54e2d7c41c1ce30a49e3b5ef4ffa9a6"
+  },
+  "release_accepted": false,
+  "remaining_before_launch": [
+    "complete verified recovery mirror receipt",
+    "exact E3 source and ranking protocol registration",
+    "bounded two-rank container supervision and continuous off-GPU selector collector registration",
+    "final launch preflight and idle GPU verification"
+  ],
+  "required_receipt": "receipt-03f1cdd6b97eede3c5e5a88a612db04dc54e2d7c41c1ce30a49e3b5ef4ffa9a6.json",
+  "supersedes_incomplete_inventory_sha256": "5c1c313df6cc73b214a022116e4f0760c39f9c3138d8e714de6ef1aea3926f5c",
+  "teacher_adapter": {
+    "bytes": 779849816,
+    "path": "/workspace/veda-assets/weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors",
+    "sha256": "5f3a626cd72c93a8b9318d6760c510bc5092d2ab13aaba1f932c5bab07a416d3"
+  },
+  "training_recovery_script_sha256": "d43f90729903cddcd1c6684ea1765e1549d375f78733869f47362e09d267fda9",
+  "training_started": false,
+  "world_size": 2
+}
