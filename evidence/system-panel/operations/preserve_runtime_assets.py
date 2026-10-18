@@ -162,17 +162,22 @@ def run():
     artifacts = read_artifacts()
     if not DESTINATION.is_dir() or DESTINATION.is_symlink():
         raise ValueError("resume requires the original real mirror directory")
-    required_free = sum(row["size_bytes"] for row in artifacts) + 64 * 1024**3
-    if shutil.disk_usage(DESTINATION).free < required_free:
-        raise ValueError("insufficient free disk for a recoverable resumed transfer")
-    for artifact in artifacts:
-        destination_file(DESTINATION, artifact["logical_name"])
     phases = transfer_groups(artifacts)
     stopped = threading.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda _signum, _frame: stopped.set())
     with (DESTINATION / ".preservation.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        pending_bytes = 0
+        for artifact in artifacts:
+            target = destination_file(DESTINATION, artifact["logical_name"])
+            if not target.is_file() or target.stat().st_size != artifact["size_bytes"]:
+                pending_bytes += artifact["size_bytes"]
+        # Completed files already occupy disk. The reserve also covers four
+        # simultaneous replacement temporaries; size does not waive SHA checks.
+        required_free = pending_bytes + 64 * 1024**3
+        if shutil.disk_usage(DESTINATION).free < required_free:
+            raise ValueError("insufficient free disk for a recoverable resumed transfer")
         document = {
             "format": "veda-off-gpu-runtime-preservation-task-v1",
             "state": "RUNNING_NOT_VERIFIED", "service": SERVICE, "main_pid": os.getpid(),

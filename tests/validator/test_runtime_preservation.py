@@ -122,6 +122,47 @@ def test_run_refuses_an_active_previous_writer(monkeypatch):
         preservation.run()
 
 
+def test_resume_disk_budget_excludes_completed_files_but_keeps_partial_and_reserve(
+    tmp_path, monkeypatch,
+):
+    rows = [artifact(f"veda-assets/{name}") for name in ("complete", "partial", "missing")]
+    destination = tmp_path / "mirror"
+    destination.mkdir()
+    completed = destination / rows[0]["logical_name"]
+    completed.parent.mkdir()
+    completed.write_bytes(b"frozen")
+    partial = completed.parent / ".rsync-partial/partial"
+    partial.parent.mkdir()
+    partial.write_bytes(b"fro")
+    current = tmp_path / "task.json"
+    monkeypatch.setattr(preservation, "CURRENT", current)
+    monkeypatch.setattr(preservation, "DESTINATION", destination)
+    monkeypatch.setattr(preservation, "read_artifacts", lambda: rows)
+    monkeypatch.setattr(preservation.subprocess, "check_output", lambda *_a, **_k: "inactive\n")
+    monkeypatch.setattr(preservation.signal, "signal", lambda *_a: None)
+    required_free = 64 * 1024**3 + 2 * len(b"frozen")
+    free = SimpleNamespace(free=required_free - 1)
+    monkeypatch.setattr(preservation.shutil, "disk_usage", lambda _p: free)
+    calls = []
+
+    def transfer(group, root, *_args):
+        calls.append(group)
+        for row in group:
+            (root / row["logical_name"]).write_bytes(b"frozen")
+
+    monkeypatch.setattr(preservation, "transfer_group", transfer)
+    with pytest.raises(ValueError, match="insufficient free disk"):
+        preservation.run()
+    assert not calls and not current.exists()
+    assert partial.read_bytes() == b"fro"
+    free.free = required_free
+    preservation.run()
+    result = json.loads(current.read_text())
+    assert result["state"] == "COMPLETED_VERIFIED"
+    assert result["verified_files"] == 3  # Existing files still require their SHA check.
+    assert partial.read_bytes() == b"fro"
+
+
 @pytest.mark.parametrize("corrupt", [False, True])
 def test_resumed_run_verifies_online_phase_before_encoder_and_never_accepts_corruption(
     tmp_path, monkeypatch, corrupt,
