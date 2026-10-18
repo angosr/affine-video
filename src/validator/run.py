@@ -265,18 +265,27 @@ async def run_evaluator(
                 break
             except Exception as exc:
                 _record_publication_failure(recovery_store, alert, exc)
-                async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
-                    scan = await scan_finalized_blocks(
-                        client, recovery_store, netuid=track.netuid,
-                        track_start_block=track.track_start_block,
-                        submission_end_block=track.track_close_block,
-                        max_blocks=max_scan_blocks,
-                    )
-                    finalized_block = await client.finalized_block()
+                scan = None
+                finalized_block = None
+                chain_error = None
+                try:
+                    async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
+                        scan = await scan_finalized_blocks(
+                            client, recovery_store, netuid=track.netuid,
+                            track_start_block=track.track_start_block,
+                            submission_end_block=track.track_close_block,
+                            max_blocks=max_scan_blocks,
+                        )
+                        finalized_block = await client.finalized_block()
+                except Exception as chain_exc:
+                    if once:
+                        raise
+                    chain_error = str(chain_exc) or type(chain_exc).__name__
                 if report is not None:
                     report(EvaluationCycleResult(
                         finalized_block, scan, None, None,
                         publication_error=str(exc) or type(exc).__name__,
+                        cycle_error=chain_error,
                     ))
                 if once:
                     return

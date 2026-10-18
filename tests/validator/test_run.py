@@ -446,7 +446,10 @@ def test_production_evaluator_rejects_missing_release_approval(monkeypatch) -> N
         )
 
 
-def test_ledger_outage_scanning_reserves_uid0_before_any_submission(monkeypatch, tmp_path):
+@pytest.mark.parametrize("chain_outage", [False, True])
+def test_ledger_outage_scanning_reserves_uid0_and_recovers_from_chain_failure(
+    monkeypatch, tmp_path, chain_outage,
+):
     document = valid_spec()
     document["initial_champion"]["hotkey"] = HOTKEY
     track = parse_track_spec(document)
@@ -455,20 +458,34 @@ def test_ledger_outage_scanning_reserves_uid0_before_any_submission(monkeypatch,
         101: empty_chain_block(101),
     }
     reports = []
+    connections = []
+    unavailable = chain_outage
+
+    class StopLoop(BaseException):
+        pass
 
     class Client(FakeClient):
         async def __aenter__(self):
+            connections.append("opened")
             return self
 
         async def __aexit__(self, *_args):
+            connections.append("closed")
             return None
 
+        async def finalized_block(self):
+            nonlocal unavailable
+            if unavailable:
+                unavailable = False
+                raise OSError("finalized head temporarily unavailable")
+            return await super().finalized_block()
+
     class Publisher(S3Repository):
-        first_load = True
+        remaining_load_failures = 2 if chain_outage else 1
 
         async def load(self, candidate):
-            if self.first_load:
-                self.first_load = False
+            if self.remaining_load_failures:
+                self.remaining_load_failures -= 1
                 raise OSError("public ledger temporarily unavailable")
             return await super().load(candidate)
 
@@ -485,6 +502,11 @@ def test_ledger_outage_scanning_reserves_uid0_before_any_submission(monkeypatch,
     def no_download(*_args, **_kwargs):
         pytest.fail("UID0 must never reach model I/O, including after public recovery")
 
+    def report(result):
+        reports.append(result)
+        if chain_outage and result.published_block is not None:
+            raise StopLoop
+
     transport = MemoryS3()
     publisher = Publisher(transport, bucket="test", prefix="isolated/uid-zero")
     monkeypatch.setattr(run_module, "load_track_spec", lambda _path: track)
@@ -493,6 +515,7 @@ def test_ledger_outage_scanning_reserves_uid0_before_any_submission(monkeypatch,
     monkeypatch.setattr(run_module, "seed_legacy_exclusions", no_seed)
     monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", no_seed)
     monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
+    monkeypatch.setattr(run_module, "webhook_alerter", lambda *_args, **_kwargs: None)
     (tmp_path / "batches").mkdir()
     database = tmp_path / "validator.db"
     arguments = {
@@ -500,7 +523,8 @@ def test_ledger_outage_scanning_reserves_uid0_before_any_submission(monkeypatch,
         "model_cache": tmp_path / "models", "exact_cache": tmp_path / "batches",
         "initial_model": tmp_path / "baseline.safetensors", "network": "finney",
         "archive_endpoints": None, "worker_id": "single-worker", "publisher": publisher,
-        "once": True, "report": reports.append,
+        "once": not chain_outage, "report": report, "poll_seconds": 0.001,
+        "alert_webhook_url": "https://alerts.example/veda",
     }
     original_admission = run_module.process_next_admission
 
@@ -508,14 +532,28 @@ def test_ledger_outage_scanning_reserves_uid0_before_any_submission(monkeypatch,
         return original_admission(store, **{**kwargs, "downloader": no_download})
 
     monkeypatch.setattr(run_module, "process_next_admission", admission)
-    asyncio.run(run_module.run_evaluator(**arguments))
+
+    async def execute():
+        async with asyncio.timeout(5):
+            await run_module.run_evaluator(**arguments)
+
+    if chain_outage:
+        with pytest.raises(StopLoop):
+            asyncio.run(execute())
+        assert reports[0].cycle_error == "finalized head temporarily unavailable"
+        assert reports[0].scan is None
+        assert reports[1].scan.submissions_found == 1
+    else:
+        asyncio.run(execute())
     with ChallengeStore(database, track_spec_digest=track.digest) as store:
         snapshot = store.public_snapshot()
         assert snapshot["challenges"][0]["state"] == ChallengeState.REJECTED_DUPLICATE_HOTKEY
         assert store.effective_challenge_count() == 0
         assert store.chain_cursor()[0] == 101
-    assert reports[-1].publication_error == "public ledger temporarily unavailable"
-    asyncio.run(run_module.run_evaluator(**arguments))
+    assert reports[0].publication_error == "public ledger temporarily unavailable"
+    if not chain_outage:
+        asyncio.run(execute())
+    assert connections == ["opened", "closed"] * (3 if chain_outage else 2)
     assert reports[-1].published_block == 101
     weights = decode_weight_artifact(transport.objects["isolated/uid-zero/weights.json"])
     assert weights.plan.uids == (0,)
