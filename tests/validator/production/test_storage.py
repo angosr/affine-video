@@ -322,6 +322,101 @@ def test_content_is_chunked_and_restored_with_complete_verification(tmp_path, mo
     ]
 
 
+def test_private_upload_verifies_bytes_before_committing_manifest(tmp_path):
+    source = tmp_path / "model.bin"
+    source.write_bytes(b"model")
+    digest = hashlib.sha256(b"model").hexdigest()
+
+    class CorruptingS3(MemoryS3):
+        def put_object(self, **kwargs):
+            if kwargs["Key"].endswith("part-00000"):
+                kwargs["Body"] = b"other"
+            return super().put_object(**kwargs)
+
+    client = CorruptingS3()
+    store = PrivateObjectStore(client, bucket="private", prefix="root")
+    with pytest.raises(StorageError, match="conflicts with manifest"):
+        store.put_content(source, sha256=digest, object_name="model/manifest.json")
+    assert ("private", "root/model/manifest.json") not in client.objects
+    assert client.head_object(Bucket="private", Key="root/model/part-00000")["Metadata"] == {
+        "sha256": digest
+    }
+
+
+def test_private_upload_rechecks_existing_chunk_bytes_not_just_metadata(tmp_path):
+    source = tmp_path / "model.bin"
+    source.write_bytes(b"model")
+    digest = hashlib.sha256(b"model").hexdigest()
+    client = MemoryS3()
+    store = PrivateObjectStore(client, bucket="private", prefix="root")
+    store.put_content(source, sha256=digest, object_name="model/manifest.json")
+    key = ("private", "root/model/part-00000")
+    _, etag, metadata = client.objects[key]
+    client.objects[key] = (b"other", etag, metadata)
+
+    with pytest.raises(StorageError, match="conflicts with manifest"):
+        PrivateObjectStore(client, bucket="private", prefix="root").put_content(
+            source, sha256=digest, object_name="model/manifest.json"
+        )
+    assert client.objects[key][0] == b"other"
+
+
+@pytest.mark.parametrize("winner", [b"model", b"other"])
+def test_private_chunk_creation_race_preserves_and_verifies_the_winner(tmp_path, winner):
+    source = tmp_path / "model.bin"
+    source.write_bytes(b"model")
+    digest = hashlib.sha256(b"model").hexdigest()
+    conditions = []
+
+    class RacingS3(MemoryS3):
+        def put_object(self, **kwargs):
+            if kwargs["Key"].endswith("part-00000"):
+                conditions.append(kwargs.get("IfNoneMatch"))
+                super().put_object(**{**kwargs, "Body": winner})
+            return super().put_object(**kwargs)
+
+    client = RacingS3()
+    store = PrivateObjectStore(client, bucket="private", prefix="root")
+    if winner == b"other":
+        with pytest.raises(StorageError, match="conflicts with manifest"):
+            store.put_content(source, sha256=digest, object_name="model/manifest.json")
+        assert ("private", "root/model/manifest.json") not in client.objects
+    else:
+        store.put_content(source, sha256=digest, object_name="model/manifest.json")
+    assert conditions == ["*"]
+    assert client.objects[("private", "root/model/part-00000")][0] == winner
+
+
+def test_private_upload_and_restore_stream_and_close_actual_chunk_bodies(tmp_path):
+    source = tmp_path / "model.bin"
+    source.write_bytes(b"x" * 150_000)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    bodies = []
+
+    class BoundedBody(io.BytesIO):
+        def read(self, size=-1):
+            assert 0 < size <= 64 * 1024
+            return super().read(size)
+
+    class StreamingS3(MemoryS3):
+        def get_object(self, **kwargs):
+            response = super().get_object(**kwargs)
+            if kwargs["Key"].endswith("part-00000"):
+                payload = self.objects[(kwargs["Bucket"], kwargs["Key"])][0]
+                response["Body"] = BoundedBody(payload)
+                bodies.append(response["Body"])
+            return response
+
+    store = PrivateObjectStore(StreamingS3(), bucket="private", prefix="root")
+    store.put_content(source, sha256=digest, object_name="model/manifest.json")
+    restored = store.download_content(
+        "model/manifest.json", tmp_path / "restored.bin", sha256=digest, size_bytes=150_000,
+    )
+    assert restored.read_bytes() == source.read_bytes()
+    assert len(bodies) == 2
+    assert all(body.closed for body in bodies)
+
+
 def test_bootstrap_and_manifest_restore_survive_loss_of_local_artifacts(
     tmp_path, monkeypatch
 ) -> None:

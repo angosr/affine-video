@@ -17,6 +17,7 @@ from validator.chunks import (
     build_chunk_manifest,
     chunk_object_name,
     read_part,
+    verify_chunked_content,
 )
 from validator.production.commitment import Artifact, ArtifactManifest
 from validator.s3 import client_config
@@ -452,19 +453,31 @@ class PrivateObjectStore:
                     raise StorageError("immutable chunk conflicts with existing content")
                 continue
             content = read_part(source, index, part.size)
-            self._client.put_object(
-                Bucket=self._bucket,
-                Key=key,
-                Body=content,
-                ContentType="application/octet-stream",
-                Metadata={"sha256": part.sha256},
-            )
+            try:
+                self._client.put_object(
+                    Bucket=self._bucket,
+                    Key=key,
+                    Body=content,
+                    ContentType="application/octet-stream",
+                    Metadata={"sha256": part.sha256},
+                    IfNoneMatch="*",
+                )
+            except Exception as exc:
+                if not _is_precondition_failed(exc):
+                    raise
             stored = self._client.head_object(Bucket=self._bucket, Key=key)
             if (
                 stored.get("Metadata", {}).get("sha256") != part.sha256
                 or stored.get("ContentLength") != part.size
             ):
                 raise StorageError("immutable chunk upload verification failed")
+        try:
+            verify_chunked_content(
+                manifest,
+                lambda part_name: self._open_content_part(object_name, part_name),
+            )
+        except ValueError as exc:
+            raise StorageError(f"immutable {exc}") from exc
         if not manifest_exists:
             self.create_plan(object_name, manifest.encode())
 
@@ -524,35 +537,34 @@ class PrivateObjectStore:
                 raise StorageError("immutable content manifest is invalid") from exc
             if manifest.sha256 != sha256 or manifest.size != size_bytes:
                 raise StorageError("immutable content manifest conflicts with expected identity")
-            complete = hashlib.sha256()
             with tempfile.NamedTemporaryFile(
                 dir=target.parent, suffix=".part", delete=False
             ) as out:
                 temporary = Path(out.name)
-                for part in manifest.parts:
-                    response = self._client.get_object(
-                        Bucket=self._bucket,
-                        Key=self._key(chunk_object_name(object_name, part.name)),
+                try:
+                    verify_chunked_content(
+                        manifest,
+                        lambda part_name: self._open_content_part(object_name, part_name),
+                        write=out.write,
                     )
-                    body = response.get("Body")
-                    content = body.read(part.size + 1) if hasattr(body, "read") else None
-                    if (
-                        not isinstance(content, bytes)
-                        or len(content) != part.size
-                        or hashlib.sha256(content).hexdigest() != part.sha256
-                    ):
-                        raise StorageError("restored immutable chunk is invalid")
-                    complete.update(content)
-                    out.write(content)
+                except ValueError as exc:
+                    raise StorageError(f"restored immutable content is invalid: {exc}") from exc
                 out.flush()
                 os.fsync(out.fileno())
-            if temporary.stat().st_size != size_bytes or complete.hexdigest() != sha256:
+            if temporary.stat().st_size != size_bytes:
                 raise StorageError("restored content failed size or SHA-256 verification")
             os.replace(temporary, target)
             return target
         finally:
             if temporary is not None and temporary.exists():
                 temporary.unlink()
+
+    def _open_content_part(self, object_name: str, part_name: str):
+        response = self._client.get_object(
+            Bucket=self._bucket,
+            Key=self._key(chunk_object_name(object_name, part_name)),
+        )
+        return response.get("Body")
 
     def _put(
         self,

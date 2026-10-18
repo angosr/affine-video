@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,45 @@ def chunk_object_name(manifest_name: str, part_name: str) -> str:
     if manifest_name.endswith("/manifest.json"):
         return f"{manifest_name.rsplit('/', 1)[0]}/{part_name}"
     return f"{manifest_name}.parts/{part_name}"
+
+
+def verify_chunked_content(
+    manifest: ChunkManifest,
+    open_part: Callable[[str], Any],
+    *,
+    write: Callable[[bytes], Any] | None = None,
+) -> None:
+    """Stream and verify actual part and complete bytes, optionally copying them."""
+
+    complete = hashlib.sha256()
+    for part in manifest.parts:
+        body = open_part(part.name)
+        received = 0
+        digest = hashlib.sha256()
+        try:
+            if not callable(getattr(body, "read", None)):
+                raise ValueError("chunk response has no readable body")
+            while True:
+                content = body.read(min(64 * 1024, part.size - received + 1))
+                if not isinstance(content, bytes):
+                    raise ValueError("chunk response contains non-byte content")
+                if not content:
+                    break
+                if len(content) > part.size - received:
+                    raise ValueError("chunk exceeds manifest size")
+                received += len(content)
+                digest.update(content)
+                complete.update(content)
+                if write is not None:
+                    write(content)
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
+        if received != part.size or digest.hexdigest() != part.sha256:
+            raise ValueError("chunk conflicts with manifest")
+    if complete.hexdigest() != manifest.sha256:
+        raise ValueError("file conflicts with its complete digest")
 
 
 def _unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

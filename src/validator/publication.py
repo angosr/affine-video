@@ -18,7 +18,13 @@ from urllib.parse import urlparse
 import httpx
 
 from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
-from validator.chunks import ChunkManifest, build_chunk_manifest, chunk_object_name, read_part
+from validator.chunks import (
+    ChunkManifest,
+    build_chunk_manifest,
+    chunk_object_name,
+    read_part,
+    verify_chunked_content,
+)
 from validator.production.batches import BatchDisclosure, public_selected_inputs_document
 from validator.production.commitment import verify_source_proof
 from validator.production.plan import (
@@ -825,9 +831,8 @@ class S3Repository:
         self._confirmed_immutable[artifact.object_name] = artifact.sha256
 
     def _verify_public_chunks(self, manifest_name: str, manifest: ChunkManifest) -> None:
-        complete = hashlib.sha256()
-        for part in manifest.parts:
-            name = chunk_object_name(manifest_name, part.name)
+        def open_part(part_name: str):
+            name = chunk_object_name(manifest_name, part_name)
             try:
                 response = self._client.get_object(
                     Bucket=self._bucket,
@@ -839,24 +844,12 @@ class S3Repository:
                 if str(code) in {"404", "NoSuchKey", "NotFound"}:
                     raise PublicArtifactError(f"immutable public chunk is missing: {name}") from exc
                 raise
-            body = response.get("Body")
-            if body is None or not callable(getattr(body, "read", None)):
-                raise PublicArtifactError("public chunk response has no readable body")
-            received = 0
-            digest = hashlib.sha256()
-            try:
-                while content := body.read(min(64 * 1024, part.size - received + 1)):
-                    if not isinstance(content, bytes) or len(content) > part.size - received:
-                        raise PublicArtifactError("immutable public chunk exceeds manifest size")
-                    received += len(content)
-                    digest.update(content)
-                    complete.update(content)
-            finally:
-                body.close()
-            if received != part.size or digest.hexdigest() != part.sha256:
-                raise PublicArtifactError("immutable public chunk conflicts with manifest")
-        if complete.hexdigest() != manifest.sha256:
-            raise PublicArtifactError("immutable public file conflicts with its complete digest")
+            return response.get("Body")
+
+        try:
+            verify_chunked_content(manifest, open_part)
+        except ValueError as exc:
+            raise PublicArtifactError(f"immutable public {exc}") from exc
 
     async def load(self, track: TrackSpec) -> PublicLedger:
         """Load and verify the committed public tournament ledger from object storage."""

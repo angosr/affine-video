@@ -339,6 +339,10 @@ replays restore this archive before contacting the submitted repository. The pro
 atomic conditional creates and replacements against that endpoint before starting. Local SQLite,
 model downloads and work directories are disposable.
 
+Private uploads and reused chunks are checked against their actual bytes before an archive is
+acknowledged; HEAD metadata alone is insufficient. Public verification, private verification and
+restoration share one bounded streaming verifier for per-part and complete SHA-256 checks.
+
 Run the private data producer separately with the same production configuration:
 
 ```bash
