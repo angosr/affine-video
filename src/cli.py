@@ -287,6 +287,7 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
         return
 
     if arguments.command == "evaluate":
+        publisher = None
         try:
             publisher = S3Repository.from_environment(
                 bucket=PUBLIC_STORAGE_BUCKET,
@@ -321,6 +322,10 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
             return
         except (RuntimeError, OSError, ValueError) as exc:
             parser.exit(1, f"error: {exc}\n")
+        finally:
+            close = getattr(publisher, "close", None)
+            if close is not None:
+                close()
         return
 
     if arguments.command == "run":

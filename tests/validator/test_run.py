@@ -150,7 +150,7 @@ def pending_evaluation(tmp_path):
         )
         transport = MemoryS3()
         publisher = S3Repository(transport, bucket="test", prefix="isolated/heartbeat")
-        publisher.verify_conditional_writes()
+        publisher.verify_writes()
         try:
             yield SimpleNamespace(
                 track=track, pool=pool, store=store, client=client, work=work, entered=entered,

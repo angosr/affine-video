@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -641,6 +642,27 @@ class S3Repository:
         self._prefix = normalized
         self.release_approval = release_approval
         self._confirmed_immutable: dict[str, str] = {}
+        self._writer_lock: Any | None = None
+
+    def acquire_writer_lock(self, database: str | Path) -> None:
+        """Hold the one evaluator deployment's filesystem lock until close or process exit."""
+
+        if self._writer_lock is not None:
+            return
+        path = Path(database).parent / ".public-writer.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+b")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise PublicArtifactError("another evaluator holds the public writer lock") from exc
+        self._writer_lock = handle
+
+    def close(self) -> None:
+        if self._writer_lock is not None:
+            self._writer_lock.close()
+            self._writer_lock = None
 
     @classmethod
     def from_environment(cls, *, bucket: str, prefix: str) -> S3Repository:
@@ -675,8 +697,8 @@ class S3Repository:
             release_approval=ReleaseApproval.from_environment(),
         )
 
-    def verify_conditional_writes(self) -> None:
-        """Refuse a public backend that cannot fence concurrent publishers."""
+    def verify_writes(self) -> None:
+        """Check write/read visibility for the single managed public publisher."""
 
         name = f"capability-probes/{uuid.uuid4().hex}.json"
         key = f"{self._prefix}/{name}"
@@ -688,32 +710,8 @@ class S3Repository:
                 IfNoneMatch="*",
             )
             first = self._get_stored_optional(name)
-            if first is None:
-                raise PublicArtifactError("conditional create was not durable")
-            try:
-                self._client.put_object(
-                    Bucket=self._bucket,
-                    Key=key,
-                    Body=b'{"state":"overwrite"}',
-                    IfNoneMatch="*",
-                )
-            except Exception as exc:
-                if not _is_precondition_failed(exc):
-                    raise
-            else:
-                raise PublicArtifactError("public object store ignores If-None-Match")
-            try:
-                self._client.put_object(
-                    Bucket=self._bucket,
-                    Key=key,
-                    Body=b'{"state":"stale"}',
-                    IfMatch="invalid-etag",
-                )
-            except Exception as exc:
-                if not _is_precondition_failed(exc):
-                    raise
-            else:
-                raise PublicArtifactError("public object store ignores If-Match")
+            if first is None or first[0] != b'{"state":"first"}':
+                raise PublicArtifactError("public object creation was not durable")
             self._client.put_object(
                 Bucket=self._bucket,
                 Key=key,
@@ -722,7 +720,7 @@ class S3Repository:
             )
             stored = self._get_stored_optional(name)
             if stored is None or stored[0] != b'{"state":"ready"}':
-                raise PublicArtifactError("conditional replacement was not durable")
+                raise PublicArtifactError("public object replacement was not durable")
         finally:
             self._client.delete_object(Bucket=self._bucket, Key=key)
 
@@ -1331,15 +1329,17 @@ class S3Repository:
                         f"concurrent public pointer update was fenced: {name}"
                     ) from exc
                 raise
-            return
-        try:
-            self._put(name, payload, False, if_none_match="*")
-        except Exception as exc:
-            if _is_precondition_failed(exc):
-                raise PublicArtifactError(
-                    f"concurrent public pointer creation was fenced: {name}"
-                ) from exc
-            raise
+        else:
+            try:
+                self._put(name, payload, False, if_none_match="*")
+            except Exception as exc:
+                if _is_precondition_failed(exc):
+                    raise PublicArtifactError(
+                        f"concurrent public pointer creation was fenced: {name}"
+                    ) from exc
+                raise
+        if self._get_optional(name) != payload:
+            raise PublicArtifactError(f"public pointer failed write verification: {name}")
 
     def _guard_mutable(self, name: str, current: bytes, proposed: bytes) -> None:
         if name == "track.json":

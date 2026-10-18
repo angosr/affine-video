@@ -168,8 +168,13 @@ may keep scanning, but evaluation and publication wait until its finalized heigh
 public state cannot move backward.
 The weight pointer binds the terminal match sequence and payload SHA-256, so a higher-block
 publisher with a shorter or conflicting match prefix is fenced before it can change champion weights.
-Mutable pointers use ETag conditional writes, and production startup probes both conditional create
-and conditional replace. A backend that cannot fence two concurrent publishers is rejected.
+Public pointers use one managed writer, a filesystem lock in the shared evaluator deployment
+directory, monotonic history checks and read-after-write verification. Conditional headers are also
+sent when supported by the backend. This is not a distributed atomic-write guarantee: never run
+writers on separate hosts or separate deployment directories against the same public prefix. Stop
+the old writer before switching releases. A delayed server-side request can still briefly overwrite
+a newer pointer on a backend that ignores conditions; subsequent verification/republication reduces
+this risk but cannot undo rewards already allocated by another validator.
 
 Every new release to `tracks/main` requires an explicitly coordinated full track digest in
 `VEDA_COORDINATED_RELEASE_DIGEST` and the matching runtime manifest. A missing approval or a
@@ -269,12 +274,11 @@ file public until admission finishes and its durable archive is confirmed by the
 
 Run the evaluator:
 
-The public write endpoint must pass the conditional-create/replace probe and serve the fixed public
-read prefix. The existing Supabase S3 endpoint fails that probe for candidate production; configuring
-a private object store alone does not fix public publication, and changing a write endpoint does not
-redirect the existing public URL. Resolve that deployment mapping and coordinate the accepted track
-digest with the external weight-setter before launch. Keep the existing URL and digest unchanged
-until that coordination is complete.
+The public write endpoint must pass the write/read visibility check and serve the fixed public read
+prefix. Keep one managed evaluator writer with a shared deployment directory. The existing Supabase
+endpoint can be used with the single-writer limitation described above; private plan storage still
+requires genuine conditional writes. Coordinate the full track digest with the external
+weight-setter before switching the existing public URL to the new track.
 
 ```bash
 uv sync --extra storage
@@ -299,7 +303,7 @@ uv run --extra storage veda validator evaluate \
 AWS S3 and compatible providers use the same storage implementation and object paths. Set the
 standard `AWS_DEFAULT_REGION` in both service environments when the provider requires a region;
 it defaults to `auto` for existing deployments. Provider selection never changes the public read
-URL or bypasses conditional-write and permission probes. Validators reading public weights do
+URL or bypasses private-state conditional-write and permission probes. Validators reading public weights do
 not need storage credentials or a region setting.
 
 The evaluator variables must identify a separate least-privilege storage role. Startup proves that the

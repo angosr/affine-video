@@ -271,9 +271,11 @@ async def run_evaluator(
     alert = webhook_alerter(alert_webhook_url, service="veda-evaluator")
     track = load_track_spec(track_spec)
     if production_config is not None:
-        verify_public_storage = getattr(publisher, "verify_conditional_writes", None)
-        if verify_public_storage is None:
-            raise ValueError("production publisher must verify conditional writes")
+        lock_publisher = getattr(publisher, "acquire_writer_lock", None)
+        verify_public_storage = getattr(publisher, "verify_writes", None)
+        if lock_publisher is None or verify_public_storage is None:
+            raise ValueError("production publisher requires a single-writer lock and write checks")
+        lock_publisher(database)
         await asyncio.to_thread(verify_public_storage)
     # Public storage can still be down after a restart. Keep ingesting finalized
     # facts, but do not initialize admission/scoring until ledger recovery succeeds.

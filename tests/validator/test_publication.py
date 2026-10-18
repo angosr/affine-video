@@ -335,16 +335,16 @@ def test_weights_reject_a_higher_block_with_a_stale_match_prefix_before_mutation
     assert client.objects["tracks/test/summary.json"] == summary_before
 
 
-def test_public_repository_capability_probe_checks_and_cleans_conditions() -> None:
+def test_public_repository_write_probe_checks_visibility_and_cleans_up() -> None:
     client = MemoryS3()
     repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
 
-    repository.verify_conditional_writes()
+    repository.verify_writes()
 
     assert client.objects == {}
 
 
-def test_public_repository_rejects_backend_that_ignores_conditions() -> None:
+def test_single_public_publisher_supports_backend_without_condition_enforcement() -> None:
     class UnsafeS3(MemoryS3):
         def put_object(self, **kwargs):
             kwargs.pop("IfMatch", None)
@@ -353,8 +353,46 @@ def test_public_repository_rejects_backend_that_ignores_conditions() -> None:
 
     repository = S3Repository(UnsafeS3(), bucket="public-data", prefix="tracks/test")
 
-    with pytest.raises(PublicArtifactError, match="ignores If-None-Match"):
-        repository.verify_conditional_writes()
+    repository.verify_writes()
+
+
+def test_public_repository_rejects_writes_that_cannot_be_read_back() -> None:
+    class DropsWrites(MemoryS3):
+        def put_object(self, **kwargs):
+            return {}
+
+    client = DropsWrites()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    with pytest.raises(PublicArtifactError, match="creation was not durable"):
+        repository.verify_writes()
+    assert client.objects == {}
+
+
+def test_public_pointer_write_is_checked_after_upload() -> None:
+    class CorruptsWrites(MemoryS3):
+        def put_object(self, **kwargs):
+            result = super().put_object(**kwargs)
+            self.objects[kwargs["Key"]] = b'{"incorrect":true}'
+            return result
+
+    repository = S3Repository(CorruptsWrites(), bucket="public-data", prefix="tracks/test")
+    with pytest.raises(PublicArtifactError, match="write verification"):
+        repository._put_mutable("status.json", b'{"source_block":1}')
+
+
+def test_one_writer_lock_covers_all_database_names_in_the_deployment(tmp_path) -> None:
+    first = S3Repository(MemoryS3(), bucket="public-data", prefix="tracks/test")
+    second = S3Repository(MemoryS3(), bucket="public-data", prefix="tracks/test")
+    first.acquire_writer_lock(tmp_path / "first.db")
+    try:
+        first.acquire_writer_lock(tmp_path / "first.db")
+        with pytest.raises(PublicArtifactError, match="another evaluator"):
+            second.acquire_writer_lock(tmp_path / "second.db")
+        first.close()
+        second.acquire_writer_lock(tmp_path / "second.db")
+    finally:
+        first.close()
+        second.close()
 
 
 def test_concurrent_stale_summary_write_is_fenced() -> None:
