@@ -221,3 +221,25 @@ def test_system_matches_are_not_attached_to_another_track(monkeypatch) -> None:
         ),
         runtime_manifest,
     ) == ()
+
+
+def test_system_evidence_is_invalidated_by_source_pool_changes(monkeypatch) -> None:
+    track = load_track_spec(Path(__file__).parents[2] / "track.json")
+    runtime_manifest = _runtime_manifest()
+    _bind_evidence(monkeypatch, track, runtime_manifest)
+
+    assert system_match_artifacts(track, runtime_manifest)
+    assert system_match_artifacts(
+        replace(track, source_pool_merkle_root="ef" * 32),
+        runtime_manifest,
+    ) == ()
+    assert system_match_artifacts(
+        replace(
+            track,
+            source_commitments=(
+                replace(track.source_commitments[0], sha256="ef" * 32),
+                *track.source_commitments[1:],
+            ),
+        ),
+        runtime_manifest,
+    ) == ()
