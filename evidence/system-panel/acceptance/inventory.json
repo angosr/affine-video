@@ -177,13 +177,35 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "前列入围召回率 ≥95%，且无单一 route/stratum/时间步出现预注册的灾难性尾误差；偏态和稀有严重失败的负控必须达到预注册误晋级上限，不能只报告 bootstrap nominal alpha",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "d1b387642e1da0fa35411c6d7ebfa830567a14e84be8c6163e2062afe4257260",
+        "runtime_source_commit": "18e9c5c",
+        "fresh_audit_batches": 1,
+        "independent_source_videos": 16,
+        "cases": 384,
+        "fixed_control_file_sha256": "31189efc1a32d2381ec79226bb078083e89d2fcdb306f5ded8a84133596df58a",
+        "control_weights_relative_l2": 0.04632733253353308,
+        "challenger_score": 0.9379008835438665,
+        "incumbent_score": 0.9378653370691498,
+        "paired_gain_lower_bound": -0.0005372797506340224,
+        "minimum_frontier_gain": 0.005,
+        "clears_exact_gate": false,
+        "children_remaining": 0,
+        "training": false,
+        "general_false_promotion_coverage_proven": false
+      },
       "id": "E13",
       "method": "按真实 source family 聚类，测试预算、分层和样本子集敏感性；使用已知总体或穷举抽样验证偏态及稀有失败下的实际覆盖率",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/fixed-perturbation-exact-gpu6.raw.log",
+          "sha256": "a9e07a7f4971a56811e14548a5125efcb4c281fb01c583182e1c716ddf30bb4b",
+          "scope": "One pre-existing fixed perturbed selector on one fresh 16-video audit batch through the actual spawned FilePairedEvaluator; not ten-batch stability, full-video promotion, or population false-positive coverage"
+        }
+      ],
       "release_blocker": false,
-      "status": "post_launch_validation_pending",
+      "status": "partial_fixed_perturbation_rejected",
       "subject": "聚合与分层稳健性"
     },
     {
@@ -230,7 +252,23 @@
         "tied_mask_budgets": [4, 8, 16, 32, 64],
         "tied_mask_mismatches": 0,
         "timeout_processes_reaped": 2,
-        "finite_overflow_quality": [0.0, 0.0, 0.0]
+        "overflow_probe_weight_dtype": "float32",
+        "overflow_probe_weight_value": 1e30,
+        "overflow_probe_is_formally_admissible_file": false,
+        "finite_overflow_quality": [0.0, 0.0, 0.0],
+        "supplemental_schema_valid_fp16_maximum": {
+          "file_sha256": "7f476b03c39069de4ba24f650a5d74c1d76feab80c3803bb806dc7435f2eb7c1",
+          "weight_value": 65504.0,
+          "independent_source_videos": 16,
+          "cases": 384,
+          "score": 0.7393190167587981,
+          "incumbent_score": 0.9378653370691498,
+          "paired_gain_lower_bound": -0.25871346670004053,
+          "following_baseline_score_delta": 0.0,
+          "children_remaining_after_each_score": 0,
+          "temporary_model_deleted": true,
+          "live_chain_admission_tested": false
+        }
       },
       "id": "E16",
       "method": "同机复跑、同型号跨卡、并列 logits、极值、padding、NaN/Inf、超时和损坏文件",
@@ -259,7 +297,12 @@
         {
           "path": "evidence/system-panel/acceptance-d1b38764/adversarial-gpu6.raw.log",
           "sha256": "4bb7c1b7ce31242207af47811c7c94842070414ccc345ace9cf6dca4a4955a2d",
-          "scope": "Padding, zero tiles, NaN/Inf, invalid prefixes, finite-weight overflow and corrupt model rejection; valid scoring after overflow"
+          "scope": "Padding, zero tiles, NaN/Inf, invalid prefixes and corrupt model rejection; internal FLOAT32 1e30 overflow injection followed by valid scoring, not a schema-valid FP16 submission"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/fp16-maximum-exact-gpu6.raw.log",
+          "sha256": "5339061b3c8f9a69733789abc79fb683af22a25acde1f39d309d8f7e9fd54203",
+          "scope": "Supplemental actual spawned scoring of one schema-valid 100-tensor FP16 selector with all weights 65504 and hotkey metadata on a fresh 16-video exact batch; normal baseline then reproduces reference exactly, with no remaining child and the temporary file deleted; not all extreme models, full-video scoring, or live chain admission"
         }
       ],
       "release_blocker": true,
@@ -286,6 +329,11 @@
         "cross_card_regenerated_units": 1,
         "regenerated_shard_latent_and_video_hashes_equal": true,
         "regeneration_seconds": 109.61946485890076,
+        "model_archive_probe_chunk_bytes": 41943040,
+        "model_archive_probe_roundtrip_seconds": 315.9163267230615,
+        "model_archive_probe_sha256_verified": true,
+        "model_archive_probe_temporary_objects_deleted": 2,
+        "whole_model_archive_throughput_measured": false,
         "whole_host_recovery_proven": false
       },
       "id": "E18",
@@ -296,10 +344,15 @@
           "path": "evidence/system-panel/acceptance-d1b38764/regeneration-gpu7.raw.log",
           "sha256": "5da71af6f348ce8460b415d26e95bbb4e41da5d3caa99d38786e0d3ec4fa54e8",
           "scope": "One real final-runtime producer rollout regenerated on a different H200 from an empty work directory; not whole-batch or whole-host recovery"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/model-transport-40m.raw.log",
+          "sha256": "f94a669d45403d44b432e24ec767be1e45dd3762d574524a0187c64e3a5e42ef",
+          "scope": "Actual 40 MiB PrivateObjectStore.put_content upload and full SHA-256 readback through the formal TLS/SSH endpoint; both temporary probe objects deleted; not whole-model admission or recovery"
         }
       ],
       "release_blocker": false,
-      "status": "partial_unit_regeneration_verified",
+      "status": "partial_unit_regeneration_and_archive_chunk_verified",
       "subject": "评测容量"
     }
   ],
