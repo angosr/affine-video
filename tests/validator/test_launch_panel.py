@@ -201,9 +201,8 @@ def test_missing_positive_power_fails(reverse):
         panel._directional_gates(controls(), reverse, 0.005, "production-00")
 
 
-def test_full_video_covers_dynamic_incumbent_even_when_baseline_comparison_rejects(
-    tmp_path, monkeypatch
-):
+@pytest.fixture
+def exact_panel(tmp_path, monkeypatch):
     monkeypatch.setattr(panel, "ROOT", tmp_path)
     document = {
         "candidate_track_spec_digest": "track",
@@ -215,10 +214,16 @@ def test_full_video_covers_dynamic_incumbent_even_when_baseline_comparison_rejec
         ],
     }
     (tmp_path / "exact-summary.json").write_text(json.dumps(document))
-    decisions = panel._full_video_eligibility(
-        SimpleNamespace(digest="track", scoring=SimpleNamespace(minimum_frontier_gain=0.005))
-    )["decisions"]
+    track = SimpleNamespace(digest="track", scoring=SimpleNamespace(minimum_frontier_gain=0.005))
+    return track, document
+
+
+def test_full_video_covers_dynamic_incumbent_even_when_baseline_comparison_rejects(exact_panel):
+    track, _document = exact_panel
+    decisions = panel._full_video_eligibility(track)["decisions"]
     assert all(row["eligible"] for row in decisions.values())
+    assert decisions["mean_pool"]["maximum_production_exact_gain_lower_bound"] < 0
+    assert decisions["mean_pool"]["reason"] == "complete_zoo_for_dynamic_incumbent_closure"
     calls = []
     replay = panel._two_stage_fifo_replay(
         order=("trained_near_neighbor", "mean_pool"),
@@ -235,6 +240,30 @@ def test_full_video_covers_dynamic_incumbent_even_when_baseline_comparison_rejec
     assert replay["terminal_champion"] == "mean_pool"
     assert calls[-1][:2] == ("mean_pool", "trained_near_neighbor")
     assert all(decisions[name]["eligible"] for call in calls for name in call[:2])
+
+
+@pytest.mark.parametrize(
+    "mutation", ["omitted_control", "excluded_control", "different_context", "changed_exact"],
+)
+def test_full_video_aggregation_rejects_posthoc_panel_changes(
+    exact_panel, tmp_path, monkeypatch, mutation,
+):
+    track, document = exact_panel
+    eligibility = panel._full_video_eligibility(track)
+    if mutation == "omitted_control":
+        eligibility["decisions"].pop("trained_near_neighbor")
+    elif mutation == "excluded_control":
+        eligibility["decisions"]["trained_near_neighbor"]["eligible"] = False
+    elif mutation == "different_context":
+        eligibility["runtime_contract_sha256"] = "different"
+    else:
+        document["batches"][0]["controls"]["trained_near_neighbor"]["gain_lower_bound"] = 0.03
+        (tmp_path / "exact-summary.json").write_text(json.dumps(document))
+    (tmp_path / "full-video-eligibility.json").write_text(json.dumps(eligibility))
+    monkeypatch.setattr(panel, "load_runtime_context", lambda **_kwargs: (None, track, None))
+
+    with pytest.raises(RuntimeError, match="complete frozen exact summary"):
+        panel.aggregate_full_video()
 
 
 def test_intermediate_runtime_binding_cannot_launch(tmp_path):

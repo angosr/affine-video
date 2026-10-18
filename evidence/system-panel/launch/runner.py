@@ -111,7 +111,6 @@ PRIOR_MECHANISM_EVIDENCE = (
         "scope": "development_minio_not_target_r2",
     },
 )
-REQUIRED_FULL_VIDEO_IDENTITIES = frozenset(EXPECTED_IDENTITIES)
 HARD_STABILITY_IDENTITIES = {
     "baseline_self",
     "mean_pool",
@@ -1470,18 +1469,13 @@ def _full_video_eligibility(track) -> dict[str, object]:
     for name in EXPECTED_IDENTITIES:
         bounds = [row["controls"][name]["gain_lower_bound"] for row in production]
         maximum = max(bounds)
-        eligible = name in REQUIRED_FULL_VIDEO_IDENTITIES
         decisions[name] = {
-            "eligible": eligible,
+            "eligible": True,
             "maximum_production_exact_gain_lower_bound": maximum,
             "reason": (
                 "shared_baseline"
                 if name == "baseline_self"
                 else "complete_zoo_for_dynamic_incumbent_closure"
-                if name in REQUIRED_FULL_VIDEO_IDENTITIES
-                else "reached_or_within_one_minimum_gain_of_exact_gate"
-                if eligible
-                else "exact_rejected_below_approach_band"
             ),
         }
     return {
@@ -1491,7 +1485,6 @@ def _full_video_eligibility(track) -> dict[str, object]:
         "runtime_contract_sha256": RUNTIME_CONTRACT,
         "rule": {
             "partition": "production",
-            "approach_floor": 0.0,
             "exact_gate": track.scoring.minimum_frontier_gain,
             "definition": (
                 "all six frozen identities; covers every reachable incumbent and challenger"
@@ -1570,13 +1563,6 @@ def full_video() -> None:
             raise RuntimeError(f"full-video control identity changed: {name}")
     eligibility = _full_video_eligibility(track)
     write_once(ROOT / "full-video-eligibility.json", eligibility)
-    selected = {
-        name: CONTROLS[name]
-        for name, decision in eligibility["decisions"].items()
-        if decision["eligible"]
-    }
-    if "baseline_self" not in selected:
-        raise RuntimeError("full-video panel omitted its shared baseline")
     pool = ConfirmationWorkerPool(config, track, timeout_seconds=48 * 60 * 60)
     budget_costs = {
         budget.target_blocks: budget.calibrated_cost for budget in track.scoring.budgets
@@ -1587,18 +1573,15 @@ def full_video() -> None:
             continue
         batch, batch_record = _load_confirmation_batch(label, track)
         started_ns = time.time_ns()
-        record_event("full_video_started", label=label, identities=tuple(selected))
-        model_cells = pool.score_models(model_paths=selected, batch=batch)
+        record_event("full_video_started", label=label, identities=tuple(CONTROLS))
+        model_cells = pool.score_models(model_paths=CONTROLS, batch=batch)
         finished_ns = time.time_ns()
         baseline = model_cells["baseline_self"]
         expected_cells = len(batch.plan.rollouts) * len(track.scoring.budgets)
         if any(len(cells) != expected_cells for cells in model_cells.values()):
             raise RuntimeError(f"full-video result has incomplete cells: {label}")
         controls = {}
-        for name, decision in eligibility["decisions"].items():
-            if not decision["eligible"]:
-                controls[name] = {"eligible": False, "reason": decision["reason"]}
-                continue
+        for name in EXPECTED_IDENTITIES:
             cells = model_cells[name]
             paired = paired_video_gain_bound(
                 cells,
@@ -1666,6 +1649,8 @@ def aggregate_full_video() -> None:
     config, track, _manifest = load_runtime_context(evaluator=True)
     del config
     eligibility = json.loads((ROOT / "full-video-eligibility.json").read_text())
+    if eligibility != _full_video_eligibility(track):
+        raise RuntimeError("full-video panel differs from the complete frozen exact summary")
     rows = []
     for label in confirmation_labels():
         path = ROOT / "full-video" / f"{label}.json"
@@ -1683,57 +1668,54 @@ def aggregate_full_video() -> None:
             or value["partition"] != label.split("-", 1)[0]
         ):
             raise RuntimeError(f"full-video evidence binding failed: {label}")
-        for name, decision in eligibility["decisions"].items():
+        for name in EXPECTED_IDENTITIES:
             control = value["controls"][name]
-            if control["eligible"] != decision["eligible"]:
-                raise RuntimeError(f"full-video eligibility changed: {label}/{name}")
-            if control["eligible"]:
-                cells = control["cells"]
-                if (
-                    hashlib.sha256(canonical(cells)).hexdigest() != control["cells_sha256"]
+            if control["eligible"] is not True:
+                raise RuntimeError(f"full-video model was excluded: {label}/{name}")
+            cells = control["cells"]
+            if (
+                hashlib.sha256(canonical(cells)).hexdigest() != control["cells_sha256"]
+                or any(
+                    not isinstance(cell["output_sha256"], str)
+                    or len(cell["output_sha256"]) != 64
                     or any(
-                        not isinstance(cell["output_sha256"], str)
-                        or len(cell["output_sha256"]) != 64
-                        or any(
-                            character not in "0123456789abcdef"
-                            for character in cell["output_sha256"]
-                        )
-                        for cell in cells
+                        character not in "0123456789abcdef"
+                        for character in cell["output_sha256"]
                     )
-                    or control["raw_output_sha256"]
-                    != [
-                        {
-                            "budget": cell["budget"],
-                            "output_sha256": cell["output_sha256"],
-                            "rollout_id": cell["rollout_id"],
-                            "stratum": cell["stratum"],
-                        }
-                        for cell in cells
-                    ]
-                    or {cell["stratum"] for cell in cells} != set(track.scoring.stratum_weight_map)
-                    or len(cells) != (
-                        track.scoring.rollouts_per_stratum
-                        * len(track.scoring.stratum_weight_map) * len(track.scoring.budgets)
-                    )
-                    or len({(cell["rollout_id"], cell["budget"]) for cell in cells}) != len(cells)
-                    or {cell["budget"] for cell in cells}
-                    != {budget.target_blocks for budget in track.scoring.budgets}
-                    or any(
-                        len({cell["rollout_id"] for cell in cells if cell["stratum"] == stratum})
-                        != track.scoring.rollouts_per_stratum
-                        for stratum in track.scoring.stratum_weight_map
-                    )
-                    or len({cell["rollout_id"] for cell in cells})
-                    != track.scoring.rollouts_per_stratum * len(track.scoring.stratum_weight_map)
-                ):
-                    raise RuntimeError(f"full-video cells are incomplete: {label}/{name}")
+                    for cell in cells
+                )
+                or control["raw_output_sha256"]
+                != [
+                    {
+                        "budget": cell["budget"],
+                        "output_sha256": cell["output_sha256"],
+                        "rollout_id": cell["rollout_id"],
+                        "stratum": cell["stratum"],
+                    }
+                    for cell in cells
+                ]
+                or {cell["stratum"] for cell in cells} != set(track.scoring.stratum_weight_map)
+                or len(cells) != (
+                    track.scoring.rollouts_per_stratum
+                    * len(track.scoring.stratum_weight_map) * len(track.scoring.budgets)
+                )
+                or len({(cell["rollout_id"], cell["budget"]) for cell in cells}) != len(cells)
+                or {cell["budget"] for cell in cells}
+                != {budget.target_blocks for budget in track.scoring.budgets}
+                or any(
+                    len({cell["rollout_id"] for cell in cells if cell["stratum"] == stratum})
+                    != track.scoring.rollouts_per_stratum
+                    for stratum in track.scoring.stratum_weight_map
+                )
+                or len({cell["rollout_id"] for cell in cells})
+                != track.scoring.rollouts_per_stratum * len(track.scoring.stratum_weight_map)
+            ):
+                raise RuntimeError(f"full-video cells are incomplete: {label}/{name}")
         if value["controls"]["baseline_self"]["gain_lower_bound"] != 0.0:
             raise RuntimeError(f"full-video self bound is not zero: {label}")
         costs = {budget.target_blocks: budget.calibrated_cost for budget in track.scoring.budgets}
         baseline = tuple(VideoCell(**cell) for cell in value["controls"]["baseline_self"]["cells"])
         for name, control in value["controls"].items():
-            if not control["eligible"]:
-                continue
             paired = paired_video_gain_bound(
                 tuple(VideoCell(**cell) for cell in control["cells"]), baseline,
                 stratum_weights=track.scoring.stratum_weight_map, budget_costs=costs,
@@ -1760,10 +1742,7 @@ def aggregate_full_video() -> None:
         )
         rows.append(value)
     stability = {}
-    for name, decision in eligibility["decisions"].items():
-        if not decision["eligible"]:
-            stability[name] = {"eligible": False, "hard_gate": False}
-            continue
+    for name in EXPECTED_IDENTITIES:
         production_outcomes = [
             row["controls"][name]["promoted"] for row in rows if row["partition"] == "production"
         ]
@@ -1822,8 +1801,7 @@ def aggregate_full_video() -> None:
                 "promotion_rate": sum(row["controls"][name]["promoted"] for row in selected)
                 / len(selected),
             }
-            for name, decision in eligibility["decisions"].items()
-            if decision["eligible"]
+            for name in EXPECTED_IDENTITIES
         }
     shift = {
         name: {
@@ -1853,8 +1831,6 @@ def aggregate_full_video() -> None:
 
     def video_replay_bound(challenger, incumbent, confirmation_label):
         evidence = by_label[confirmation_label]["controls"]
-        if not evidence[challenger]["eligible"] or not evidence[incumbent]["eligible"]:
-            raise RuntimeError("exact-qualified selector lacks full-video evidence")
         challenger_cells = tuple(VideoCell(**cell) for cell in evidence[challenger]["cells"])
         incumbent_cells = tuple(VideoCell(**cell) for cell in evidence[incumbent]["cells"])
         return paired_video_gain_bound(
@@ -1993,7 +1969,6 @@ def aggregate_full_video() -> None:
             row["label"]: {
                 name: control["raw_output_sha256"]
                 for name, control in row["controls"].items()
-                if control["eligible"]
             }
             for row in rows
         },
