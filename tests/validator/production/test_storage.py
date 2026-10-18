@@ -417,6 +417,70 @@ def test_private_upload_and_restore_stream_and_close_actual_chunk_bodies(tmp_pat
     assert all(body.closed for body in bodies)
 
 
+@pytest.mark.parametrize("mirror", [False, True])
+def test_warm_artifact_sync_reads_local_bytes_once_before_final_verification(
+    tmp_path, monkeypatch, mirror,
+):
+    source = tmp_path / "model.bin"
+    data = b"runtime bytes"
+    source.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    manifest = ArtifactManifest((Artifact("model.bin", digest, len(data), f"artifacts/{digest}"),))
+    store = PrivateObjectStore(MemoryS3(), bucket="private", prefix="root")
+    store.put_content(source, sha256=digest, object_name=f"artifacts/{digest}")
+    read_bytes = 0
+    original_open = type(source).open
+
+    class Reader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def read(self, *args, **kwargs):
+            nonlocal read_bytes
+            content = self.stream.read(*args, **kwargs)
+            read_bytes += len(content)
+            return content
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+    def tracked_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        return Reader(stream) if path == source else stream
+
+    monkeypatch.setattr(type(source), "open", tracked_open)
+    if mirror:
+        store.ensure_artifacts(manifest, tmp_path)
+    else:
+        store.restore_artifacts(manifest, tmp_path, logical_names=("model.bin",))
+    assert read_bytes == len(data)
+    manifest.verify_local(tmp_path)
+    assert read_bytes == 2 * len(data)
+
+
+@pytest.mark.parametrize("mirror", [False, True])
+def test_artifact_sync_restores_same_size_corrupted_local_bytes(tmp_path, mirror):
+    source = tmp_path / "model.bin"
+    source.write_bytes(b"model")
+    digest = hashlib.sha256(b"model").hexdigest()
+    manifest = ArtifactManifest((Artifact("model.bin", digest, 5, f"artifacts/{digest}"),))
+    store = PrivateObjectStore(MemoryS3(), bucket="private", prefix="root")
+    store.put_content(source, sha256=digest, object_name=f"artifacts/{digest}")
+    source.write_bytes(b"other")
+
+    if mirror:
+        store.ensure_artifacts(manifest, tmp_path)
+    else:
+        store.restore_artifacts(manifest, tmp_path, logical_names=("model.bin",))
+
+    assert source.read_bytes() == b"model"
+    manifest.verify_local(tmp_path)
+
+
 def test_bootstrap_and_manifest_restore_survive_loss_of_local_artifacts(
     tmp_path, monkeypatch
 ) -> None:

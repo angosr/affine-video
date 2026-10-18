@@ -399,25 +399,29 @@ class PrivateObjectStore:
             if selected is not None and artifact.logical_name not in selected:
                 continue
             path = base / artifact.logical_name
-            local_valid = (
-                path.is_file()
-                and path.stat().st_size == artifact.size_bytes
-                and _file_sha256(path) == artifact.sha256
-            )
-            if local_valid and mirror:
-                self.put_content(
+            local_manifest = None
+            if mirror and path.is_file() and path.stat().st_size == artifact.size_bytes:
+                try:
+                    local_manifest = build_chunk_manifest(path)
+                except ValueError:
+                    local_manifest = None
+            if (
+                local_manifest is not None
+                and local_manifest.sha256 == artifact.sha256
+                and local_manifest.size == artifact.size_bytes
+            ):
+                self._put_content(
                     path,
-                    sha256=artifact.sha256,
+                    local_manifest,
                     object_name=artifact.object_key,
                 )
-            elif not local_valid:
+            else:
                 self.download_content(
                     artifact.object_key,
                     path,
                     sha256=artifact.sha256,
                     size_bytes=artifact.size_bytes,
                 )
-        manifest.verify_local(base, logical_names=logical_names)
 
     def put_content(self, path: str | Path, *, sha256: str, object_name: str) -> None:
         """Upload one immutable file as storage-limit-safe verified chunks."""
@@ -428,6 +432,15 @@ class PrivateObjectStore:
         manifest = build_chunk_manifest(source)
         if manifest.sha256 != sha256:
             raise StorageError("content source is missing or its SHA-256 is wrong")
+        self._put_content(source, manifest, object_name=object_name)
+
+    def _put_content(
+        self,
+        source: Path,
+        manifest: ChunkManifest,
+        *,
+        object_name: str,
+    ) -> None:
         existing_manifest = self.get_optional(object_name)
         manifest_exists = existing_manifest is not None
         if existing_manifest is not None:
