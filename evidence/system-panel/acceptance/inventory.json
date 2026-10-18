@@ -2,10 +2,11 @@
   "constraints": [
     "No independent SCREEN stage; E17 measures exact gate retention of full-video top models.",
     "Pilot thresholds must be registered before disjoint confirmation.",
-    "Canonical dense dfd6cbc evidence is complete; reference and verify it instead of regenerating it.",
+    "Selectors are fixed read-only inputs; no training or checkpoint-trajectory study is required.",
+    "Historical numerical evidence must be checked against the final runtime binding, not relabeled as acceptance.",
     "No formal panel or public v2 switch while release blockers remain."
   ],
-  "design_sha256": "c2584eb4d706e25585787766a3b86d10de89602c3fe3c7decca24622d1df13a2",
+  "design_sha256": "7ac4778f8be50631b6198a48309e7b8eee75a8889d5b3b508be82984f1676c75",
   "experiments": [
     {
       "acceptance_manifest": null,
@@ -33,22 +34,22 @@
     },
     {
       "acceptance_manifest": null,
-      "acceptance_rule": "混合轨迹相关性的 bootstrap 95% 下界 ≥0.8，且不比稠密轨迹下降超过 0.02；失败则扩充轨迹，或仅在 E18 证明全量 rollout 可负担时取消缓存排名",
+      "acceptance_rule": "按预注册 production/audit 面板报告 teacher-state exact 与 sparse full-video 的偏差、近阈值两阶段判定和最终 champion regret；若存在可复现的错误晋级或系统性误拒绝，修正机制后使用独立数据重验",
       "actual_values": null,
       "id": "E3",
-      "method": "用至少 30 个好坏覆盖的 checkpoint，比较稠密轨迹缓存与混合轨迹缓存对完整 rollout 排名的预测",
+      "method": "使用冻结的 self、退化、近邻、route/step 专家和来源可审计的外部 selector；比较 dense exact 与独立未来批次的完整稀疏 rollout，并重放两种 FIFO 顺序；不训练模型或混合轨迹",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
       "status": "not_final_runtime_verified",
-      "subject": "轨迹分布偏移"
+      "subject": "teacher-state 到完整稀疏 rollout 的分布偏移"
     },
     {
       "acceptance_manifest": null,
       "acceptance_rule": "正式预算内基线不饱和，Oracle 有稳定可测优势，允许输入上限代理未显示输入摘要构成主要瓶颈；否则改输入、tile 或预算",
       "actual_values": null,
       "id": "E4",
-      "method": "比较随机、平均池化、Veda 风格基线、训练基线、特权 Oracle、精确小 Oracle 和允许输入上限代理",
+      "method": "比较固定随机/退化对照、官方 VEDA、可审计外部 selector 和仅用于离线诊断的特权 Oracle；所有模型为只读输入",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
@@ -57,34 +58,34 @@
     },
     {
       "acceptance_manifest": null,
-      "acceptance_rule": "pilot 选择局部误差、视频质量与 GPU 延迟共同占优的方案，confirmation 只验收该方案；无稳定优势时选规则更少的无锚点方案",
+      "acceptance_rule": "所有 route、geometry、segment、padding 和并列分数的 valid/required/selected mask 与正式 runtime 完全一致；非法布局必须拒绝",
       "actual_values": null,
       "id": "E5",
-      "method": "比较统一 tiling、head-aware tiling，以及强制锚点和无约束 Top k",
+      "method": "对冻结 tile plan 和预算规则逐项比较独立 scorer 与真实 sparse runtime；覆盖边界、必选块和实际分段预算，不开展架构搜索",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
       "status": "not_final_runtime_verified",
-      "subject": "tile 与锚点"
+      "subject": "tile、必选块与预算语义"
     },
     {
       "acceptance_manifest": null,
-      "acceptance_rule": "pilot 中若分析模型或新增统计稳定降低误差且开销合格，则先修改固定结构；confirmation 只验收冻结结构",
+      "acceptance_rule": "声明的固定输入、FP32 predictor 和权重 schema 与实际 runtime 一致；无额外输入、可执行代码或隐藏状态；合法边界模型均在资源限制内执行",
       "actual_values": null,
       "id": "E6",
-      "method": "比较 TripPool、额外低成本统计、正式结构和 2–4 倍参数分析模型",
+      "method": "用冻结 selector 的真实输入 trace、schema 负控和极值测试核验 TripPool/投影/Top k 的运行边界及开销，不训练或扩大模型结构",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
       "status": "not_final_runtime_verified",
-      "subject": "选块器容量与输入"
+      "subject": "固定选块器结构与输入边界"
     },
     {
       "acceptance_manifest": null,
       "acceptance_rule": "至少三个预算通过预注册的异常率、时间一致性和盲评非劣门槛；否则提高预算或更换基础模型",
       "actual_values": null,
       "id": "E7",
-      "method": "冻结 backbone，以训练基线和特权 Oracle 在全部候选预算生成配对视频",
+      "method": "冻结 backbone，以官方基线、外部固定 selector 和离线 Oracle 在全部候选预算生成配对视频；不更新任何模型参数",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
@@ -153,10 +154,10 @@
     },
     {
       "acceptance_manifest": null,
-      "acceptance_rule": "前列入围召回率 ≥95%，且无单一层/head/时间步出现预注册的灾难性尾误差",
+      "acceptance_rule": "前列入围召回率 ≥95%，且无单一 route/stratum/时间步出现预注册的灾难性尾误差；偏态和稀有严重失败的负控必须达到预注册误晋级上限，不能只报告 bootstrap nominal alpha",
       "actual_values": null,
       "id": "E13",
-      "method": "改变预算网格、\\(\\lambda\\)、分层权重和样本子集并 bootstrap",
+      "method": "按真实 source family 聚类，测试预算、分层和样本子集敏感性；使用已知总体或穷举抽样验证偏态及稀有失败下的实际覆盖率",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
@@ -165,10 +166,10 @@
     },
     {
       "acceptance_manifest": null,
-      "acceptance_rule": "来源组零交叉；重复提交不能从公开反馈重建逐样本或逐层标签；否则收紧反馈与频率",
+      "acceptance_rule": "每个提交只用其最终确认后生成的数据；production/audit 和已披露 family 零交叉；整组终态前不能通过公开对象或 producer 权限取得 exact、视频和 dense latents",
       "actual_values": null,
       "id": "E14",
-      "method": "近重复检测、分组审计、记忆型基线和模拟重复提交",
+      "method": "近重复/family 分组审计、公开反馈探测、批次披露时序检查和真实 producer/evaluator IAM 越权负控",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
@@ -177,10 +178,10 @@
     },
     {
       "acceptance_manifest": null,
-      "acceptance_rule": "95% 区间宽度小于 pilot 前两名差距的三分之一，并满足 E13 入围召回率",
+      "acceptance_rule": "独立确认中实际误晋级/误拒绝及其不确定性满足预注册门槛，并满足 E13；重复 route/step/query 不增加独立视频数，增加 bootstrap 次数不能代替 source 样本量",
       "actual_values": null,
       "id": "E15",
-      "method": "对候选规模逐级 bootstrap，估计置信区间和排名翻转",
+      "method": "在冻结样本预算和 season alpha/M 下，对 source 聚类、近阈值、偏态和稀有严重失败进行功效/覆盖率实验，并报告计算成本",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
@@ -219,7 +220,7 @@
       "acceptance_rule": "完整视频真实 Top k 的精确阶段保留率 ≥99%，否则扩大精确缓存、调整晋级门或取消该低成本门",
       "actual_values": null,
       "id": "E17",
-      "method": "对代表性 checkpoint 同时运行精确评分与完整视频确认",
+      "method": "对同一冻结只读模型面板同时运行精确评分与完整视频确认，包括 exact 未通过的模型，防止只验证幸存者",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
@@ -241,7 +242,7 @@
   ],
   "format": "veda-release-acceptance-inventory-v1",
   "release_accepted": false,
-  "review_sha256": "3e91ce72a9b9b31b3eacb39c3968888d26c000a92e58b35479e80a929cb506ff",
+  "review_sha256": "611bda80950a6b443652022164a1ae35ae841a76b461c68bfeb4ce872163835a",
   "runtime_contract_sha256": null,
   "scope": "requirements_and_gap_inventory_not_acceptance"
 }

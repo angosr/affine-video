@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
+import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +15,19 @@ from validator.release import ReleaseApproval
 from validator.weights import WeightChainState
 
 from .test_publication import MemoryS3
+
+
+def test_current_inventory_matches_release_checks_without_claiming_acceptance():
+    directory = Path(__file__).resolve().parents[2] / "evidence/system-panel/acceptance"
+    assert sorted(path.name for path in directory.glob("inventory*.json")) == ["inventory.json"]
+    inventory = json.loads((directory / "inventory.json").read_bytes())
+    checks = inventory["experiments"]
+    assert len({check["id"] for check in checks}) == len(checks)
+    assert {check["id"] for check in checks if check["release_blocker"]} == (
+        release._REQUIRED_EXPERIMENTS
+    )
+    assert inventory["release_accepted"] is False
+    assert inventory["scope"] == "requirements_and_gap_inventory_not_acceptance"
 
 
 def approved_candidate(monkeypatch, *, mutation=None):
