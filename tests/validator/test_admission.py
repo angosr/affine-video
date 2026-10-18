@@ -1,6 +1,7 @@
 import errno
 import hashlib
 import json
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -1085,6 +1086,98 @@ def test_admission_retry_ceiling_survives_total_local_state_loss(tmp_path) -> No
         outcome = process_next_admission(
             store, worker_id="recovered", settings=configured,
             current_finalized_block=10_000, now_ms=150_100,
+            downloader=model_downloader(model),
+        )
+        assert outcome is not None and outcome.status is AdmissionStatus.ACCEPTED
+
+
+@pytest.mark.parametrize("failure_phase", ["download", "restore", "archive", "rejection"])
+@pytest.mark.parametrize("durable", [False, True])
+def test_long_admission_failure_starts_cooldown_when_the_failure_is_observed(
+    tmp_path, monkeypatch, failure_phase, durable,
+):
+    clock = {"ms": 1_000}
+    monkeypatch.setattr(time, "time_ns", lambda: clock["ms"] * 1_000_000)
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
+    failed_at = 7_201_000
+
+    def outage(*_args, **_kwargs):
+        clock["ms"] = failed_at
+        raise ModelDownloadError("TEMPORARY_OUTAGE", "late failure", temporary=True)
+
+    def unavailable(*_args, **_kwargs):
+        raise ModelDownloadError("MODEL_NOT_PUBLIC", "private", temporary=False)
+
+    retries = PrivateRetryStore(
+        PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc"),
+        track_spec_digest="ab" * 32,
+    )
+    configured = replace(
+        settings(tmp_path), max_attempts=1, retry_max_ms=3_600_000,
+        restore=outage if failure_phase == "restore" else lambda _task: None,
+        archive=outage if failure_phase == "archive" else None,
+        archive_rejection=outage if failure_phase == "rejection" else None,
+        restore_retry=retries.restore if durable else None,
+        record_retry=retries.record_failure if durable else None,
+    )
+    downloader = (
+        outage if failure_phase == "download" else
+        unavailable if failure_phase == "rejection" else model_downloader(model)
+    )
+    with ChallengeStore(tmp_path / "long-admission.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(
+            store, worker_id="worker", settings=configured, current_finalized_block=10_000,
+            downloader=downloader,
+        )
+        assert outcome is not None and outcome.status is AdmissionStatus.BLOCKED
+        assert clock["ms"] == failed_at
+        if durable:
+            clock["ms"] = failed_at + configured.retry_max_ms - 1
+            with ChallengeStore(tmp_path / "restored-admission.db") as fresh:
+                fresh.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+                restored = process_next_admission(
+                    fresh, worker_id="restored", settings=configured,
+                    current_finalized_block=10_000, downloader=downloader,
+                )
+                assert restored is not None and restored.status is AdmissionStatus.BLOCKED
+                assert clock["ms"] == failed_at + configured.retry_max_ms - 1
+                assert fresh.claim_next_admission(
+                    "early", lease_ms=1_000, ready_through_block=10_000,
+                    now_ms=clock["ms"],
+                ) is None
+        assert store.claim_next_admission(
+            "early", lease_ms=1_000, ready_through_block=10_000,
+            now_ms=failed_at + configured.retry_max_ms - 1,
+        ) is None
+        recovered = store.claim_next_admission(
+            "recovered", lease_ms=1_000, ready_through_block=10_000,
+            now_ms=failed_at + configured.retry_max_ms,
+        )
+        assert recovered is not None and recovered.challenge_id == identifier
+
+
+def test_slow_durable_admission_restore_uses_the_clock_after_io(tmp_path, monkeypatch):
+    from validator.retries import RetryCheckpoint
+
+    clock = {"ms": 1_000}
+    monkeypatch.setattr(time, "time_ns", lambda: clock["ms"] * 1_000_000)
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
+
+    def restore(_task, _stage):
+        clock["ms"] = 7_201_000
+        return RetryCheckpoint(1, True, 3_601_000, "OLD_OUTAGE", "already cooled down")
+
+    configured = replace(
+        settings(tmp_path), restore_retry=restore,
+        record_retry=lambda *_args, **_kwargs: pytest.fail("recovery should succeed"),
+    )
+    with ChallengeStore(tmp_path / "slow-restore.db") as store:
+        store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(
+            store, worker_id="worker", settings=configured, current_finalized_block=10_000,
             downloader=model_downloader(model),
         )
         assert outcome is not None and outcome.status is AdmissionStatus.ACCEPTED

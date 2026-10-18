@@ -966,12 +966,13 @@ async def process_cycle(
                 track_close_block is not None and finalized_block > track_close_block
             ):
                 reason = "TRACK_ABORTED" if track_aborted else "TRACK_CLOSE_REACHED"
+                wait_at = evaluated.clock()
                 store.wait_leased(
                     evaluated.task.challenge_id,
                     evaluated.task.lease_token,
-                    retry_after_ms=evaluated.occurred_at_ms + scoring_settings.retry_base_ms,
+                    retry_after_ms=wait_at + scoring_settings.retry_base_ms,
                     reason=reason,
-                    occurred_at_ms=evaluated.occurred_at_ms,
+                    occurred_at_ms=wait_at,
                 )
                 scoring = ScoringOutcome(
                     evaluated.task.challenge_id,

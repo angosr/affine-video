@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -30,12 +31,18 @@ RetryRestore = Callable[[LeasedChallenge, str], RetryCheckpoint | None]
 RetryRecorder = Callable[..., RetryCheckpoint]
 
 
+def retry_clock(fixed_time_ms: int | None) -> Callable[[], int]:
+    """Read wall time at each event; an explicit test time remains fixed."""
+
+    return lambda: time.time_ns() // 1_000_000 if fixed_time_ms is None else fixed_time_ms
+
+
 def prepare_durable_retry(
     store: ChallengeStore,
     task: LeasedChallenge,
     *,
     stage: str,
-    now_ms: int,
+    clock: Callable[[], int],
     restore: RetryRestore | None,
     wait_ms: int,
 ) -> tuple[LeasedChallenge | None, RetryCheckpoint | None]:
@@ -46,6 +53,7 @@ def prepare_durable_retry(
     checkpoint = restore(task, stage)
     if checkpoint is None:
         return task, None
+    now_ms = clock()
     if checkpoint.blocked and checkpoint.retry_after_ms > now_ms:
         store.synchronize_leased_attempts(
             task.challenge_id,

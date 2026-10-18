@@ -11,7 +11,6 @@ import json
 import multiprocessing
 import resource
 import signal
-import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import isfinite
@@ -38,6 +37,7 @@ from validator.retries import (
     RetryRestore,
     persist_retry_failure,
     prepare_durable_retry,
+    retry_clock,
     retry_stage,
 )
 from validator.store import ChallengeStore, LeasedChallenge
@@ -104,13 +104,13 @@ class ScoringOutcome:
 
 @dataclass(frozen=True, slots=True)
 class EvaluatedStage:
-    """A leased successful stage waiting for a fresh finalized decision block."""
+    """A leased stage whose clock stays live through decision and archival I/O."""
 
     task: LeasedChallenge
     result: StageOutcome
     recorded_score_block: int | None
     recorded_locally: bool
-    occurred_at_ms: int
+    clock: Callable[[], int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -698,7 +698,8 @@ def evaluate_next_scoring(
 ) -> EvaluatedStage | ScoringOutcome | None:
     """Evaluate at most one stage while retaining its lease for atomic commit."""
 
-    now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
+    clock = retry_clock(now_ms)
+    now = clock()
     readiness = getattr(evaluator, "ready_through_block", None)
     ready_through_block = None if readiness is None else readiness(current_finalized_block)
     task = store.claim_next_scoring(
@@ -715,7 +716,7 @@ def evaluate_next_scoring(
         store,
         task,
         stage=retry_stage(task.state),
-        now_ms=now,
+        clock=clock,
         restore=settings.restore_retry,
         wait_ms=settings.retry_base_ms,
     )
@@ -743,7 +744,7 @@ def evaluate_next_scoring(
                         store,
                         task,
                         settings,
-                        now,
+                        clock(),
                         code="EVALUATION_BATCH_TIMEOUT",
                         summary=(
                             "evaluation batch remained unavailable after finalized "
@@ -755,12 +756,13 @@ def evaluate_next_scoring(
                         state,
                         "EVALUATION_BATCH_TIMEOUT",
                     )
+                wait_at = clock()
                 store.wait_leased(
                     task.challenge_id,
                     task.lease_token,
-                    retry_after_ms=now + settings.retry_base_ms,
+                    retry_after_ms=wait_at + settings.retry_base_ms,
                     reason="EVALUATION_BATCH_PENDING",
-                    occurred_at_ms=now,
+                    occurred_at_ms=wait_at,
                 )
                 return ScoringOutcome(
                     task.challenge_id,
@@ -799,7 +801,7 @@ def evaluate_next_scoring(
                 store,
                 task,
                 settings,
-                now,
+                clock(),
                 code=exc.code,
                 summary=str(exc),
             )
@@ -809,7 +811,7 @@ def evaluate_next_scoring(
                 store,
                 task,
                 settings,
-                now,
+                clock(),
                 code="SCORING_WORKER_FAILURE",
                 summary=str(exc) or type(exc).__name__,
             )
@@ -825,7 +827,7 @@ def evaluate_next_scoring(
                 store,
                 task,
                 settings,
-                now,
+                clock(),
                 code="SCORING_RECORD_AHEAD",
                 summary="recorded stage result is newer than the finalized chain head",
             )
@@ -836,7 +838,7 @@ def evaluate_next_scoring(
         )
         recorded_score_block = recorded.score_block
         recorded_locally = True
-    return EvaluatedStage(task, result, recorded_score_block, recorded_locally, now)
+    return EvaluatedStage(task, result, recorded_score_block, recorded_locally, clock)
 
 
 def commit_evaluated_scoring(
@@ -864,7 +866,7 @@ def commit_evaluated_scoring(
                     store,
                     task,
                     settings,
-                    evaluated.occurred_at_ms,
+                    evaluated.clock(),
                     code="STAGE_ARCHIVE_UNAVAILABLE",
                     summary=str(exc) or type(exc).__name__,
                 )
@@ -876,7 +878,7 @@ def commit_evaluated_scoring(
             score=result.score,
             score_block=result_score_block,
             metrics=result.metrics,
-            occurred_at_ms=evaluated.occurred_at_ms,
+            occurred_at_ms=evaluated.clock(),
         )
     if task.state is ChallengeState.SCORING and result.metrics.get("requires_confirmation") is True:
         store.advance_leased(
@@ -884,7 +886,7 @@ def commit_evaluated_scoring(
             task.lease_token,
             ChallengeState.CONFIRMING,
             release=True,
-            occurred_at_ms=evaluated.occurred_at_ms,
+            occurred_at_ms=evaluated.clock(),
             details={"exact_score": result.score},
         )
         return ScoringOutcome(task.challenge_id, ChallengeState.CONFIRMING)
@@ -892,7 +894,7 @@ def commit_evaluated_scoring(
         task.challenge_id,
         ChallengeState.SUCCEEDED,
         final_score=result.score,
-        occurred_at_ms=evaluated.occurred_at_ms,
+        occurred_at_ms=evaluated.clock(),
         lease_token=task.lease_token,
         score_block=result_score_block,
     )
@@ -913,7 +915,7 @@ def defer_evaluated_scoring(
         store,
         evaluated.task,
         settings,
-        evaluated.occurred_at_ms,
+        evaluated.clock(),
         code=code,
         summary=summary,
     )

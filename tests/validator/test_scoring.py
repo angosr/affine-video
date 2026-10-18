@@ -1193,6 +1193,104 @@ def test_scoring_retry_ceiling_survives_total_local_state_loss(tmp_path) -> None
         assert store.get_challenge(identifier).state is ChallengeState.SUCCEEDED
 
 
+@pytest.mark.parametrize("failure_phase", ["evaluate", "archive", "decision"])
+@pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
+@pytest.mark.parametrize("durable", [False, True])
+def test_long_scoring_failure_starts_cooldown_at_failure_not_task_start(
+    tmp_path, monkeypatch, failure_phase, stage, durable,
+):
+    clock = {"ms": 1_000}
+    monkeypatch.setattr(time, "time_ns", lambda: clock["ms"] * 1_000_000)
+    failed_at = 7_201_000
+
+    def outage(*_args):
+        clock["ms"] = failed_at
+        raise TemporaryScoringError("TEMPORARY_OUTAGE", "late failure")
+
+    retries = PrivateRetryStore(
+        PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc"),
+        track_spec_digest="ab" * 32,
+    )
+    configured = ScoringSettings(
+        max_attempts=1, retry_max_ms=3_600_000,
+        archive_stage=outage if failure_phase == "archive" else None,
+        restore_retry=retries.restore if durable else None,
+        record_retry=retries.record_failure if durable else None,
+    )
+    with ChallengeStore(tmp_path / "long-scoring.db") as store:
+        identifier = ready_for_scoring(store)
+        if stage is ChallengeState.CONFIRMING:
+            store.transition(identifier, stage, occurred_at_ms=14)
+        evaluator = outage if failure_phase == "evaluate" else lambda _task: StageOutcome(0.7, {})
+        if failure_phase == "decision":
+            evaluated = scoring_module.evaluate_next_scoring(
+                store, worker_id="worker", settings=configured,
+                current_finalized_block=100, evaluator=evaluator,
+            )
+            assert isinstance(evaluated, scoring_module.EvaluatedStage)
+            clock["ms"] = failed_at
+            outcome = scoring_module.defer_evaluated_scoring(
+                store, evaluated, settings=configured,
+                code="FINALIZED_HEAD_UNAVAILABLE", summary="late chain error",
+            )
+        else:
+            outcome = process_next_scoring(
+                store, worker_id="worker", settings=configured,
+                current_finalized_block=100, evaluator=evaluator,
+            )
+        assert outcome is not None and outcome.state is ChallengeState.SYSTEM_BLOCKED
+        assert clock["ms"] == failed_at
+        if durable:
+            clock["ms"] = failed_at + configured.retry_max_ms - 1
+            with ChallengeStore(tmp_path / "restored-scoring.db") as fresh:
+                assert ready_for_scoring(fresh) == identifier
+                if stage is ChallengeState.CONFIRMING:
+                    fresh.transition(identifier, stage, occurred_at_ms=14)
+                restored = process_next_scoring(
+                    fresh, worker_id="restored", settings=configured,
+                    current_finalized_block=100, evaluator=evaluator,
+                )
+                assert restored is not None and restored.state is ChallengeState.SYSTEM_BLOCKED
+                assert clock["ms"] == failed_at + configured.retry_max_ms - 1
+                assert fresh.claim_next_scoring(
+                    "early", lease_ms=1_000, now_ms=clock["ms"],
+                ) is None
+        assert store.claim_next_scoring(
+            "early", lease_ms=1_000, now_ms=failed_at + configured.retry_max_ms - 1,
+        ) is None
+        recovered = store.claim_next_scoring(
+            "recovered", lease_ms=1_000, now_ms=failed_at + configured.retry_max_ms,
+        )
+        assert recovered is not None and recovered.challenge_id == identifier
+        assert recovered.state is stage
+
+
+def test_slow_ready_probe_waits_from_completion_without_consuming_an_attempt(tmp_path, monkeypatch):
+    clock = {"ms": 1_000}
+    monkeypatch.setattr(time, "time_ns", lambda: clock["ms"] * 1_000_000)
+
+    class WaitingBatch:
+        def batch_ready(self, _task):
+            clock["ms"] = 7_201_000
+            return False
+
+        def __call__(self, _task):
+            pytest.fail("an unavailable batch must not be evaluated")
+
+    configured = ScoringSettings(max_attempts=1)
+    with ChallengeStore(tmp_path / "slow-ready.db") as store:
+        identifier = ready_for_scoring(store)
+        outcome = process_next_scoring(
+            store, worker_id="worker", settings=configured,
+            current_finalized_block=100, evaluator=WaitingBatch(),
+        )
+        assert outcome is not None and outcome.code == "EVALUATION_BATCH_PENDING"
+        assert store.get_challenge(identifier).attempts == 0
+        assert store.claim_next_scoring(
+            "early", lease_ms=1_000, now_ms=clock["ms"] + configured.retry_base_ms - 1,
+        ) is None
+
+
 @pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
 def test_cooldown_probe_keeps_fifo_and_resumes_original_stage(tmp_path, stage):
     calls = []

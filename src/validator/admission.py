@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -26,6 +25,7 @@ from validator.retries import (
     RetryRestore,
     persist_retry_failure,
     prepare_durable_retry,
+    retry_clock,
 )
 from validator.store import ChallengeStore, LeasedChallenge
 
@@ -114,7 +114,8 @@ def process_next_admission(
 
     if current_finalized_block < 0:
         raise ValueError("current finalized block must be non-negative")
-    now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
+    clock = retry_clock(now_ms)
+    now = clock()
     task = store.claim_next_admission(
         worker_id,
         lease_ms=settings.lease_ms,
@@ -129,7 +130,7 @@ def process_next_admission(
         store,
         task,
         stage="ADMISSION",
-        now_ms=now,
+        clock=clock,
         restore=settings.restore_retry,
         wait_ms=settings.retry_base_ms,
     )
@@ -179,12 +180,12 @@ def process_next_admission(
                 "archived admission could not be restored",
                 temporary=True,
             )
-            status = _defer_or_fail(store, task, settings, now, error)
+            status = _defer_or_fail(store, task, settings, clock(), error)
             return AdmissionOutcome(task.challenge_id, status, error.code)
     if isinstance(downloaded, RejectedAdmission):
         return _reject_participant(
             store, task, settings, downloaded,
-            current_finalized_block=current_finalized_block, now_ms=now,
+            current_finalized_block=current_finalized_block, clock=clock,
         )
     reference_owner = store.earlier_reference_owner(task.challenge_id)
     if reference_owner is not None:
@@ -195,7 +196,7 @@ def process_next_admission(
                 "repository revision duplicates an earlier active submission",
                 current_finalized_block, duplicate_of=reference_owner,
             ),
-            current_finalized_block=current_finalized_block, now_ms=now,
+            current_finalized_block=current_finalized_block, clock=clock,
         )
     model_path = Path(task.model_path) if task.model_path is not None else None
     expected_file_sha256 = task.file_sha256
@@ -214,14 +215,14 @@ def process_next_admission(
                     store,
                     task,
                     settings,
-                    now,
+                    clock(),
                     exc,
                 )
                 return AdmissionOutcome(task.challenge_id, status, exc.code)
             return _reject_participant(
                 store, task, settings,
                 _observed_rejection(store, task, exc.code, str(exc), current_finalized_block),
-                current_finalized_block=current_finalized_block, now_ms=now,
+                current_finalized_block=current_finalized_block, clock=clock,
             )
         store.record_downloaded_model(
             task.challenge_id,
@@ -229,7 +230,7 @@ def process_next_admission(
             model_path=downloaded.path,
             file_sha256=downloaded.file_sha256,
             size_bytes=downloaded.size_bytes,
-            occurred_at_ms=now,
+            occurred_at_ms=clock(),
             details={"etag": downloaded.etag, "download_host": downloaded.download_host},
         )
         model_path = downloaded.path
@@ -243,7 +244,7 @@ def process_next_admission(
             store,
             task,
             settings,
-            now,
+            clock(),
             error,
             resume_state=ChallengeState.FETCHING,
         )
@@ -263,7 +264,7 @@ def process_next_admission(
             store,
             task,
             settings,
-            now_ms=now,
+            now_ms=clock(),
             summary=cache_error,
         )
 
@@ -279,7 +280,7 @@ def process_next_admission(
             store,
             task,
             settings,
-            now_ms=now,
+            now_ms=clock(),
             summary="cached model cannot be read",
         )
     except ModelValidationError as exc:
@@ -295,13 +296,13 @@ def process_next_admission(
                 store,
                 task,
                 settings,
-                now_ms=now,
+                now_ms=clock(),
                 summary="cached model changed during validation",
             )
         return _reject_participant(
             store, task, settings,
             _observed_rejection(store, task, exc.code, str(exc), current_finalized_block),
-            current_finalized_block=current_finalized_block, now_ms=now,
+            current_finalized_block=current_finalized_block, clock=clock,
         )
 
     if expected_file_sha256 is not None and validated.file_sha256 != expected_file_sha256:
@@ -309,7 +310,7 @@ def process_next_admission(
             store,
             task,
             settings,
-            now_ms=now,
+            now_ms=clock(),
             summary="cached model changed during validation",
         )
 
@@ -321,7 +322,7 @@ def process_next_admission(
             settings,
             duplicate_owner,
             current_finalized_block=current_finalized_block,
-            now_ms=now,
+            clock=clock,
         )
 
     if settings.archive is not None:
@@ -337,7 +338,7 @@ def process_next_admission(
                 store,
                 task,
                 settings,
-                now,
+                clock(),
                 error,
             )
             return AdmissionOutcome(task.challenge_id, status, error.code)
@@ -346,7 +347,7 @@ def process_next_admission(
         task.challenge_id,
         task.lease_token,
         model_digest=validated.model_digest,
-        occurred_at_ms=now,
+        occurred_at_ms=clock(),
     )
     if not registration.accepted:
         return _reject_exact_duplicate(
@@ -355,7 +356,7 @@ def process_next_admission(
             settings,
             registration.duplicate_of,
             current_finalized_block=current_finalized_block,
-            now_ms=now,
+            clock=clock,
         )
     return AdmissionOutcome(task.challenge_id, AdmissionStatus.ACCEPTED)
 
@@ -377,7 +378,7 @@ def _reject_participant(
     rejection: RejectedAdmission,
     *,
     current_finalized_block: int,
-    now_ms: int,
+    clock: Callable[[], int],
 ) -> AdmissionOutcome:
     if rejection.score_block > current_finalized_block:
         error = ModelDownloadError(
@@ -397,7 +398,7 @@ def _reject_participant(
             store.complete_challenge(
                 task.challenge_id, ChallengeState.PARTICIPANT_FAILED,
                 error_code=rejection.code, error_summary=rejection.summary,
-                occurred_at_ms=now_ms, lease_token=task.lease_token,
+                occurred_at_ms=clock(), lease_token=task.lease_token,
                 score_block=rejection.score_block,
                 file_sha256=rejection.file_sha256,
                 model_size_bytes=rejection.model_size_bytes,
@@ -405,7 +406,7 @@ def _reject_participant(
             return AdmissionOutcome(
                 task.challenge_id, AdmissionStatus.FAILED, rejection.code, rejection.duplicate_of,
             )
-    status = _defer_or_fail(store, task, settings, now_ms, error)
+    status = _defer_or_fail(store, task, settings, clock(), error)
     return AdmissionOutcome(task.challenge_id, status, error.code)
 
 
@@ -436,7 +437,7 @@ def _reject_exact_duplicate(
     duplicate_of: str | None,
     *,
     current_finalized_block: int,
-    now_ms: int,
+    clock: Callable[[], int],
 ) -> AdmissionOutcome:
     if duplicate_of is None:
         raise RuntimeError("duplicate model is missing its earlier owner")
@@ -446,7 +447,7 @@ def _reject_exact_duplicate(
             store, task, "EXACT_DUPLICATE", "model weights duplicate an earlier submission",
             current_finalized_block, duplicate_of=duplicate_of,
         ),
-        current_finalized_block=current_finalized_block, now_ms=now_ms,
+        current_finalized_block=current_finalized_block, clock=clock,
     )
 
 
