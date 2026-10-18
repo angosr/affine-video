@@ -1,4 +1,4 @@
-"""Fit and independently confirm registered costs from hash-bound native timings."""
+"""Fit and independently confirm registered costs from hash-bound production timings."""
 
 from __future__ import annotations
 
@@ -211,6 +211,8 @@ def load_measurements(roots, registration_path, phase, fit_path=None):
                 for proof in row["pattern_proofs"]:
                     if proof["pattern"] != row["model"].removeprefix("pattern_"):
                         raise ValueError("wrong pattern identity")
+                    if proof["budget"] != row["budget"]:
+                        raise ValueError("allocation proof uses another row's budget")
                     proof_digest = hashlib.sha256(
                         json.dumps(
                             proof, sort_keys=True, separators=(",", ":"), allow_nan=False,
@@ -397,7 +399,7 @@ def analyze(roots, registration_path, phase, fit_path=None):
         "provisional_cost_track_spec_digest": derived_digest,
         "cost_independent_track_sha256": registration["cost_independent_track_sha256"],
         "release_accepted": False,
-        "scope": "native_attention_costs_not_complete_release_acceptance",
+        "scope": "production_selector_costs_not_complete_release_acceptance",
         "registration_sha256": sha256(registration_path),
         "fit_sha256": None if fit_path is None else sha256(fit_path),
         "source_sha256": protocol["source_sha256"],

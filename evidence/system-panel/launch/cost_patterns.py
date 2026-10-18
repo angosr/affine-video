@@ -1,7 +1,7 @@
 """Deterministic legal allocation probes; production selector still enforces all rules.
 
 The real predictor executes before these precomputed logits are supplied to the
-native stable selector. This measures complete dispatch cost under adversarial
+production stable selector. This measures complete dispatch cost under adversarial
 legal layouts, not trained models or their quality.
 """
 
@@ -49,36 +49,65 @@ def scores(pattern, valid_count, rows, budget, heads):
     return values
 
 
-def selection_proof(index, keep, valid_count, rows, budget):
-    index, keep = np.asarray(index), np.asarray(keep)
-    valid_count, rows = np.asarray(valid_count), np.asarray(rows)
-    if index.shape != keep.shape or index.shape[1] != len(rows):
-        raise ValueError("selection shape mismatch")
-    if np.any(index < 0) or np.any(index >= len(valid_count)):
-        raise ValueError("out of bounds key")
-    expected = min(budget, np.count_nonzero(valid_count))
-    counts = keep.sum(-1)
-    if np.any(counts != expected) or np.any((valid_count[index] == 0) & keep):
-        raise ValueError("pattern violates fixed budget or padding rule")
-    for head in range(index.shape[0]):
-        for ri, query in enumerate(rows):
-            selected = index[head, ri][keep[head, ri]]
-            if len(np.unique(selected)) != expected:
-                raise ValueError("duplicate selected key")
-            if valid_count[query] and query not in selected:
-                raise ValueError("pattern omits compulsory own key")
+def _full_scores(pattern, counts, rows, budget, heads, video_tiles):
+    values = scores(pattern, counts[:video_tiles], rows, budget, heads)
+    globals_ = np.zeros((heads, len(rows), len(counts) - video_tiles), dtype=np.float32)
+    return np.concatenate((values, globals_), axis=-1)
+
+
+def _expected_mask(values, counts, rows, budget, video_tiles, include_global_rows):
+    """Independent stable NumPy allocation, including empty and global tiles."""
+    if not 0 < budget <= np.count_nonzero(counts[:video_tiles]):
+        raise ValueError("pattern budget cannot be satisfied")
+    ranked = values[..., :video_tiles].copy()
+    ranked[..., counts[:video_tiles] == 0] = -np.inf
+    own = counts[rows] > 0
+    ranked[:, np.arange(len(rows)), rows] = np.where(
+        own[None, :], np.inf, ranked[:, np.arange(len(rows)), rows],
+    )
+    order = np.argsort(-ranked, axis=-1, kind="stable")[..., :budget]
+    result = np.zeros(values.shape, dtype=np.bool_)
+    np.put_along_axis(result[..., :video_tiles], order, True, axis=-1)
+    result[..., video_tiles:] = counts[video_tiles:] > 0
+    if include_global_rows:
+        globals_ = np.broadcast_to(
+            counts > 0, (values.shape[0], len(counts) - video_tiles, len(counts)),
+        )
+        result = np.concatenate((result, globals_), axis=-2)
+    return result
+
+
+def selection_proof(mask, valid_count, rows, budget, video_tiles, include_global_rows):
+    mask, counts, rows = np.asarray(mask), np.asarray(valid_count), np.asarray(rows)
+    expected_rows = len(rows) + (len(counts) - video_tiles if include_global_rows else 0)
+    if (
+        mask.ndim != 3 or mask.dtype != np.bool_
+        or mask.shape[-2:] != (expected_rows, len(counts))
+        or np.any(rows < 0) or np.any(rows >= video_tiles)
+    ):
+        raise ValueError("selection shape or query rows mismatch")
+    if np.any(mask[..., counts == 0]):
+        raise ValueError("pattern selects empty keys")
+    video_mask = mask[:, :len(rows)]
+    if np.any(video_mask[..., :video_tiles].sum(-1) != budget):
+        raise ValueError("pattern violates fixed budget")
+    own = counts[rows] > 0
+    if not video_mask[:, np.arange(len(rows))[own], rows[own]].all():
+        raise ValueError("pattern omits compulsory own key")
+    if not np.array_equal(
+        video_mask[..., video_tiles:],
+        np.broadcast_to(counts[video_tiles:] > 0, video_mask[..., video_tiles:].shape),
+    ):
+        raise ValueError("pattern omits global keys")
+    if include_global_rows and not np.array_equal(
+        mask[:, len(rows):], np.broadcast_to(counts > 0, mask[:, len(rows):].shape),
+    ):
+        raise ValueError("global queries must use every valid key")
     return {
-        "index_sha256": hashlib.sha256(index.tobytes()).hexdigest(),
-        "keep_sha256": hashlib.sha256(keep.tobytes()).hexdigest(),
-        "shape": list(index.shape),
-        "valid_count": valid_count.tolist(),
-        "rows": rows.tolist(),
-        "budget": budget,
-        "minimum_kept": int(counts.min()),
-        "maximum_kept": int(counts.max()),
-        "padding_violations": 0,
-        "anchor_violations": 0,
-        "duplicate_violations": 0,
+        "mask_sha256": hashlib.sha256(mask.tobytes()).hexdigest(),
+        "shape": list(mask.shape), "valid_count": counts.tolist(), "rows": rows.tolist(),
+        "budget": budget, "n_video_tiles": video_tiles,
+        "include_global_rows": include_global_rows,
     }
 
 
@@ -86,32 +115,31 @@ def verify_proof(proof):
     counts, rows = np.asarray(proof["valid_count"]), np.asarray(proof["rows"])
     if hashlib.sha256(rows.tobytes()).hexdigest() != proof["rows_sha256"]:
         raise ValueError("pattern query row identity mismatch")
-    heads = proof["shape"][0]
-    values = scores(proof["pattern"], counts, rows, proof["budget"], heads)
+    values = _full_scores(
+        proof["pattern"], counts, rows, proof["budget"], proof["shape"][0],
+        proof["n_video_tiles"],
+    )
     if hashlib.sha256(values.tobytes()).hexdigest() != proof["logits_sha256"]:
         raise ValueError("pattern logits hash mismatch")
-    values[:, :, counts == 0] = -np.inf
-    values[:, np.arange(len(rows)), rows] = np.inf
-    # Pinned installed split_budget(16, 300) returns (16, 17, 0):
-    # index has 17 columns, with exactly 16 kept. Verify against the
-    # real installed selector in native_self_test, including saturated budgets.
-    width = min(proof["budget"] + 1, len(counts))
-    index = np.argsort(-values, axis=-1, kind="stable")[..., :width].astype(np.int64)
-    keep = np.broadcast_to(np.arange(width) < proof["budget"], index.shape).copy()
-    keep &= np.take_along_axis(values, index, axis=-1) > -np.inf
-    actual = selection_proof(index, keep, counts, rows, proof["budget"])
+    mask = _expected_mask(
+        values, counts, rows, proof["budget"], proof["n_video_tiles"],
+        proof["include_global_rows"],
+    )
+    actual = selection_proof(
+        mask, counts, rows, proof["budget"], proof["n_video_tiles"],
+        proof["include_global_rows"],
+    )
     if any(proof[field] != value for field, value in actual.items()):
-        raise ValueError("native pattern differs from deterministic legal allocation")
+        raise ValueError("production pattern differs from deterministic legal allocation")
 
 
-class NativePattern:
-    def __init__(self, torch, native, name):
-        self.torch, self.native, self.name = torch, native, name
-        self.entries = []
-        self.proofs = []
-        self.mode = "unprimed"
-        self.cursor = 0
-        self.observed = []
+class SelectorPattern:
+    """Inject primed logits before the real production mask; no timed host copies."""
+
+    def __init__(self, torch, selector, name):
+        self.torch, self.selector, self.name = torch, selector, name
+        self.entries, self.proofs = [], []
+        self.mode, self.cursor, self.observed = "unprimed", 0, []
 
     def prime(self, operation):
         if self.mode != "unprimed":
@@ -126,19 +154,16 @@ class NativePattern:
         def call():
             if self.mode != "ready":
                 raise RuntimeError("pattern sequence must be primed and verified")
-            self.cursor = 0
-            self.observed = []
-            self.mode = "replay"
+            self.cursor, self.observed, self.mode = 0, [], "replay"
             result = operation()
             if self.cursor != len(self.entries):
                 raise RuntimeError("timed operation omitted primed selector calls")
             self.mode = "pending_verification"
             return result
-
         return call
 
     def verify_replay(self):
-        """Called AFTER the latency timestamp, never from the timed operation."""
+        """Called after the latency timestamp, never from the timed operation."""
         if self.mode != "pending_verification":
             raise RuntimeError("no complete pattern operation to verify")
         for actual, entry in zip(self.observed, self.entries, strict=True):
@@ -148,171 +173,119 @@ class NativePattern:
                 raise RuntimeError("timed operation changed primed query-row sequence")
         self.mode = "ready"
 
-    def __call__(self, logits, layout, blocks, rows=None, **kwargs):
-        native_rows = rows
-        implicit_full_rows = rows is None
-        if len(blocks) != 1 or blocks[0].start != 0 or kwargs.get("rule", "topk") != "topk":
+    def __call__(
+        self, torch, logits, layout, *, target_blocks, reference_blocks, query_rows=None,
+    ):
+        if torch is not self.torch:
+            raise ValueError("pattern torch module differs from production")
+        if reference_blocks != 0 or layout.n_ref_tiles != 0:
             raise ValueError("pattern probe requires production target-only fixed Top-k")
-        budget = blocks[0].budget.tiles
-        if budget is None or budget != int(budget):
-            raise ValueError("pattern probe requires integer block budget")
-        identity = (
-            id(layout),
-            tuple(logits.shape),
-            int(budget),
-            None if implicit_full_rows else tuple(rows.shape),
-        )
+        identity = (id(layout), tuple(logits.shape), target_blocks,
+                    None if query_rows is None else tuple(query_rows.shape))
         if self.mode == "prime":
-            if implicit_full_rows:
-                rows = self.torch.arange(layout.n_video_tiles, device=logits.device)
-            counts = layout.valid_count[: layout.n_video_tiles].cpu().numpy()
-            query_rows = rows.detach().cpu().numpy()
-            rows_digest = hashlib.sha256(query_rows.tobytes()).hexdigest()
-            values = scores(self.name, counts, query_rows, int(budget), logits.shape[0])
+            rows = (
+                self.torch.arange(layout.n_video_tiles, device=logits.device)
+                if query_rows is None else query_rows
+            )
+            counts, query_ids = layout.valid_count.cpu().numpy(), rows.cpu().numpy()
+            values = _full_scores(
+                self.name, counts, query_ids, target_blocks, logits.shape[0], layout.n_video_tiles,
+            )
             gpu_values = self.torch.from_numpy(values).to(logits.device)
-            selection = self.native(gpu_values, layout, blocks, native_rows, **kwargs)
+            selected = self.selector(
+                self.torch, gpu_values, layout, target_blocks=target_blocks,
+                reference_blocks=reference_blocks, query_rows=query_rows,
+            )
             proof = selection_proof(
-                selection.index.cpu().numpy(),
-                selection.keep.cpu().numpy(),
-                counts,
-                query_rows,
-                int(budget),
+                selected.cpu().numpy(), counts, query_ids, target_blocks,
+                layout.n_video_tiles, query_rows is None,
             )
             proof.update(
                 logits_sha256=hashlib.sha256(values.tobytes()).hexdigest(),
-                pattern=self.name,
-                rows_sha256=rows_digest,
+                pattern=self.name, rows_sha256=hashlib.sha256(query_ids.tobytes()).hexdigest(),
                 sequence_index=len(self.entries),
-                implicit_full_rows=implicit_full_rows,
             )
-            self.entries.append(
-                {
-                    "identity": identity,
-                    "implicit_full_rows": implicit_full_rows,
-                    "logits": gpu_values,
-                    "rows": rows.clone(),
-                    "rows_sha256": rows_digest,
-                }
-            )
+            self.entries.append({
+                "identity": identity, "implicit_full_rows": query_rows is None,
+                "logits": gpu_values, "rows": rows.clone(),
+            })
             self.proofs.append(proof)
-            return selection
+            return selected
         if self.mode != "replay" or self.cursor >= len(self.entries):
             raise RuntimeError("unprimed selector call during timing")
         entry = self.entries[self.cursor]
         if identity != entry["identity"]:
             raise RuntimeError("timed selector signature differs from primed sequence")
         self.cursor += 1
-        self.observed.append(native_rows)
-        return self.native(entry["logits"], layout, blocks, native_rows, **kwargs)
+        self.observed.append(query_rows)
+        return self.selector(
+            self.torch, entry["logits"], layout, target_blocks=target_blocks,
+            reference_blocks=reference_blocks, query_rows=query_rows,
+        )
 
 
-def native_self_test(device="cpu"):
-    """Real installed selector, including equal-shaped distinct query chunks."""
+def production_self_test(device="cpu"):
+    """Actual shared mask, including empty/global tiles and distinct equal-shaped rows."""
     from types import SimpleNamespace
-
-    import torch
-    from miowtion.veda import mask
-
-    counts = torch.tensor([128] * 128 + [4, 8, 0], dtype=torch.int64, device=device)
-    layout = SimpleNamespace(n_video_tiles=len(counts), valid_count=counts, kv_ok=counts > 0)
     from unittest.mock import patch
 
+    import torch
+
+    from scoring.torch_selector import runtime_block_mask
+
+    counts = torch.tensor([128] * 128 + [4, 8, 0, 2, 0], dtype=torch.long, device=device)
+    layout = SimpleNamespace(n_tiles=len(counts), n_video_tiles=131, n_ref_tiles=0,
+                             valid_count=counts)
     results = []
     for name in PATTERNS:
-        for budget in (4, 16, 32, 64, 131):
-            pattern = NativePattern(torch, mask.select_video_blocks, name)
-            blocks = [
-                mask.ColumnBlock(0, len(counts), mask.Budget(tiles=budget), int(counts.sum()))
-            ]
-            chunks = [
-                torch.tensor([0, 1, 2], device=device),
-                torch.tensor([64, 65, 66], device=device),
-            ]
-            logits = torch.zeros(2, 3, len(counts), device=device)
-
-            def operation(pattern=pattern, logits=logits, blocks=blocks, chunks=chunks):
-                return [pattern(logits, layout, blocks, rows) for rows in chunks]
-
-            pattern.prime(operation)
-            for proof in pattern.proofs:
-                verify_proof(proof)
-                results.append(
-                    {
-                        "pattern": name,
-                        "budget": budget,
-                        "index_width": proof["shape"][-1],
-                        "proof": proof,
-                    }
+        for budget in (4, 16, 32, 64, 130):
+            for implicit in (False, True):
+                pattern = SelectorPattern(torch, runtime_block_mask, name)
+                chunks = (
+                    [None] if implicit else [
+                        torch.tensor([0, 1, 2], device=device),
+                        torch.tensor([64, 65, 66], device=device),
+                    ]
                 )
-            if (
-                len(pattern.entries) != 2
-                or pattern.proofs[0]["rows_sha256"] == pattern.proofs[1]["rows_sha256"]
-            ):
-                raise AssertionError("equal-shaped different rows shared primed logits")
-            replay = pattern.replay(operation)
-            with (
-                patch.object(
-                    torch.Tensor, "cpu", side_effect=AssertionError("timed host transfer")
-                ),
-                patch.object(
-                    torch.Tensor, "numpy", side_effect=AssertionError("timed host conversion")
-                ),
-            ):
-                for _ in range(3):
-                    replay()
-                    pattern.verify_replay()
-                chunks.reverse()
-                replay()
-                try:
-                    pattern.verify_replay()
-                except RuntimeError as exc:
-                    if "query-row sequence" not in str(exc):
-                        raise
-                else:
-                    raise AssertionError("different-row replay order was accepted")
-            implicit = NativePattern(torch, mask.select_video_blocks, name)
-            full_logits = torch.zeros(2, len(counts), len(counts), device=device)
-            # Use nonempty rows in this test's full production layout. Empty keys
-            # remain covered by the explicit-row cases above.
-            full_counts = counts.clamp(min=1)
-            full_layout = SimpleNamespace(
-                n_video_tiles=len(counts), valid_count=full_counts, kv_ok=full_counts > 0
-            )
+                logits = torch.zeros(2, 131 if implicit else 3, len(counts), device=device)
 
-            def full_operation(
-                implicit=implicit, full_logits=full_logits, full_layout=full_layout, blocks=blocks
-            ):
-                return implicit(full_logits, full_layout, blocks)
+                def operation(pattern=pattern, chunks=chunks, logits=logits, budget=budget):
+                    return [
+                        pattern(torch, logits, layout, target_blocks=budget, reference_blocks=0,
+                                query_rows=rows) for rows in chunks
+                    ]
 
-            implicit.prime(full_operation)
-            verify_proof(implicit.proofs[0])
-            replay_full = implicit.replay(full_operation)
-            with (
-                patch.object(
-                    torch.Tensor, "cpu", side_effect=AssertionError("timed host transfer")
-                ),
-                patch.object(
-                    torch.Tensor, "numpy", side_effect=AssertionError("timed host conversion")
-                ),
-            ):
-                for _ in range(3):
-                    replay_full()
-                    implicit.verify_replay()
-            results.append(
-                {
-                    "pattern": name,
-                    "budget": budget,
-                    "index_width": implicit.proofs[0]["shape"][-1],
-                    "implicit_full_rows": True,
-                    "proof": implicit.proofs[0],
-                }
-            )
+                pattern.prime(operation)
+                for proof in pattern.proofs:
+                    verify_proof(proof)
+                    results.append(proof)
+                if not implicit and pattern.proofs[0]["rows_sha256"] == (
+                    pattern.proofs[1]["rows_sha256"]
+                ):
+                    raise AssertionError("equal-shaped different rows shared primed logits")
+                replay = pattern.replay(operation)
+                with (
+                    patch.object(torch.Tensor, "cpu",
+                                 side_effect=AssertionError("timed host transfer")),
+                    patch.object(torch.Tensor, "numpy",
+                                 side_effect=AssertionError("timed host conversion")),
+                ):
+                    for _ in range(3):
+                        replay()
+                        pattern.verify_replay()
+                    if not implicit:
+                        chunks.reverse()
+                        replay()
+                        try:
+                            pattern.verify_replay()
+                        except RuntimeError as exc:
+                            if "query-row sequence" not in str(exc):
+                                raise
+                        else:
+                            raise AssertionError("different-row replay order was accepted")
     return {
-        "format": "veda-cost-native-pattern-regression-v2",
-        "pass": True,
-        "torch": torch.__version__,
-        "device": device,
-        "cases": results,
+        "format": "veda-cost-production-pattern-regression", "pass": True,
+        "torch": torch.__version__, "device": device, "cases": results,
         "host_conversion_disabled_during_replay": True,
         "reversed_equal_shape_sequence_rejected": True,
     }
@@ -327,7 +300,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
-    result = native_self_test(args.device)
+    result = production_self_test(args.device)
     with args.output.open("x") as stream:
         json.dump(result, stream, sort_keys=True, separators=(",", ":"))
         stream.write("\n")

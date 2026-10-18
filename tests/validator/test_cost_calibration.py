@@ -122,7 +122,8 @@ def fixture(
                     "layer": layer,
                     "budget": budget,
                     "pattern_proofs": (
-                        [{"pattern": model.removeprefix("pattern_"), "valid": True}]
+                        [{"pattern": model.removeprefix("pattern_"),
+                          "budget": budget, "valid": True}]
                         if model.startswith("pattern_") else []
                     ),
                     "protocol_sha256": protocol_hash,
@@ -261,9 +262,10 @@ def test_identical_proofs_are_verified_once_per_analysis_but_mutations_are_check
 
     monkeypatch.setattr(analysis.patterns, "verify_proof", verify)
     analysis.analyze([root], registration, "calibration")
-    assert observed == [{"pattern": "clustered", "valid": True}]
+    assert {proof["budget"] for proof in observed} == {16, 32, 64}
+    assert len(observed) == 3
     analysis.analyze([root], registration, "calibration")
-    assert len(observed) == 2  # A later analysis independently revalidates it.
+    assert len(observed) == 6  # A later analysis independently revalidates each budget.
     path = next(root.glob("b-256-pattern_clustered-*.json"))
     row = json.loads(path.read_text())
     row["pattern_proofs"][0]["valid"] = False
@@ -274,28 +276,44 @@ def test_identical_proofs_are_verified_once_per_analysis_but_mutations_are_check
     assert any(proof["valid"] is False for proof in observed)
 
 
+def test_allocation_proof_cannot_be_reused_for_another_budget(tmp_path, monkeypatch):
+    root, registration = fixture(tmp_path, models=("baseline_self", "pattern_clustered"))
+    monkeypatch.setattr(analysis.patterns, "verify_proof", lambda proof: None)
+    path = next(root.glob("b-256-pattern_clustered-*-64.json"))
+    row = json.loads(path.read_text())
+    row["pattern_proofs"][0]["budget"] = 16
+    write(path, row)
+    rehash(root)
+    with pytest.raises(ValueError, match="another row's budget"):
+        analysis.analyze([root], registration, "calibration")
+
+
 @pytest.mark.parametrize("pattern", analysis.patterns.PATTERNS)
 def test_legal_pattern_proof_recomputes_and_rejects_mutation(pattern):
     import hashlib
 
     import numpy as np
 
-    counts = np.array([128] * 35 + [0, 3, 17, 0, 128])
-    rows = np.flatnonzero(counts)
-    logits = analysis.patterns.scores(pattern, counts, rows, 16, 2)
+    counts = np.array([128] * 35 + [0, 3, 17, 0, 128, 2, 0])
+    video_tiles = len(counts) - 2
+    rows = np.flatnonzero(counts[:video_tiles])
+    logits = analysis.patterns._full_scores(pattern, counts, rows, 16, 2, video_tiles)
     digest = hashlib.sha256(logits.tobytes()).hexdigest()
-    logits[:, :, counts == 0] = -np.inf
-    logits[:, np.arange(len(rows)), rows] = np.inf
-    index = np.argsort(-logits, axis=-1, kind="stable")[..., :17].astype(np.int64)
-    keep = np.broadcast_to(np.arange(17) < 16, index.shape).copy()
-    proof = analysis.patterns.selection_proof(index, keep, counts, rows, 16)
+    ranked = logits[..., :video_tiles].copy()
+    ranked[:, :, counts[:video_tiles] == 0] = -np.inf
+    ranked[:, np.arange(len(rows)), rows] = np.inf
+    index = np.argsort(-ranked, axis=-1, kind="stable")[..., :16]
+    mask = np.zeros(logits.shape, dtype=np.bool_)
+    np.put_along_axis(mask[..., :video_tiles], index, True, axis=-1)
+    mask[..., video_tiles:] = counts[video_tiles:] > 0
+    proof = analysis.patterns.selection_proof(mask, counts, rows, 16, video_tiles, False)
     proof.update(
         pattern=pattern,
         logits_sha256=digest,
         rows_sha256=hashlib.sha256(rows.tobytes()).hexdigest(),
     )
     analysis.patterns.verify_proof(proof)
-    proof["index_sha256"] = "wrong"
+    proof["mask_sha256"] = "wrong"
     with pytest.raises(ValueError, match="deterministic legal allocation"):
         analysis.patterns.verify_proof(proof)
 
@@ -343,6 +361,19 @@ def test_vectorized_pattern_logits_preserve_the_original_allocation_exactly(patt
         np.testing.assert_array_equal(
             analysis.patterns.scores(pattern, counts, rows, budget, 3), expected,
         )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_cost_patterns_use_the_production_mask_and_reject_reordered_replays(device):
+    torch = pytest.importorskip("torch")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for production allocation probes")
+    result = analysis.patterns.production_self_test(device)
+    assert result["pass"] and len(result["cases"]) == 60
+    assert result["host_conversion_disabled_during_replay"]
+    assert result["reversed_equal_shape_sequence_rejected"]
+    assert {row["pattern"] for row in result["cases"]} == set(analysis.patterns.PATTERNS)
+    assert {row["include_global_rows"] for row in result["cases"]} == {False, True}
 
 
 @pytest.mark.parametrize(

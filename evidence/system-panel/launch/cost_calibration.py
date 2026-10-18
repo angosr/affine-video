@@ -1,4 +1,4 @@
-"""Replayable H200 E10/E11 measurements using production SparseStudent.
+"""Replayable H200 E10/E11 measurements using the tournament's production selector.
 
 Synthetic QKV avoids consuming hidden acceptance families. This is a kernel and
 selection-cost experiment, not complete final-release acceptance evidence.
@@ -85,8 +85,8 @@ def benchmark(torch, operation, warmup, repeats, post_check=None):
     return values, cuda_values
 
 
-def profile_components(torch, attention, mask, fa4, predictor, operation, repeats, post_check=None):
-    """Bracket native calls without inserting synchronizations inside the attention call."""
+def profile_components(torch, attention, runtime, fa4, operation, repeats, post_check=None):
+    """Bracket production calls without adding synchronizations inside attention."""
 
     events = defaultdict(list)
 
@@ -103,11 +103,10 @@ def profile_components(torch, attention, mask, fa4, predictor, operation, repeat
         return measured
 
     targets = (
-        (attention, "_gather_and_pool", "gather_and_trippool"),
+        (runtime, "gather_and_pool", "gather_and_trippool"),
         (attention, "_gather", "value_gather"),
-        (predictor, "forward", "residual_projection_and_logits"),
-        (mask, "select_video_blocks", "stable_topk_and_anchors"),
-        (mask, "dense_block_mask", "dense_mask_construction"),
+        (runtime, "selector_logits", "residual_projection_and_logits"),
+        (runtime, "runtime_block_mask", "stable_topk_and_anchors"),
         (fa4, "index_lists", "kernel_mask_packing"),
         (fa4, "block_sparse_attention", "sparse_attention_including_packing"),
         (attention, "_scatter_", "output_scatter"),
@@ -138,18 +137,18 @@ def profile_components(torch, attention, mask, fa4, predictor, operation, repeat
 def run(arguments):
     import torch
     from cost_analysis import cost_independent_contract, verify_phase_track
-    from cost_patterns import PATTERNS, NativePattern
+    from cost_patterns import PATTERNS, SelectorPattern
     from miowtion.h3 import attention as dense_runtime
     from miowtion.h3 import layout as packed_layout
     from miowtion.kernels import fa4
     from miowtion.train.data import parse_geometry
     from miowtion.veda import attention, bundle, mask
     from miowtion.veda.plan import PlanTable, TilePlan
-    from miowtion.veda.predictor import TileScorePredictor
     from safetensors import safe_open
 
     from scoring.model import validate_model
     from scoring.spec import load_track_spec, track_spec_dict
+    from validator.production import runtime
     from validator.production.environment import (
         evaluation_environment_digest,
         evaluation_source_digest,
@@ -242,7 +241,7 @@ def run(arguments):
         "phase": arguments.phase,
         "registration_sha256": sha256(arguments.registration),
         "fit_sha256": None if arguments.fit is None else sha256(arguments.fit),
-        "scope": "registered_native_cost_measurement",
+        "scope": "registered_production_selector_cost_measurement",
         "source_sha256": evaluation_source_digest(),
         "environment_sha256": evaluation_environment_digest(),
         "dependency_lock_sha256": sha256(arguments.dependency_lock),
@@ -257,7 +256,7 @@ def run(arguments):
         "model_identities": identities,
         "pattern_script_sha256": registration["pattern_script_sha256"],
         "pattern_estimand": (
-            "real baseline predictor plus precomputed legal pattern logits before native selection"
+            "real production projections plus precomputed legal logits before production selection"
         ),
         "seed": arguments.seed,
         "warmup": arguments.warmup,
@@ -277,10 +276,10 @@ def run(arguments):
         },
         "e11_non_attention_fraction_max": 0.10,
         "e11_denominator": "installed dense H3 attention with FA4, same packed QKV and used rows",
-        "e10_estimand": "complete production SparseStudent call, synchronized wall latency",
+        "e10_estimand": "complete tournament SelectorAttention call, synchronized wall latency",
         "dense_estimand": "complete production h3.attention.dense_attention call, backend=fa4",
         "collect_bytes": attention.VedaConfig().collect_bytes,
-        "profiling": "CUDA event spans around installed native functions; packing subtracted once",
+        "profiling": "CUDA spans around actual production functions; packing subtracted once",
         "gpu": torch.cuda.get_device_name(0),
         "gpu_identity": subprocess.check_output(
             ["nvidia-smi", "--query-gpu=uuid,pci.bus_id", "--format=csv,noheader"], text=True
@@ -290,12 +289,6 @@ def run(arguments):
     }
     write_once(arguments.output / "protocol.json", protocol)
     device = torch.device("cuda:0")
-    predictor = TileScorePredictor(
-        track.model.selector.num_layers,
-        track.model.selector.num_heads,
-        track.model.selector.head_dim,
-    )
-    predictor = predictor.to(device, torch.float32).eval()
     rows = []
     with torch.inference_mode():
         for geometry_name in protocol["geometries"]:
@@ -342,11 +335,12 @@ def run(arguments):
                     with safe_open(
                         arguments.controls / f"{model_name}.safetensors", framework="pt"
                     ) as tensors:
-                        for layer in protocol["layers"]:
-                            for side in ("proj_q", "proj_k"):
-                                getattr(predictor.layers[layer], side).copy_(
-                                    tensors.get_tensor(f"layers.{layer}.{side}")
-                                )
+                        projections = {
+                            f"layers.{layer}.{side}": tensors.get_tensor(
+                                f"layers.{layer}.{side}"
+                            ).to(device, torch.float32)
+                            for layer in protocol["layers"] for side in ("proj_q", "proj_k")
+                        }
                     for layer in protocol["layers"]:
                         for budget in track.scoring.budgets:
                             label = (
@@ -370,13 +364,15 @@ def run(arguments):
                                 ),
                                 device,
                             )
-                            operation = attention.SparseStudent(clip, plan, predictor)
+                            operation = runtime._selector_attention(
+                                torch, attention, clip, plan, projections, budget,
+                            )
 
                             call = partial(operation, q, k, v, layer)
 
                             pattern = (
-                                NativePattern(
-                                    torch, mask.select_video_blocks, name.removeprefix("pattern_")
+                                SelectorPattern(
+                                    torch, runtime.runtime_block_mask, name.removeprefix("pattern_")
                                 )
                                 if name.startswith("pattern_")
                                 else None
@@ -384,7 +380,7 @@ def run(arguments):
                             with ExitStack() as stack:
                                 if pattern is not None:
                                     stack.enter_context(
-                                        patch.object(mask, "select_video_blocks", pattern)
+                                        patch.object(runtime, "runtime_block_mask", pattern)
                                     )
                                     pattern.prime(call)
                                     call = pattern.replay(call)
@@ -396,9 +392,8 @@ def run(arguments):
                                 components = profile_components(
                                     torch,
                                     attention,
-                                    mask,
+                                    runtime,
                                     fa4,
-                                    predictor.layers[layer],
                                     call,
                                     arguments.profile_repeats,
                                     post_check,
@@ -442,6 +437,7 @@ def run(arguments):
                                 ),
                                 flush=True,
                             )
+                    projections.clear()
                 del q, k, v
     expected = (
         len(protocol["geometries"])
@@ -454,7 +450,7 @@ def run(arguments):
         arguments.output / "summary.json",
         {
             "format": "veda-h200-cost-measurement-summary-v2",
-            "scope": "registered_native_cost_measurement",
+            "scope": "registered_production_selector_cost_measurement",
             "protocol_sha256": sha256(arguments.output / "protocol.json"),
             "row_count": len(rows),
             "expected_rows": expected,
