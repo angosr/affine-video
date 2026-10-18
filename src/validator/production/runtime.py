@@ -22,8 +22,15 @@ from scoring.exact import (
     ExactCase,
     canonical_dense_reference,
 )
+from scoring.model import ModelValidationError
 from scoring.selector import SelectorArchitecture, load_selector, route_indices, route_name
 from scoring.spec import BudgetSpec
+from scoring.torch_selector import (
+    runtime_block_mask,
+    selector_logits,
+)
+from scoring.torch_selector import segmented_top_k as segmented_torch_mask
+from scoring.torch_selector import trip_pool as torch_trip_pool
 from validator.production.plan import select_query_tiles
 
 
@@ -63,6 +70,9 @@ class RuntimeTraceVerification:
     mask_mismatches: tuple[int, ...]
     output_max_abs: tuple[float, ...]
     output_mean_abs: tuple[float, ...]
+    production_descriptor_max_abs: float
+    production_logits_max_abs: float
+    production_mask_mismatches: tuple[int, ...]
 
 
 class SparseOutputInvalid(RuntimeError):
@@ -152,33 +162,23 @@ class DenseRolloutRuntime:
         """Run one real VEDA trajectory with submitted projection weights."""
 
         from miowtion.veda import mask as veda_mask
-        from miowtion.veda import predictor as veda_predictor
         from safetensors import safe_open
 
         if sample_id not in self.samples:
             raise KeyError(f"{sample_id} is absent from the encoded sample cache")
         torch = self.torch
-        predictor = veda_predictor.TileScorePredictor(
-            architecture.num_layers,
-            architecture.num_heads,
-            architecture.head_dim,
-        )
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
         state = {}
         with safe_open(selector_path, framework="pt", device="cpu") as tensors:
-            expected = {
-                f"layers.{layer}.{side}"
-                for layer in range(architecture.num_layers)
-                for side in ("proj_q", "proj_k")
-            }
-            if set(tensors.keys()) != expected:
-                raise ValueError("selector tensor keys do not match the runtime predictor")
-            for name in sorted(expected):
-                state[name] = tensors.get_tensor(name)
-        predictor.load_state_dict(state, strict=True)
-        # Miowtion pools BF16 activations into FP32 descriptors and its predictor
-        # explicitly evaluates projections in FP32. Preserve submitted FP16 values
-        # exactly when materializing that FP32 side branch.
-        predictor = predictor.to(self.environment.device, torch.float32).eval()
+            expected = architecture.tensor_schema
+            if set(tensors.keys()) != set(expected):
+                raise ValueError("selector tensor keys do not match the runtime contract")
+            for name, spec in expected.items():
+                tensor = tensors.get_tensor(name)
+                if tuple(tensor.shape) != spec.shape:
+                    raise ValueError("selector projection shape differs from the runtime contract")
+                state[name] = tensor.to(self.environment.device, torch.float32)
         parsed_geometry = self.data.parse_geometry(geometry)
         tile_plan = self.plans.select(parsed_geometry)
         ref_budget = (
@@ -208,29 +208,37 @@ class DenseRolloutRuntime:
         dense_calls = 0
         torch.cuda.synchronize(self.environment.device)
         started = time.monotonic()
-        with torch.no_grad():
-            while not rollout.done:
-                inputs = rollout.inputs()
-                attention = self.veda_attention.SparseStudent(clip, tile_plan, predictor)
-                video_v, audio_v = self.teacher.model(
-                    rollout.clip,
-                    inputs.video_rows,
-                    inputs.audio_rows,
-                    inputs.timestep,
-                    attention,
-                    self.teacher.tables.get(inputs.timestep.timesteps),
-                )
-                sparse_calls += attention.calls["sparse"]
-                dense_calls += attention.calls["dense"]
-                rollout.advance(video_v, audio_v)
-                if inputs.step in step_windows:
-                    trajectory.append(
-                        (
-                            inputs.step,
-                            step_windows[inputs.step],
-                            rollout.video_rows[rollout.n_cond_video :].float().cpu().numpy(),
-                        )
+        try:
+            with torch.no_grad():
+                while not rollout.done:
+                    inputs = rollout.inputs()
+                    attention = _selector_attention(
+                        torch, self.veda_attention, clip, tile_plan, state, budget,
                     )
+                    video_v, audio_v = self.teacher.model(
+                        rollout.clip,
+                        inputs.video_rows,
+                        inputs.audio_rows,
+                        inputs.timestep,
+                        attention,
+                        self.teacher.tables.get(inputs.timestep.timesteps),
+                    )
+                    sparse_calls += attention.calls["sparse"]
+                    dense_calls += attention.calls["dense"]
+                    rollout.advance(video_v, audio_v)
+                    if inputs.step in step_windows:
+                        trajectory.append(
+                            (
+                                inputs.step,
+                                step_windows[inputs.step],
+                                rollout.video_rows[rollout.n_cond_video :].float().cpu().numpy(),
+                            )
+                        )
+        except ModelValidationError as exc:
+            raise SparseOutputInvalid(str(exc)) from exc
+        finally:
+            state.clear()
+            torch.cuda.empty_cache()
         torch.cuda.synchronize(self.environment.device)
         elapsed = time.monotonic() - started
         if len(trajectory) != len(steps):
@@ -242,8 +250,6 @@ class DenseRolloutRuntime:
             or not np.isfinite(audio).all()
             or any(not np.isfinite(rows).all() for _, _, rows in trajectory)
         )
-        del predictor, state
-        torch.cuda.empty_cache()
         if invalid:
             raise SparseOutputInvalid("sparse rollout produced non-finite latents")
         return SparseRollout(
@@ -522,6 +528,44 @@ class DenseRolloutRuntime:
                     path.unlink()
 
 
+def _selector_attention(torch, attention_module, clip, plan, projections, budget):
+    """Keep pinned gather/kernel/scatter, replacing its independent selector path."""
+
+    if clip.config.budget_rule != "topk" or any(
+        getattr(clip.config, name)
+        for name in ("zero_order_compensation", "fused_compensation", "triton_compensation")
+    ):
+        raise ValueError("the tournament runtime permits only uncompensated stable Top-k")
+
+    class SelectorAttention(attention_module.SparseStudent):
+        def _attend(self, q, k, v, layer_index, tile_layout, heads, out):
+            tiles = [attention_module._gather(value, tile_layout, heads) for value in (q, k, v)]
+            q_tiles, k_tiles, v_tiles = tiles
+            q_features, k_features = (
+                torch_trip_pool(
+                    torch,
+                    value.view(tile_layout.n_tiles, 128, heads.numel(), -1).permute(2, 0, 1, 3),
+                    tile_layout.valid_count,
+                )
+                for value in (q_tiles, k_tiles)
+            )
+            logits = selector_logits(
+                torch, q_features[:, :tile_layout.n_video_tiles], k_features,
+                projections[f"layers.{layer_index}.proj_q"].index_select(0, heads),
+                projections[f"layers.{layer_index}.proj_k"].index_select(0, heads),
+            )
+            block_mask = runtime_block_mask(
+                torch, logits, tile_layout, target_blocks=budget.target_blocks,
+                reference_blocks=budget.reference_blocks,
+            )
+            result = attention_module.fa4.block_sparse_attention(
+                q_tiles, k_tiles, v_tiles, block_mask, tile_layout,
+            )
+            attention_module._scatter_(out, result, tile_layout, heads)
+
+    return SelectorAttention(clip, plan, predictor=None)
+
+
 def verify_runtime_trace(
     case: ExactCase,
     *,
@@ -553,6 +597,9 @@ def verify_runtime_trace(
         raise RuntimeError("runtime trace verification requires CUDA")
 
     selector = load_selector(selector_path, architecture)
+    from scoring.torch_backend import TorchCaseScorer
+
+    exact_scorer = TorchCaseScorer(case, device=device)
     layer_index, head_index = route_indices(case.route)
     with safe_open(selector_path, framework="pt", device="cpu") as tensors, torch.no_grad():
         predictor = veda_predictor.LayerPredictor(architecture.num_heads, architecture.head_dim).to(
@@ -580,6 +627,24 @@ def verify_runtime_trace(
     logits_delta = float(np.max(np.abs(runtime_logits.detach().cpu().numpy() - expected_logits)))
     if descriptor_delta > descriptor_atol or logits_delta > logits_atol:
         raise RuntimeError("cached predictor arithmetic diverges from the Miowtion runtime")
+    production_q = torch_trip_pool(torch, q[None], query_layout.valid_count)
+    production_k = torch_trip_pool(torch, k[None], key_layout.valid_count)
+    production_descriptor_delta = max(
+        float((production_q[0] - exact_scorer.q_descriptors).abs().max()),
+        float((production_k[0] - exact_scorer.k_descriptors).abs().max()),
+    )
+    q_projection, k_projection = (
+        torch.as_tensor(selector.weights[f"{case.route}.proj_{side}"], device=resolved)
+        for side in ("q", "k")
+    )
+    production_logits = selector_logits(
+        torch, production_q, production_k, q_projection[None], k_projection[None],
+    )
+    exact_logits = selector_logits(
+        torch, exact_scorer.q_descriptors, exact_scorer.k_descriptors,
+        q_projection, k_projection,
+    )
+    production_logits_delta = float((production_logits[0] - exact_logits).abs().max())
 
     reference_tiles = int(np.count_nonzero(case.key_segments == REFERENCE_SEGMENT))
     target_tiles = int(np.count_nonzero(case.key_segments == TARGET_SEGMENT))
@@ -608,6 +673,7 @@ def verify_runtime_trace(
     mismatches = []
     maxima = []
     means = []
+    production_mismatches = []
     for budget in budgets:
         if reference_tiles and budget.reference_blocks <= 0:
             raise ValueError("a runtime case with references requires a reference budget")
@@ -628,6 +694,19 @@ def verify_runtime_trace(
         )
         mismatch = int(np.count_nonzero(runtime_mask.cpu().numpy() != expected_mask))
         mismatches.append(mismatch)
+        production_mask = runtime_block_mask(
+            torch, production_logits, layout, target_blocks=budget.target_blocks,
+            reference_blocks=budget.reference_blocks, query_rows=rows,
+        )[0]
+        exact_mask = segmented_torch_mask(
+            torch, exact_logits, exact_scorer.segments, exact_scorer.k_counts,
+            target_blocks=budget.target_blocks, reference_blocks=budget.reference_blocks,
+            required_keys=exact_scorer.required,
+        )
+        production_mismatches.append(
+            int((production_mask != exact_mask).count_nonzero())
+            + int(np.count_nonzero(production_mask.cpu().numpy() != expected_mask))
+        )
         runtime_output = reference.block_sparse_attention(
             q.reshape(-1, 1, architecture.head_dim),
             k.reshape(-1, 1, architecture.head_dim),
@@ -653,15 +732,22 @@ def verify_runtime_trace(
         tuple(mismatches),
         tuple(maxima),
         tuple(means),
+        production_descriptor_delta,
+        production_logits_delta,
+        tuple(production_mismatches),
     )
     if (
         any(result.mask_mismatches)
+        or any(result.production_mask_mismatches)
+        or result.production_descriptor_max_abs > descriptor_atol
+        or result.production_logits_max_abs > logits_atol
         or any(value > output_atol for value in result.output_max_abs)
         or any(value > output_mean_atol for value in result.output_mean_abs)
     ):
         raise RuntimeError(
             "cached mask or sparse output diverges from the Miowtion runtime: "
             f"mask_mismatches={result.mask_mismatches}, "
+            f"production_mask_mismatches={result.production_mask_mismatches}, "
             f"output_max_abs={result.output_max_abs}, "
             f"output_mean_abs={result.output_mean_abs}"
         )

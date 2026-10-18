@@ -14,7 +14,7 @@ import numpy as np
 
 from scoring.evaluate import tail_error
 from scoring.metrics import relative_squared_error
-from scoring.model import ModelValidationError
+from scoring.torch_selector import segmented_top_k, selector_logits, trip_pool
 
 if TYPE_CHECKING:
     from scoring.exact import ExactCase
@@ -75,8 +75,8 @@ class TorchCaseScorer:
         self.k_counts = torch.as_tensor(case.key_valid_counts, device=resolved)
         self.segments = torch.as_tensor(case.key_segments, device=resolved)
         self.required = torch.as_tensor(case.required_keys, device=resolved)
-        self.q_descriptors = self._pool(self.q, self.q_counts)
-        self.k_descriptors = self._pool(self.k, self.k_counts)
+        self.q_descriptors = trip_pool(torch, self.q, self.q_counts)
+        self.k_descriptors = trip_pool(torch, self.k, self.k_counts)
 
     def score(
         self,
@@ -93,17 +93,15 @@ class TorchCaseScorer:
             selector.weights[f"{self.case.route}.proj_k"],
             device=self.device,
         )
-        dimension = selector.architecture.head_dim
-        q_hat = self.q_descriptors @ q_projection + self.q_descriptors[:, :dimension]
-        k_hat = self.k_descriptors @ k_projection + self.k_descriptors[:, :dimension]
-        logits = q_hat @ k_hat.T / sqrt(dimension)
-        _require_finite_logits(torch, logits)
+        logits = selector_logits(
+            torch, self.q_descriptors, self.k_descriptors, q_projection, k_projection,
+        )
 
         qualities: list[float] = []
         all_errors: list[list[float]] = []
         for budget in budgets:
-            mask = self._segmented_top_k(
-                logits,
+            mask = segmented_top_k(
+                torch, logits, self.segments, self.k_counts, required_keys=self.required,
                 target_blocks=budget.target_blocks,
                 reference_blocks=budget.reference_blocks,
             )
@@ -119,45 +117,6 @@ class TorchCaseScorer:
             all_errors.append(errors)
             qualities.append(1 / (1 + tail_error(errors, mean_weight=tail_mean_weight)))
         return qualities, all_errors
-
-    def _pool(self, tiles: Any, counts: Any) -> Any:
-        torch = self.torch
-        rows = torch.arange(tiles.shape[1], device=self.device)[None, :]
-        valid = rows < counts[:, None]
-        mean = (tiles * valid[:, :, None]).sum(dim=1) / counts[:, None].float()
-        maximum = tiles.masked_fill(~valid[:, :, None], float("-inf")).amax(dim=1)
-        minimum = tiles.masked_fill(~valid[:, :, None], float("inf")).amin(dim=1)
-        return torch.cat((mean, maximum, minimum), dim=-1)
-
-    def _segmented_top_k(
-        self,
-        logits: Any,
-        *,
-        target_blocks: int,
-        reference_blocks: int,
-    ) -> Any:
-        torch = self.torch
-        mask = self.required.clone()
-        mask[:, self.segments == 2] = True
-        for segment, budget, name in (
-            (0, target_blocks, "target"),
-            (1, reference_blocks, "reference"),
-        ):
-            keys = torch.nonzero(self.segments == segment, as_tuple=False).flatten()
-            if not keys.numel():
-                continue
-            if budget <= 0 or budget > keys.numel():
-                raise ValueError(f"{name} block budget cannot be satisfied")
-            required = mask.index_select(1, keys)
-            if bool((required.sum(dim=1) > budget).any()):
-                raise ValueError(f"required {name} keys exceed the block budget")
-            scores = logits.index_select(1, keys).masked_fill(required, float("inf"))
-            order = torch.argsort(scores, dim=1, descending=True, stable=True)
-            chosen = order[:, :budget]
-            segment_mask = torch.zeros_like(required)
-            segment_mask.scatter_(1, chosen, True)
-            mask[:, keys] = segment_mask
-        return mask
 
     def _attention(self, mask: Any) -> Any:
         return _attention(
@@ -194,8 +153,3 @@ def _attention(
         probabilities = torch.softmax(q[query, :count] @ keys.T * scale, dim=-1)
         output[query, :count] = probabilities @ values
     return output
-
-
-def _require_finite_logits(torch: Any, logits: Any) -> None:
-    if not bool(torch.isfinite(logits).all()):
-        raise ModelValidationError("MODEL_RUNTIME_INVALID", "selector produced non-finite logits")
