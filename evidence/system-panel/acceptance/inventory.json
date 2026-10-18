@@ -180,13 +180,97 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "正式预算内基线不饱和，Oracle 有稳定可测优势，允许输入上限代理未显示输入摘要构成主要瓶颈；否则改输入、tile 或预算",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "runtime_source_commit": "b81bfa8",
+        "cases": 384,
+        "independent_videos": 16,
+        "baseline_score": 0.9491625628902893,
+        "privileged_attention_mass_score": 0.962636856957986,
+        "privileged_attention_mass_gain_lower_bound": 0.003407085747544154,
+        "post_label_best_of_envelope_score": 0.96314658964124,
+        "post_label_best_of_envelope_gain_lower_bound": 0.003592955330838937,
+        "minimum_gain": 0.005,
+        "neither_diagnostic_clears_exact_gate": true,
+        "budgets": [
+          16,
+          32,
+          64
+        ],
+        "baseline_qualities": [
+          0.9049515788521687,
+          0.9527474088825503,
+          0.978196420771837
+        ],
+        "attention_mass_qualities": [
+          0.928434524341356,
+          0.9651849881975947,
+          0.9855038665795014
+        ],
+        "all_native_mask_budgets_and_required_keys_verified": true,
+        "elapsed_seconds": 69.00278203189373,
+        "scope": "One existing teacher-state audit batch. Privileged token-level information and post-label best-of are diagnostic only, not a legal submitted selector, optimum quality upper bound, full-video promotion or measured actual-model false-rejection rate. No training, production changes or threshold tuning.",
+        "fixed_existing_legal_mean_pool_control": {
+          "file_sha256": "58b972162e69435378a9a8fb0433bdf2916688fa74ccc7ddfb147d9373317d07",
+          "schema_valid": true,
+          "model_predates_both_batches": true,
+          "cases": 768,
+          "independent_videos": 32,
+          "source_families_disjoint": true,
+          "both_exact_gates_reject": true,
+          "batches": [
+            {
+              "cache_sha256": "25394b9282a9b79fd9f7b589281d49d17abafb753e69548db5af2124d7a8acb3",
+              "baseline_score": 0.9491625628902893,
+              "control_score": 0.9353699844236218,
+              "gain_lower_bound": -0.039145090975663745,
+              "elapsed_seconds": 85.88770762179047,
+              "children_remaining": 0
+            },
+            {
+              "cache_sha256": "38394c068b9f540c7617d672ffb67bd33ee9ac44fe63d9c39518b3c6500a3fbb",
+              "baseline_score": 0.9435341769270493,
+              "control_score": 0.9362689887617214,
+              "gain_lower_bound": -0.01900907332829081,
+              "elapsed_seconds": 83.446871236898,
+              "children_remaining": 0
+            }
+          ],
+          "scope": "Actual isolated FilePairedEvaluator with a fixed existing schema-valid model; exact-only on two disjoint cached batches, not full-video, live submission or broad ranking acceptance"
+        }
+      },
       "id": "E4",
       "method": "比较固定随机/退化对照、官方 VEDA、可审计外部 selector 和仅用于离线诊断的特权 Oracle；所有模型为只读输入",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/attention-mass-diagnostic-registration.json",
+          "sha256": "e5d5ef252a55a1455fbf260593ec05b2db42d5749ecf92d70d1925140320d242",
+          "scope": "Preregistered full-batch diagnostic with embedded exact harness and no directional success assertion"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/attention-mass-diagnostic-gpu6.raw.log",
+          "sha256": "9fb89b2e5c495a5ae61f7db58c6c9cf4c4aea877d87da170791a206f70dd32bc",
+          "scope": "Actual final-runtime H200 execution of all 384 original cases; original baseline reproduced, native segmented budgets/global/required masks checked, process exited zero"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/attention-mass-independent-review.json",
+          "sha256": "9b059dd41042118559811c6caece7422344150293c0215e0948b7aab13c51390",
+          "scope": "Independent low-memory CPU recomputation and complete original-case/baseline binding review; does not establish legal-model realizability or optimal quality"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/mean-pool-exact-registration.json",
+          "sha256": "0a60426a855b78a7701cea53ea80cd177b71124b5c60cc511c4e0a173140b842",
+          "scope": "Preregistered fixed existing model and both input batches; no training or directional success assertion"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/mean-pool-exact-gpu6.raw.log",
+          "sha256": "5ef66a79ad05f683a6e6cbc33683e89cc675417006f6e1950438a6c1a8d1c8e9",
+          "scope": "Actual current-image H200 isolated paired evaluation, two disjoint batches/768 cases, both original baseline scores reproduced, no promotion or public writes, exit zero"
+        }
+      ],
       "release_blocker": false,
-      "status": "post_launch_validation_pending",
+      "status": "privileged_headroom_and_two_batch_legal_control_verified_full_video_pending",
       "subject": "可竞争空间"
     },
     {
