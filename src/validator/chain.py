@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -82,7 +83,11 @@ async def scan_finalized_blocks(
             snapshot = await client.at(block_height)
             current_commitments = await snapshot.subnets.commitments(netuid)
             by_hotkey = _commitments_by_hotkey(current_commitments)
+            reveal_counts = Counter(reveal.hotkey for reveal in reveals)
+            reveal_offsets: Counter[str] = Counter()
             for reveal in reveals:
+                offset = reveal_offsets[reveal.hotkey]
+                reveal_offsets[reveal.hotkey] += 1
                 item = by_hotkey.get(reveal.hotkey)
                 values = getattr(item, "revealed", ()) if item is not None else ()
                 context = {
@@ -130,7 +135,7 @@ async def scan_finalized_blocks(
                         )
                         continue
                     matching.append(payload)
-                if len(matching) != 1:
+                if len(matching) != reveal_counts[reveal.hotkey]:
                     LOGGER.warning(
                         "skipping unmatched finalized commitment reveal",
                         extra={
@@ -138,6 +143,7 @@ async def scan_finalized_blocks(
                             "event_index": reveal.position.event_index,
                             "hotkey": reveal.hotkey,
                             "matching_plaintexts": len(matching),
+                            "reveal_events": reveal_counts[reveal.hotkey],
                             "netuid": netuid,
                         },
                     )
@@ -148,7 +154,9 @@ async def scan_finalized_blocks(
                         netuid,
                         block_hash,
                         reveal.position,
-                        matching[0],
+                        # The pallet appends plaintexts and emits their events in
+                        # the same field order, including multiple fields per block.
+                        matching[offset],
                     )
                 )
         commitments.sort(key=lambda item: item.position)

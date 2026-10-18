@@ -355,6 +355,82 @@ def test_scanner_skips_bad_timelock_reveals_and_advances_cursor(tmp_path, caplog
     assert "skipping unmatched finalized commitment reveal" in caplog.text
 
 
+@pytest.mark.parametrize("same_payload", [False, True])
+def test_scanner_binds_multiple_timelock_fields_in_event_order(tmp_path, same_payload):
+    payloads = [ModelSubmission("owner/first", "12" * 20).encode()]
+    payloads.append(
+        payloads[0] if same_payload else ModelSubmission("owner/second", "34" * 20).encode()
+    )
+    block_hash = "0x" + f"{100:064x}"
+    events = [
+        {"extrinsic_idx": None, "module_id": "Commitments", "event_id": "CommitmentRevealed",
+         "attributes": {"netuid": 7, "who": HOTKEY}}
+        for _ in payloads
+    ]
+    client = FakeClient({100: (block_hash, {"extrinsics": []}, events)})
+    client.revealed = {100: [SimpleNamespace(
+        hotkey=HOTKEY, revealed=[(100, "0x" + payload.hex()) for payload in payloads],
+    )]}
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        result = asyncio.run(scan_finalized_blocks(
+            client, store, netuid=7, track_start_block=100,
+        ))
+        challenges = store.public_snapshot()["challenges"]
+        assert result.submissions_found == 2
+        assert [row["event_index"] for row in challenges] == [0, 1]
+        assert [row["repo_id"] for row in challenges] == [
+            "owner/first", "owner/first" if same_payload else "owner/second",
+        ]
+        assert [row["state"] for row in challenges] == [
+            ChallengeState.QUEUED, ChallengeState.REJECTED_DUPLICATE_HOTKEY,
+        ]
+        assert len(store.active_competitors({HOTKEY: 1})) == 1
+
+
+@pytest.mark.parametrize("activation_first", [False, True])
+@pytest.mark.parametrize("submissions_closed", [False, True])
+def test_multiple_timelock_fields_cannot_hide_signed_legacy_activation(
+    tmp_path, activation_first, submissions_closed,
+):
+    import base64
+
+    from bittensor.wallet import Keypair
+
+    from validator.competition import is_valid_legacy_activation, legacy_activation_message
+
+    key = Keypair.create_from_seed(bytes([91]) * 32, crypto_type=0)
+    hotkey = key.ss58_address
+    signature = key.sign(legacy_activation_message(hotkey, 7))
+    activation = (
+        b"affine2|activate|" + hotkey.encode() + b"|"
+        + base64.urlsafe_b64encode(signature).rstrip(b"=")
+    )
+    assert is_valid_legacy_activation(activation, hotkey=hotkey, netuid=7)
+    payloads = [activation, b"unrelated"] if activation_first else [b"unrelated", activation]
+    first = chain_block(ModelSubmission("owner/model", "12" * 20).encode(), 100)
+    first[1]["extrinsics"][0]["address"] = hotkey
+    first[2][1]["attributes"]["who"] = hotkey
+    block_hash = "0x" + f"{101:064x}"
+    events = [
+        {"extrinsic_idx": None, "module_id": "Commitments", "event_id": "CommitmentRevealed",
+         "attributes": {"netuid": 7, "who": hotkey}}
+        for _ in payloads
+    ]
+    client = FakeClient({100: first, 101: (block_hash, {"extrinsics": []}, events)})
+    client.revealed = {101: [SimpleNamespace(
+        hotkey=hotkey, revealed=[(101, "0x" + payload.hex()) for payload in payloads],
+    )]}
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        result = asyncio.run(scan_finalized_blocks(
+            client, store, netuid=7, track_start_block=100,
+            submission_end_block=100 if submissions_closed else None,
+        ))
+        assert result.submissions_found == 1
+        assert store.active_competitors({hotkey: 1}) == []
+        assert store.legacy_excluded_hotkeys() == frozenset({hotkey})
+        assert store.chain_cursor() == (101, block_hash)
+
+
 @pytest.mark.parametrize("stored", ["0x", "", b""])
 def test_scanner_skips_empty_reveal_and_processes_the_next_block(
     tmp_path, caplog, stored
