@@ -179,10 +179,12 @@ verified published matches reconstruct completed work, and remaining submissions
 again.
 
 Private R2 is the durable source for unrevealed plans, the committed source pool, the artifact
-manifest, every runtime artifact, exact batches, validated selectors and recoverable scoring stages.
+manifest, every runtime artifact, exact batches, validated selectors, admission refusals and
+recoverable scoring stages.
 Both production services verify conditional-write support before starting, seed missing immutable
 objects from a complete local runtime, and restore missing local bytes by committed size and SHA-256.
-The GPU host therefore contains no unique tournament state.
+Verified archives on an independent storage backend are required before GPU-local state is disposable;
+same-host storage alone does not establish recovery after loss of the GPU machine.
 
 The manifest must cover a restorable OCI image, the exact producer/scorer source bundle and its
 dependency lock. The source bundle is a ZIP whose `cli.py`, `miner/`, `scoring/`, `validator/` and
@@ -332,10 +334,12 @@ recorded as `REJECTED_TRACK_CLOSED` without downloading or evaluating their mode
 
 `--exact-cache` contains immutable NPZ batches named `<generation-block>-<sha256>.npz`. Every batch
 binds its finalized block hash, source proofs, runtime artifacts and each case's planned
-source/rollout, route, step/sigma and deterministic query selection. Private R2
-stores the source pool, runtime-specific artifacts, every generated batch and every validated
-selector together with its immutable challenge binding and recoverable stage results. Admission
-replays restore this archive before contacting the submitted repository. The producer verifies
+source/rollout, route, step/sigma and deterministic query selection. Admission replays restore their
+archived result before contacting the submitted repository. Repository-access and model-validation
+refusals are archived before local completion: recovery preserves the original reason, decision
+block and downloaded file identity even if the repository later changes visibility. Failure to
+archive a refusal defers work as an infrastructure fault instead of rejecting the participant.
+The producer verifies
 atomic conditional creates and replacements against that endpoint before starting. Local SQLite,
 model downloads and work directories are disposable.
 
