@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, replace
 from math import ceil
 from pathlib import Path
@@ -37,6 +37,7 @@ from validator.publication import (
     build_public_artifacts,
     fetch_track_identity,
     fetch_weight_artifact,
+    resolve_public_disclosures,
     validate_public_weights_url,
 )
 from validator.queue import TERMINAL_STATES, ChallengeState
@@ -76,9 +77,13 @@ DEFAULT_MECHID = 1
 
 
 class ArtifactRepository(Protocol):
+    async def stage(self, artifacts: PublicArtifacts) -> None: ...
+
     async def publish(self, artifacts: PublicArtifacts) -> None: ...
 
     async def load(self, track: TrackSpec) -> PublicLedger: ...
+
+    async def finalize_abort(self, track: TrackSpec) -> None: ...
 
 
 def _require_production_release(
@@ -211,6 +216,28 @@ class _EvaluationWorker:
         self._pending = None
 
 
+async def _stage_publication(
+    artifacts: PublicArtifacts,
+    *,
+    terminal_ids: frozenset[str],
+    disclosed_plan_digests: frozenset[str],
+    batch_source: ReadyBatchSource | None,
+    publisher: ArtifactRepository,
+    work: _EvaluationWorker,
+) -> PublicArtifacts:
+    # Never overlap CUDA restore validation with the one in-flight evaluator.
+    # Its completed result may stay leased while the old public champion refreshes.
+    while work.busy and not work.done:
+        await asyncio.sleep(0.05)
+    prepared = await asyncio.to_thread(
+        resolve_public_disclosures, artifacts, terminal_challenge_ids=terminal_ids,
+        resolver=None if batch_source is None else batch_source.public_disclosure,
+        disclosed_plan_digests=disclosed_plan_digests,
+    )
+    await publisher.stage(prepared)
+    return prepared
+
+
 async def run_evaluator(
     *,
     track_spec: str | Path,
@@ -262,6 +289,8 @@ async def run_evaluator(
         while True:
             try:
                 ledger = await publisher.load(track)
+                if ledger.aborted:
+                    await publisher.finalize_abort(track)
                 break
             except Exception as exc:
                 _record_publication_failure(recovery_store, alert, exc)
@@ -382,7 +411,7 @@ async def run_evaluator(
         record_retry=None if retry_store is None else retry_store.record_failure,
     )
 
-    with ExitStack() as resources:
+    async with AsyncExitStack() as resources:
         store = resources.enter_context(ChallengeStore(database, track_spec_digest=track.digest))
         if confirmation_pool is not None:
             resources.callback(confirmation_pool.close)
@@ -416,6 +445,32 @@ async def run_evaluator(
         recovery_index = 0
         track_aborted = ledger.aborted
         publication: PublicArtifacts | None = None
+        published_match_count = ledger.committed_match_count
+        staged_match_count = published_match_count
+        reconcile_publication = bool(ledger.matches)
+        pending_artifacts: PublicArtifacts | None = None
+        publication_task: asyncio.Task[PublicArtifacts] | None = None
+        once_result: EvaluationCycleResult | None = None
+
+        def start_publication() -> asyncio.Task[PublicArtifacts]:
+            assert pending_artifacts is not None
+            return asyncio.create_task(_stage_publication(
+                pending_artifacts,
+                terminal_ids=frozenset(
+                    item["challenge_id"] for item in store.public_snapshot()["challenges"]
+                    if item["state"] in TERMINAL_STATES
+                ),
+                disclosed_plan_digests=frozenset(disclosed_plan_digests),
+                batch_source=batch_source, publisher=publisher, work=work,
+            ))
+
+        async def finish_publication() -> None:
+            work.allowed = False
+            if publication_task is not None:
+                with suppress(Exception):
+                    await asyncio.shield(publication_task)
+
+        resources.push_async_callback(finish_publication)
         consecutive_cycle_errors = 0
         while True:
             try:
@@ -424,6 +479,11 @@ async def run_evaluator(
                         finalized_block = await client.finalized_block()
                         if finalized_block >= track.track_start_block:
                             break
+                        if track_aborted:
+                            if once:
+                                return
+                            await asyncio.sleep(poll_seconds)
+                            continue
                         chain = await read_weight_chain_state(
                             client,
                             netuid=track.netuid,
@@ -462,6 +522,14 @@ async def run_evaluator(
                         before_block=track.track_start_block - 1,
                     )
                     while True:
+                        if (
+                            track_aborted and publication_task is not None
+                            and publication_task.done()
+                        ):
+                            with suppress(Exception):
+                                publication_task.result()
+                            publication_task = None
+                            pending_artifacts = None
                         await _refresh_seed_block_hashes(client, evaluator)
                         result = await process_cycle(
                             client,
@@ -470,6 +538,11 @@ async def run_evaluator(
                             track_start_block=track.track_start_block,
                             work=work,
                             wait_for_work=once,
+                            work_paused=(
+                                reconcile_publication or pending_artifacts is not None
+                                or staged_match_count != published_match_count
+                            ),
+                            published_match_count=published_match_count,
                             max_scan_blocks=max_scan_blocks,
                             recovery_matches=ledger.matches[recovery_index:],
                             # One height identifies one immutable public snapshot.
@@ -496,44 +569,95 @@ async def run_evaluator(
                                     netuid=track.netuid,
                                     finalized_block=result.finalized_block,
                                 )
+                                stage_error = None
+                                if (
+                                    publication_task is not None and publication_task.done()
+                                    and (
+                                        publication is None
+                                        or chain.finalized_block > publication.source_block
+                                    )
+                                ):
+                                    finished, publication_task = publication_task, None
+                                    try:
+                                        prepared = finished.result()
+                                    except Exception as exc:
+                                        _record_publication_failure(store, alert, exc)
+                                        stage_error = str(exc) or type(exc).__name__
+                                    else:
+                                        staged_match_count = len(prepared.matches)
+                                        disclosed_plan_digests.update(
+                                            name.removeprefix("batch_groups/").removesuffix(".json")
+                                            for name, _ in prepared.batch_groups
+                                        )
+                                        pending_artifacts = None
                                 if (
                                     publication is None
                                     or publication.source_block != chain.finalized_block
                                 ):
-                                    publication = build_public_artifacts(
-                                        store,
-                                        track,
-                                        chain,
-                                        version_key=version_key,
-                                        batch_disclosure_resolver=(
-                                            None
-                                            if batch_source is None
-                                            else batch_source.public_disclosure
-                                        ),
-                                        disclosed_plan_digests=frozenset(disclosed_plan_digests),
-                                        model_resolver=(
+                                    arguments = {
+                                        "version_key": version_key,
+                                        "model_resolver": (
                                             None if batch_source is None
                                             else batch_source.restore_model
                                         ),
-                                        runtime_manifest=runtime_manifest_payload,
-                                        track_aborted=track_aborted,
-                                        release_approval=getattr(
+                                        "runtime_manifest": runtime_manifest_payload,
+                                        "track_aborted": track_aborted,
+                                        "release_approval": getattr(
                                             publisher, "release_approval", None,
                                         ),
+                                    }
+                                    candidate = None
+                                    if (
+                                        pending_artifacts is None
+                                        and staged_match_count == published_match_count
+                                    ):
+                                        candidate = build_public_artifacts(
+                                            store, track, chain, **arguments,
+                                        )
+                                        if (
+                                            candidate is not None
+                                            and (
+                                                len(candidate.matches) > published_match_count
+                                                or reconcile_publication
+                                            )
+                                            and candidate.abort is None
+                                        ):
+                                            pending_artifacts = candidate
+                                            reconcile_publication = False
+                                            once_result = result
+                                    publication = (
+                                        candidate
+                                        if candidate is not None
+                                        and len(candidate.matches) == staged_match_count
+                                        else build_public_artifacts(
+                                            store, track, chain, match_limit=staged_match_count,
+                                            **arguments,
+                                        )
                                     )
+                                if once and pending_artifacts is not None:
+                                    if publication_task is None:
+                                        publication_task = start_publication()
+                                    await asyncio.shield(publication_task)
+                                    # No old-prefix heartbeat was published in one-shot mode;
+                                    # re-scan and bind the ready prefix to a fresh finalized head.
+                                    publication = None
+                                    continue
                                 artifacts = publication
                                 if artifacts is not None:
                                     await publisher.publish(artifacts)
                                     # publish() completes the full continuous match prefix,
                                     # disclosures and fenced pointers before clearing this gate.
-                                    store.publication_succeeded()
-                                    disclosed_plan_digests.update(
-                                        name.removeprefix("batch_groups/").removesuffix(".json")
-                                        for name, _ in artifacts.batch_groups
-                                    )
+                                    published_match_count = staged_match_count
+                                    if pending_artifacts is None:
+                                        store.publication_succeeded()
                                     if artifacts.abort is not None:
                                         track_aborted = True
-                                    if batch_source is not None:
+                                    elif pending_artifacts is not None and publication_task is None:
+                                        publication_task = start_publication()
+                                    if (
+                                        batch_source is not None and pending_artifacts is None
+                                        and publication_task is None
+                                    ):
                                         terminal_ids = {
                                             challenge["challenge_id"]
                                             for challenge in store.public_snapshot()["challenges"]
@@ -541,14 +665,16 @@ async def run_evaluator(
                                             in {state.value for state in TERMINAL_STATES}
                                         }
                                         batch_source.prune_disclosed(terminal_ids)
-                                    result = EvaluationCycleResult(
-                                        result.finalized_block,
-                                        result.scan,
-                                        result.admission,
-                                        result.scoring,
-                                        restored_matches=result.restored_matches,
+                                    result = replace(
+                                        result,
                                         published_block=artifacts.source_block,
+                                        publication_error=stage_error,
                                     )
+                                    if once and once_result is not None:
+                                        result = replace(
+                                            result, admission=once_result.admission,
+                                            scoring=once_result.scoring,
+                                        )
                             except Exception as exc:
                                 _record_publication_failure(store, alert, exc)
                                 result = EvaluationCycleResult(
@@ -748,6 +874,8 @@ async def process_cycle(
     track_start_block: int,
     work: _EvaluationWorker,
     wait_for_work: bool = False,
+    work_paused: bool = False,
+    published_match_count: int = 0,
     max_scan_blocks: int = 100,
     recovery_matches: Sequence[MatchRecord] = (),
     minimum_finalized_block: int = 0,
@@ -760,6 +888,8 @@ async def process_cycle(
     scoring_settings = work.scoring_settings
     if minimum_finalized_block < 0:
         raise ValueError("minimum finalized block cannot be negative")
+    if type(published_match_count) is not int or published_match_count < 0:
+        raise ValueError("published match count must be a non-negative integer")
     if track_close_block is not None and track_close_block < 0:
         raise ValueError("track close block cannot be negative")
     scan = await scan_finalized_blocks(
@@ -775,7 +905,12 @@ async def process_cycle(
         recovery_matches,
         maximum_effective_challenges=admission_settings.maximum_effective_challenges,
     )
-    if finalized_block < minimum_finalized_block:
+    cursor = store.chain_cursor()
+    if (
+        finalized_block < minimum_finalized_block
+        or cursor is None or cursor[0] != finalized_block
+        or restored_matches != len(recovery_matches)
+    ):
         work.allowed = False
         return EvaluationCycleResult(
             finalized_block,
@@ -785,8 +920,13 @@ async def process_cycle(
             restored_matches=restored_matches,
         )
     track_closed = track_close_block is not None and finalized_block > track_close_block
+    terminal_prefix = 0
+    for challenge in store.public_snapshot()["challenges"]:
+        if challenge["state"] not in TERMINAL_STATES:
+            break
+        terminal_prefix += 1
     work.allowed = not (
-        track_aborted or track_closed
+        work_paused or terminal_prefix > published_match_count or track_aborted or track_closed
         or store.publication_failures() >= MAX_PUBLICATION_FAILURES
     )
     if track_closed and admission_settings.last_submission_block is not None:

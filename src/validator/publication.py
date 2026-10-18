@@ -9,7 +9,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -96,6 +96,7 @@ class PublicLedger:
     matches: tuple[MatchRecord, ...]
     aborted: bool = False
     disclosed_plan_digests: frozenset[str] = frozenset()
+    committed_match_count: int = 0
 
     @property
     def required_finalized_block(self) -> int:
@@ -123,16 +124,13 @@ def build_public_artifacts(
     chain: WeightChainState,
     *,
     version_key: int,
-    batch_disclosure_resolver: Callable[
-        [str, frozenset[str]], BatchDisclosure | None
-    ] | None = None,
-    disclosed_plan_digests: frozenset[str] = frozenset(),
+    match_limit: int | None = None,
     model_resolver: Callable[[str, int], Path] | None = None,
     runtime_manifest: bytes | None = None,
     track_aborted: bool = False,
     release_approval: ReleaseApproval | None = None,
 ) -> PublicArtifacts | None:
-    """Build one auditable public snapshot when chain scanning is caught up."""
+    """Build bounded metadata without restoring or uploading disclosure payloads."""
 
     _verify_candidate_release(track, runtime_manifest, release_approval)
     cursor = store.chain_cursor()
@@ -148,8 +146,10 @@ def build_public_artifacts(
         chain.finalized_block > track.track_close_block and bool(unfinished)
     )
     initial = genesis_champion(track)
+    if match_limit is not None and (type(match_limit) is not int or match_limit < 0):
+        raise ValueError("public match limit must be a non-negative integer")
     tournament = resolve_tournament(
-        snapshot["challenges"],
+        snapshot["challenges"] if match_limit is None else snapshot["challenges"][:match_limit],
         track_id=track.track_id,
         track_spec_digest=track.digest,
         netuid=track.netuid,
@@ -158,6 +158,8 @@ def build_public_artifacts(
         initial_champion=initial,
         minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
     )
+    if match_limit is not None and len(tournament.matches) != match_limit:
+        raise PublicArtifactError("the committed public match prefix is missing locally")
     if any(match.document["decided_block"] > chain.finalized_block for match in tournament.matches):
         raise PublicArtifactError("a terminal decision is newer than the finalized chain snapshot")
     match_sequence, terminal_match_sha256 = _terminal_match_fence(tournament)
@@ -209,54 +211,8 @@ def build_public_artifacts(
         system_matches=system_match_summaries(system_matches),
     )
     files: dict[str, PublicFile] = {}
-    batch_groups: dict[str, bytes] = {}
-    terminal_ids = frozenset(
-        challenge["challenge_id"]
-        for challenge in snapshot["challenges"]
-        if challenge["state"] in {state.value for state in TERMINAL_STATES}
-    )
-    disclosure: dict[str, bool] = {}
     for match in tournament.matches:
         evaluation = match.document["evaluation"]
-        batch = evaluation["evaluation_batch"]
-        stage_batches = [
-            stage["evaluation_batch"]
-            for stage in evaluation["stages"]
-            if "evaluation_batch" in stage
-        ]
-        if batch is not None:
-            stage_batches.append(batch)
-        for used_batch in stage_batches:
-            plan_digest = used_batch["plan_digest"]
-            if plan_digest not in disclosure:
-                if plan_digest in disclosed_plan_digests:
-                    disclosure[plan_digest] = True
-                else:
-                    resolved = (
-                        None
-                        if batch_disclosure_resolver is None
-                        else batch_disclosure_resolver(plan_digest, terminal_ids)
-                    )
-                    disclosure[plan_digest] = bool(resolved) and set(
-                        resolved.challenge_ids
-                    ).issubset(terminal_ids)
-                    if disclosure[plan_digest]:
-                        assert resolved is not None
-                        batch_groups[resolved.record_name] = resolved.record_payload
-                        for item in resolved.files:
-                            files[item.object_name] = PublicFile(
-                                item.object_name,
-                                item.path,
-                                item.sha256,
-                            )
-            if (
-                disclosure[plan_digest]
-                and plan_digest not in disclosed_plan_digests
-                and used_batch["object"] not in files
-            ):
-                raise PublicArtifactError(
-                    "batch disclosure omitted its exact evaluation object"
-                )
         object_name = evaluation["model_object"]
         if object_name is not None:
             path_value = store.model_path(match.challenge_id)
@@ -289,7 +245,54 @@ def build_public_artifacts(
         files=tuple(files.values()),
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
         abort=_track_abort_artifact(track) if aborted else None,
-        batch_groups=tuple(sorted(batch_groups.items())),
+    )
+
+
+def resolve_public_disclosures(
+    artifacts: PublicArtifacts,
+    *,
+    terminal_challenge_ids: frozenset[str],
+    resolver: Callable[[str, frozenset[str]], BatchDisclosure | None] | None,
+    disclosed_plan_digests: frozenset[str] = frozenset(),
+) -> PublicArtifacts:
+    """Restore terminal groups off the scan loop; retain the exact immutable prefix."""
+
+    if resolver is None:
+        return artifacts
+    files = {item.object_name: item for item in artifacts.files}
+    batch_groups = dict(artifacts.batch_groups)
+    disclosure: dict[str, bool] = {}
+    for _name, payload in artifacts.matches:
+        evaluation = _decode_canonical_object(payload, "match")["evaluation"]
+        stage_batches = [
+            stage["evaluation_batch"] for stage in evaluation["stages"]
+            if "evaluation_batch" in stage
+        ]
+        if evaluation["evaluation_batch"] is not None:
+            stage_batches.append(evaluation["evaluation_batch"])
+        for used_batch in stage_batches:
+            plan_digest = used_batch["plan_digest"]
+            if plan_digest not in disclosure:
+                if plan_digest in disclosed_plan_digests:
+                    disclosure[plan_digest] = True
+                else:
+                    resolved = resolver(plan_digest, terminal_challenge_ids)
+                    disclosure[plan_digest] = bool(resolved) and set(
+                        resolved.challenge_ids
+                    ).issubset(terminal_challenge_ids)
+                    if disclosure[plan_digest]:
+                        batch_groups[resolved.record_name] = resolved.record_payload
+                        for item in resolved.files:
+                            files[item.object_name] = PublicFile(
+                                item.object_name, item.path, item.sha256,
+                            )
+            if (
+                disclosure[plan_digest] and plan_digest not in disclosed_plan_digests
+                and used_batch["object"] not in files
+            ):
+                raise PublicArtifactError("batch disclosure omitted its exact evaluation object")
+    return replace(
+        artifacts, files=tuple(files.values()), batch_groups=tuple(sorted(batch_groups.items())),
     )
 
 
@@ -581,7 +584,13 @@ async def _fetch_track_document(
                     raise PublicArtifactError("track artifact exceeds the byte limit")
     except httpx.HTTPError as exc:
         raise PublicArtifactError("track artifact could not be fetched") from exc
-    document = _decode_canonical_object(bytes(received), "track")
+    return _decode_track_document(bytes(received))
+
+
+def _decode_track_document(payload: bytes) -> dict[str, Any]:
+    """Authenticate the version-independent envelope, not an older scoring schema."""
+
+    document = _decode_canonical_object(payload, "track")
     if set(document) != {"track_spec_digest", "spec"}:
         raise PublicArtifactError("public track fields are invalid")
     digest = document["track_spec_digest"]
@@ -717,7 +726,9 @@ class S3Repository:
         finally:
             self._client.delete_object(Bucket=self._bucket, Key=key)
 
-    async def publish(self, artifacts: PublicArtifacts) -> None:
+    async def stage(self, artifacts: PublicArtifacts) -> None:
+        """Verify/upload immutable facts without changing any mutable pointer."""
+
         track_document = _decode_canonical_object(artifacts.track, "track")
         if self._prefix == "tracks/main":
             try:
@@ -759,7 +770,6 @@ class S3Repository:
             raise PublicArtifactError("track abort requires its null weight fence")
         if artifacts.runtime_manifest is not None:
             await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
-        await asyncio.to_thread(self._put_mutable, "track.json", artifacts.track)
         for artifact in artifacts.files:
             await asyncio.to_thread(self._put_file_immutable, artifact)
         for name, payload in artifacts.system_matches:
@@ -768,6 +778,10 @@ class S3Repository:
             await asyncio.to_thread(self._put_immutable, name, payload)
         for name, payload in artifacts.batch_groups:
             await asyncio.to_thread(self._put_immutable, name, payload)
+
+    async def publish(self, artifacts: PublicArtifacts) -> None:
+        await self.stage(artifacts)
+        await asyncio.to_thread(self._put_mutable, "track.json", artifacts.track)
         await asyncio.to_thread(self._put_mutable, "weights.json", artifacts.weights)
         if artifacts.abort is not None:
             await asyncio.to_thread(self._put_immutable, *artifacts.abort)
@@ -870,36 +884,24 @@ class S3Repository:
         if track_payload is None:
             if summary_payload is not None:
                 raise PublicArtifactError("public summary exists without its immutable track")
-            return PublicLedger(None, ())
+            return self._uncommitted_ledger(track)
 
-        track_document = _decode_canonical_object(track_payload, "track")
-        if set(track_document) != {"track_spec_digest", "spec"}:
-            raise PublicArtifactError("public track fields are invalid")
+        track_document = _decode_track_document(track_payload)
         try:
-            stored_track = parse_track_spec(track_document["spec"])
-        except ValueError as exc:
-            raise PublicArtifactError("public track specification is invalid") from exc
-        if track_document["track_spec_digest"] != stored_track.digest:
-            raise PublicArtifactError("public track digest is invalid")
-        if stored_track != track:
-            if stored_track.track_id == track.track_id:
-                raise PublicArtifactError("an active track ID cannot change its specification")
-            return PublicLedger(None, ())
+            stored_id = _string(track_document["spec"]["track_id"], "track_id")
+        except (KeyError, TypeError) as exc:
+            raise PublicArtifactError("public track identity is invalid") from exc
+        if stored_id != track.track_id:
+            return self._uncommitted_ledger(track)
+        if track_document["track_spec_digest"] != track.digest:
+            raise PublicArtifactError("an active track ID cannot change its specification")
 
-        aborted = self._load_track_abort(track)
-
-        if summary_payload is None:
-            matches = tuple(
-                self._load_following_matches(track, 1, genesis_champion(track))
-            )
-            self._verify_model_archives(matches)
-            return PublicLedger(
-                None,
-                matches,
-                aborted,
-                self._load_batch_disclosures(track, matches),
-            )
-        summary = _decode_canonical_object(summary_payload, "summary")
+        summary = (
+            None if summary_payload is None
+            else _decode_canonical_object(summary_payload, "summary")
+        )
+        if summary is None or summary.get("track_id") != track.track_id:
+            return self._uncommitted_ledger(track)
         expected_fields = {
             "track_id",
             "track_spec_digest",
@@ -960,13 +962,73 @@ class S3Repository:
 
         matches.extend(self._load_following_matches(track, match_count + 1, incumbent))
         complete_matches = tuple(matches)
-        self._verify_model_archives(complete_matches)
-        return PublicLedger(
-            source_block,
-            complete_matches,
-            aborted,
-            self._load_batch_disclosures(track, complete_matches),
+        return self._recovered_ledger(
+            track, complete_matches, source_block=source_block,
+            committed_count=match_count, aborted=self._load_track_abort(track),
         )
+
+    def _uncommitted_ledger(self, track: TrackSpec) -> PublicLedger:
+        matches = tuple(self._load_following_matches(track, 1, genesis_champion(track)))
+        return self._recovered_ledger(
+            track, matches, source_block=None, committed_count=0,
+            aborted=self._load_track_abort(track),
+        )
+
+    def _recovered_ledger(
+        self, track: TrackSpec, matches: tuple[MatchRecord, ...], *,
+        source_block: int | None, committed_count: int, aborted: bool,
+    ) -> PublicLedger:
+        self._verify_model_archives(matches)
+        disclosures = self._load_batch_disclosures(track, matches)
+        payload = self._get_optional("weights.json")
+        if payload is not None and (
+            _decode_canonical_object(payload, "weights").get("track_id") == track.track_id
+        ):
+            weights = decode_weight_artifact(payload)
+            if (
+                weights.track_id != track.track_id or weights.track_spec_digest != track.digest
+                or weights.netuid != track.netuid or weights.mechid != track.mechid
+            ):
+                raise PublicArtifactError("public weight fence targets a different track")
+            count = weights.match_sequence
+            if count > len(matches):
+                raise PublicArtifactError("public weight fence is missing immutable matches")
+            terminal_sha256 = (
+                None if count == 0
+                else hashlib.sha256(_json_bytes(matches[count - 1].document)).hexdigest()
+            )
+            if (
+                weights.terminal_match_sha256 != terminal_sha256
+                or any(match.document["decided_block"] > weights.source_block
+                       for match in matches[:count])
+            ):
+                raise PublicArtifactError("public weight fence does not bind its immutable prefix")
+            committed_count = max(committed_count, count)
+            source_block = max(0 if source_block is None else source_block, weights.source_block)
+            aborted = aborted or weights.track_aborted
+        return PublicLedger(
+            source_block, matches, aborted, disclosures, committed_count,
+        )
+
+    async def finalize_abort(self, track: TrackSpec) -> None:
+        """Finish an interrupted terminal event; never refresh or revive weights."""
+
+        await asyncio.to_thread(self._finalize_abort, track)
+
+    def _finalize_abort(self, track: TrackSpec) -> None:
+        if self._load_track_abort(track):
+            return
+        payload = self._get_optional("weights.json")
+        if payload is None:
+            raise PublicArtifactError("track abort requires its durable null weight fence")
+        fence = decode_weight_artifact(payload)
+        if (
+            fence.track_id != track.track_id or fence.track_spec_digest != track.digest
+            or fence.netuid != track.netuid or fence.mechid != track.mechid
+            or not fence.track_aborted or fence.plan is not None
+        ):
+            raise PublicArtifactError("track abort requires its durable null weight fence")
+        self._put_immutable(*_track_abort_artifact(track))
 
     def _load_track_abort(self, track: TrackSpec) -> bool:
         name, expected = _track_abort_artifact(track)

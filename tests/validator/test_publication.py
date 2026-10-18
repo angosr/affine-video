@@ -26,11 +26,13 @@ from validator.publication import (
     PublicArtifacts,
     PublicFile,
     S3Repository,
+    build_genesis_artifacts,
     build_public_artifacts,
     decode_weight_artifact,
     encode_weight_artifact,
     fetch_track_identity,
     fetch_weight_artifact,
+    resolve_public_disclosures,
     validate_public_weights_url,
 )
 from validator.queue import ChainPosition
@@ -541,6 +543,21 @@ def test_storage_factory_requires_complete_safe_environment(monkeypatch) -> None
         S3Repository.from_environment(bucket="public-data", prefix="veda/track")
 
 
+def test_staging_uploads_only_immutable_facts_without_any_pointer() -> None:
+    client = MemoryS3()
+    publisher = S3Repository(client, bucket="public-data", prefix="veda/track")
+    artifacts = PublicArtifacts(
+        120, pointer_track(), b"summary", pointer_weights(120),
+        (("matches/track/000000000001.json", b"match"),),
+    )
+    asyncio.run(publisher.stage(artifacts))
+    assert client.objects == {"veda/track/matches/track/000000000001.json": b"match"}
+    assert client.calls[0]["IfNoneMatch"] == "*"
+    asyncio.run(publisher.publish(artifacts))
+    assert client.objects["veda/track/weights.json"] == artifacts.weights
+    assert len([call for call in client.calls if call["Key"].endswith("000000000001.json")]) == 1
+
+
 def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
     client = MemoryS3()
     publisher = S3Repository(client, bucket="public-data", prefix="veda/track")
@@ -555,13 +572,13 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
 
     writes = [call for call in client.calls if "Key" in call and "Body" in call]
     assert [call["Key"] for call in writes] == [
-        "veda/track/track.json",
         "veda/track/matches/track/000000000001.json",
+        "veda/track/track.json",
         "veda/track/weights.json",
         "veda/track/summary.json",
     ]
-    assert writes[0]["CacheControl"] == "no-store, max-age=0"
-    assert writes[1]["CacheControl"].endswith("immutable")
+    assert writes[0]["CacheControl"].endswith("immutable")
+    assert writes[1]["CacheControl"] == "no-store, max-age=0"
     assert writes[2]["CacheControl"] == writes[3]["CacheControl"] == "no-store, max-age=0"
 
     client.calls.clear()
@@ -1069,7 +1086,8 @@ def test_empty_track_publishes_uid_zero_veda_as_genesis_champion() -> None:
     assert status["track_close_block"] == 1150
 
 
-def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
+@pytest.mark.parametrize("event_failure", [False, True])
+def test_track_abort_stops_weight_refresh_after_close_grace(event_failure) -> None:
     track = parse_track_spec(valid_spec())
     snapshot = {
         "challenges": [
@@ -1127,7 +1145,20 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
     )
     client.objects["tracks/test/weights.json"] = existing
     repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
-    asyncio.run(repository.publish(artifacts))
+    with pytest.raises(PublicArtifactError, match="null weight fence"):
+        asyncio.run(repository.finalize_abort(track))
+    if event_failure:
+        def fail_event(arguments):
+            if arguments["Key"].endswith("/track-aborted.json"):
+                client.before_put = None
+                raise OSError("interrupted after null weights and before abort event")
+
+        client.before_put = fail_event
+        with pytest.raises(OSError, match="interrupted"):
+            asyncio.run(repository.publish(artifacts))
+        assert f"tracks/test/{artifacts.abort[0]}" not in client.objects
+    else:
+        asyncio.run(repository.publish(artifacts))
     stopped = decode_weight_artifact(client.objects["tracks/test/weights.json"])
     assert stopped.source_block == block
     assert stopped.plan is None
@@ -1135,6 +1166,14 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
 
     ledger = asyncio.run(repository.load(track))
     assert ledger.aborted is True
+    weights_before = client.objects["tracks/test/weights.json"]
+    writes_before = len(client.calls)
+    asyncio.run(repository.finalize_abort(track))
+    assert client.objects[f"tracks/test/{artifacts.abort[0]}"] == artifacts.abort[1]
+    assert client.objects["tracks/test/weights.json"] == weights_before
+    assert [call["Key"] for call in client.calls[writes_before:]] == (
+        [f"tracks/test/{artifacts.abort[0]}"] if event_failure else []
+    )
     recovered_store = SimpleNamespace(
         chain_cursor=lambda: (block, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": []},
@@ -1237,11 +1276,51 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary(tmp_path)
         S3Repository(client, bucket="public-data", prefix="veda/track").load(track)
     )
     assert recovered.source_block == 120
+    assert recovered.committed_match_count == 1
     assert recovered.required_finalized_block == 126
     assert [match.challenge_id for match in recovered.matches] == [
         "challenge-1",
         "challenge-2",
     ]
+
+
+@pytest.mark.parametrize("phase", ["previous", "track", "weights", "summary"])
+def test_loader_reconciles_fixed_path_cutover_without_parsing_previous_scoring_schema(phase):
+    track = parse_track_spec(valid_spec())
+    previous_spec = {
+        "track_id": "previous-track", "netuid": track.netuid, "mechid": track.mechid,
+        "track_start_block": 1, "retired_scoring_schema": {"version": "not-v2"},
+    }
+    previous_document = {
+        "spec": previous_spec,
+        "track_spec_digest": hashlib.sha256(canonical_json(previous_spec)).hexdigest(),
+    }
+    client = MemoryS3()
+    client.objects = {
+        "tracks/main/track.json": canonical_json(previous_document),
+        "tracks/main/weights.json": canonical_json({"track_id": "previous-track", "old_format": 1}),
+        "tracks/main/summary.json": canonical_json({"track_id": "previous-track", "old_format": 1}),
+    }
+    current = build_genesis_artifacts(
+        track, WeightChainState(120, {track.initial_champion.hotkey: 0}, 1, 1.0, 1, {}),
+        version_key=0,
+    )
+    if phase != "previous":
+        client.objects["tracks/main/track.json"] = current.track
+    if phase in {"weights", "summary"}:
+        client.objects["tracks/main/weights.json"] = current.weights
+    if phase == "summary":
+        client.objects["tracks/main/summary.json"] = current.summary
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    recovered = asyncio.run(repository.load(track))
+    assert recovered.matches == () and recovered.committed_match_count == 0
+    assert recovered.source_block == (120 if phase in {"weights", "summary"} else None)
+    assert client.calls == []
+    if phase == "previous":
+        previous_document["spec"]["track_start_block"] = 2
+        client.objects["tracks/main/track.json"] = canonical_json(previous_document)
+        with pytest.raises(PublicArtifactError, match="digest"):
+            asyncio.run(repository.load(track))
 
 
 def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_path) -> None:
@@ -1639,6 +1718,16 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     assert public_summary["leaderboard_total"] == 2
     assert public_match["outcome"] == "CHALLENGER_WON"
 
+    previous_prefix = build_public_artifacts(store, track, chain, version_key=9, match_limit=0)
+    assert previous_prefix.matches == previous_prefix.files == ()
+    assert decode_weight_artifact(previous_prefix.weights).plan.hotkeys == ("genesis-hotkey",)
+    assert json.loads(previous_prefix.summary)["match_count"] == 0
+    for invalid in (-1, True):
+        with pytest.raises(ValueError, match="match limit"):
+            build_public_artifacts(store, track, chain, version_key=9, match_limit=invalid)
+    with pytest.raises(PublicArtifactError, match="prefix is missing"):
+        build_public_artifacts(store, track, chain, version_key=9, match_limit=2)
+
     missing_champion = WeightChainState(
         121,
         {"genesis-hotkey": 0},
@@ -1689,12 +1778,12 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
             ),
         )
 
-    withheld = build_public_artifacts(
-        store,
-        track,
-        chain,
-        version_key=9,
-        batch_disclosure_resolver=lambda digest, _terminal: disclosure(
+    metadata = build_public_artifacts(store, track, chain, version_key=9)
+    assert metadata is not None
+    withheld = resolve_public_disclosures(
+        metadata,
+        terminal_challenge_ids=frozenset({"challenge"}),
+        resolver=lambda digest, _terminal: disclosure(
             digest, ("challenge", "pending")
         ),
     )
@@ -1707,19 +1796,16 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         unresolved.append(digest)
         return None
 
-    still_pending = build_public_artifacts(
-        store, track, chain, version_key=9, batch_disclosure_resolver=no_terminal_group,
+    still_pending = resolve_public_disclosures(
+        metadata, terminal_challenge_ids=frozenset({"challenge"}), resolver=no_terminal_group,
     )
     assert still_pending is not None
     assert len(unresolved) == 2 and len(set(unresolved)) == 2
     assert still_pending.batch_groups == ()
     assert not any(item.object_name.startswith("batches/") for item in still_pending.files)
-    disclosed = build_public_artifacts(
-        store,
-        track,
-        chain,
-        version_key=9,
-        batch_disclosure_resolver=lambda digest, _terminal: disclosure(digest, ("challenge",)),
+    disclosed = resolve_public_disclosures(
+        metadata, terminal_challenge_ids=frozenset({"challenge"}),
+        resolver=lambda digest, _terminal: disclosure(digest, ("challenge",)),
     )
     assert disclosed is not None
     assert sum(item.object_name.startswith("batches/") for item in disclosed.files) == 2
@@ -1734,12 +1820,9 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     def unexpected_disclosure(_digest, _terminal):
         raise AssertionError("an already public batch was restored from private storage")
 
-    repeated = build_public_artifacts(
-        store,
-        track,
-        chain,
-        version_key=9,
-        batch_disclosure_resolver=unexpected_disclosure,
+    repeated = resolve_public_disclosures(
+        metadata, terminal_challenge_ids=frozenset({"challenge"}),
+        resolver=unexpected_disclosure,
         disclosed_plan_digests=resolved_digests,
     )
     assert repeated is not None
