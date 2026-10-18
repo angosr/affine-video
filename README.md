@@ -324,8 +324,8 @@ Policy generation refuses to overwrite an existing file; verification rejects ex
 This document check does not replace live credential denial probes against the target backend.
 The production configuration also uses a separate `evaluator_artifact_root`; it must be mounted
 without the producer artifact root, source-pool file, complete production/audit SampleCache, or
-producer work tree. Mount only the producer's `work_dir/content` subdirectory read-only at the same
-configured path in the evaluator, so it can read selected batch data without access to the full pool.
+producer work tree. Mount only the producer's `work_dir/content` subdirectory at the same configured
+path in the evaluator, allowing terminal-data cleanup without access to the full pool.
 
 Failure events are logged when `VEDA_ALERT_WEBHOOK_URL` is unset; no external notification service
 is required to start. To enable push notifications, configure it in both service environments as an
