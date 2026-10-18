@@ -364,6 +364,22 @@
           "gpu_devices_requested": false,
           "scope": "Full existing 550MB-class files checked on GPU host, using original schema/finite/hash validator; declared metadata is not chain/HF authentication. Existing registration file hashes still enforced. No models created or modified."
         },
+        "registered_full_layer_study": {
+          "status": "running",
+          "runtime_source_commit": "b81bfa8",
+          "layers": 50,
+          "geometries": 4,
+          "text_token_counts": [90, 107],
+          "fixed_controls": 3,
+          "legal_mask_patterns": 4,
+          "physical_gpus": [6, 7],
+          "expected_sparse_rows_per_phase": 8400,
+          "calibration_and_confirmation_seeds_disjoint": true,
+          "execution_mode": "torch.no_grad, matching formal sparse rollout",
+          "timeout_seconds_per_shard": 14400,
+          "automatic_restart_or_deadline_extension": false,
+          "scope": "Initial real H200 execution and protocol/source/control bindings verified, with live off-GPU raw collectors. No completed fit, independent confirmation, E10/E11 acceptance or formal cost changes yet."
+        },
         "cost_parameters_changed": false,
         "scope": "Synthetic BF16 packed QKV; original full production selector plus four legal mask probes, not necessarily realizable submitted projections. Original evaluator with live cost shape and optimistic per-geometry scales on the same measurements; not preregistered fit or independent confirmation, not all50 layers or whole-model throughput. All four observed geometry gates failed."
       },
@@ -390,6 +406,16 @@
           "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/control-preflight-result.json",
           "sha256": "a2d3f44e1824e0b0282f6394455def783b16f5a20a89fd45cb89d773b15110c3",
           "scope": "Actual frozen 860 runtime on GPU host: official baseline plus two owner-bearing fixed controls, original anonymous-only failure reproduced then full schema/finite/file and tensor digest validation through corrected benchmark helper; no GPU allocation, new models or miner ownership claim."
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/registration.json",
+          "sha256": "950bfef233187617041cc43efc29b227147664f37918242a4dd59468061c40d3",
+          "scope": "Frozen full50-layer cost protocol, actual fixed input length endpoints, three read-only controls/four legal mask probes, disjoint calibration/confirmation seeds and fixed per-shard deadlines. No hidden video generation, training or live parameter change."
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/first-live-observation.json",
+          "sha256": "25c482d6d3733db44915acae20db6a5dec0ff0eaf481e761852d92af40f2c4c1",
+          "scope": "Actual GPU6/GPU7 container IDs, deadlines, first completed raw rows, protocol mirrors and source/environment/control identities checked. Running measurements only, not completed calibration or confirmation."
         }
       ],
       "release_blocker": false,
@@ -723,7 +749,17 @@
           "runtime_source_commit": "b81bfa8",
           "temporary_cleanup_passed": false,
           "scoring_opportunity_preserved": true,
-          "scope": "Actual SIGKILL and off-GPU S3 READY commit with injected response loss. Recovery succeeded but a retained-plan batch temp survived normal pruning. Candidate cleanup fix is not deployed or counted as passing; no CUDA dense revalidation, real scoring or whole-host recovery claim."
+          "scope": "Actual SIGKILL and off-GPU S3 READY commit with injected response loss. Recovery succeeded but a retained-plan batch temp survived normal pruning. This frozen-runtime failure remains recorded; separate candidate repair evidence is not a deployed fix. No CUDA dense revalidation, real scoring or whole-host recovery claim."
+        },
+        "candidate_cleanup_repair": {
+          "source_commit": "8863972",
+          "cpu_tests_passed": 732,
+          "cpu_tests_skipped_without_torch": 12,
+          "three_ready_plans_oldest_pending_progress_regression_passed": true,
+          "real_interrupted_temp_copy_bytes_reclaimed": 11827811,
+          "original_failed_file_and_complete_npz_sha_unchanged": true,
+          "deployed": false,
+          "scope": "Minimal candidate repair, independent clean CPU suite/build hashes and isolated actual orphan-copy cleanup reviewed. Three-plan scheduling is a controlled regression, not actual three-batch S3 generation or new frozen-image acceptance."
         },
         "current_production_plan_lifecycle": {
           "videos": 16,
@@ -850,6 +886,16 @@
           "path": "private/production-plan-860-20261019-0205/assembly-interruption-20261019-0405/controller-component-review.json",
           "sha256": "c01e9a460b39904bb051e7e9443a1226079310ff004f64a3895455d7f5da3160",
           "scope": "Native controller actual TLS S3 metadata and SQLite integrity review, preserving the failed cleanup finding; not an independent re-read of bulk NPZ or whole-host acceptance."
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/assembly-interruption-20261019-0405/pending-retention/controller-review.json",
+          "sha256": "6ce953cfea6e376e447dd3ce8f78020ea15a633a519c2a63e3ed85bd06d67f6d",
+          "scope": "Candidate886 service SHA matches Git; actual isolated real-orphan-copy cleanup preserves original failed file and complete NPZ. Controlled scheduling regression preserves oldest pending READY work among three plans. Source overlay, not deployed b81 or a frozen new runtime."
+        },
+        {
+          "path": "private/code-verification-8863972/result.json",
+          "sha256": "974fc61917cf16fb33aae88624dd0f932682735417c2e87ce8d98581f89b705e",
+          "scope": "Clean committed candidate full732-pass/12-no-Torch-skip suite, Ruff, offline sdist/wheel and exact source bytes. Root independently verified six artifact hashes and JUnit744/0fail/0error/12skip totals; not GPU or formal runtime deployment acceptance."
         }
       ],
       "release_blocker": false,
