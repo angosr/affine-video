@@ -44,6 +44,7 @@ class RejectedAdmission:
     score_block: int
     file_sha256: str | None = None
     model_size_bytes: int | None = None
+    duplicate_of: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,24 +169,6 @@ def process_next_admission(
             now_ms=now,
         )
 
-    reference_owner = store.earlier_reference_owner(task.challenge_id)
-    if reference_owner is not None:
-        store.complete_challenge(
-            task.challenge_id,
-            ChallengeState.PARTICIPANT_FAILED,
-            error_code="REFERENCE_DUPLICATE",
-            error_summary="repository revision duplicates an earlier active submission",
-            occurred_at_ms=now,
-            lease_token=task.lease_token,
-            score_block=current_finalized_block,
-        )
-        return AdmissionOutcome(
-            task.challenge_id,
-            AdmissionStatus.FAILED,
-            "REFERENCE_DUPLICATE",
-            reference_owner,
-        )
-
     downloaded = None
     if settings.restore is not None:
         try:
@@ -201,6 +184,17 @@ def process_next_admission(
     if isinstance(downloaded, RejectedAdmission):
         return _reject_participant(
             store, task, settings, downloaded,
+            current_finalized_block=current_finalized_block, now_ms=now,
+        )
+    reference_owner = store.earlier_reference_owner(task.challenge_id)
+    if reference_owner is not None:
+        return _reject_participant(
+            store, task, settings,
+            _observed_rejection(
+                store, task, "REFERENCE_DUPLICATE",
+                "repository revision duplicates an earlier active submission",
+                current_finalized_block, duplicate_of=reference_owner,
+            ),
             current_finalized_block=current_finalized_block, now_ms=now,
         )
     model_path = Path(task.model_path) if task.model_path is not None else None
@@ -323,8 +317,8 @@ def process_next_admission(
     if duplicate_owner is not None:
         return _reject_exact_duplicate(
             store,
-            task.challenge_id,
-            task.lease_token,
+            task,
+            settings,
             duplicate_owner,
             current_finalized_block=current_finalized_block,
             now_ms=now,
@@ -357,8 +351,8 @@ def process_next_admission(
     if not registration.accepted:
         return _reject_exact_duplicate(
             store,
-            task.challenge_id,
-            task.lease_token,
+            task,
+            settings,
             registration.duplicate_of,
             current_finalized_block=current_finalized_block,
             now_ms=now,
@@ -368,10 +362,11 @@ def process_next_admission(
 
 def _observed_rejection(
     store: ChallengeStore, task: LeasedChallenge, code: str, summary: str, score_block: int,
+    *, duplicate_of: str | None = None,
 ) -> RejectedAdmission:
     row = store.public_challenge(task.challenge_id)
     return RejectedAdmission(
-        code, summary, score_block, row["file_sha256"], row["model_size_bytes"],
+        code, summary, score_block, row["file_sha256"], row["model_size_bytes"], duplicate_of,
     )
 
 
@@ -407,7 +402,9 @@ def _reject_participant(
                 file_sha256=rejection.file_sha256,
                 model_size_bytes=rejection.model_size_bytes,
             )
-            return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, rejection.code)
+            return AdmissionOutcome(
+                task.challenge_id, AdmissionStatus.FAILED, rejection.code, rejection.duplicate_of,
+            )
     status = _defer_or_fail(store, task, settings, now_ms, error)
     return AdmissionOutcome(task.challenge_id, status, error.code)
 
@@ -434,8 +431,8 @@ def _defer_cached_model(
 
 def _reject_exact_duplicate(
     store: ChallengeStore,
-    challenge_id: str,
-    lease_token: str,
+    task: LeasedChallenge,
+    settings: AdmissionSettings,
     duplicate_of: str | None,
     *,
     current_finalized_block: int,
@@ -443,20 +440,13 @@ def _reject_exact_duplicate(
 ) -> AdmissionOutcome:
     if duplicate_of is None:
         raise RuntimeError("duplicate model is missing its earlier owner")
-    store.complete_challenge(
-        challenge_id,
-        ChallengeState.PARTICIPANT_FAILED,
-        error_code="EXACT_DUPLICATE",
-        error_summary="model weights duplicate an earlier submission",
-        occurred_at_ms=now_ms,
-        lease_token=lease_token,
-        score_block=current_finalized_block,
-    )
-    return AdmissionOutcome(
-        challenge_id,
-        AdmissionStatus.FAILED,
-        "EXACT_DUPLICATE",
-        duplicate_of,
+    return _reject_participant(
+        store, task, settings,
+        _observed_rejection(
+            store, task, "EXACT_DUPLICATE", "model weights duplicate an earlier submission",
+            current_finalized_block, duplicate_of=duplicate_of,
+        ),
+        current_finalized_block=current_finalized_block, now_ms=now_ms,
     )
 
 

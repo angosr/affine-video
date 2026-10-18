@@ -163,9 +163,64 @@ def test_admission_rejection_survives_loss_of_local_database(
             assert downloads == []
 
 
+@pytest.mark.parametrize("duplicate_reference", [False, True])
+def test_duplicate_rejection_survives_loss_without_repository_access(
+    tmp_path, duplicate_reference,
+) -> None:
+    objects = PrivateObjectStore(MemoryS3(), bucket="private-data", prefix="test")
+    source = ReadyBatchSource(
+        track=SimpleNamespace(digest="ab" * 32), objects=objects, cache_dir=tmp_path / "archive",
+    )
+    configured = replace(
+        settings(tmp_path), archive=source.archive_model, restore=source.restore_admission,
+        archive_rejection=source.archive_rejection,
+    )
+    first = submission_at(100, "hk1", "owner/first")
+    second = submission_at(101, "hk2", "owner/first" if duplicate_reference else "owner/copy")
+    models = (tmp_path / "first.safetensors", tmp_path / "copy.safetensors")
+    write_model(models[0], "hk1")
+    write_model(models[1], "hk2")
+    expected_code = "REFERENCE_DUPLICATE" if duplicate_reference else "EXACT_DUPLICATE"
+    with ChallengeStore(tmp_path / "original.db") as store:
+        owner, _ = store.add_submission(first, occurred_at_ms=1)
+        duplicate, _ = store.add_submission(second, occurred_at_ms=2)
+        assert process_next_admission(
+            store, worker_id="original", settings=configured, current_finalized_block=110,
+            now_ms=10, downloader=model_downloader(models[0]),
+        ).status is AdmissionStatus.ACCEPTED
+        result = process_next_admission(
+            store, worker_id="original", settings=configured, current_finalized_block=110,
+            now_ms=20, downloader=model_downloader(models[1]),
+        )
+        assert result.code == expected_code and result.duplicate_of == owner
+        original = store.public_challenge(duplicate)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("duplicate recovery must not contact the repository")
+
+    with ChallengeStore(tmp_path / "fresh.db") as store:
+        store.add_submission(first, occurred_at_ms=30)
+        store.add_submission(second, occurred_at_ms=40)
+        assert process_next_admission(
+            store, worker_id="recovered", settings=configured, current_finalized_block=120,
+            now_ms=50, downloader=forbidden,
+        ).status is AdmissionStatus.ACCEPTED
+        result = process_next_admission(
+            store, worker_id="recovered", settings=configured, current_finalized_block=120,
+            now_ms=60, downloader=forbidden,
+        )
+        assert result.status is AdmissionStatus.FAILED
+        assert result.code == expected_code and result.duplicate_of == owner
+        recovered = store.public_challenge(duplicate)
+        for field in ("score_block", "file_sha256", "model_size_bytes", "error_code"):
+            assert recovered[field] == original[field]
+
+
 @pytest.mark.parametrize("changes", [
     {"hotkey": "another-hotkey"}, {"score_block": True},
     {"file_sha256": "ab" * 32}, {"file_sha256": "ab" * 32, "model_size_bytes": -1},
+    {"duplicate_of": "not-a-challenge"},
+    {"error_code": "EXACT_DUPLICATE"},
 ])
 def test_archived_admission_rejection_rejects_invalid_identity(tmp_path, changes) -> None:
     client = MemoryS3()

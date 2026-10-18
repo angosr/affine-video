@@ -162,6 +162,7 @@ class ReadyBatchSource:
             "score_block": rejection.score_block,
             "file_sha256": rejection.file_sha256,
             "model_size_bytes": rejection.model_size_bytes,
+            "duplicate_of": rejection.duplicate_of,
         }
         self.objects.create_plan(self._admission_name(task.challenge_id), _json(document))
 
@@ -185,6 +186,7 @@ class ReadyBatchSource:
                 _json(document) != stored.body
                 or set(document) != set(identity) | {
                     "error_code", "error_summary", "score_block", "file_sha256", "model_size_bytes",
+                    "duplicate_of",
                 }
                 or any(document.get(key) != value for key, value in identity.items())
                 or not isinstance(document.get("error_code"), str)
@@ -192,6 +194,14 @@ class ReadyBatchSource:
                 or not isinstance(document.get("error_summary"), str)
                 or type(document.get("score_block")) is not int
                 or document["score_block"] < task.position.block
+                or (
+                    document.get("duplicate_of") is not None
+                    and not _digest(document["duplicate_of"])
+                )
+                or (
+                    (document["error_code"] in {"REFERENCE_DUPLICATE", "EXACT_DUPLICATE"})
+                    != (document.get("duplicate_of") is not None)
+                )
                 or (
                     (document.get("file_sha256") is None)
                     != (document.get("model_size_bytes") is None)
@@ -209,6 +219,7 @@ class ReadyBatchSource:
             return RejectedAdmission(
                 document["error_code"], document["error_summary"], document["score_block"],
                 document["file_sha256"], document["model_size_bytes"],
+                document["duplicate_of"],
             )
         file_sha256 = document.get("file_sha256") if isinstance(document, dict) else None
         model_digest = document.get("model_digest") if isinstance(document, dict) else None
