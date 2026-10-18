@@ -395,7 +395,7 @@ def validate_dense_reference(
         expected_float[valid].reshape(-1),
         epsilon=case.epsilon,
     )
-    if not np.array_equal(observed_storage, expected):
+    if not np.array_equal(observed_storage.view(np.uint16), expected.view(np.uint16)):
         raise ValueError(
             "exact dense reference diverges from its Q/K/V: "
             f"max_abs={maximum:.9g}, mean_abs={mean:.9g}, relative={relative:.9g}"

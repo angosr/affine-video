@@ -64,6 +64,26 @@ def test_canonical_dense_reference_is_an_exact_float16_binding() -> None:
         validate_dense_reference(replace(canonical, dense=dense + np.float16(100)))
 
 
+@pytest.mark.parametrize("bit", [0, 15])
+def test_canonical_dense_reference_rejects_single_bit_changes_including_signed_zero(
+    bit: int,
+) -> None:
+    case = exact_case(1)
+    q, k, v = (np.zeros_like(value, dtype=np.float16) for value in (case.q, case.k, case.v))
+    dense = canonical_dense_reference(
+        q, k, v, case.query_valid_counts, case.key_valid_counts
+    )
+    canonical = replace(case, q=q, k=k, v=v, dense=dense)
+    assert validate_dense_reference(canonical) == (0.0, 0.0, 0.0)
+
+    mutated = dense.copy()
+    mutated.view(np.uint16).flat[0] ^= np.uint16(1 << bit)
+    if bit == 15:
+        assert np.array_equal(mutated, dense)
+    with pytest.raises(ValueError, match="diverges"):
+        validate_dense_reference(replace(canonical, dense=mutated))
+
+
 def test_paired_gain_bound_supports_losses_and_is_deterministic() -> None:
     cases = [exact_case(seed) for seed in range(4)]
     arguments = {
