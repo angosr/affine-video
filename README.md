@@ -13,6 +13,12 @@ Every Validator, including the one operated alongside the evaluator, runs the sa
 lightweight process: fetch `weights.json`, validate it against finalized chain state, and sign its
 own `SetWeights` transaction. No service or direct Miner-to-Validator protocol exists.
 
+The live SN120/mech-1 [track specification](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/track.json)
+uses digest `8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34`
+and frozen evaluator source `b81bfa8`. Public paths are unchanged. The new image has passed
+H200 numerical, repeatability, CUDA tie-order and error checks; its fresh two-stage validation
+continues after deployment, without relabeling earlier runtime evidence.
+
 ## Competition flow
 
 1. A Miner commits a Hugging Face `repo_id` and a complete 40-character commit SHA on-chain.
@@ -72,7 +78,8 @@ cannot turn its own numerical failure into an infrastructure retry that blocks t
 
 Initial launch requires real H200 scorer/runtime parity, fixed self and degraded-model controls,
 a two-stage FIFO challenge, measured budget costs, data isolation and durable recovery. Immutable
-control summaries are published under `system_matches/` without affecting rewards. Broader
+control summaries are published under `system_matches/` when their recorded contract matches
+the live runtime, without affecting rewards. Broader
 ten-batch stability, near-threshold power, proxy-ranking and human-quality studies continue after
 launch; pending research is not marked passed. Bootstrap alpha is a calibration target, not a
 proved finite-sample guarantee. Unit tests and intermediate GPU checks alone do not establish
