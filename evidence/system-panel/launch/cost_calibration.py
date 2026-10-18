@@ -335,7 +335,6 @@ def run(arguments):
                         "end_to_end_cuda_samples_ms": dense_cuda,
                         "end_to_end": summarize(dense_samples),
                     }
-                    write_once(dense_path, dense_row)
                 write_once(dense_path, dense_row)
                 dense_samples = dense_row["end_to_end_samples_ms"]
                 for name in controls:
