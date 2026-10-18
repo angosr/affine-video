@@ -457,21 +457,20 @@ class ProducerService:
                         ) as store,
                     ):
                         cursor = store.chain_cursor()
+                        if cursor is not None and cursor[0] > self.track.track_close_block:
+                            return
                         coordinator = PlanCoordinator(
                             track=self.track,
                             store=store,
                             objects=self.objects,
                             source_pool=self.pool,
                         )
-                        closed = cursor is not None and cursor[0] > self.track.track_close_block
-                        created = None if closed else coordinator.create_next()
+                        created = coordinator.create_next()
                         plans = coordinator.plans()
                         pending = next(
                             (row for row in plans if row[2].state == "PLANNED"
                              or self._needs_regeneration(row[2])), None,
                         )
-                        if closed and pending is None:
-                            return
                         retained = _retained_plan_digests(plans)
                         attempt = (
                             None if pending is None

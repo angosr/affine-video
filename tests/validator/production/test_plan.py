@@ -60,6 +60,7 @@ from validator.production.service import (
 )
 from validator.production.storage import LocalBatchStore, PreconditionFailed, StoredObject
 from validator.queue import ChainPosition, ChallengeState
+from validator.store import ChallengeStore
 
 
 def scoring() -> ScoringSpec:
@@ -682,6 +683,86 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_blocks_changed_bytes
     assert objects.get("stages/challenge/SCORING.json").body == b"immutable scored result"
     assert objects.get_optional(f"interruptions/{plan.plan_digest}.json") is not None
     assert not service._needs_regeneration(ready)  # durable stop, not an endless GPU retry
+
+
+@pytest.mark.parametrize("state", ["PLANNED", "READY"])
+@pytest.mark.parametrize("initially_closed", [False, True])
+def test_producer_close_stops_pending_work_and_releases_workers(
+    monkeypatch, tmp_path, state, initially_closed,
+) -> None:
+    plan = build_plan(
+        track_spec_digest="ab" * 32, generation_block=120,
+        block_hash="0x" + "cd" * 32, track_start_block=100,
+        minimum_generation_delay_blocks=1, generation_interval_blocks=20,
+        exact_challenge_ids=("challenge",), confirmation_challenge_ids=(),
+        source_proofs=(proof(0), proof(1)), scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+    if state == "READY":
+        plan = plan.ready(
+            exact=ReadyObject("exact/batch.npz", "12" * 32, 100),
+            dense_references=tuple(
+                DenseReference(
+                    rollout.rollout_id,
+                    ReadyObject(f"videos/{index}.mp4", "34" * 32, 100),
+                    ReadyObject(f"latents/{index}.safetensors", "56" * 32, 100),
+                )
+                for index, rollout in enumerate(plan.rollouts)
+            ),
+            sample_cache=ready_sample_cache(),
+        )
+    database = tmp_path / "validator.db"
+    with ChallengeStore(database, track_spec_digest=plan.track_spec_digest) as store:
+        store.advance_chain_cursor(201 if initially_closed else 200, "0x" + "cd" * 32)
+    objects = AttemptObjects({"plans/120.json": plan.encode()})
+    original = objects.get("plans/120.json")
+    executions, closed_workers = [], []
+
+    class Coordinator:
+        def __init__(self, **_kwargs):
+            pass
+
+        def create_next(self):
+            return None
+
+        def plans(self):
+            return (("plans/120.json", original, plan),)
+
+    service = object.__new__(ProducerService)
+    service.config = SimpleNamespace(
+        validator_database=database, work_dir=tmp_path, poll_seconds=0.01,
+    )
+    service.track = SimpleNamespace(digest=plan.track_spec_digest, track_close_block=200)
+    service.objects = objects
+    service.pool = None
+    service.alert = None
+    service.attempt_timeout_seconds = 10
+    service._needs_regeneration = lambda _plan: True
+
+    def execute(*_args, **_kwargs):
+        executions.append(plan.plan_digest)
+        assert len(executions) == 1, "no attempt may start after the close cursor"
+        with ChallengeStore(database, track_spec_digest=plan.track_spec_digest) as store:
+            store.advance_chain_cursor(201, "0x" + "ef" * 32)
+        return plan
+
+    service._execute = execute
+
+    def sleep(_seconds):
+        assert len(executions) <= 1, "producer kept retrying after close"
+
+    monkeypatch.setattr(production_service, "PlanCoordinator", Coordinator)
+    monkeypatch.setattr(
+        production_service, "WorkerPool",
+        lambda *_args: SimpleNamespace(close=lambda: closed_workers.append(True)),
+    )
+    monkeypatch.setattr(production_service.time, "sleep", sleep)
+    service._run_locked(once=False)
+
+    expected = 0 if initially_closed else 1
+    assert len(executions) == len(closed_workers) == expected
+    assert _plan_attempt_count(objects, plan) == expected
+    assert objects.get("plans/120.json") == original
 
 
 def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
