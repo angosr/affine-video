@@ -1,3 +1,5 @@
+import pytest
+
 from validator.monitor import render_status
 
 
@@ -42,7 +44,7 @@ def test_monitor_renders_all_active_competitors_in_uid_order() -> None:
 
     rendered = render_status(status, color=False)
 
-    assert "VEDA SN120  block 12345  ACTIVE" in rendered
+    assert "VEDA SN120  block 12345  UNKNOWN" in rendered
     assert "abcdef" in rendered and "123456" in rendered
     assert "CHAMPION" in rendered
     assert "#1" in rendered and "#2" in rendered
@@ -51,3 +53,12 @@ def test_monitor_renders_all_active_competitors_in_uid_order() -> None:
     assert "MeanPool control" in rendered
     assert "0.549221" in rendered and "0.505509" in rendered
     assert "do not affect tournament rank" in rendered
+
+
+@pytest.mark.parametrize("phase", ["SCHEDULED", "ACCEPTING", "DRAINING", "CLOSED", "TRACK_ABORTED"])
+def test_monitor_displays_only_the_reported_phase(phase):
+    rendered = render_status(
+        {"netuid": 120, "source_block": 12345, "track_phase": phase, "participants": []},
+        color=False,
+    )
+    assert f"VEDA SN120  block 12345  {phase}" in rendered

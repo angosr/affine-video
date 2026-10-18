@@ -51,7 +51,7 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
     yellow = "\033[33m" if use_color else ""
     bold = "\033[1m" if use_color else ""
     reset = "\033[0m" if use_color else ""
-    phase = status.get("track_phase", "ACTIVE")
+    phase = status.get("track_phase", "UNKNOWN")
     if not isinstance(phase, str) or not phase:
         raise PublicArtifactError("public status track phase is invalid")
 
