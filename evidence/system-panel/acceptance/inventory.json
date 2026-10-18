@@ -11,13 +11,40 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "full-mask 与 dense 的相对 L2 误差、最大绝对误差均低于清单门槛；否则修实现",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "runtime_source_commit": "b81bfa8",
+        "image_id": "sha256:3749e5b063b50d66c4d676dd2c79c10c460e5d7f1de9e7713f7444428bcc2c2c",
+        "cases": 16,
+        "geometries": 4,
+        "text_token_counts": [1, 257],
+        "layers": [0, 49],
+        "heads": 56,
+        "physical_gpu": 6,
+        "max_relative_squared_error": 7.626704394121098e-06,
+        "max_abs_delta": 0.000244140625,
+        "padding_max_abs": 0.0,
+        "elapsed_seconds": 12.038463227916509,
+        "input": "Seeded synthetic BF16 full packed QKV, not hidden source families",
+        "scope": "Actual production projections/gather/native sparse FA4/scatter with an all-valid-key mask versus installed H3 dense FA4; not full-model hook recapture or Top-k quality acceptance"
+      },
       "id": "E1",
       "method": "逐层比较在线 hook、独立 dense reference 与稀疏 kernel 在 full-mask 下的 Q/K/V 和输出",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/full-mask-native-registration.json",
+          "sha256": "b93ee3bd9b899676885486f27748126a8543f6fe0fb90b7506d9b235bc1be9a9",
+          "scope": "Preregistered component diagnostic with embedded exact harness and thresholds, no production changes"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/full-mask-native-gpu6.raw.log",
+          "sha256": "b5bb58a2122d2180ea561ecb8988c2b1055812d54cf42e7d03199933417861a6",
+          "scope": "Actual frozen-runtime H200 execution, all 16 registered component cases passed and process exited zero; does not establish the broader E1 hook/reference criterion"
+        }
+      ],
       "release_blocker": false,
-      "status": "not_final_runtime_verified",
+      "status": "native_full_mask_component_verified_hook_reference_pending",
       "subject": "截取点与参考实现"
     },
     {
@@ -71,72 +98,83 @@
       "subject": "缓存数值忠实度"
     },
     {
-      "acceptance_manifest": null,
+      "acceptance_manifest": {
+        "path": "evidence/system-panel/acceptance-8608cf5d/sqlite-final/result.json",
+        "sha256": "54d774dba6e60b45b7ec8b5872aa922a13ddb3269ac3d4a32436620821770687"
+      },
       "acceptance_rule": "真实GPU执行固定self和退化对照，完成一次两阶段FIFO闭环；self不能晋级，较好基线能战胜可控退化，两阶段均过线才替换冠军，confirmation使用exact决策之后的新批次；报告局部与完整视频分数差异，不宣称已证明总体排序一致",
       "actual_values": {
         "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
         "runtime_source_commit": "b81bfa8",
-        "status": "Fresh final-runtime exact and independent future full-video execution are running; no current E3 pass claimed",
-        "historical_d1b": {
-          "track_spec_digest": "d1b387642e1da0fa35411c6d7ebfa830567a14e84be8c6163e2062afe4257260",
-          "runtime_source_commit": "18e9c5c",
-          "independent_videos_per_phase": 16,
-          "exact_cases_per_phase": 384,
-          "full_video_cells": 96,
-          "exact_gain_lower_bound": 0.1124564422946204,
-          "full_video_baseline_score": 0.748815835848915,
-          "full_video_shuffled_score": 0.6697538860530137,
-          "full_video_gain_lower_bound": 0.03787727964707052,
-          "minimum_gain": 0.005,
-          "self_gain_lower_bound": 0.0,
-          "phase_source_families_disjoint": true,
-          "both_stage_gates_required_for_promotion": true,
-          "following_fifo_negative_preserves_new_champion": true,
-          "archived_stages_restored_without_rescoring": true,
-          "private_s3_stage_objects_independently_verified": 5,
-          "saved_sqlite_databases_verified": 10,
-          "memory_s3_used": false,
-          "clock": "user-approved isolated accelerated chain fixture",
-          "real_chain_admission_or_weight_transaction_claimed": false
-        }
+        "image_id": "sha256:3749e5b063b50d66c4d676dd2c79c10c460e5d7f1de9e7713f7444428bcc2c2c",
+        "source_sha256": "3fdf7148a4da81119ee51b6557e2a08066c4ffdc69bdb759fd567e524ab0c025",
+        "independent_videos_per_phase": 16,
+        "exact_cases_per_phase": 384,
+        "full_video_cells": 96,
+        "exact_gain_lower_bound": 0.09963065729838526,
+        "full_video_baseline_score": 0.7619235479211722,
+        "full_video_shuffled_score": 0.6570879920438147,
+        "full_video_gain_lower_bound": 0.04190771739740623,
+        "minimum_gain": 0.005,
+        "self_gain_lower_bound": 0.0,
+        "phase_source_families_disjoint": true,
+        "both_stage_gates_required_for_promotion": true,
+        "following_fifo_negative_preserves_new_champion": true,
+        "archived_stages_restored_without_rescoring": true,
+        "private_s3_stage_objects_independently_verified": 5,
+        "saved_sqlite_databases_verified": 10,
+        "memory_s3_used": false,
+        "clock": "user-approved isolated accelerated chain fixture",
+        "real_chain_admission_or_weight_transaction_claimed": false,
+        "scope": "Fixed self/degraded controls and actual two-stage SQLite/S3 lifecycle only; not overall ranking, whole-host recovery or release acceptance"
       },
       "id": "E3",
       "method": "用固定只读self和退化模型运行真实exact及完整视频，核验FIFO、未来confirmation、冠军替换及持久化事实；更广的跨批次、近阈值和排序研究上线后继续，不训练模型",
-      "pass": false,
+      "pass": true,
       "raw_evidence": [
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/confirmation-result.json",
-          "sha256": "6e176d5d9355d294224be2074c0f98c3d4c69ced03d9659f7a45af9086291776",
-          "scope": "Historical D1B only, not current 860 acceptance: Fresh independent 16-video future audit confirmation using the actual frozen 18e9c5c scorer; virtual chain clock, not a real Miner match"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/sqlite-final/result.json",
-          "sha256": "143f6aeb53457b8d26aad75362c4389d7e13d0ab8f214f0d2a98d5f565508b75",
-          "scope": "Historical D1B only, not current 860 acceptance: Real GPU reports wired to SQLite, actual off-GPU S3 stage archives, two-stage promotion, FIFO, loss-before-local-commit recovery and ledger replay; controlled degraded incumbent, no HF admission or official genesis defeat"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/sqlite-final.raw.log",
-          "sha256": "f4ca2c06c8dd64b27426544f0eb02213458cc96bb19c62b5db9064fbfec34c09",
-          "scope": "Historical D1B only, not current 860 acceptance: Actual isolated two-stage SQLite/S3 execution, exit zero; no public writes or chain transaction"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/sqlite-final/independent-s3-check.json",
-          "sha256": "7884b757f198117843c33584f947a2838c133127683659b7eee496b954b73173",
-          "scope": "Historical D1B only, not current 860 acceptance: Independent control-host GET of all five archived stage bodies and SHA/identity/metrics verification against ten integrity-checked saved SQLite databases"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/e3-two-stage.json",
-          "sha256": "d98d19e427b8459ba9d39247ef8c3c276ec38969b352196d1e17b59c7bdf0445",
-          "scope": "Historical D1B two-stage receipt, not current 860 acceptance"
-        },
         {
           "path": "evidence/system-panel/acceptance-8608cf5d/registration.json",
           "sha256": "b2ea42e559398b52a365491311c29077f69adc8c95c8f5c55d2536cb4fc0b188",
-          "scope": "Preregistration only; not a two-stage result"
+          "scope": "Preregistration of the exact frozen runtime and phase identities"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/exact-result.json",
+          "sha256": "4a2f9c84bef9067522a83d80b8674d2eba7438439aa8495cc0c550852fa66809",
+          "scope": "Actual 16-video first-stage GPU report"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/confirmation-result.json",
+          "sha256": "59b6aba46debcb3001848ca667443106b25fc075bc7071acf0487ceb5d37057e",
+          "scope": "Independent future 16-video complete video report, disjoint source families"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/exact-aggregate-independent-review.json",
+          "sha256": "0eea4323a33b56b6cff031b0e3d80a1843c809bee1d86e3b18441ba8c2aa1174",
+          "scope": "Independent frozen-source recomputation of all 384 exact cells"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/full-video-aggregate-independent-review.json",
+          "sha256": "2624dfff2064e57784af9db51f79978d8993b96a66d183dbe18c822b903b789e",
+          "scope": "Independent frozen-source recomputation of 96 full-video cells"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/sqlite-final/result.json",
+          "sha256": "54d774dba6e60b45b7ec8b5872aa922a13ddb3269ac3d4a32436620821770687",
+          "scope": "Actual frozen-runtime GPU reports to SQLite FIFO, two-stage promotion, real off-GPU S3 archives and loss-before-commit recovery; isolated accelerated chain fixture, not HF admission or formal-genesis defeat"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/sqlite-final.raw.log",
+          "sha256": "cc16e97cd66c071afb68000395d761721a1284b7b80a1ba632033e883f77754e",
+          "scope": "Actual isolated SQLite/S3 execution exited zero, no public writes or chain transactions"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/sqlite-final/independent-s3-check.json",
+          "sha256": "01affe0848568ad8a1443e1cffb11b30528ed675806ecb223ffbeea87ce6dfca",
+          "scope": "Independent actual S3 GET of five full private stage bodies against ten saved SQLite databases; public projections separately verified"
         }
       ],
       "release_blocker": true,
-      "status": "final_runtime_two_stage_running",
+      "status": "final_runtime_registered_two_stage_controls_and_sqlite_s3_passed",
       "subject": "teacher-state 到完整稀疏 rollout 的分布偏移"
     },
     {
