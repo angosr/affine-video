@@ -512,13 +512,37 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "局部对视频主指标的 Spearman bootstrap 95% 下界 ≥0.8，且前列无集中结构性伪影；否则修改缓存/分数，或仅在 E18 证明扩大完整视频评测可负担时发布",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "same_cohort_diagnostic": {
+          "independent_videos": 16,
+          "fixed_models": 2,
+          "exact_cases": 384,
+          "video_budget_cells": 96,
+          "paired_gain_spearman_across_videos": -0.2323529411764706,
+          "stratified_video_bootstrap_95_percent_interval": [-0.6385318869165023, 0.2053581468194474],
+          "within_stratum_demeaned_spearman": -0.011764705882352941,
+          "per_video_gain_sign_disagreements": 0,
+          "scope": "All original confirmation videos, baseline versus shuffled-head control. Local and full-video ordering agree on all16 videos, but improvement magnitudes do not correlate reliably. This is cross-video paired-gain evidence, not cross-model ranking, near-baseline retention, human visual quality or E12/E17 acceptance. No GPU call, inference, training or scoring change."
+        }
+      },
       "id": "E12",
       "method": "比较 \\(S_{local}\\)、自动视频指标和盲法配对结果",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "private/same-cohort-fidelity-860-20261019/registration.json",
+          "sha256": "95a6921e785dfd7cae865922cd52decdd1269a914faddbf16fddffcb859907fe",
+          "scope": "Frozen input hashes and complete CPU harness before this diagnostic: aggregate all16 original videos, stratify bootstrap by geometry, preserve route/step/budget dependence, fixed seed and10000 resamples; not a new model-ranking acceptance protocol."
+        },
+        {
+          "path": "private/same-cohort-fidelity-860-20261019/result.json",
+          "sha256": "abbf52a1fb87d8d9f7cb7815ae5ee564c78b5a15c476195b3438d141dfdebd5e",
+          "scope": "Actual bounded CPU recomputation, all original worker/binding hashes and aggregate scores verified. Two executions reproduce all correlations, intervals and counts; final receipt retains per-video values. Weak cross-video paired-gain correlation is not relabeled as model-ranking failure or acceptance."
+        }
+      ],
       "release_blocker": false,
-      "status": "post_launch_validation_pending",
+      "status": "same_cohort_magnitude_diagnostic_complete_model_ranking_unverified",
       "subject": "局部分数有效性"
     },
     {
