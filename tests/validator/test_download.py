@@ -1,11 +1,15 @@
 import errno
 import hashlib
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from validator import chunks
+from validator import download as download_module
 from validator.chunks import ChunkManifest, ChunkPart
 from validator.download import (
     ModelDownloadError,
@@ -224,11 +228,52 @@ def test_download_persists_an_absolute_cache_path(monkeypatch, tmp_path) -> None
     assert downloaded.path.parent == (tmp_path / "relative-cache").resolve()
 
 
-def test_local_download_preparation_failure_is_temporary(monkeypatch, tmp_path) -> None:
-    def disk_full(*_args, **_kwargs):
-        raise OSError(errno.ENOSPC, "no space left on device")
+@pytest.mark.parametrize("error_number", [errno.ENOSPC, errno.EIO])
+@pytest.mark.parametrize(
+    "operation",
+    ["mkdir", "mkstemp", "fdopen", "write", "flush", "close", "fsync", "replace", "unlink"],
+)
+def test_local_download_io_failure_is_temporary(
+    monkeypatch, tmp_path, operation, error_number
+) -> None:
+    failure = OSError(error_number, "injected local I/O failure")
 
-    monkeypatch.setattr("validator.download.tempfile.mkstemp", disk_full)
+    def disk_full(*_args, **_kwargs):
+        raise failure
+
+    targets = {
+        "mkdir": "validator.download.Path.mkdir",
+        "mkstemp": "validator.download.tempfile.mkstemp",
+        "fdopen": "validator.download.os.fdopen",
+        "fsync": "validator.download.os.fsync",
+        "replace": "validator.download.os.replace",
+        "unlink": "validator.download.Path.unlink",
+    }
+    if operation == "unlink":
+        (tmp_path / f"{hashlib.sha256(b'abcdef').hexdigest()}.safetensors").write_bytes(
+            b"abcdef"
+        )
+    if operation in targets:
+        monkeypatch.setattr(targets[operation], disk_full)
+    else:
+        real_fdopen = os.fdopen
+
+        class FailingOutput:
+            def __init__(self, *args, **kwargs):
+                self.output = real_fdopen(*args, **kwargs)
+
+            def close(self):
+                self.output.close()
+                if operation == "close":
+                    raise failure
+
+            def __getattr__(self, name):
+                if name == operation:
+                    return disk_full
+                return getattr(self.output, name)
+
+        monkeypatch.setattr(download_module.os, "fdopen", FailingOutput)
+
     with pytest.raises(ModelDownloadError) as caught:
         download_public_model(
             "owner/model",
@@ -241,6 +286,110 @@ def test_local_download_preparation_failure_is_temporary(monkeypatch, tmp_path) 
 
     assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
     assert caught.value.temporary is True
+    assert caught.value.__cause__ is failure
+
+
+def test_fdopen_failure_closes_the_unclaimed_descriptor(monkeypatch, tmp_path) -> None:
+    descriptors = []
+    real_close = os.close
+
+    def fail_fdopen(descriptor, _mode):
+        descriptors.append(descriptor)
+        raise OSError(errno.ENOSPC, "fdopen failed")
+
+    monkeypatch.setattr(download_module.os, "fdopen", fail_fdopen)
+    with pytest.raises(ModelDownloadError):
+        download_public_model(
+            "owner/model", "12" * 20, cache_dir=tmp_path, max_bytes=10,
+            api=FakeApi([sibling(size=6)]), http_client=FakeClient(),
+        )
+
+    assert len(descriptors) == 1
+    with pytest.raises(OSError) as caught:
+        real_close(descriptors[0])
+    assert caught.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "temporary"),
+    [(401, "REPOSITORY_UNAVAILABLE", False), (403, "REPOSITORY_UNAVAILABLE", False),
+     (404, "MODEL_FILE_MISSING", False), (429, "DOWNLOAD_TEMPORARY_FAILURE", True),
+     (500, "DOWNLOAD_TEMPORARY_FAILURE", True), (200, "DOWNLOAD_TEMPORARY_FAILURE", True)],
+)
+def test_cleanup_failures_preserve_the_original_download_error(
+    monkeypatch, tmp_path, status, code, temporary
+) -> None:
+    primary_failure = OSError(errno.ENOSPC, "original disk full")
+    cleanup_calls = []
+    real_fdopen = os.fdopen
+
+    def failing_fdopen(*args, **kwargs):
+        output = real_fdopen(*args, **kwargs)
+        real_close = output.close
+
+        def fail_close():
+            real_close()
+            cleanup_calls.append("file")
+            raise OSError(errno.EIO, "secondary file close failure")
+
+        monkeypatch.setattr(output, "close", fail_close)
+        return output
+
+    class CleanupFailingClient(FakeClient):
+        def stream(self, method, url):
+            response = super().stream(method, url)
+            response.status_code = status
+            return response
+
+        def close(self):
+            cleanup_calls.append("client")
+            raise httpx.CloseError("secondary close failure")
+
+    def fail_unlink(*_args, **_kwargs):
+        cleanup_calls.append("unlink")
+        raise OSError(errno.EIO, "secondary unlink failure")
+
+    def fail_fsync(*_args):
+        raise primary_failure
+
+    monkeypatch.setattr(download_module.httpx, "Client", lambda **_kwargs: CleanupFailingClient())
+    monkeypatch.setattr(download_module.os, "fdopen", failing_fdopen)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    monkeypatch.setattr(download_module.os, "fsync", fail_fsync)
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model", "12" * 20, cache_dir=tmp_path, max_bytes=10,
+            api=FakeApi([sibling(size=6)]),
+        )
+
+    assert caught.value.code == code
+    assert caught.value.temporary is temporary
+    assert cleanup_calls == ["file", "unlink", "client"]
+    if status == 200:
+        assert caught.value.__cause__ is primary_failure
+
+
+@pytest.mark.parametrize(
+    "failure", [OSError(errno.EIO, "close failed"), httpx.CloseError("close failed")]
+)
+def test_client_close_io_failure_after_download_is_temporary(
+    monkeypatch, tmp_path, failure
+) -> None:
+    class CleanupFailingClient(FakeClient):
+        def close(self):
+            raise failure
+
+    monkeypatch.setattr(download_module.httpx, "Client", lambda **_kwargs: CleanupFailingClient())
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model", "12" * 20, cache_dir=tmp_path, max_bytes=10,
+            api=FakeApi([sibling(size=6)]),
+        )
+
+    assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
+    assert caught.value.temporary is True
+    assert caught.value.__cause__ is failure
+    assert list(tmp_path.glob("*.safetensors"))
 
 
 def test_metadata_size_rejects_before_download(tmp_path) -> None:

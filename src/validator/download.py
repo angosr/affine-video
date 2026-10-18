@@ -6,9 +6,9 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 from collections.abc import Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -378,6 +378,7 @@ def download_public_model(
     client: httpx.Client | None = http_client
     descriptor: int | None = None
     temporary: Path | None = None
+    output = None
     digest = hashlib.sha256()
     received = 0
     etag: str | None = None
@@ -389,32 +390,33 @@ def download_public_model(
         descriptor, temporary_name = tempfile.mkstemp(prefix=".partial-", dir=cache)
         temporary = Path(temporary_name)
         client = client or httpx.Client(follow_redirects=True, timeout=timeout_seconds)
-        raw_descriptor = descriptor
+        output = os.fdopen(descriptor, "wb")
         descriptor = None
-        with os.fdopen(raw_descriptor, "wb") as output:
-            url = hf_hub_url(repo_id, MODEL_FILENAME, revision=revision)
-            with client.stream("GET", url) as response:
-                if response.status_code >= 400:
-                    raise _http_failure(response.status_code)
-                content_length = response.headers.get("content-length")
-                if content_length is not None and int(content_length) > max_bytes:
+        url = hf_hub_url(repo_id, MODEL_FILENAME, revision=revision)
+        with client.stream("GET", url) as response:
+            if response.status_code >= 400:
+                raise _http_failure(response.status_code)
+            content_length = response.headers.get("content-length")
+            if content_length is not None and int(content_length) > max_bytes:
+                raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
+            etag = response.headers.get("etag")
+            host = urlparse(str(response.url)).hostname
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                received += len(chunk)
+                if received > max_bytes:
                     raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
-                etag = response.headers.get("etag")
-                host = urlparse(str(response.url)).hostname
-                for chunk in response.iter_bytes(chunk_size=1024 * 1024):
-                    received += len(chunk)
-                    if received > max_bytes:
-                        raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
-                    digest.update(chunk)
-                    output.write(chunk)
-            if declared_size is not None and received != declared_size:
-                raise ModelDownloadError(
-                    "DOWNLOAD_TEMPORARY_FAILURE",
-                    "downloaded model size does not match repository metadata",
-                    temporary=True,
-                )
-            output.flush()
-            os.fsync(output.fileno())
+                digest.update(chunk)
+                output.write(chunk)
+        if declared_size is not None and received != declared_size:
+            raise ModelDownloadError(
+                "DOWNLOAD_TEMPORARY_FAILURE",
+                "downloaded model size does not match repository metadata",
+                temporary=True,
+            )
+        output.flush()
+        os.fsync(output.fileno())
+        output.close()
+        output = None
 
         file_sha256 = digest.hexdigest()
         target = cache / f"{file_sha256}.safetensors"
@@ -431,15 +433,34 @@ def download_public_model(
             "DOWNLOAD_TEMPORARY_FAILURE", "model download did not complete", temporary=True
         ) from exc
     finally:
+        # Preserve an active download/HF error even if cleanup also fails. A
+        # cleanup failure after an otherwise successful download is still I/O,
+        # and must enter the same temporary infrastructure retry path.
+        cleanup_error: Exception | None = None
+        if output is not None:
+            try:
+                output.close()
+            except OSError as exc:
+                cleanup_error = exc
         if descriptor is not None:
-            with suppress(OSError):
+            try:
                 os.close(descriptor)
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
         if temporary is not None:
-            with suppress(OSError):
+            try:
                 temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
         if owned_client and client is not None:
-            with suppress(OSError):
+            try:
                 client.close()
+            except (httpx.HTTPError, OSError, ValueError) as exc:
+                cleanup_error = cleanup_error or exc
+        if cleanup_error is not None and sys.exception() is None:
+            raise ModelDownloadError(
+                "DOWNLOAD_TEMPORARY_FAILURE", "model download cleanup failed", temporary=True
+            ) from cleanup_error
 
 
 def _http_failure(status_code: int) -> ModelDownloadError:
