@@ -6,7 +6,6 @@
     "Historical numerical evidence must be checked against the final runtime binding, not relabeled as acceptance.",
     "No formal panel or public v2 switch while release blockers remain."
   ],
-  "design_sha256": "7ac4778f8be50631b6198a48309e7b8eee75a8889d5b3b508be82984f1676c75",
   "experiments": [
     {
       "acceptance_manifest": null,
@@ -242,7 +241,5 @@
   ],
   "format": "veda-release-acceptance-inventory-v1",
   "release_accepted": false,
-  "review_sha256": "611bda80950a6b443652022164a1ae35ae841a76b461c68bfeb4ce872163835a",
-  "runtime_contract_sha256": null,
   "scope": "requirements_and_gap_inventory_not_acceptance"
 }
