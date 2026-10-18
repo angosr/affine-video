@@ -163,6 +163,16 @@ publisher with a shorter or conflicting match prefix is fenced before it can cha
 Mutable pointers use ETag conditional writes, and production startup probes both conditional create
 and conditional replace. A backend that cannot fence two concurrent publishers is rejected.
 
+Every new release to `tracks/main` also requires the pinned, verified E1–E8/E10–E18 acceptance
+result and an explicitly coordinated full track digest. The evaluator reads these from
+`VEDA_RELEASE_ACCEPTANCE` (the canonical acceptance JSON file) and
+`VEDA_COORDINATED_RELEASE_DIGEST`. The release manifest must bind the acceptance result, its
+preregistered protocols and raw evidence; the accepted scoring/runtime contracts must match the
+active candidate. Missing, incomplete or mismatched acceptance rejects publication before any
+write. The existing public v1 identity alone retains its established publication behavior.
+The current candidate has no approved acceptance result or coordinated deployment digest.
+
+
 Object storage is the durable source for public tournament facts. The local SQLite database and
 downloaded model cache are disposable execution state: after loss, finalized chain submissions plus
 verified published matches reconstruct completed work, and remaining submissions can be evaluated

@@ -276,6 +276,7 @@ async def run_evaluator(
                             chain,
                             version_key=version_key,
                             runtime_manifest=runtime_manifest_payload,
+                            release_approval=getattr(publisher, "release_approval", None),
                         )
                         await publisher.publish(artifacts)
                         if report is not None:
@@ -344,6 +345,7 @@ async def run_evaluator(
                                     ),
                                     runtime_manifest=runtime_manifest_payload,
                                     track_aborted=track_aborted,
+                                    release_approval=getattr(publisher, "release_approval", None),
                                 )
                                 if artifacts is not None:
                                     await publisher.publish(artifacts)

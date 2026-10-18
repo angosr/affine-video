@@ -229,7 +229,7 @@ def test_public_repository_rejects_active_track_pointer_rollback() -> None:
         matches=(),
     )
     client = MemoryS3()
-    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
     asyncio.run(repository.publish(current))
 
     with pytest.raises(PublicArtifactError, match="rollback"):
@@ -311,25 +311,25 @@ def test_weights_reject_a_higher_block_with_a_stale_match_prefix_before_mutation
         matches=(),
     )
     client = MemoryS3()
-    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
     asyncio.run(repository.publish(current))
-    weights_before = client.objects["tracks/main/weights.json"]
-    summary_before = client.objects["tracks/main/summary.json"]
+    weights_before = client.objects["tracks/test/weights.json"]
+    summary_before = client.objects["tracks/test/summary.json"]
 
     with pytest.raises(PublicArtifactError, match="rollback"):
         asyncio.run(repository.publish(stale))
-    assert client.objects["tracks/main/weights.json"] == weights_before
-    assert client.objects["tracks/main/summary.json"] == summary_before
+    assert client.objects["tracks/test/weights.json"] == weights_before
+    assert client.objects["tracks/test/summary.json"] == summary_before
 
     with pytest.raises(PublicArtifactError, match="two histories"):
         asyncio.run(repository.publish(conflicting))
-    assert client.objects["tracks/main/weights.json"] == weights_before
-    assert client.objects["tracks/main/summary.json"] == summary_before
+    assert client.objects["tracks/test/weights.json"] == weights_before
+    assert client.objects["tracks/test/summary.json"] == summary_before
 
 
 def test_public_repository_capability_probe_checks_and_cleans_conditions() -> None:
     client = MemoryS3()
-    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
 
     repository.verify_conditional_writes()
 
@@ -343,7 +343,7 @@ def test_public_repository_rejects_backend_that_ignores_conditions() -> None:
             kwargs.pop("IfNoneMatch", None)
             return super().put_object(**kwargs)
 
-    repository = S3Repository(UnsafeS3(), bucket="public-data", prefix="tracks/main")
+    repository = S3Repository(UnsafeS3(), bucket="public-data", prefix="tracks/test")
 
     with pytest.raises(PublicArtifactError, match="ignores If-None-Match"):
         repository.verify_conditional_writes()
@@ -371,12 +371,12 @@ def test_concurrent_stale_summary_write_is_fenced() -> None:
         )
 
     client = MemoryS3()
-    stale = S3Repository(client, bucket="public-data", prefix="tracks/main")
-    current = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    stale = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    current = S3Repository(client, bucket="public-data", prefix="tracks/test")
     asyncio.run(current.publish(artifacts(10)))
 
     def interleave(arguments):
-        if arguments["Key"] != "tracks/main/summary.json" or "IfMatch" not in arguments:
+        if arguments["Key"] != "tracks/test/summary.json" or "IfMatch" not in arguments:
             return
         client.before_put = None
         current._put_mutable("summary.json", artifacts(12).summary)
@@ -385,7 +385,7 @@ def test_concurrent_stale_summary_write_is_fenced() -> None:
     with pytest.raises(PublicArtifactError, match="fenced"):
         asyncio.run(stale.publish(artifacts(11)))
 
-    assert json.loads(client.objects["tracks/main/summary.json"])["source_block"] == 12
+    assert json.loads(client.objects["tracks/test/summary.json"])["source_block"] == 12
 
 
 def test_track_abort_fences_concurrent_stale_weight_refresh() -> None:
@@ -411,12 +411,12 @@ def test_track_abort_fences_concurrent_stale_weight_refresh() -> None:
         )
 
     client = MemoryS3()
-    stale = S3Repository(client, bucket="public-data", prefix="tracks/main")
-    current = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    stale = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    current = S3Repository(client, bucket="public-data", prefix="tracks/test")
     asyncio.run(current.publish(artifacts(9)))
 
     def interleave(arguments):
-        if arguments["Key"] != "tracks/main/weights.json" or "IfMatch" not in arguments:
+        if arguments["Key"] != "tracks/test/weights.json" or "IfMatch" not in arguments:
             return
         client.before_put = None
         asyncio.run(current.publish(artifacts(11, aborted=True)))
@@ -425,16 +425,16 @@ def test_track_abort_fences_concurrent_stale_weight_refresh() -> None:
     with pytest.raises(PublicArtifactError, match="fenced"):
         asyncio.run(stale.publish(artifacts(10)))
 
-    published = decode_weight_artifact(client.objects["tracks/main/weights.json"])
+    published = decode_weight_artifact(client.objects["tracks/test/weights.json"])
     assert published.source_block == 11
     assert published.plan is None
     assert published.track_aborted is True
-    assert "tracks/main/events/track/track-aborted.json" in client.objects
+    assert "tracks/test/events/track/track-aborted.json" in client.objects
 
-    summary = client.objects["tracks/main/summary.json"]
+    summary = client.objects["tracks/test/summary.json"]
     with pytest.raises(PublicArtifactError, match="cannot resume"):
         asyncio.run(current.publish(artifacts(12)))
-    assert client.objects["tracks/main/summary.json"] == summary
+    assert client.objects["tracks/test/summary.json"] == summary
 
 
 def test_pointer_from_previous_track_cannot_overwrite_active_track() -> None:
@@ -442,7 +442,7 @@ def test_pointer_from_previous_track_cannot_overwrite_active_track() -> None:
         return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
     client = MemoryS3()
-    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
     old_track = encoded(
         {
             "spec": {"track_id": "old", "track_start_block": 10},
@@ -577,7 +577,7 @@ def test_runtime_manifest_is_content_addressed_and_published_before_track() -> N
     payload = b"runtime-manifest"
     digest = hashlib.sha256(payload).hexdigest()
     client = MemoryS3()
-    publisher = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    publisher = S3Repository(client, bucket="public-data", prefix="tracks/test")
     artifacts = PublicArtifacts(
         120,
         pointer_track(),
@@ -594,8 +594,8 @@ def test_runtime_manifest_is_content_addressed_and_published_before_track() -> N
 
     writes = [call["Key"] for call in client.calls if "Body" in call]
     assert writes[:2] == [
-        f"tracks/main/runtime/{digest}/manifest.json",
-        "tracks/main/track.json",
+        f"tracks/test/runtime/{digest}/manifest.json",
+        "tracks/test/track.json",
     ]
 
 
@@ -605,7 +605,7 @@ def test_storage_publishes_large_files_as_bounded_verified_chunks(tmp_path, monk
     source.write_bytes(b"abcdefghij")
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     client = MemoryS3()
-    publisher = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    publisher = S3Repository(client, bucket="public-data", prefix="tracks/test")
     artifacts = PublicArtifacts(
         120,
         pointer_track(),
@@ -617,7 +617,7 @@ def test_storage_publishes_large_files_as_bounded_verified_chunks(tmp_path, monk
 
     asyncio.run(publisher.publish(artifacts))
 
-    prefix = f"tracks/main/batches/{digest}/"
+    prefix = f"tracks/test/batches/{digest}/"
     assert sorted(key for key in client.objects if key.startswith(prefix)) == [
         prefix + "manifest.json",
         prefix + "part-00000",
@@ -627,14 +627,14 @@ def test_storage_publishes_large_files_as_bounded_verified_chunks(tmp_path, monk
 
     source.unlink()
     client.calls.clear()
-    restarted = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    restarted = S3Repository(client, bucket="public-data", prefix="tracks/test")
     asyncio.run(restarted.publish(artifacts))
     assert [call["Key"] for call in client.calls if "Body" in call] == []
 
     del client.objects[prefix + "part-00001"]
     with pytest.raises(PublicArtifactError, match="chunk is missing"):
         asyncio.run(
-            S3Repository(client, bucket="public-data", prefix="tracks/main").publish(artifacts)
+            S3Repository(client, bucket="public-data", prefix="tracks/test").publish(artifacts)
         )
 
 
@@ -872,10 +872,10 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
             ),
         )
     )
-    client.objects["tracks/main/weights.json"] = existing
-    repository = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    client.objects["tracks/test/weights.json"] = existing
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
     asyncio.run(repository.publish(artifacts))
-    stopped = decode_weight_artifact(client.objects["tracks/main/weights.json"])
+    stopped = decode_weight_artifact(client.objects["tracks/test/weights.json"])
     assert stopped.source_block == block
     assert stopped.plan is None
     assert stopped.track_aborted is True
@@ -1142,12 +1142,12 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
     )
 
     client = MemoryS3()
-    publisher = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    publisher = S3Repository(client, bucket="public-data", prefix="tracks/test")
     for object_name, path, item in local_files:
         publisher._put_file_immutable(PublicFile(object_name, path, item.sha256))
     publisher._put_immutable(f"batch_groups/{ready.plan_digest}.json", record)
 
-    restarted = S3Repository(client, bucket="public-data", prefix="tracks/main")
+    restarted = S3Repository(client, bucket="public-data", prefix="tracks/test")
     assert restarted._load_batch_disclosures(track, (match,)) == frozenset(
         {ready.plan_digest}
     )
@@ -1160,7 +1160,7 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         },
     )
     with pytest.raises(PublicArtifactError, match="wrong generation boundary"):
-        S3Repository(client, bucket="public-data", prefix="tracks/main")._load_batch_disclosures(
+        S3Repository(client, bucket="public-data", prefix="tracks/test")._load_batch_disclosures(
             track, (wrong_boundary,)
         )
 
@@ -1180,7 +1180,7 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         },
     )
     with pytest.raises(PublicArtifactError, match="challenge assignment"):
-        S3Repository(client, bucket="public-data", prefix="tracks/main")._load_batch_disclosures(
+        S3Repository(client, bucket="public-data", prefix="tracks/test")._load_batch_disclosures(
             track, (wrong_assignment,)
         )
 
@@ -1263,14 +1263,14 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         },
     )
     assert (
-        S3Repository(client, bucket="public-data", prefix="tracks/main")
+        S3Repository(client, bucket="public-data", prefix="tracks/test")
         ._load_batch_disclosures(track, (gap_match,))
         == frozenset()
     )
 
-    client.objects.pop(f"tracks/main/batches/{exact.sha256}/part-00000")
+    client.objects.pop(f"tracks/test/batches/{exact.sha256}/part-00000")
     with pytest.raises(PublicArtifactError, match="chunk is missing"):
-        S3Repository(client, bucket="public-data", prefix="tracks/main")._load_batch_disclosures(
+        S3Repository(client, bucket="public-data", prefix="tracks/test")._load_batch_disclosures(
             track, (match,)
         )
 

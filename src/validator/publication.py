@@ -26,8 +26,10 @@ from validator.production.plan import (
     validate_source_selection_sequence,
 )
 from validator.queue import TERMINAL_STATES, ChallengeState
+from validator.release import LEGACY_PUBLIC_IDENTITY, ReleaseApproval, require_release_approval
 from validator.s3 import client_config
 from validator.store import ChallengeStore
+from validator.system_match_data import PRODUCTION_TRACK_ID
 from validator.system_matches import system_match_artifacts, system_match_summaries
 from validator.tournament import (
     Champion,
@@ -51,10 +53,7 @@ _STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MAX_WEIGHT_ARTIFACT_BYTES = 1024 * 1024
 _MAX_PUBLIC_OBJECT_BYTES = 1024 * 1024
 _SUMMARY_LEADERBOARD_LIMIT = 100
-_LEGACY_UNFENCED_WEIGHT_TRACK = (
-    "veda-sn120-v1",
-    "0fcae991aef29f87b97fbb07cf79c49e5eb9cc2a5d9aecdd2a566443e2b81dd5",
-)
+_LEGACY_UNFENCED_WEIGHT_TRACK = LEGACY_PUBLIC_IDENTITY
 
 
 class PublicArtifactError(RuntimeError):
@@ -121,9 +120,11 @@ def build_public_artifacts(
     model_resolver: Callable[[str, int], Path] | None = None,
     runtime_manifest: bytes | None = None,
     track_aborted: bool = False,
+    release_approval: ReleaseApproval | None = None,
 ) -> PublicArtifacts | None:
     """Build one auditable public snapshot when chain scanning is caught up."""
 
+    _verify_candidate_release(track, runtime_manifest, release_approval)
     cursor = store.chain_cursor()
     if cursor is None or cursor[0] != chain.finalized_block:
         return None
@@ -280,9 +281,11 @@ def build_genesis_artifacts(
     *,
     version_key: int,
     runtime_manifest: bytes | None = None,
+    release_approval: ReleaseApproval | None = None,
 ) -> PublicArtifacts:
     """Build the complete pre-launch snapshot with UID0 as champion."""
 
+    _verify_candidate_release(track, runtime_manifest, release_approval)
     tournament = resolve_tournament(
         (),
         track_id=track.track_id,
@@ -333,6 +336,17 @@ def build_genesis_artifacts(
         system_matches=system_matches,
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
     )
+
+
+def _verify_candidate_release(
+    track: TrackSpec, runtime_manifest: bytes | None, approval: ReleaseApproval | None
+) -> None:
+    if track.track_id != PRODUCTION_TRACK_ID:
+        return
+    try:
+        require_release_approval(track, runtime_manifest, approval)
+    except ValueError as exc:
+        raise PublicArtifactError(str(exc)) from exc
 
 
 def _runtime_manifest(track: TrackSpec, payload: bytes | None) -> tuple[str, bytes] | None:
@@ -582,7 +596,10 @@ def validate_public_weights_url(url: str) -> str:
 class S3Repository:
     """Persist versioned match facts and publish bounded current-state pointers."""
 
-    def __init__(self, client: Any, *, bucket: str, prefix: str) -> None:
+    def __init__(
+        self, client: Any, *, bucket: str, prefix: str,
+        release_approval: ReleaseApproval | None = None,
+    ) -> None:
         if not _STORAGE_NAME.fullmatch(bucket) or len(bucket) > 64:
             raise ValueError("storage bucket name is invalid")
         normalized = prefix.strip("/")
@@ -595,6 +612,7 @@ class S3Repository:
         self._client = client
         self._bucket = bucket
         self._prefix = normalized
+        self.release_approval = release_approval
         self._confirmed_immutable: dict[str, str] = {}
 
     @classmethod
@@ -626,7 +644,10 @@ class S3Repository:
             region_name="auto",
             config=client_config(),
         )
-        return cls(client, bucket=bucket, prefix=prefix)
+        return cls(
+            client, bucket=bucket, prefix=prefix,
+            release_approval=ReleaseApproval.from_environment(),
+        )
 
     def verify_conditional_writes(self) -> None:
         """Refuse a public backend that cannot fence concurrent publishers."""
@@ -681,6 +702,26 @@ class S3Repository:
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
         track_document = _decode_canonical_object(artifacts.track, "track")
+        if self._prefix == "tracks/main":
+            try:
+                document = track_document
+                if hashlib.sha256(_json_bytes(document["spec"])).hexdigest() != document[
+                    "track_spec_digest"
+                ]:
+                    raise ValueError("public track digest is invalid")
+                identity = (document["spec"]["track_id"], document["track_spec_digest"])
+                if identity != LEGACY_PUBLIC_IDENTITY:
+                    track = parse_track_spec(document["spec"])
+                    require_release_approval(
+                        track,
+                        (
+                            None if artifacts.runtime_manifest is None
+                            else artifacts.runtime_manifest[1]
+                        ),
+                        self.release_approval,
+                    )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PublicArtifactError(f"formal release rejected: {exc}") from exc
         try:
             track_id = track_document["spec"]["track_id"]
         except (KeyError, TypeError) as exc:

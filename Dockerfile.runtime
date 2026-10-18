@@ -27,6 +27,7 @@ RUN python -m pip install --no-cache-dir "/tmp/veda[storage]" \
 # scorer's ascending key-index tie break; these installed bytes are bound by
 # both the source bundle and the dependency lock generated inside this image.
 RUN python - <<'PY'
+import py_compile
 from pathlib import Path
 from miowtion.veda import mask
 
@@ -40,6 +41,13 @@ new = (
 if source.count(old) != 1:
     raise RuntimeError("pinned Miowtion mask source differs from the audited patch target")
 path.write_text(source.replace(old, new))
+# RECORD also binds installed bytecode. Use source-hash invalidation so the
+# first runtime import cannot rewrite it and rebuild time cannot change it.
+py_compile.compile(
+    str(path),
+    doraise=True,
+    invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+)
 PY
 
 WORKDIR /work

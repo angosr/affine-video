@@ -279,15 +279,17 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch(tmp_path) -
     assert sum(item.object_name.startswith("models/") for item in with_files.files) == 1
 
     remote = MemoryS3()
-    repository = S3Repository(remote, bucket="public-data", prefix="tracks/main")
+    repository = S3Repository(remote, bucket="public-data", prefix="tracks/battle-test")
     asyncio.run(repository.publish(artifacts))
     recovered = asyncio.run(repository.load(track))
     assert len(recovered.matches) == 5
     assert recovered.matches[-1].champion_after.hotkey == "dave"
 
-    name = "tracks/main/matches/veda-sn120/000000000004.json"
+    name = "tracks/battle-test/matches/veda-sn120/000000000004.json"
     tampered = bytearray(remote.objects[name])
     tampered[-2] ^= 1
     remote.objects[name] = bytes(tampered)
     with pytest.raises(PublicArtifactError):
-        asyncio.run(S3Repository(remote, bucket="public-data", prefix="tracks/main").load(track))
+        asyncio.run(
+            S3Repository(remote, bucket="public-data", prefix="tracks/battle-test").load(track)
+        )

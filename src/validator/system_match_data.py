@@ -2,6 +2,8 @@
 
 PRODUCTION_TRACK_ID = "veda-sn120-v2"
 PRODUCTION_NETUID = 120
+# Filled only after every mandatory experiment is recomputed and accepted.
+PRODUCTION_ACCEPTANCE_SHA256 = "0" * 64
 PRODUCTION_EVIDENCE_CONTRACT_DIGEST = (
     "eb091449d2ab176ad6f9136461d9b88c1d69061b1db3175b11192e289c58aa59"
 )
