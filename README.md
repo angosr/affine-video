@@ -70,13 +70,13 @@ A selector that produces non-finite logits or sparse latents receives zero quali
 case. This rule is applied independently to the challenger and incumbent, so a pathological model
 cannot turn its own numerical failure into an infrastructure retry that blocks the FIFO queue.
 
-The launch checks use ten consecutive 384-case batches on NVIDIA H200 hardware. They require the
-VEDA incumbent to retain the title against MeanPool, shuffled-head and slightly perturbed VEDA
-challengers in every batch, while the reverse VEDA-versus-shuffled positive control must promote
-in every batch. The immutable summaries are published under `system_matches/`. Full-video
-execution, H200 cost calibration, and the complete design acceptance matrix remain release
-requirements until immutable, final-runtime evidence passes their registered gates. Unit tests and
-intermediate GPU mechanism checks do not establish release acceptance.
+Initial launch requires real H200 scorer/runtime parity, fixed self and degraded-model controls,
+a two-stage FIFO challenge, measured budget costs, data isolation and durable recovery. Immutable
+control summaries are published under `system_matches/` without affecting rewards. Broader
+ten-batch stability, near-threshold power, proxy-ranking and human-quality studies continue after
+launch; pending research is not marked passed. Bootstrap alpha is a calibration target, not a
+proved finite-sample guarantee. Unit tests and intermediate GPU checks alone do not establish
+release acceptance.
 
 ## Public object-storage state
 
@@ -171,7 +171,8 @@ publisher with a shorter or conflicting match prefix is fenced before it can cha
 Mutable pointers use ETag conditional writes, and production startup probes both conditional create
 and conditional replace. A backend that cannot fence two concurrent publishers is rejected.
 
-Every new release to `tracks/main` also requires the pinned, verified E1–E8/E10–E18 acceptance
+Every new release to `tracks/main` also requires the pinned, verified
+E1/E2/E3/E5/E6/E10/E11/E14/E16/E18 core acceptance
 result and an explicitly coordinated full track digest. The evaluator reads these from
 `VEDA_RELEASE_ACCEPTANCE` (the canonical acceptance JSON file) and
 `VEDA_COORDINATED_RELEASE_DIGEST`. The release manifest must bind the acceptance result, its

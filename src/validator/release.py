@@ -17,7 +17,12 @@ from validator.system_matches import (
 )
 
 ACCEPTANCE_LOGICAL_NAME = "evidence/system-panel/acceptance/accepted.json"
-_REQUIRED_EXPERIMENTS = frozenset(f"E{index}" for index in range(1, 19) if index != 9)
+# Launch requires correct execution, bounded cost, isolated data and recovery.
+# Broader quality/power studies remain visible in the acceptance inventory but
+# are not prerequisites for the initial release or claims of proven coverage.
+_REQUIRED_EXPERIMENTS = frozenset(
+    f"E{index}" for index in (1, 2, 3, 5, 6, 10, 11, 14, 16, 18)
+)
 LEGACY_PUBLIC_IDENTITY = (
     "veda-sn120-v1",
     "0fcae991aef29f87b97fbb07cf79c49e5eb9cc2a5d9aecdd2a566443e2b81dd5",

@@ -4,7 +4,8 @@
     "Pilot thresholds must be registered before disjoint confirmation.",
     "Selectors are fixed read-only inputs; no training or checkpoint-trajectory study is required.",
     "Historical numerical evidence must be checked against the final runtime binding, not relabeled as acceptance.",
-    "No formal panel or public v2 switch while release blockers remain."
+    "Initial release requires execution correctness, a real paired two-stage challenge, isolation, bounded cost and recovery; broader quality and power studies continue after launch without being marked passed.",
+    "No public v2 switch while core release blockers or external digest coordination remain."
   ],
   "experiments": [
     {
@@ -33,10 +34,10 @@
     },
     {
       "acceptance_manifest": null,
-      "acceptance_rule": "按预注册 production/audit 面板报告 teacher-state exact 与 sparse full-video 的偏差、近阈值两阶段判定和最终 champion regret；若存在可复现的错误晋级或系统性误拒绝，修正机制后使用独立数据重验",
+      "acceptance_rule": "真实GPU执行固定self和退化对照，完成一次两阶段FIFO闭环；self不能晋级，较好基线能战胜可控退化，两阶段均过线才替换冠军，confirmation使用exact决策之后的新批次；报告局部与完整视频分数差异，不宣称已证明总体排序一致",
       "actual_values": null,
       "id": "E3",
-      "method": "使用冻结的 self、退化、近邻、route/step 专家和来源可审计的外部 selector；比较 dense exact 与独立未来批次的完整稀疏 rollout，并重放两种 FIFO 顺序；不训练模型或混合轨迹",
+      "method": "用固定只读self和退化模型运行真实exact及完整视频，核验FIFO、未来confirmation、冠军替换及持久化事实；更广的跨批次、近阈值和排序研究上线后继续，不训练模型",
       "pass": false,
       "raw_evidence": [],
       "release_blocker": true,
@@ -51,8 +52,8 @@
       "method": "比较固定随机/退化对照、官方 VEDA、可审计外部 selector 和仅用于离线诊断的特权 Oracle；所有模型为只读输入",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
-      "status": "not_final_runtime_verified",
+      "release_blocker": false,
+      "status": "post_launch_validation_pending",
       "subject": "可竞争空间"
     },
     {
@@ -87,8 +88,8 @@
       "method": "冻结 backbone，以官方基线、外部固定 selector 和离线 Oracle 在全部候选预算生成配对视频；不更新任何模型参数",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
-      "status": "not_final_runtime_verified",
+      "release_blocker": false,
+      "status": "post_launch_validation_pending",
       "subject": "只训练选块器是否可行"
     },
     {
@@ -99,8 +100,8 @@
       "method": "扫描 k，绘制基线、上限代理与视频质量曲线",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
-      "status": "not_final_runtime_verified",
+      "release_blocker": false,
+      "status": "post_launch_validation_pending",
       "subject": "正式预算区间"
     },
     {
@@ -147,8 +148,8 @@
       "method": "比较 \\(S_{local}\\)、自动视频指标和盲法配对结果",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
-      "status": "not_final_runtime_verified",
+      "release_blocker": false,
+      "status": "post_launch_validation_pending",
       "subject": "局部分数有效性"
     },
     {
@@ -159,8 +160,8 @@
       "method": "按真实 source family 聚类，测试预算、分层和样本子集敏感性；使用已知总体或穷举抽样验证偏态及稀有失败下的实际覆盖率",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
-      "status": "not_final_runtime_verified",
+      "release_blocker": false,
+      "status": "post_launch_validation_pending",
       "subject": "聚合与分层稳健性"
     },
     {
@@ -183,8 +184,8 @@
       "method": "在冻结样本预算和 season alpha/M 下，对 source 聚类、近阈值、偏态和稀有严重失败进行功效/覆盖率实验，并报告计算成本",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
-      "status": "not_final_runtime_verified",
+      "release_blocker": false,
+      "status": "post_launch_validation_pending",
       "subject": "样本量"
     },
     {
@@ -222,13 +223,13 @@
       "method": "对同一冻结只读模型面板同时运行精确评分与完整视频确认，包括 exact 未通过的模型，防止只验证幸存者",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
-      "status": "not_final_runtime_verified",
+      "release_blocker": false,
+      "status": "post_launch_validation_pending",
       "subject": "精确晋级误杀"
     },
     {
       "acceptance_manifest": null,
-      "acceptance_rule": "按预计峰值参赛量可在时限内完成，并保留 ≥30% 算力、存储和重试余量",
+      "acceptance_rule": "按固定GPU分工打通生产、评测与发布，记录单批耗时、显存和磁盘占用；unit/assemble/upload中断后恢复同一批次和冠军，重试耗尽有告警且到期自动恢复；峰值容量与30%余量作为上线后持续压测目标",
       "actual_values": null,
       "id": "E18",
       "method": "压测上传校验、轻量缓存、精确缓存、完整视频、重试和故障恢复",

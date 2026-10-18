@@ -30,6 +30,19 @@ def test_current_inventory_matches_release_checks_without_claiming_acceptance():
     assert inventory["scope"] == "requirements_and_gap_inventory_not_acceptance"
 
 
+def test_launch_scope_retains_correctness_and_defers_research_without_claiming_success():
+    directory = Path(__file__).resolve().parents[2] / "evidence/system-panel/acceptance"
+    inventory = json.loads((directory / "inventory.json").read_bytes())
+    checks = {check["id"]: check for check in inventory["experiments"]}
+    assert {
+        "E1", "E2", "E3", "E5", "E6", "E10", "E11", "E14", "E16", "E18",
+    } == release._REQUIRED_EXPERIMENTS
+    for identifier in ("E4", "E7", "E8", "E12", "E13", "E15", "E17"):
+        assert checks[identifier]["release_blocker"] is False
+        assert checks[identifier]["status"] == "post_launch_validation_pending"
+        assert checks[identifier]["pass"] is False
+
+
 def approved_candidate(monkeypatch, *, mutation=None):
     document = valid_spec()
     document["track_id"] = "veda-sn120-v2"
@@ -129,10 +142,10 @@ def test_formal_release_rejection_performs_zero_writes(monkeypatch, failure):
         lambda result: result.update(release_accepted=False),
         lambda result: result.update(runtime_contract_sha256="00" * 32),
         lambda result: result.update(evidence_contract_sha256="00" * 32),
-        lambda result: result["experiments"].pop("E17"),
+        lambda result: result["experiments"].pop("E18"),
         lambda result: result["experiments"]["E10"].update(**{"pass": False}),
         lambda result: result["experiments"]["E11"].update(raw_evidence=[]),
-        lambda result: result["experiments"]["E12"]["raw_evidence"][0].update(sha256="00" * 32),
+        lambda result: result["experiments"]["E14"]["raw_evidence"][0].update(sha256="00" * 32),
     ],
 )
 def test_acceptance_cannot_omit_failed_unbound_or_mismatched_evidence(monkeypatch, mutation):
