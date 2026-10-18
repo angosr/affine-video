@@ -602,7 +602,20 @@ def run_producer(config_path: str | Path, *, once: bool = False) -> None:
     if not once and not alert_url:
         raise ValueError("a push alert webhook is required for the continuous producer")
     alert = webhook_alerter(alert_url, service="veda-producer") if alert_url is not None else None
-    ProducerService(load_producer_config(config_path), alert=alert).run(once=once)
+    try:
+        with _interrupt_at_deadline(time.monotonic() + _PRODUCER_ATTEMPT_TIMEOUT_SECONDS):
+            service = ProducerService(load_producer_config(config_path), alert=alert)
+    except (_DeadlineInterrupt, Exception) as exc:
+        timed_out = isinstance(exc, _DeadlineInterrupt)
+        if alert is not None:
+            alert(
+                "PRODUCER_STARTUP_FAILURE",
+                {"error_type": "TimeoutError" if timed_out else type(exc).__name__},
+            )
+        if timed_out:
+            raise TimeoutError("producer startup exceeded the wall-clock limit") from None
+        raise
+    service.run(once=once)
 
 
 def _worker_loop(

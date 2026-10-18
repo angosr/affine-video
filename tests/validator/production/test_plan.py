@@ -633,6 +633,76 @@ def test_producer_retry_ceiling_survives_process_and_host_loss(monkeypatch) -> N
         service._run_locked(once=True)
 
 
+@pytest.mark.parametrize("failure", ["configuration", "restore", "timeout"])
+def test_producer_bootstrap_failures_are_bounded_and_alerted(monkeypatch, failure) -> None:
+    alerts = []
+    config = object()
+    monkeypatch.setenv("VEDA_ALERT_WEBHOOK_URL", "https://alerts.example/producer")
+    monkeypatch.setattr(production_service, "_PRODUCER_ATTEMPT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        production_service, "webhook_alerter",
+        lambda *_a, **_k: lambda event, details: alerts.append((event, details)),
+    )
+
+    def load(_path):
+        if failure == "configuration":
+            raise ValueError("invalid configuration")
+        return config
+
+    def create(value, *, alert):
+        assert value is config
+        assert alert is not None
+        if failure == "restore":
+            raise RuntimeError("storage bootstrap failed")
+        time.sleep(1)
+        raise AssertionError("blocking bootstrap was not interrupted")
+
+    monkeypatch.setattr(production_service, "load_producer_config", load)
+    monkeypatch.setattr(production_service, "ProducerService", create)
+    started = time.monotonic()
+    with pytest.raises((ValueError, RuntimeError, TimeoutError)):
+        production_service.run_producer("producer.json")
+
+    assert time.monotonic() - started < 0.5
+    expected_type = {
+        "configuration": "ValueError",
+        "restore": "RuntimeError",
+        "timeout": "TimeoutError",
+    }[failure]
+    assert alerts == [("PRODUCER_STARTUP_FAILURE", {"error_type": expected_type})]
+
+
+@pytest.mark.parametrize("runtime_failure", [False, True])
+def test_producer_bootstrap_guard_ends_before_running_batches(monkeypatch, runtime_failure):
+    alerts = []
+    calls = []
+    monkeypatch.setenv("VEDA_ALERT_WEBHOOK_URL", "https://alerts.example/producer")
+    monkeypatch.setattr(
+        production_service, "webhook_alerter",
+        lambda *_a, **_k: lambda event, details: alerts.append((event, details)),
+    )
+    monkeypatch.setattr(production_service, "load_producer_config", lambda _path: "config")
+
+    def run(*, once):
+        assert production_service.signal.getitimer(production_service.signal.ITIMER_REAL) == (0, 0)
+        calls.append(once)
+        if runtime_failure:
+            raise RuntimeError("batch failure, handled by its existing path")
+
+    def create(config, *, alert):
+        assert config == "config" and alert is not None
+        return SimpleNamespace(run=run)
+
+    monkeypatch.setattr(production_service, "ProducerService", create)
+    if runtime_failure:
+        with pytest.raises(RuntimeError, match="batch failure"):
+            production_service.run_producer("producer.json", once=True)
+    else:
+        production_service.run_producer("producer.json", once=True)
+    assert calls == [True]
+    assert alerts == []
+
+
 def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch) -> None:
     plan = build_plan(
         track_spec_digest="ab" * 32,
