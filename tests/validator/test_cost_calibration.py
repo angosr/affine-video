@@ -23,7 +23,10 @@ def write(path, value):
     path.write_text(json.dumps(value, sort_keys=True))
 
 
-def fixture(tmp_path, phase="calibration", fit=None, times=(10, 13, 19)):
+def fixture(
+    tmp_path, phase="calibration", fit=None, times=(10, 13, 19),
+    models=("baseline_self", "shuffled_heads"),
+):
     registration = tmp_path / "registration.json"
     if not registration.exists():
         track = valid_spec()
@@ -37,10 +40,10 @@ def fixture(tmp_path, phase="calibration", fit=None, times=(10, 13, 19)):
                 "cost_independent_track_sha256": analysis.cost_independent_contract(track),
                 "seeds": {"calibration": [1], "confirmation": [2]},
                 "layers": [0, 1],
-                "models": ["baseline_self", "shuffled_heads"],
+                "models": list(models),
                 "model_identities": {
                     name: {"file_sha256": name, "model_digest": name}
-                    for name in ("baseline_self", "shuffled_heads")
+                    for name in models
                 },
                 "predictor_bundle_sha256": "plans",
                 "geometries": ["a", "b"],
@@ -118,6 +121,10 @@ def fixture(tmp_path, phase="calibration", fit=None, times=(10, 13, 19)):
                     "model": model,
                     "layer": layer,
                     "budget": budget,
+                    "pattern_proofs": (
+                        [{"pattern": model.removeprefix("pattern_"), "valid": True}]
+                        if model.startswith("pattern_") else []
+                    ),
                     "protocol_sha256": protocol_hash,
                     "dense_record": dense_name,
                     "dense_sha256": analysis.sha256(root / dense_name),
@@ -241,6 +248,32 @@ def test_one_failed_geometry_cannot_be_averaged_away(tmp_path):
     assert result["e11_confirmation_pass"] is False
 
 
+def test_identical_proofs_are_verified_once_per_analysis_but_mutations_are_checked(
+    tmp_path, monkeypatch,
+):
+    root, registration = fixture(tmp_path, models=("baseline_self", "pattern_clustered"))
+    observed = []
+
+    def verify(proof):
+        observed.append(proof.copy())
+        if proof["valid"] is not True:
+            raise ValueError("mutated allocation proof")
+
+    monkeypatch.setattr(analysis.patterns, "verify_proof", verify)
+    analysis.analyze([root], registration, "calibration")
+    assert observed == [{"pattern": "clustered", "valid": True}]
+    analysis.analyze([root], registration, "calibration")
+    assert len(observed) == 2  # A later analysis independently revalidates it.
+    path = next(root.glob("b-256-pattern_clustered-*.json"))
+    row = json.loads(path.read_text())
+    row["pattern_proofs"][0]["valid"] = False
+    write(path, row)
+    rehash(root)
+    with pytest.raises(ValueError, match="mutated allocation proof"):
+        analysis.analyze([root], registration, "calibration")
+    assert any(proof["valid"] is False for proof in observed)
+
+
 @pytest.mark.parametrize("pattern", analysis.patterns.PATTERNS)
 def test_legal_pattern_proof_recomputes_and_rejects_mutation(pattern):
     import hashlib
@@ -280,6 +313,36 @@ def test_patterns_exercise_distinct_locality_and_partial_tiles():
     assert set(top["boundary_padding"][:2]) == {128, 129}
     assert top["repeated_keys"].tolist() == list(range(16))
     assert all(130 not in indices for indices in top.values())
+
+
+@pytest.mark.parametrize("pattern", analysis.patterns.PATTERNS)
+def test_vectorized_pattern_logits_preserve_the_original_allocation_exactly(pattern):
+    import numpy as np
+
+    counts = np.array([128, 0, 17, 128, 1, 9, 128, 0, 5, 128, 16])
+    valid = np.flatnonzero(counts)
+    rows = [9, 0, 6, 2]
+    for budget in (1, 4, len(valid), len(valid) + 3):
+        expected = np.full((3, len(rows), len(counts)), -1e9, dtype=np.float32)
+        for ri, query in enumerate(rows):
+            for head in range(3):
+                if pattern == "clustered":
+                    order = sorted(valid, key=lambda key: (abs(int(key) - query), int(key)))
+                elif pattern == "spread":
+                    count = min(budget, len(valid))
+                    positions = (np.arange(count) * len(valid) // count + ri + head) % len(valid)
+                    first = [int(valid[position]) for position in positions]
+                    order = first + [int(key) for key in valid if key not in set(first)]
+                elif pattern == "boundary_padding":
+                    order = sorted(valid, key=lambda key: (
+                        int(counts[key]), min(int(key), len(counts) - 1 - int(key)), int(key),
+                    ))
+                else:
+                    order = list(valid)
+                expected[head, ri, order] = np.arange(len(order), 0, -1, dtype=np.float32)
+        np.testing.assert_array_equal(
+            analysis.patterns.scores(pattern, counts, rows, budget, 3), expected,
+        )
 
 
 @pytest.mark.parametrize(

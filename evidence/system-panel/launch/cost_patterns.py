@@ -22,29 +22,30 @@ def scores(pattern, valid_count, rows, budget, heads):
     if not len(valid):
         raise ValueError("pattern requires nonempty video keys")
     values = np.full((heads, len(rows), len(valid_count)), -1e9, dtype=np.float32)
-    for ri, query in enumerate(rows):
-        for head in range(heads):
-            if pattern == "clustered":
-                order = sorted(valid, key=lambda col: (abs(int(col) - int(query)), int(col)))
-            elif pattern == "spread":
-                # Evenly spaced ranks among nonempty keys; rotate per query/head.
-                count = min(budget, len(valid))
-                positions = (np.arange(count) * len(valid) // count + ri + head) % len(valid)
-                first = [int(valid[p]) for p in positions]
-                chosen = set(first)
-                order = first + [int(col) for col in valid if col not in chosen]
-            elif pattern == "boundary_padding":
-                order = sorted(
-                    valid,
-                    key=lambda col: (
-                        int(valid_count[col]),
-                        min(int(col), len(valid_count) - 1 - int(col)),
-                        int(col),
-                    ),
-                )
-            else:
-                order = list(valid)
-            values[head, ri, order] = np.arange(len(order), 0, -1, dtype=np.float32)
+    ranks = np.arange(len(valid), 0, -1, dtype=np.float32)
+    if pattern == "clustered":
+        distance = np.abs(valid[None, :] - np.asarray(rows)[:, None])
+        order = valid[np.argsort(distance, axis=-1, kind="stable")][None, :, :]
+    elif pattern == "spread":
+        count = min(budget, len(valid))
+        positions = (
+            np.arange(count)[None, None, :] * len(valid) // count
+            + np.arange(len(rows))[None, :, None] + np.arange(heads)[:, None, None]
+        ) % len(valid)
+        chosen = np.zeros((heads, len(rows), len(valid)), dtype=np.bool_)
+        np.put_along_axis(chosen, positions, True, axis=-1)
+        remaining = np.argsort(chosen, axis=-1, kind="stable")[..., :len(valid) - count]
+        order = np.concatenate((valid[positions], valid[remaining]), axis=-1)
+    elif pattern == "boundary_padding":
+        order = np.asarray(sorted(
+            valid,
+            key=lambda col: (
+                int(valid_count[col]), min(int(col), len(valid_count) - 1 - int(col)), int(col),
+            ),
+        ))[None, None, :]
+    else:
+        order = valid[None, None, :]
+    np.put_along_axis(values, order, ranks, axis=-1)
     return values
 
 

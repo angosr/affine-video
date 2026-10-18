@@ -133,6 +133,7 @@ def load_measurements(roots, registration_path, phase, fit_path=None):
     )
     verify_phase_track(registration, document, phase, fit)
     rows, protocols, references = [], [], []
+    verified_proofs: set[bytes] = set()
     for root in roots:
         protocol_path = root / "protocol.json"
         protocol = json.loads(protocol_path.read_text())
@@ -210,7 +211,17 @@ def load_measurements(roots, registration_path, phase, fit_path=None):
                 for proof in row["pattern_proofs"]:
                     if proof["pattern"] != row["model"].removeprefix("pattern_"):
                         raise ValueError("wrong pattern identity")
-                    patterns.verify_proof(proof)
+                    proof_digest = hashlib.sha256(
+                        json.dumps(
+                            proof, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                        ).encode()
+                    ).digest()
+                    # Layers often repeat the exact same allocation proof.
+                    # Cache only a fully verified document, never its label or
+                    # shape; every file/protocol hash is still checked above.
+                    if proof_digest not in verified_proofs:
+                        patterns.verify_proof(proof)
+                        verified_proofs.add(proof_digest)
             measured = samples(row["end_to_end_samples_ms"], protocol["repeats"])
             dense_ms = samples(dense["end_to_end_samples_ms"], protocol["repeats"])
             samples(row["end_to_end_cuda_samples_ms"], protocol["repeats"])
