@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil
 from pathlib import Path
 from typing import Any, Protocol
@@ -116,6 +117,98 @@ class WeightCycleResult:
     status: str
     receipt: WeightReceipt | None = None
     error: str | None = None
+
+
+class _EvaluationWorker:
+    """One FIFO task at a time, with SQLite connections owned by its worker thread."""
+
+    def __init__(
+        self,
+        *,
+        database: str | Path,
+        track_spec_digest: str | None,
+        evaluator_factory: Callable[[ChallengeStore], Callable[[LeasedChallenge], StageOutcome]],
+        admission_settings: AdmissionSettings,
+        scoring_settings: ScoringSettings,
+        worker_id: str,
+        downloader: Callable[..., DownloadedModel] = download_public_model,
+        model_validator: Callable[..., ValidatedModel] = validate_model,
+    ) -> None:
+        if not worker_id:
+            raise ValueError("worker id cannot be empty")
+        self.database = database
+        self.track_spec_digest = track_spec_digest
+        self.evaluator_factory = evaluator_factory
+        self.admission_settings = admission_settings
+        self.scoring_settings = scoring_settings
+        self.worker_id = worker_id
+        self.downloader = downloader
+        self.model_validator = model_validator
+        self.allowed = True
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="veda-evaluation")
+        self._pending: Future[
+            tuple[AdmissionOutcome | None, EvaluatedStage | ScoringOutcome | None]
+        ] | None = None
+
+    @property
+    def busy(self) -> bool:
+        return self._pending is not None
+
+    @property
+    def done(self) -> bool:
+        return self._pending is not None and self._pending.done()
+
+    def start(self, finalized_block: int) -> None:
+        if self.busy:
+            raise RuntimeError("an evaluation task is already pending")
+        self._pending = self._executor.submit(self._run, finalized_block)
+
+    def _run(
+        self, finalized_block: int,
+    ) -> tuple[AdmissionOutcome | None, EvaluatedStage | ScoringOutcome | None]:
+        with ChallengeStore(self.database, track_spec_digest=self.track_spec_digest) as store:
+            if not self.allowed or store.publication_failures() >= MAX_PUBLICATION_FAILURES:
+                return None, None
+            evaluator = self.evaluator_factory(store)
+            admission = process_next_admission(
+                store, worker_id=f"{self.worker_id}:admission", settings=self.admission_settings,
+                current_finalized_block=finalized_block, downloader=self.downloader,
+                model_validator=self.model_validator,
+            )
+            if not self.allowed or store.publication_failures() >= MAX_PUBLICATION_FAILURES:
+                return admission, None
+            evaluated = evaluate_next_scoring(
+                store, worker_id=f"{self.worker_id}:scoring", settings=self.scoring_settings,
+                current_finalized_block=finalized_block, evaluator=evaluator,
+            )
+            return admission, evaluated
+
+    async def take(
+        self, *, wait: bool,
+    ) -> tuple[AdmissionOutcome | None, EvaluatedStage | ScoringOutcome | None] | None:
+        pending = self._pending
+        if pending is None:
+            return None
+        try:
+            if wait:
+                await asyncio.shield(asyncio.wrap_future(pending))
+            elif not pending.done():
+                return None
+            self._pending = None
+            return pending.result()
+        except Exception as exc:
+            self._pending = None
+            if self.scoring_settings.alert is not None:
+                self.scoring_settings.alert("EVALUATOR_WORKER_FAILURE", {
+                    "error_type": type(exc).__name__,
+                    "error": (str(exc) or type(exc).__name__)[:500],
+                })
+            raise
+
+    def close(self) -> None:
+        self.allowed = False
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._pending = None
 
 
 async def run_evaluator(
@@ -299,8 +392,17 @@ async def run_evaluator(
             batch_source=batch_source,
             confirmation_pool=confirmation_pool,
         )
+        work = _EvaluationWorker(
+            database=database, track_spec_digest=track.digest,
+            evaluator_factory=lambda worker_store: replace(evaluator, store=worker_store),
+            admission_settings=admission_settings, scoring_settings=scoring_settings,
+            worker_id=worker_id,
+        )
+        # Join the owner before closing its confirmation processes or main connection.
+        resources.callback(work.close)
         recovery_index = 0
         track_aborted = ledger.aborted
+        publication: PublicArtifacts | None = None
         consecutive_cycle_errors = 0
         while True:
             try:
@@ -353,13 +455,17 @@ async def run_evaluator(
                             store,
                             netuid=track.netuid,
                             track_start_block=track.track_start_block,
-                            admission_settings=admission_settings,
-                            scoring_settings=scoring_settings,
-                            evaluator=evaluator,
-                            worker_id=worker_id,
+                            work=work,
+                            wait_for_work=once,
                             max_scan_blocks=max_scan_blocks,
                             recovery_matches=ledger.matches[recovery_index:],
-                            minimum_finalized_block=ledger.required_finalized_block,
+                            # One height identifies one immutable public snapshot.
+                            # Keep finished work leased until it can enter the next
+                            # snapshot, including after a partially failed publication.
+                            minimum_finalized_block=max(
+                                ledger.required_finalized_block,
+                                0 if publication is None else publication.source_block + 1,
+                            ),
                             track_close_block=track.track_close_block,
                             track_aborted=track_aborted,
                         )
@@ -377,24 +483,32 @@ async def run_evaluator(
                                     netuid=track.netuid,
                                     finalized_block=result.finalized_block,
                                 )
-                                artifacts = build_public_artifacts(
-                                    store,
-                                    track,
-                                    chain,
-                                    version_key=version_key,
-                                    batch_disclosure_resolver=(
-                                        None
-                                        if batch_source is None
-                                        else batch_source.public_disclosure
-                                    ),
-                                    disclosed_plan_digests=frozenset(disclosed_plan_digests),
-                                    model_resolver=(
-                                        None if batch_source is None else batch_source.restore_model
-                                    ),
-                                    runtime_manifest=runtime_manifest_payload,
-                                    track_aborted=track_aborted,
-                                    release_approval=getattr(publisher, "release_approval", None),
-                                )
+                                if (
+                                    publication is None
+                                    or publication.source_block != chain.finalized_block
+                                ):
+                                    publication = build_public_artifacts(
+                                        store,
+                                        track,
+                                        chain,
+                                        version_key=version_key,
+                                        batch_disclosure_resolver=(
+                                            None
+                                            if batch_source is None
+                                            else batch_source.public_disclosure
+                                        ),
+                                        disclosed_plan_digests=frozenset(disclosed_plan_digests),
+                                        model_resolver=(
+                                            None if batch_source is None
+                                            else batch_source.restore_model
+                                        ),
+                                        runtime_manifest=runtime_manifest_payload,
+                                        track_aborted=track_aborted,
+                                        release_approval=getattr(
+                                            publisher, "release_approval", None,
+                                        ),
+                                    )
+                                artifacts = publication
                                 if artifacts is not None:
                                     await publisher.publish(artifacts)
                                     # publish() completes the full continuous match prefix,
@@ -619,22 +733,18 @@ async def process_cycle(
     *,
     netuid: int,
     track_start_block: int,
-    admission_settings: AdmissionSettings,
-    scoring_settings: ScoringSettings,
-    evaluator: Callable[[LeasedChallenge], StageOutcome],
-    worker_id: str,
+    work: _EvaluationWorker,
+    wait_for_work: bool = False,
     max_scan_blocks: int = 100,
-    downloader: Callable[..., DownloadedModel] = download_public_model,
-    model_validator: Callable[..., ValidatedModel] = validate_model,
     recovery_matches: Sequence[MatchRecord] = (),
     minimum_finalized_block: int = 0,
     track_close_block: int | None = None,
     track_aborted: bool = False,
 ) -> EvaluationCycleResult:
-    """Synchronize the chain, admit one model, and score one ready stage."""
+    """Scan/publish independently of one leased FIFO task; commit on the owner loop."""
 
-    if not worker_id:
-        raise ValueError("worker id cannot be empty")
+    admission_settings = work.admission_settings
+    scoring_settings = work.scoring_settings
     if minimum_finalized_block < 0:
         raise ValueError("minimum finalized block cannot be negative")
     if track_close_block is not None and track_close_block < 0:
@@ -653,6 +763,7 @@ async def process_cycle(
         maximum_effective_challenges=admission_settings.maximum_effective_challenges,
     )
     if finalized_block < minimum_finalized_block:
+        work.allowed = False
         return EvaluationCycleResult(
             finalized_block,
             scan,
@@ -661,15 +772,16 @@ async def process_cycle(
             restored_matches=restored_matches,
         )
     track_closed = track_close_block is not None and finalized_block > track_close_block
+    work.allowed = not (
+        track_aborted or track_closed
+        or store.publication_failures() >= MAX_PUBLICATION_FAILURES
+    )
     if track_closed and admission_settings.last_submission_block is not None:
         store.reject_submissions_after(
             admission_settings.last_submission_block,
             decision_block=finalized_block,
         )
-    if (
-        track_aborted or track_closed
-        or store.publication_failures() >= MAX_PUBLICATION_FAILURES
-    ):
+    if not work.allowed and not ((track_aborted or track_closed) and work.done):
         return EvaluationCycleResult(
             finalized_block,
             scan,
@@ -677,21 +789,14 @@ async def process_cycle(
             None,
             restored_matches=restored_matches,
         )
-    admission = process_next_admission(
-        store,
-        worker_id=f"{worker_id}:admission",
-        settings=admission_settings,
-        current_finalized_block=finalized_block,
-        downloader=downloader,
-        model_validator=model_validator,
-    )
-    evaluated = evaluate_next_scoring(
-        store,
-        worker_id=f"{worker_id}:scoring",
-        current_finalized_block=finalized_block,
-        settings=scoring_settings,
-        evaluator=evaluator,
-    )
+    if not work.busy:
+        work.start(finalized_block)
+    completed = await work.take(wait=wait_for_work)
+    if completed is None:
+        return EvaluationCycleResult(
+            finalized_block, scan, None, None, restored_matches=restored_matches,
+        )
+    admission, evaluated = completed
     if isinstance(evaluated, EvaluatedStage):
         try:
             finalized_block = await client.finalized_block()
@@ -704,18 +809,21 @@ async def process_cycle(
                 summary=str(exc) or type(exc).__name__,
             )
         else:
-            if track_close_block is not None and finalized_block > track_close_block:
+            if track_aborted or (
+                track_close_block is not None and finalized_block > track_close_block
+            ):
+                reason = "TRACK_ABORTED" if track_aborted else "TRACK_CLOSE_REACHED"
                 store.wait_leased(
                     evaluated.task.challenge_id,
                     evaluated.task.lease_token,
                     retry_after_ms=evaluated.occurred_at_ms + scoring_settings.retry_base_ms,
-                    reason="TRACK_CLOSE_REACHED",
+                    reason=reason,
                     occurred_at_ms=evaluated.occurred_at_ms,
                 )
                 scoring = ScoringOutcome(
                     evaluated.task.challenge_id,
                     ChallengeState.SYSTEM_DEFERRED,
-                    "TRACK_CLOSE_REACHED",
+                    reason,
                 )
             else:
                 scoring = commit_evaluated_scoring(

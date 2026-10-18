@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -10,14 +11,21 @@ from safetensors.numpy import save_file
 
 from miner.submit import ModelSubmission
 from scoring.model import TensorSpec
-from scoring.spec import track_spec_dict
+from scoring.spec import parse_track_spec, track_spec_dict
+from tests.scoring.test_spec import valid_spec
 from validator import run as run_module
 from validator.admission import AdmissionSettings, AdmissionStatus
 from validator.chain import ScanResult
 from validator.download import DownloadedModel
-from validator.publication import encode_weight_artifact
+from validator.publication import (
+    PublicArtifactError,
+    S3Repository,
+    build_public_artifacts,
+    decode_weight_artifact,
+    encode_weight_artifact,
+)
 from validator.queue import ChainPosition, ChallengeState
-from validator.run import EvaluationCycleResult, process_cycle, process_weight_cycle
+from validator.run import EvaluationCycleResult, process_weight_cycle
 from validator.scoring import ScoringSettings, StageOutcome
 from validator.store import ChallengeStore
 from validator.tournament import Champion, MatchOutcome, resolve_tournament
@@ -27,9 +35,379 @@ from validator.weights import (
     WeightPlan,
     WeightReceipt,
     plan_champion_weight,
+    validate_weight_artifact,
 )
 
 from .test_chain import HOTKEY, FakeClient, chain_block
+from .test_publication import MemoryS3
+
+
+async def _complete_cycle(
+    client, store, *, admission_settings, scoring_settings, evaluator, worker_id,
+    downloader=run_module.download_public_model, model_validator=run_module.validate_model,
+    **kwargs,
+):
+    """Drive one real worker to completion for the bounded one-shot regressions."""
+
+    database = store._connection.execute("PRAGMA database_list").fetchone()[2]
+    work = run_module._EvaluationWorker(
+        database=database, track_spec_digest=store.track_spec_digest(),
+        evaluator_factory=lambda _store: evaluator,
+        admission_settings=admission_settings, scoring_settings=scoring_settings,
+        worker_id=worker_id, downloader=downloader, model_validator=model_validator,
+    )
+    try:
+        return await run_module.process_cycle(
+            client, store, work=work, wait_for_work=True, **kwargs,
+        )
+    finally:
+        work.close()
+
+
+async def _eventually(predicate):
+    async with asyncio.timeout(5):
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+
+@pytest.fixture
+def pending_evaluation(tmp_path):
+    """Real scan, admission, SQLite leases and publication; only inference is held."""
+
+    track = parse_track_spec(valid_spec())
+    path = tmp_path / "selector.safetensors"
+    save_file(
+        {name: np.ones(spec.shape, dtype=spec.dtype)
+         for name, spec in track.model.tensor_schema.items()},
+        path, metadata={"hotkey": HOTKEY},
+    )
+    downloaded = DownloadedModel(
+        path, hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_size, None, None,
+    )
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    client = FakeClient({
+        height: chain_block(payload, height) if height == 100 else empty_chain_block(height)
+        for height in range(100, 131)
+    })
+    client._finalized = 101
+    entered, release = threading.Event(), threading.Event()
+    calls, connections, alerts = [], [], []
+    owner_thread = threading.get_ident()
+    with ChallengeStore(tmp_path / "validator.db", track_spec_digest=track.digest) as store:
+        def factory(worker_store):
+            assert worker_store is not store
+            assert threading.get_ident() != owner_thread
+            # A connection opened on the owner thread would raise ProgrammingError here.
+            worker_store.public_snapshot()
+            connections.append(worker_store)
+
+            def evaluate(task):
+                calls.append(task.challenge_id)
+                entered.set()
+                if not release.wait(10):
+                    raise RuntimeError("test did not release inference")
+                return StageOutcome(0.7, {"stage": "scoring"})
+
+            return evaluate
+
+        work = run_module._EvaluationWorker(
+            database=tmp_path / "validator.db", track_spec_digest=track.digest,
+            evaluator_factory=factory,
+            admission_settings=AdmissionSettings(
+                cache_dir=tmp_path / "cache", max_model_bytes=track.model.max_bytes,
+                tensor_schema=track.model.tensor_schema, publication_grace_blocks=1,
+            ),
+            scoring_settings=ScoringSettings(alert=lambda *args: alerts.append(args)),
+            worker_id="single-worker", downloader=lambda *_args, **_kwargs: downloaded,
+        )
+        transport = MemoryS3()
+        publisher = S3Repository(transport, bucket="test", prefix="isolated/heartbeat")
+        publisher.verify_conditional_writes()
+        try:
+            yield SimpleNamespace(
+                track=track, store=store, client=client, work=work, entered=entered,
+                release=release, calls=calls, connections=connections, alerts=alerts,
+                transport=transport, publisher=publisher,
+            )
+        finally:
+            release.set()
+            work.close()
+
+
+async def _pending_cycle(case, **kwargs):
+    return await run_module.process_cycle(
+        case.client, case.store, netuid=case.track.netuid,
+        track_start_block=case.track.track_start_block, work=case.work, **kwargs,
+    )
+
+
+async def _publish_pending(case):
+    chain = WeightChainState(
+        finalized_block=case.client._finalized,
+        uid_by_hotkey={case.track.initial_champion.hotkey: 0, HOTKEY: 1},
+        min_allowed_weights=1, max_weight=1.0, weights_rate_limit=1,
+        last_update_by_hotkey={},
+    )
+    artifacts = build_public_artifacts(case.store, case.track, chain, version_key=0)
+    assert artifacts is not None
+    await case.publisher.publish(artifacts)
+    weights = decode_weight_artifact(case.transport.objects["isolated/heartbeat/weights.json"])
+    plan = validate_weight_artifact(
+        weights, chain, expected_netuid=case.track.netuid,
+        expected_track_digest=case.track.digest, expected_mechid=case.track.mechid,
+        max_staleness_blocks=1,
+    )
+    assert plan is not None and plan.uids == (0,)
+    assert weights.source_block == chain.finalized_block
+    return artifacts
+
+
+@pytest.mark.parametrize("phase", ["download", "scoring"])
+def test_pending_work_keeps_scanning_status_and_cas_weights_fresh(pending_evaluation, phase):
+    case = pending_evaluation
+    if phase == "download":
+        download = case.work.downloader
+
+        def held_download(*args, **kwargs):
+            case.entered.set()
+            if not case.release.wait(10):
+                raise OSError("test did not release download")
+            return download(*args, **kwargs)
+
+        case.work.downloader = held_download
+
+    async def execute():
+        result = await _pending_cycle(case)
+        assert result.scoring is None
+        await _eventually(case.entered.is_set)
+        first = await _publish_pending(case)
+        for height in range(102, 106):
+            case.client._finalized = height
+            result = await _pending_cycle(case)
+            assert result.scoring is None
+            assert case.store.chain_cursor()[0] == height
+            artifacts = await _publish_pending(case)
+            participant = next(
+                row for row in json.loads(artifacts.status)["participants"]
+                if row["hotkey"] == HOTKEY
+            )
+            assert participant["state"] == ("FETCHING" if phase == "download" else "SCORING")
+            assert participant["score"] is None
+            assert case.calls == ([] if phase == "download" else [participant["challenge_id"]])
+        # A stale concurrent publisher cannot undo fresh weights while inference runs.
+        before = case.transport.objects["isolated/heartbeat/weights.json"]
+        with pytest.raises(PublicArtifactError, match="older|rollback|stale"):
+            await S3Repository(
+                case.transport, bucket="test", prefix="isolated/heartbeat",
+            ).publish(first)
+        assert case.transport.objects["isolated/heartbeat/weights.json"] == before
+        with pytest.raises(RuntimeError, match="already pending"):
+            case.work.start(105)
+        case.release.set()
+        result = await _pending_cycle(case, wait_for_work=True)
+        assert result.scoring.state is ChallengeState.SUCCEEDED
+        assert case.store.public_snapshot()["challenges"][0]["score_block"] == 105
+        assert len(case.calls) == len(case.connections) == 1
+
+    asyncio.run(execute())
+
+
+@pytest.mark.parametrize("fence", ["close", "abort", "publication"])
+def test_inflight_result_obeys_close_abort_and_publication_fences(pending_evaluation, fence):
+    case = pending_evaluation
+
+    async def execute():
+        await _pending_cycle(case)
+        await _eventually(case.entered.is_set)
+        case.client._finalized = 105
+        if fence == "publication":
+            for _ in range(run_module.MAX_PUBLICATION_FAILURES):
+                case.store.record_publication_failure()
+            options = {}
+        else:
+            options = {"track_close_block": 103} if fence == "close" else {"track_aborted": True}
+        paused = await _pending_cycle(case, **options)
+        assert paused.scoring is None
+        case.release.set()
+        await _eventually(lambda: case.work.done)
+        result = await _pending_cycle(case, **options)
+        challenge = case.store.public_snapshot()["challenges"][0]
+        assert challenge["final_score"] is None
+        assert challenge["stages"] == []
+        assert len(case.calls) == 1
+        if fence == "publication":
+            assert result.scoring is None and case.work.busy
+            await _publish_pending(case)
+            case.store.publication_succeeded()
+            result = await _pending_cycle(case)
+            assert result.scoring.state is ChallengeState.SUCCEEDED
+            assert not case.work.busy
+        else:
+            assert result.scoring.state is ChallengeState.SYSTEM_DEFERRED
+            expected = "TRACK_CLOSE_REACHED" if fence == "close" else "TRACK_ABORTED"
+            assert result.scoring.code == expected
+            assert not case.work.busy
+
+    asyncio.run(execute())
+
+
+def test_worker_setup_failure_alerts_and_does_not_poison_next_task(pending_evaluation):
+    case = pending_evaluation
+    factory = case.work.evaluator_factory
+
+    def fail(_store):
+        raise OSError("worker setup failed")
+
+    async def execute():
+        case.work.evaluator_factory = fail
+        with pytest.raises(OSError, match="worker setup failed"):
+            await _pending_cycle(case, wait_for_work=True)
+        assert not case.work.busy
+        assert case.alerts == [("EVALUATOR_WORKER_FAILURE", {
+            "error_type": "OSError", "error": "worker setup failed",
+        })]
+        await _publish_pending(case)
+        case.work.evaluator_factory = factory
+        case.release.set()
+        result = await _pending_cycle(case, wait_for_work=True)
+        assert result.scoring.state is ChallengeState.SUCCEEDED
+        assert len(case.calls) == 1
+
+    asyncio.run(execute())
+
+
+def test_evaluator_loop_publishes_while_worker_owns_its_connection(
+    pending_evaluation, monkeypatch, tmp_path,
+):
+    case = pending_evaluation
+    entered, release = threading.Event(), threading.Event()
+    admission_gate = threading.Event()
+    calls, reports, failures = [], [], []
+    snapshots = []
+    original_admission = run_module.process_next_admission
+    original_scoring = run_module.evaluate_next_scoring
+    owner = threading.get_ident()
+
+    class StopLoop(BaseException):
+        pass
+
+    class Client(FakeClient):
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    client = Client(case.client._substrate.blocks)
+    client._finalized = 102
+
+    async def no_seed(*_args, **_kwargs):
+        pass
+
+    async def chain_state(_client, *, netuid, finalized_block):
+        assert netuid == case.track.netuid
+        return WeightChainState(
+            finalized_block=finalized_block,
+            uid_by_hotkey={case.track.initial_champion.hotkey: 0, HOTKEY: 1},
+            min_allowed_weights=1, max_weight=1.0, weights_rate_limit=1,
+            last_update_by_hotkey={},
+        )
+
+    def admission(store, **kwargs):
+        assert threading.get_ident() != owner
+        if not admission_gate.wait(5):
+            raise OSError("test did not release admission")
+        return original_admission(store, **{**kwargs, "downloader": case.work.downloader})
+
+    def scoring(store, **kwargs):
+        assert threading.get_ident() != owner
+        assert kwargs["evaluator"].store is store
+
+        def held(task):
+            calls.append(task.challenge_id)
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("test did not release inference")
+            return StageOutcome(0.7, {})
+
+        return original_scoring(store, **{**kwargs, "evaluator": held})
+
+    def report(result):
+        if result.cycle_error or result.publication_error:
+            failures.append(result)
+            release.set()
+            raise StopLoop
+        published_block = client._finalized
+        snapshots.append((
+            published_block, case.transport.objects["isolated/heartbeat/status.json"],
+        ))
+        if not admission_gate.is_set():
+            admission_gate.set()
+            return
+        if not entered.is_set():
+            client._finalized += 1
+            return
+        assert result.published_block == published_block
+        status = json.loads(case.transport.objects["isolated/heartbeat/status.json"])
+        if next(row for row in status["participants"] if row["hotkey"] == HOTKEY)[
+            "state"
+        ] != "SCORING":
+            # The first snapshot is frozen before admission, then retried unchanged
+            # at this height even when the worker has progressed to SCORING.
+            client._finalized += 1
+            return
+        reports.append(result)
+        weights = decode_weight_artifact(
+            case.transport.objects["isolated/heartbeat/weights.json"],
+        )
+        assert weights.source_block == published_block
+        assert weights.plan.uids == (0,)
+        if len(reports) == 3:
+            release.set()
+            raise StopLoop
+        client._finalized += 1
+
+    monkeypatch.setattr(run_module, "load_track_spec", lambda _path: case.track)
+    monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run_module.bt, "Client", lambda *_args, **_kwargs: client)
+    monkeypatch.setattr(run_module, "seed_legacy_exclusions", no_seed)
+    monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", no_seed)
+    monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
+    monkeypatch.setattr(run_module, "process_next_admission", admission)
+    monkeypatch.setattr(run_module, "evaluate_next_scoring", scoring)
+    monkeypatch.setattr(
+        run_module, "webhook_alerter",
+        lambda *_args, **_kwargs: lambda *args: case.alerts.append(args),
+    )
+    (tmp_path / "batches").mkdir()
+
+    async def execute():
+        async with asyncio.timeout(5):
+            await run_module.run_evaluator(
+                track_spec="track.json", database=tmp_path / "loop.db",
+                model_cache=tmp_path / "models", exact_cache=tmp_path / "batches",
+                initial_model=tmp_path / "selector.safetensors", network="finney",
+                archive_endpoints=None, worker_id="single-worker", publisher=case.publisher,
+                report=report, poll_seconds=0.001,
+                alert_webhook_url="https://alerts.example/veda",
+            )
+
+    try:
+        with pytest.raises(StopLoop):
+            asyncio.run(execute())
+    finally:
+        admission_gate.set()
+        release.set()
+    assert not failures
+    assert len(calls) == 1
+    assert len(reports) == 3
+    first_height = [payload for height, payload in snapshots if height == 102]
+    assert len(first_height) >= 2 and len(set(first_height)) == 1
+    assert next(
+        row for row in json.loads(first_height[0])["participants"] if row["hotkey"] == HOTKEY
+    )["state"] == "QUEUED"
+    # ExitStack joins the in-flight thread before closing the evaluator resources.
+    assert not any(thread.name.startswith("veda-evaluation") for thread in threading.enumerate())
 
 
 def test_release_defaults_target_sn120_initial_state() -> None:
@@ -329,10 +707,12 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
             "worker_id": "validator-a",
             "downloader": download,
         }
-        paused = asyncio.run(process_cycle(client, store, minimum_finalized_block=102, **arguments))
-        closed = asyncio.run(process_cycle(client, store, track_close_block=100, **arguments))
-        aborted = asyncio.run(process_cycle(client, store, track_aborted=True, **arguments))
-        first = asyncio.run(process_cycle(client, store, **arguments))
+        paused = asyncio.run(
+            _complete_cycle(client, store, minimum_finalized_block=102, **arguments)
+        )
+        closed = asyncio.run(_complete_cycle(client, store, track_close_block=100, **arguments))
+        aborted = asyncio.run(_complete_cycle(client, store, track_aborted=True, **arguments))
+        first = asyncio.run(_complete_cycle(client, store, **arguments))
 
         assert paused.scan.submissions_found == 1
         assert paused.admission is paused.scoring is None
@@ -361,7 +741,7 @@ def test_closed_track_rejects_scanned_late_work_and_ignores_new_commitments(tmp_
 
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest="ab" * 32) as store:
         cycle = asyncio.run(
-            process_cycle(
+            _complete_cycle(
                 client,
                 store,
                 netuid=7,
@@ -411,7 +791,7 @@ def test_cycle_does_not_commit_a_stage_after_the_track_closes(tmp_path) -> None:
     client.finalized_block = advancing_finalized_block
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest="ab" * 32) as store:
         cycle = asyncio.run(
-            process_cycle(
+            _complete_cycle(
                 client,
                 store,
                 netuid=7,
@@ -519,12 +899,12 @@ def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_
         "max_scan_blocks": 300,
     }
     with ChallengeStore(database, track_spec_digest="ab" * 32) as store:
-        exact_cycle = asyncio.run(process_cycle(client, store, **arguments))
+        exact_cycle = asyncio.run(_complete_cycle(client, store, **arguments))
         assert exact_cycle.scoring is not None
         assert exact_cycle.scoring.state is ChallengeState.CONFIRMING
 
     with ChallengeStore(database, track_spec_digest="ab" * 32) as store:
-        confirmation_cycle = asyncio.run(process_cycle(client, store, **arguments))
+        confirmation_cycle = asyncio.run(_complete_cycle(client, store, **arguments))
         assert confirmation_cycle.scoring is not None
         snapshot = store.public_snapshot()
         challenge = snapshot["challenges"][0]
@@ -603,7 +983,7 @@ def test_cycle_releases_scoring_lease_when_fresh_finalized_head_is_unavailable(t
 
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest="ab" * 32) as store:
         cycle = asyncio.run(
-            process_cycle(
+            _complete_cycle(
                 client,
                 store,
                 netuid=7,
