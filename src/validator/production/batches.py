@@ -386,16 +386,19 @@ class ReadyBatchSource:
             raise RuntimeError("challenge is assigned to multiple private plans")
         return bool(matches and matches[0].state == "READY")
 
-    def batch_challenge_ids(self, plan_digest: str) -> tuple[str, ...]:
-        """Return every challenge sharing a plan, for delayed public disclosure."""
+    def public_disclosure(
+        self,
+        plan_digest: str,
+        terminal_challenge_ids: frozenset[str],
+    ) -> BatchDisclosure | None:
+        """Restore replay bytes only after every challenge sharing the batch is terminal."""
 
         plan = self._plan_by_digest(plan_digest)
-        return tuple(dict.fromkeys(plan.exact_challenge_ids + plan.confirmation_challenge_ids))
-
-    def public_disclosure(self, plan_digest: str) -> BatchDisclosure:
-        """Restore every byte needed to independently replay one terminal batch group."""
-
-        plan = self._plan_by_digest(plan_digest)
+        challenge_ids = tuple(
+            dict.fromkeys(plan.exact_challenge_ids + plan.confirmation_challenge_ids)
+        )
+        if not set(challenge_ids).issubset(terminal_challenge_ids):
+            return None
         assert plan.exact is not None
         exact = self._restore_exact(plan)
         files = [
@@ -453,7 +456,7 @@ class ReadyBatchSource:
             }
         )
         return BatchDisclosure(
-            tuple(dict.fromkeys(plan.exact_challenge_ids + plan.confirmation_challenge_ids)),
+            challenge_ids,
             f"batch_groups/{plan.plan_digest}.json",
             record,
             tuple(files),

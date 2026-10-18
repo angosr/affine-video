@@ -1597,16 +1597,32 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         track,
         chain,
         version_key=9,
-        batch_disclosure_resolver=lambda digest: disclosure(digest, ("challenge", "pending")),
+        batch_disclosure_resolver=lambda digest, _terminal: disclosure(
+            digest, ("challenge", "pending")
+        ),
     )
     assert withheld is not None
     assert not any(item.object_name.startswith("batches/") for item in withheld.files)
+    unresolved = []
+
+    def no_terminal_group(digest, terminal_ids):
+        assert terminal_ids == frozenset({"challenge"})
+        unresolved.append(digest)
+        return None
+
+    still_pending = build_public_artifacts(
+        store, track, chain, version_key=9, batch_disclosure_resolver=no_terminal_group,
+    )
+    assert still_pending is not None
+    assert len(unresolved) == 2 and len(set(unresolved)) == 2
+    assert still_pending.batch_groups == ()
+    assert not any(item.object_name.startswith("batches/") for item in still_pending.files)
     disclosed = build_public_artifacts(
         store,
         track,
         chain,
         version_key=9,
-        batch_disclosure_resolver=lambda digest: disclosure(digest, ("challenge",)),
+        batch_disclosure_resolver=lambda digest, _terminal: disclosure(digest, ("challenge",)),
     )
     assert disclosed is not None
     assert sum(item.object_name.startswith("batches/") for item in disclosed.files) == 2
@@ -1618,7 +1634,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         for name, _ in disclosed.batch_groups
     )
 
-    def unexpected_disclosure(_digest):
+    def unexpected_disclosure(_digest, _terminal):
         raise AssertionError("an already public batch was restored from private storage")
 
     repeated = build_public_artifacts(

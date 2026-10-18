@@ -1265,6 +1265,25 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
         source._restore_exact(inconsistent_ready)
 
 
+@pytest.mark.parametrize("terminal_ids", [frozenset(), frozenset({"a"}), frozenset({"b"})])
+def test_disclosure_does_not_restore_files_until_the_whole_group_is_terminal(
+    tmp_path, monkeypatch, terminal_ids,
+) -> None:
+    source = ReadyBatchSource(track=SimpleNamespace(), objects=object(), cache_dir=tmp_path)
+    plan = SimpleNamespace(
+        exact=object(), exact_challenge_ids=("a",), confirmation_challenge_ids=("b",),
+    )
+    monkeypatch.setattr(source, "_plan_by_digest", lambda _digest: plan)
+
+    def unexpected_restore(_plan):
+        raise AssertionError("a nonterminal batch group must not restore any payload")
+
+    monkeypatch.setattr(source, "_restore_exact", unexpected_restore)
+    monkeypatch.setattr(source, "_restore_sample_cache", unexpected_restore)
+    assert source.public_disclosure("ab" * 32, terminal_ids) is None
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_path) -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
     track = SimpleNamespace(
@@ -1370,11 +1389,9 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     assert restored.plan == ready_plan
     assert restored.exact.sha256 == "12" * 32
     assert len(restored.latent_paths) == 2
-    assert source.batch_challenge_ids(ready_plan.plan_digest) == (
-        "exact-a",
-        "confirm-a",
-    )
-    disclosure = source.public_disclosure(ready_plan.plan_digest)
+    terminal_ids = frozenset({"exact-a", "confirm-a"})
+    disclosure = source.public_disclosure(ready_plan.plan_digest, terminal_ids)
+    assert disclosure is not None
     assert disclosure.challenge_ids == ("exact-a", "confirm-a")
     assert disclosure.record_name == f"batch_groups/{ready_plan.plan_digest}.json"
     assert len(disclosure.files) == 7
@@ -1392,7 +1409,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
             track=mismatched_track,
             objects=Objects(),
             cache_dir=tmp_path,
-        ).batch_challenge_ids(ready_plan.plan_digest)
+        ).public_disclosure(ready_plan.plan_digest, terminal_ids)
 
     wrong_namespace = replace(
         ready_plan,
@@ -1403,7 +1420,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
             track=track,
             objects=Objects(wrong_namespace),
             cache_dir=tmp_path,
-        ).batch_challenge_ids(ready_plan.plan_digest)
+        ).public_disclosure(ready_plan.plan_digest, terminal_ids)
 
     exact = tmp_path / f"{ready_plan.generation_block}-{ready_plan.exact.sha256}.npz"
     exact.write_bytes(b"temporary")

@@ -123,7 +123,9 @@ def build_public_artifacts(
     chain: WeightChainState,
     *,
     version_key: int,
-    batch_disclosure_resolver: Callable[[str], BatchDisclosure] | None = None,
+    batch_disclosure_resolver: Callable[
+        [str, frozenset[str]], BatchDisclosure | None
+    ] | None = None,
     disclosed_plan_digests: frozenset[str] = frozenset(),
     model_resolver: Callable[[str, int], Path] | None = None,
     runtime_manifest: bytes | None = None,
@@ -201,11 +203,11 @@ def build_public_artifacts(
     )
     files: dict[str, PublicFile] = {}
     batch_groups: dict[str, bytes] = {}
-    terminal_ids = {
+    terminal_ids = frozenset(
         challenge["challenge_id"]
         for challenge in snapshot["challenges"]
         if challenge["state"] in {state.value for state in TERMINAL_STATES}
-    }
+    )
     disclosure: dict[str, bool] = {}
     for match in tournament.matches:
         evaluation = match.document["evaluation"]
@@ -226,7 +228,7 @@ def build_public_artifacts(
                     resolved = (
                         None
                         if batch_disclosure_resolver is None
-                        else batch_disclosure_resolver(plan_digest)
+                        else batch_disclosure_resolver(plan_digest, terminal_ids)
                     )
                     disclosure[plan_digest] = bool(resolved) and set(
                         resolved.challenge_ids
