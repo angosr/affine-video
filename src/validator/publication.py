@@ -34,7 +34,7 @@ from validator.production.plan import (
     validate_source_selection_sequence,
 )
 from validator.queue import TERMINAL_STATES, ChallengeState
-from validator.release import LEGACY_PUBLIC_IDENTITY, ReleaseApproval, require_release_approval
+from validator.release import ReleaseApproval, require_release_approval
 from validator.s3 import client_config
 from validator.store import ChallengeStore
 from validator.system_match_data import PRODUCTION_TRACK_ID
@@ -61,7 +61,10 @@ _STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MAX_WEIGHT_ARTIFACT_BYTES = 1024 * 1024
 _MAX_PUBLIC_OBJECT_BYTES = 1024 * 1024
 _SUMMARY_LEADERBOARD_LIMIT = 100
-_LEGACY_UNFENCED_WEIGHT_TRACK = LEGACY_PUBLIC_IDENTITY
+_LEGACY_UNFENCED_WEIGHT_TRACK = (
+    "veda-sn120-v1",
+    "0fcae991aef29f87b97fbb07cf79c49e5eb9cc2a5d9aecdd2a566443e2b81dd5",
+)
 
 
 class PublicArtifactError(RuntimeError):
@@ -527,23 +530,6 @@ async def fetch_weight_artifact(
     return decode_weight_artifact(bytes(received))
 
 
-async def fetch_track_spec(
-    url: str,
-    *,
-    client: httpx.AsyncClient,
-) -> TrackSpec:
-    """Fetch and verify the current track document from public storage."""
-
-    document = await _fetch_track_document(url, client=client)
-    try:
-        track = parse_track_spec(document["spec"])
-    except ValueError as exc:
-        raise PublicArtifactError("public track specification is invalid") from exc
-    if document["track_spec_digest"] != track.digest:
-        raise PublicArtifactError("public track digest is invalid")
-    return track
-
-
 async def fetch_track_identity(
     url: str,
     *,
@@ -735,17 +721,15 @@ class S3Repository:
                     "track_spec_digest"
                 ]:
                     raise ValueError("public track digest is invalid")
-                identity = (document["spec"]["track_id"], document["track_spec_digest"])
-                if identity != LEGACY_PUBLIC_IDENTITY:
-                    track = parse_track_spec(document["spec"])
-                    require_release_approval(
-                        track,
-                        (
-                            None if artifacts.runtime_manifest is None
-                            else artifacts.runtime_manifest[1]
-                        ),
-                        self.release_approval,
-                    )
+                track = parse_track_spec(document["spec"])
+                require_release_approval(
+                    track,
+                    (
+                        None if artifacts.runtime_manifest is None
+                        else artifacts.runtime_manifest[1]
+                    ),
+                    self.release_approval,
+                )
             except (KeyError, TypeError, ValueError) as exc:
                 raise PublicArtifactError(f"formal release rejected: {exc}") from exc
         try:

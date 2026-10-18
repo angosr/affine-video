@@ -108,19 +108,15 @@ def test_coordinated_release_environment_requires_only_the_existing_digest_setti
     assert ReleaseApproval.from_environment() == ReleaseApproval("ab" * 32)
 
 
-def test_legacy_exception_is_only_the_pinned_public_identity():
+def test_retired_public_identity_cannot_bypass_release_approval():
     from types import SimpleNamespace
 
-    release.require_release_approval(
-        SimpleNamespace(
-            track_id=release.LEGACY_PUBLIC_IDENTITY[0], digest=release.LEGACY_PUBLIC_IDENTITY[1]
-        ),
-        None,
-        None,
-    )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="coordinated track digest"):
         release.require_release_approval(
-            SimpleNamespace(track_id=release.LEGACY_PUBLIC_IDENTITY[0], digest="ab" * 32),
+            SimpleNamespace(
+                track_id="veda-sn120-v1",
+                digest="0fcae991aef29f87b97fbb07cf79c49e5eb9cc2a5d9aecdd2a566443e2b81dd5",
+            ),
             None,
             None,
         )

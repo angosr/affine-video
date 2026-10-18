@@ -180,8 +180,7 @@ Every new release to `tracks/main` requires an explicitly coordinated full track
 `VEDA_COORDINATED_RELEASE_DIGEST` and the matching runtime manifest. A missing approval or a
 mismatched identity rejects publication before any write. Research experiments remain tracked in
 the evidence inventory, with incomplete work explicitly marked as such; completing the entire
-panel is not a startup requirement. The existing public v1 identity alone retains its established
-publication behavior.
+panel is not a startup requirement.
 
 Initial operation can generate batches on demand with `veda validator produce --config ... --once`.
 Continuous generation and broader quality studies can be enabled after the evaluator is operating;

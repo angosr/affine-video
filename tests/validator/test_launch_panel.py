@@ -269,16 +269,11 @@ def cost_evidence(tmp_path, monkeypatch):
     from copy import deepcopy
 
     from scoring.spec import parse_track_spec
-    from tests.validator.test_cost_calibration import analysis
+    from tests.validator.test_cost_calibration import analysis, cost_registration
     from validator.system_matches import _evidence_contract_digest
 
-    registration = json.loads(
-        (PANEL.parents[1] / "cost-3466b72/registration-implicit-rows.json").read_text()
-    )
-    # These reports are synthetic fixtures for the current verifier, not a
-    # claim that the historical immutable registration binds newer scripts.
-    registration["analysis_script_sha256"] = analysis.sha256(Path(analysis.__file__))
-    registration["pattern_script_sha256"] = analysis.sha256(Path(analysis.patterns.__file__))
+    registration = cost_registration()
+    registration["runtime_contract_sha256"] = "ab" * 32
     costs = {
         str(b["target_blocks"]): b["calibrated_cost"]
         for b in registration["calibration_track_document"]["scoring"]["budgets"]

@@ -16,4 +16,9 @@ wallets/
 deploy/
 docs/
 experiments/*.md
+evidence/system-panel/*
+!evidence/system-panel/README.md
+!evidence/system-panel/acceptance/
+!evidence/system-panel/launch/
+!evidence/system-panel/operations/
 

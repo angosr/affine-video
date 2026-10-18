@@ -212,6 +212,14 @@ def test_weight_artifact_has_one_strict_canonical_representation() -> None:
     encoded = encode_weight_artifact(weight_artifact())
     decoded = decode_weight_artifact(encoded)
 
+    assert encoded == (
+        b'{"match_sequence":2,"mechid":2,"netuid":7,"source_block":120,'
+        b'"terminal_match_sha256":"' + b"cd" * 32
+        + b'","track_aborted":false,"track_id":"track","track_spec_digest":"'
+        + b"ab" * 32
+        + b'","version_key":9,"weights":[{"hotkey":"alice","uid":1,"weight":0.6},'
+        b'{"hotkey":"bob","uid":4,"weight":0.4}]}'
+    )
     assert decoded == weight_artifact()
     assert encoded == encode_weight_artifact(decoded)
     with pytest.raises(PublicArtifactError, match="duplicate"):

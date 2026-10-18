@@ -23,48 +23,50 @@ def write(path, value):
     path.write_text(json.dumps(value, sort_keys=True))
 
 
+def cost_registration(models=("baseline_self", "shuffled_heads")):
+    """Build synthetic registration data without depending on historical GPU runs."""
+    track = valid_spec()
+    for budget, target in zip(track["scoring"]["budgets"], (16, 32, 64), strict=True):
+        budget["target_blocks"] = target
+    return {
+        "format": "veda-h200-cost-registration-v2",
+        "calibration_track_document": track,
+        "cost_independent_track_sha256": analysis.cost_independent_contract(track),
+        "seeds": {"calibration": [1], "confirmation": [2]},
+        "layers": [0, 1],
+        "models": list(models),
+        "model_identities": {name: {"file_sha256": name, "model_digest": name} for name in models},
+        "predictor_bundle_sha256": "plans",
+        "geometries": ["a", "b"],
+        "text_token_counts": [77, 256],
+        "budgets": [16, 32, 64],
+        "warmup": 10,
+        "repeats": 50,
+        "profile_repeats": 10,
+        "first_cost": 0.04,
+        "measurement_script_sha256": "measurement",
+        "pattern_script_sha256": analysis.sha256(Path(analysis.patterns.__file__)),
+        "source_bundle_sha256": "source-zip",
+        "dependency_lock_sha256": "lock",
+        "analysis_script_sha256": analysis.sha256(Path(analysis.__file__)),
+        "e10_thresholds": {
+            "spearman_min": 0.95,
+            "median_relative_error_max": 0.05,
+            "p95_relative_error_max": 0.10,
+        },
+    }
+
+
 def fixture(
-    tmp_path, phase="calibration", fit=None, times=(10, 13, 19),
+    tmp_path,
+    phase="calibration",
+    fit=None,
+    times=(10, 13, 19),
     models=("baseline_self", "shuffled_heads"),
 ):
     registration = tmp_path / "registration.json"
     if not registration.exists():
-        track = valid_spec()
-        for budget, target in zip(track["scoring"]["budgets"], (16, 32, 64), strict=True):
-            budget["target_blocks"] = target
-        write(
-            registration,
-            {
-                "format": "veda-h200-cost-registration-v2",
-                "calibration_track_document": track,
-                "cost_independent_track_sha256": analysis.cost_independent_contract(track),
-                "seeds": {"calibration": [1], "confirmation": [2]},
-                "layers": [0, 1],
-                "models": list(models),
-                "model_identities": {
-                    name: {"file_sha256": name, "model_digest": name}
-                    for name in models
-                },
-                "predictor_bundle_sha256": "plans",
-                "geometries": ["a", "b"],
-                "text_token_counts": [77, 256],
-                "budgets": [16, 32, 64],
-                "warmup": 10,
-                "repeats": 50,
-                "profile_repeats": 10,
-                "first_cost": 0.04,
-                "measurement_script_sha256": "measurement",
-                "pattern_script_sha256": analysis.sha256(Path(analysis.patterns.__file__)),
-                "source_bundle_sha256": "source-zip",
-                "dependency_lock_sha256": "lock",
-                "analysis_script_sha256": analysis.sha256(Path(analysis.__file__)),
-                "e10_thresholds": {
-                    "spearman_min": 0.95,
-                    "median_relative_error_max": 0.05,
-                    "p95_relative_error_max": 0.10,
-                },
-            },
-        )
+        write(registration, cost_registration(models))
     registered = json.loads(registration.read_text())
     root = tmp_path / phase
     root.mkdir()
@@ -122,9 +124,15 @@ def fixture(
                     "layer": layer,
                     "budget": budget,
                     "pattern_proofs": (
-                        [{"pattern": model.removeprefix("pattern_"),
-                          "budget": budget, "valid": True}]
-                        if model.startswith("pattern_") else []
+                        [
+                            {
+                                "pattern": model.removeprefix("pattern_"),
+                                "budget": budget,
+                                "valid": True,
+                            }
+                        ]
+                        if model.startswith("pattern_")
+                        else []
                     ),
                     "protocol_sha256": protocol_hash,
                     "dense_record": dense_name,
@@ -250,7 +258,8 @@ def test_one_failed_geometry_cannot_be_averaged_away(tmp_path):
 
 
 def test_identical_proofs_are_verified_once_per_analysis_but_mutations_are_checked(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     root, registration = fixture(tmp_path, models=("baseline_self", "pattern_clustered"))
     observed = []
@@ -352,14 +361,20 @@ def test_vectorized_pattern_logits_preserve_the_original_allocation_exactly(patt
                     first = [int(valid[position]) for position in positions]
                     order = first + [int(key) for key in valid if key not in set(first)]
                 elif pattern == "boundary_padding":
-                    order = sorted(valid, key=lambda key: (
-                        int(counts[key]), min(int(key), len(counts) - 1 - int(key)), int(key),
-                    ))
+                    order = sorted(
+                        valid,
+                        key=lambda key: (
+                            int(counts[key]),
+                            min(int(key), len(counts) - 1 - int(key)),
+                            int(key),
+                        ),
+                    )
                 else:
                     order = list(valid)
                 expected[head, ri, order] = np.arange(len(order), 0, -1, dtype=np.float32)
         np.testing.assert_array_equal(
-            analysis.patterns.scores(pattern, counts, rows, budget, 3), expected,
+            analysis.patterns.scores(pattern, counts, rows, budget, 3),
+            expected,
         )
 
 

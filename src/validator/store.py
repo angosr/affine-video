@@ -715,21 +715,6 @@ class ChallengeStore:
         ).fetchall()
         return tuple(row["challenge_id"] for row in rows)
 
-    def challenge_ids_in_state(self, state: ChallengeState) -> tuple[str, ...]:
-        """Return challenges in canonical chain order for private batch planning."""
-
-        rows = self._connection.execute(
-            """
-            SELECT c.challenge_id
-            FROM challenges c
-            JOIN submissions s ON s.submission_id = c.submission_id
-            WHERE c.state = ?
-            ORDER BY s.block_height, s.extrinsic_index, s.event_index
-            """,
-            (state,),
-        ).fetchall()
-        return tuple(row["challenge_id"] for row in rows)
-
     def advance_chain_cursor(self, block_height: int, block_hash: str) -> bool:
         """Persist the next scanned finalized block, enforcing continuity."""
 

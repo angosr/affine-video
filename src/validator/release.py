@@ -8,11 +8,6 @@ from dataclasses import dataclass
 from scoring.spec import TrackSpec
 from validator.production.commitment import ArtifactManifest
 
-LEGACY_PUBLIC_IDENTITY = (
-    "veda-sn120-v1",
-    "0fcae991aef29f87b97fbb07cf79c49e5eb9cc2a5d9aecdd2a566443e2b81dd5",
-)
-
 
 @dataclass(frozen=True, slots=True)
 class ReleaseApproval:
@@ -40,8 +35,6 @@ class ReleaseApproval:
 def require_release_approval(
     track: TrackSpec, runtime_manifest: bytes | None, approval: ReleaseApproval | None
 ) -> None:
-    if (track.track_id, track.digest) == LEGACY_PUBLIC_IDENTITY:
-        return
     if approval is None:
         raise ValueError("formal publication requires a coordinated track digest")
     approval.verify(track, runtime_manifest)

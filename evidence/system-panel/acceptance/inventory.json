@@ -195,21 +195,6 @@
       "id": "E16",
       "method": "同机复跑、同型号跨卡、并列 logits、极值、padding、NaN/Inf、超时和损坏文件",
       "pass": false,
-      "prior_mechanism_evidence": [
-        {
-          "actual_values": {
-            "mask_mismatches_per_budget": [
-              32,
-              32,
-              32
-            ]
-          },
-          "pass": false,
-          "path": "evidence/system-panel/review-0753/tied-mask-5d52463.json",
-          "runtime": "5d52463 intermediate; replacement validation required",
-          "sha256": "d402964171ba605536bd44d378bc855361fac1fce1eda81505ac4d9c5942ef11"
-        }
-      ],
       "raw_evidence": [],
       "release_blocker": false,
       "status": "not_final_runtime_verified",
