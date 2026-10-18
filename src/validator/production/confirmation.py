@@ -168,29 +168,33 @@ def _confirmation_worker(
 
         from validator.production.runtime import DenseRolloutRuntime, trajectory_tensor_key
 
+        # score_models binds every queued selector to the same READY batch.
+        runtime = None
+        metric = None
         while True:
             task = tasks.get()
             if task is None:
                 return
             side, selector_path, batch = task
             try:
-                runtime = DenseRolloutRuntime(
-                    model_root=str(config.evaluator_artifact_path(config.runtime.model_root)),
-                    adapter_path=str(config.evaluator_artifact_path(config.runtime.adapter)),
-                    predictor_bundle=str(
-                        config.evaluator_artifact_path(config.runtime.predictor)
-                    ),
-                    sample_cache=str(batch.sample_cache_path),
-                    offload_blocks=config.runtime.offload_blocks,
-                    prefetch=config.runtime.prefetch,
-                    mlp_chunk_rows=config.runtime.mlp_chunk_rows,
-                )
-                runtime.verify_trajectory_schedule(track.scoring.trajectory_schedule.sigmas)
-                metric = VideoFidelityMetric(
-                    config.evaluator_artifact_path(config.runtime.feature_model),
-                    expected_sha256=track.full_video.feature_model_sha256,
-                    device="cuda:0",
-                )
+                if runtime is None:
+                    runtime = DenseRolloutRuntime(
+                        model_root=str(config.evaluator_artifact_path(config.runtime.model_root)),
+                        adapter_path=str(config.evaluator_artifact_path(config.runtime.adapter)),
+                        predictor_bundle=str(
+                            config.evaluator_artifact_path(config.runtime.predictor)
+                        ),
+                        sample_cache=str(batch.sample_cache_path),
+                        offload_blocks=config.runtime.offload_blocks,
+                        prefetch=config.runtime.prefetch,
+                        mlp_chunk_rows=config.runtime.mlp_chunk_rows,
+                    )
+                    runtime.verify_trajectory_schedule(track.scoring.trajectory_schedule.sigmas)
+                    metric = VideoFidelityMetric(
+                        config.evaluator_artifact_path(config.runtime.feature_model),
+                        expected_sha256=track.full_video.feature_model_sha256,
+                        device="cuda:0",
+                    )
                 cells = []
                 paths = {reference.rollout_id: path for reference, path in batch.latent_paths}
                 for rollout in batch.plan.rollouts:
@@ -232,6 +236,7 @@ def _confirmation_worker(
                 results.put(("ok", side, tuple(cells)))
             except Exception as exc:  # process boundary returns a bounded diagnostic
                 results.put(("error", side, f"{type(exc).__name__}: {exc}"))
+                return
     except Exception as exc:
         results.put(("error", f"gpu-{gpu_id}", f"startup failed: {type(exc).__name__}: {exc}"))
 

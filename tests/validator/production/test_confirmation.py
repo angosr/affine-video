@@ -88,7 +88,10 @@ def test_full_video_cell_hash_binds_raw_sparse_outputs() -> None:
     assert first_hash != second_hash
 
 
-def test_confirmation_setup_uses_only_the_ready_selected_cache(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("model_count", [1, 3])
+def test_confirmation_setup_uses_only_the_ready_selected_cache(
+    tmp_path, monkeypatch, model_count,
+) -> None:
     """Exercise the worker setup after the evaluator's hidden-pool reads are denied."""
 
     selected_cache = tmp_path / "ready-inputs"
@@ -96,6 +99,8 @@ def test_confirmation_setup_uses_only_the_ready_selected_cache(tmp_path, monkeyp
     evaluator_root = tmp_path / "evaluator-runtime"
     evaluator_root.mkdir()
     initialized = []
+    metrics = []
+    scored = []
 
     class Runtime:
         def __init__(self, **kwargs):
@@ -104,8 +109,13 @@ def test_confirmation_setup_uses_only_the_ready_selected_cache(tmp_path, monkeyp
         def verify_trajectory_schedule(self, sigmas):
             assert sigmas == (1.0, 0.0)
 
+        def decode_frames(self, _rows, *, geometry):
+            assert geometry == "wide"
+            return np.ones((2, 2, 2, 3), dtype=np.uint8)
+
     class Metric:
         def __init__(self, path, *, expected_sha256, device):
+            metrics.append(path)
             assert path == evaluator_root / "weights/feature.safetensors"
             assert expected_sha256 == "12" * 32
             assert device == "cuda:0"
@@ -114,16 +124,18 @@ def test_confirmation_setup_uses_only_the_ready_selected_cache(tmp_path, monkeyp
         def __init__(self):
             self.values = [
                 (
-                    "challenger",
-                    "selector.safetensors",
+                    f"model-{index}",
+                    f"selector-{index}.safetensors",
                     SimpleNamespace(
                         sample_cache_path=selected_cache,
-                        latent_paths=(),
-                        plan=SimpleNamespace(rollouts=(), selected_steps=()),
+                        latent_paths=((SimpleNamespace(rollout_id="video"), "dense"),),
+                        plan=SimpleNamespace(
+                            rollouts=(SimpleNamespace(rollout_id="video", stratum="wide"),),
+                            selected_steps=(),
+                        ),
                     ),
-                ),
-                None,
-            ]
+                ) for index in range(model_count)
+            ] + [None]
 
         def get(self):
             return self.values.pop(0)
@@ -161,19 +173,38 @@ def test_confirmation_setup_uses_only_the_ready_selected_cache(tmp_path, monkeyp
     )
     candidate_track = SimpleNamespace(
         scoring=SimpleNamespace(
-            trajectory_schedule=SimpleNamespace(sigmas=(1.0, 0.0))
+            trajectory_schedule=SimpleNamespace(sigmas=(1.0, 0.0)),
+            budgets=(SimpleNamespace(target_blocks=16),),
         ),
         full_video=SimpleNamespace(feature_model_sha256="12" * 32),
     )
     results = Results()
     monkeypatch.setattr("validator.production.runtime.DenseRolloutRuntime", Runtime)
     monkeypatch.setattr(confirmation, "VideoFidelityMetric", Metric)
+    monkeypatch.setattr("safetensors.numpy.load_file", lambda _path: {
+        "video_rows": np.ones((2, 3), dtype=np.float16),
+        "audio_rows": np.ones((1, 1), dtype=np.float16),
+    })
+
+    def score(**kwargs):
+        index = len(scored)
+        assert kwargs["selector_path"] == f"selector-{index}.safetensors"
+        scored.append((id(kwargs["runtime"]), id(kwargs["metric"])))
+        return (index + 1) / 10, f"{index + 1:064x}"
+
+    monkeypatch.setattr(confirmation, "_score_rollout_budget", score)
 
     confirmation._confirmation_worker(0, config, candidate_track, Tasks(), results)
 
     assert len(initialized) == 1
+    assert len(metrics) == 1
     assert initialized[0]["sample_cache"] == str(selected_cache)
-    assert results.values == [("ok", "challenger", ())]
+    assert len(scored) == model_count and len(set(scored)) == 1
+    assert results.values == [
+        ("ok", f"model-{index}", (
+            VideoCell("wide", "video", 16, (index + 1) / 10, f"{index + 1:064x}"),
+        )) for index in range(model_count)
+    ]
 
 
 def test_partial_worker_start_is_cleaned_up_and_pool_can_be_reused(monkeypatch) -> None:
