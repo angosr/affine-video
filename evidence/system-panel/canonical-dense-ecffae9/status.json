@@ -30,13 +30,29 @@
     ]
   },
   "gpu7": {
-    "status": "QUEUED_AFTER_EXISTING_COST_CALIBRATION",
+    "status": "PASSED",
     "container": "veda-dense-gpu7-ecffae9-1",
     "predecessor": "veda-cost-calibration-3466-a2-gpu7",
     "allocation": 7,
     "rule": "Wait for predecessor exit; do not overlap performance calibration.",
-    "result": null
+    "result": {
+      "case_count": 384,
+      "canonical_passes": 2,
+      "bitwise_equal": true,
+      "matches_gpu6_each_case": true,
+      "negative_controls_rejected": 12,
+      "elapsed_seconds": 41.49955904763192,
+      "peak_cuda_bytes": 321863168,
+      "raw_log": "gpu7-cross.log",
+      "raw_log_sha256": "31b5531a253900280eaa091c551f92ee4361048ff0b9d6d0aad295f20a4b3816",
+      "container_id": "f7e9e8583d4d55b4d3b80996b8461218b29629b1d0d128a837583f8c55996406",
+      "exit_code": 0,
+      "launch_source_sha256": "f71a6c2c267f722d68ca6edf0a76751096600bbc66eb773e6285fc1a19f93771",
+      "predecessor_finished_at": "2026-10-18T05:11:42.426387237Z",
+      "started_at": "2026-10-18T05:11:42.646231615Z",
+      "finished_at": "2026-10-18T05:12:26.350132106Z"
+    }
   },
-  "cross_gpu_acceptance_complete": false,
+  "cross_gpu_acceptance_complete": true,
   "final_release_accepted": false
 }
