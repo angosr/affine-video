@@ -14,6 +14,25 @@ panel = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(panel)
 
 
+@pytest.mark.parametrize("passed", [False, True])
+def test_tied_mask_probe_reports_failure_through_its_exit_status(
+    tmp_path, monkeypatch, capsys, passed,
+):
+    path = PANEL.with_name("tied_mask_probe.py")
+    spec = importlib.util.spec_from_file_location("tied_mask_probe", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    result = {"pass": passed, "results": []}
+    monkeypatch.setattr(module, "probe", lambda: result)
+    output = tmp_path / "probe.json"
+    monkeypatch.setattr("sys.argv", [str(path), "--output", str(output)])
+
+    assert module.main() == (0 if passed else 1)
+    assert json.loads(output.read_text()) == result
+    assert json.loads(capsys.readouterr().out) == result
+
+
 def controls():
     return {
         name: {"gain_lower_bound": 0.0 if name == "baseline_self" else -0.01, "promoted": False}

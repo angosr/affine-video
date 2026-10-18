@@ -16,7 +16,7 @@ def probe():
     device = torch.device("cuda:0")
     properties = torch.cuda.get_device_properties(device)
     rows = 16
-    keys = 32
+    keys = 128
     layout = SimpleNamespace(
         n_tiles=keys,
         n_video_tiles=keys,
@@ -28,7 +28,7 @@ def probe():
     logits = torch.zeros((1, rows, keys), dtype=torch.float32, device=device)
     row_ids = torch.arange(rows, device=device)
     results = []
-    for k in (4, 8, 16):
+    for k in (4, 8, 16, 32, 64):
         blocks = mask.column_blocks(layout, mask.Budget(tiles=k), None)
         selected = mask.select_video_blocks(logits, layout, blocks, rows=row_ids)
         actual = mask.dense_block_mask(selected, layout, global_rows=False)[0]
@@ -58,7 +58,7 @@ def probe():
     }
 
 
-if __name__ == "__main__":
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
@@ -67,3 +67,8 @@ if __name__ == "__main__":
         json.dump(result, stream, sort_keys=True, indent=2)
         stream.write("\n")
     print(json.dumps(result, sort_keys=True))
+    return 0 if result["pass"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

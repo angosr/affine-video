@@ -191,13 +191,30 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "mask 完全一致；分数差 ≤1e-6；所有非法输入按固定错误码拒绝",
-      "actual_values": null,
+      "actual_values": {
+        "runtime_source_commit": "4e2182b",
+        "cached_cases": 16,
+        "source_videos": 16,
+        "sampled_routes": 8,
+        "production_budgets": [16, 32, 64],
+        "mask_mismatches": 0,
+        "production_logits_max_abs": 9.5367431640625e-7,
+        "tied_mask_gpu_count": 2,
+        "tied_mask_budgets": [4, 8, 16, 32, 64],
+        "tied_mask_mismatches": 0
+      },
       "id": "E16",
       "method": "同机复跑、同型号跨卡、并列 logits、极值、padding、NaN/Inf、超时和损坏文件",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/runtime-parity-4e2182b.json",
+          "sha256": "e29a50668b27020795c32ee737575f44dd84629c550b2a4b88fde9d880aff8c9",
+          "scope": "Partial GPU numerical and cross-card tied-mask checks; excludes complete matches, adversarial inputs and whole-host recovery"
+        }
+      ],
       "release_blocker": false,
-      "status": "not_final_runtime_verified",
+      "status": "partial_current_runtime_verified",
       "subject": "确定性与异常输入"
     },
     {
