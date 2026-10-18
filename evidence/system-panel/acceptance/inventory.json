@@ -211,32 +211,59 @@
       "subject": "样本量"
     },
     {
-      "acceptance_manifest": null,
+      "acceptance_manifest": {
+        "path": "evidence/system-panel/acceptance-d1b38764/e16-determinism-and-errors.json",
+        "sha256": "b62d0214f0a200caf06d86841ce2e263dddd70dd05ec0e712f07683846804f29"
+      },
       "acceptance_rule": "mask 完全一致；分数差 ≤1e-6；所有非法输入按固定错误码拒绝",
       "actual_values": {
-        "runtime_source_commit": "4e2182b",
-        "cached_cases": 16,
-        "source_videos": 16,
-        "sampled_routes": 8,
+        "track_spec_digest": "d1b387642e1da0fa35411c6d7ebfa830567a14e84be8c6163e2062afe4257260",
+        "runtime_source_commit": "18e9c5c",
+        "full_video_source_videos": 1,
+        "full_video_controls": 2,
         "production_budgets": [16, 32, 64],
-        "mask_mismatches": 0,
-        "production_logits_max_abs": 9.5367431640625e-7,
+        "same_card_full_video_pairs": 6,
+        "cross_card_full_video_pairs": 9,
+        "full_video_max_score_delta": 0.0,
+        "all_full_video_output_hashes_equal": true,
         "tied_mask_gpu_count": 2,
         "tied_mask_budgets": [4, 8, 16, 32, 64],
-        "tied_mask_mismatches": 0
+        "tied_mask_mismatches": 0,
+        "timeout_processes_reaped": 2,
+        "finite_overflow_quality": [0.0, 0.0, 0.0]
       },
       "id": "E16",
       "method": "同机复跑、同型号跨卡、并列 logits、极值、padding、NaN/Inf、超时和损坏文件",
-      "pass": false,
+      "pass": true,
       "raw_evidence": [
         {
-          "path": "evidence/system-panel/runtime-parity-4e2182b.json",
-          "sha256": "e29a50668b27020795c32ee737575f44dd84629c550b2a4b88fde9d880aff8c9",
-          "scope": "Partial GPU numerical and cross-card tied-mask checks; excludes complete matches, adversarial inputs and whole-host recovery"
+          "path": "evidence/system-panel/acceptance-d1b38764/full-video-repeat-gpu6.raw.log",
+          "sha256": "fbfeda66c6d4d58e73bf06182b3d0d17d043d5bfbdea9c24c062a2b16891c0e4",
+          "scope": "Final-runtime full-video repeat on one historical source; all three budgets"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/runtime-checks-gpu7.raw.log",
+          "sha256": "80a50de05c8838ecda54e93a3e4fdd57384bf476fcbfb57e87e76cb27b629c18",
+          "scope": "Independent H200 full-video repeat and paired cross-card comparison"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/tie-timeout-gpu6.raw.log",
+          "sha256": "3bf50f430dff14eb4dddbe512559d27126a60e2899eab5f314c60b499e5086b7",
+          "scope": "Native CUDA tied masks and actual spawned scorer startup timeout, not a hung CUDA kernel"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/tie-timeout-gpu7.raw.log",
+          "sha256": "d0fca73e54f90df8fd9301df3f450d3f85af0357ac22e50a728fd9d27be34aae",
+          "scope": "Independent H200 tied masks and spawned scorer timeout"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/adversarial-gpu6.raw.log",
+          "sha256": "4bb7c1b7ce31242207af47811c7c94842070414ccc345ace9cf6dca4a4955a2d",
+          "scope": "Padding, zero tiles, NaN/Inf, invalid prefixes, finite-weight overflow and corrupt model rejection; valid scoring after overflow"
         }
       ],
       "release_blocker": true,
-      "status": "partial_current_runtime_verified",
+      "status": "registered_determinism_and_error_checks_passed",
       "subject": "确定性与异常输入"
     },
     {
@@ -254,13 +281,25 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "按固定GPU分工打通生产、评测与发布，记录单批耗时、显存和磁盘占用；unit/assemble/upload中断后恢复同一批次和冠军，重试耗尽有告警且到期自动恢复；峰值容量与30%余量作为上线后持续压测目标",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "d1b387642e1da0fa35411c6d7ebfa830567a14e84be8c6163e2062afe4257260",
+        "cross_card_regenerated_units": 1,
+        "regenerated_shard_latent_and_video_hashes_equal": true,
+        "regeneration_seconds": 109.61946485890076,
+        "whole_host_recovery_proven": false
+      },
       "id": "E18",
       "method": "压测上传校验、轻量缓存、精确缓存、完整视频、重试和故障恢复",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-gpu7.raw.log",
+          "sha256": "5da71af6f348ce8460b415d26e95bbb4e41da5d3caa99d38786e0d3ec4fa54e8",
+          "scope": "One real final-runtime producer rollout regenerated on a different H200 from an empty work directory; not whole-batch or whole-host recovery"
+        }
+      ],
       "release_blocker": false,
-      "status": "not_final_runtime_verified",
+      "status": "partial_unit_regeneration_verified",
       "subject": "评测容量"
     }
   ],
