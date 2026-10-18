@@ -33,10 +33,13 @@ from validator.production.plan import (
 )
 from validator.production.storage import (
     ADMISSIONS_NAMESPACE,
+    EXACT_NAMESPACE,
     INPUTS_NAMESPACE,
+    LATENTS_NAMESPACE,
     MODELS_NAMESPACE,
     PLANS_NAMESPACE,
     STAGES_NAMESPACE,
+    VIDEOS_NAMESPACE,
     PrivateObjectStore,
 )
 
@@ -569,6 +572,22 @@ class ReadyBatchSource:
         )
         if rebuilt.planned_document() != plan.planned_document():
             raise RuntimeError("private plan conflicts with the deterministic track schedule")
+        if plan.state == "READY":
+            assert plan.exact is not None and plan.sample_cache is not None
+            objects = [
+                (plan.exact, EXACT_NAMESPACE),
+                (plan.sample_cache.index, INPUTS_NAMESPACE),
+                (plan.sample_cache.text, INPUTS_NAMESPACE),
+                *((reference.video, VIDEOS_NAMESPACE) for reference in plan.dense_references),
+                *((reference.latent, LATENTS_NAMESPACE) for reference in plan.dense_references),
+            ]
+            if plan.sample_cache.condition is not None:
+                objects.append((plan.sample_cache.condition, INPUTS_NAMESPACE))
+            if any(
+                not item.object_key.startswith(f"{namespace}/")
+                for item, namespace in objects
+            ):
+                raise RuntimeError("READY plan object is outside its runtime namespace")
 
 
 def validate_selected_sample_cache(path: Path, plan: BatchPlan) -> None:

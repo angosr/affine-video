@@ -10,6 +10,8 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
+from validator.production.storage import ARTIFACTS_NAMESPACE
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
@@ -113,6 +115,12 @@ class ProducerConfig:
         }
         if files & forbidden:
             raise ValueError("evaluator runtime selection includes hidden source inputs")
+        by_name = {artifact.logical_name: artifact for artifact in manifest.artifacts}
+        if any(
+            not by_name[name].object_key.startswith(f"{ARTIFACTS_NAMESPACE}/")
+            for name in files
+        ):
+            raise ValueError("evaluator runtime artifact is outside its IAM namespace")
         return tuple(sorted(files))
 
     def verify_evaluator_manifest(self, manifest: Any) -> None:

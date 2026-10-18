@@ -1172,8 +1172,9 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     )
 
     class Objects:
-        def __init__(self):
+        def __init__(self, plan=ready_plan):
             self.small = {}
+            self.plan = plan
 
         def list_names(self, _prefix):
             return ("plans/120.json",)
@@ -1181,7 +1182,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         def get(self, name):
             if name in self.small:
                 return self.small[name]
-            return StoredObject(ready_plan.encode(), "etag")
+            return StoredObject(self.plan.encode(), "etag")
 
         def get_optional(self, name):
             return self.small.get(name)
@@ -1238,6 +1239,17 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         ReadyBatchSource(
             track=mismatched_track,
             objects=Objects(),
+            cache_dir=tmp_path,
+        ).batch_challenge_ids(ready_plan.plan_digest)
+
+    wrong_namespace = replace(
+        ready_plan,
+        exact=replace(ready_plan.exact, object_key="source-pool/substituted.npz"),
+    )
+    with pytest.raises(RuntimeError, match="outside its runtime namespace"):
+        ReadyBatchSource(
+            track=track,
+            objects=Objects(wrong_namespace),
             cache_dir=tmp_path,
         ).batch_challenge_ids(ready_plan.plan_digest)
 

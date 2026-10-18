@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -130,3 +131,14 @@ def test_evaluator_artifact_selection_excludes_hidden_source_inputs(tmp_path) ->
     assert "weights/model/shard.safetensors" in selected
     assert "samples/source-binding.json" not in selected
     assert not any(name.startswith("samples/production/") for name in selected)
+
+    substituted = ArtifactManifest(
+        tuple(
+            replace(artifact, object_key="source-pool/substituted")
+            if artifact.logical_name == "weights/predictor.safetensors"
+            else artifact
+            for artifact in manifest.artifacts
+        )
+    )
+    with pytest.raises(ValueError, match="outside its IAM namespace"):
+        config.evaluator_artifact_names(substituted)
