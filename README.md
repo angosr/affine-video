@@ -113,6 +113,11 @@ tracks/main/
       manifest.json
       part-00000
       ...
+  batch_inputs/
+    <sha256>/
+      manifest.json
+      part-00000
+      ...
   models/
     <track_id>/<sha256>/
       manifest.json
@@ -140,8 +145,9 @@ tracks/main/
 - `batch_groups/<plan_digest>.json` reveals the finalized-block seed, source proofs, routes, samples,
   steps and immutable object mapping only after every linked challenge is terminal.
   `batches/<sha256>/manifest.json` publishes its exact QKV batch, while `batch_assets/` publishes
-  every referenced source video and dense latent. Each manifest verifies every bounded part and the
-  reassembled file digest.
+  every referenced source video and dense latent. `batch_inputs/` publishes the selected encoded
+  input cache; its public mapping is derived from the same READY references bound into the exact
+  batch. Each manifest verifies every bounded part and the reassembled file digest.
 - `models/<track_id>/<sha256>/manifest.json` is the public durable copy of every selector that
   completes scoring, including challengers that do not replace the champion. A private copy of
   every validated selector is stored before scoring, so publication, independent replay and later

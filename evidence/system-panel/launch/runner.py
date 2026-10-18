@@ -1441,7 +1441,7 @@ def _load_confirmation_batch(label, track):
         or exact.source_proofs != tuple(proof.document() for proof in ready_plan.source_proofs)
         or exact.dense_references
         != tuple(reference.document() for reference in ready_plan.dense_references)
-        or exact.selected_inputs != ready_plan.sample_cache.document()
+        or exact.sample_cache != ready_plan.sample_cache.document()
     ):
         raise RuntimeError(f"full-video exact data conflicts with its READY plan: {label}")
     return ConfirmationBatch(ready_plan, exact, tuple(references), sample_cache), record

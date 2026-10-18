@@ -21,12 +21,15 @@ def controls():
     }
 
 
-def test_panel_generation_assembles_real_shards_with_the_selected_cache(tmp_path, monkeypatch):
-    """Stub GPU work, but exercise real assembly, metadata inspection and resume."""
+@pytest.mark.parametrize("replace_selected_inputs", [False, True])
+def test_panel_generation_assembles_real_shards_with_the_selected_cache(
+    tmp_path, monkeypatch, replace_selected_inputs,
+):
+    """Stub GPU/domain checks; exercise real assembly, binding, file hashes and resume."""
     from scoring.cache import ExactCacheReader, inspect_exact_cache_batch, write_exact_cache_batch
     from tests.scoring.test_cache import write_batch
-    from validator.production import service
-    from validator.production.plan import ReadySampleCache
+    from validator.production import batches, service
+    from validator.production.plan import BatchPlan, ReadySampleCache
     from validator.production.storage import INPUTS_NAMESPACE
 
     original = write_batch(tmp_path / "source")
@@ -52,6 +55,9 @@ def test_panel_generation_assembles_real_shards_with_the_selected_cache(tmp_path
     plan = SimpleNamespace(
         plan_digest=original.plan_digest, generation_block=original.generated_block,
         block_hash=original.seed_block_hash, batch_seed="ab" * 32,
+        track_spec_digest=original.track_spec_digest,
+        rollouts=tuple(SimpleNamespace(rollout_id=row.rollout_id) for row in results),
+        selected_routes=("route-0", "route-1"),
         source_proofs=(SimpleNamespace(
             leaf=SimpleNamespace(
                 source_id="source-0", source_family_id="family-0", digest="12" * 32,
@@ -63,7 +69,11 @@ def test_panel_generation_assembles_real_shards_with_the_selected_cache(tmp_path
         digest=original.track_spec_digest,
         artifact_manifest_sha256=original.artifact_manifest_sha256,
         source_pool_merkle_root=original.source_pool_merkle_root,
-        scoring=SimpleNamespace(case_count=len(cases)),
+        model=SimpleNamespace(selector=SimpleNamespace(head_dim=2)),
+        scoring=SimpleNamespace(
+            case_count=len(cases), stratum_weight_map={"all": 1.0}, sampled_route_count=2,
+            rollouts_per_stratum=2, sampled_step_count=2, query_tiles_per_case=2,
+        ),
         cache=SimpleNamespace(exact_max_bytes=1_000_000),
     )
     calls = []
@@ -116,6 +126,41 @@ def test_panel_generation_assembles_real_shards_with_the_selected_cache(tmp_path
     assert report["exact_sha256"] == batch.sha256
     panel.generate()
     assert calls == ["start", "generate", "close"]
+
+    # Continue the generated batch into the actual confirmation loader. Only
+    # the heavyweight encoded-input/CUDA/domain validators are stand-ins.
+    from scoring import cache as cache_module
+
+    validations = []
+    plan.ready = lambda **fields: SimpleNamespace(**vars(plan), **fields)
+    monkeypatch.setattr(BatchPlan, "decode", lambda _payload: plan)
+    monkeypatch.setattr(panel, "confirmation_labels", lambda: ("production-00",))
+    for module, name in (
+        (batches, "validate_selected_sample_cache"),
+        (batches, "_validate_plan_case_binding"),
+        (cache_module, "validate_exact_cache"),
+    ):
+        monkeypatch.setattr(
+            module, name, lambda *_args, _name=name, **_kwargs: validations.append(_name),
+        )
+    (tmp_path / "plans").mkdir()
+    (tmp_path / "plans/production-00.json").write_bytes(b"validated plan fixture")
+    if replace_selected_inputs:
+        text = Path(report["selected_cache_path"]) / "text.safetensors"
+        text.write_bytes(b"replacement encoded inputs")
+        report["selected_inputs"]["text"] = service._ready_file(
+            text, INPUTS_NAMESPACE, ".safetensors",
+        ).document()
+        (tmp_path / "batches/production-00.json").write_text(json.dumps(report))
+        with pytest.raises(RuntimeError, match="conflicts with its READY plan"):
+            panel._load_confirmation_batch("production-00", track)
+    else:
+        confirmed, _ = panel._load_confirmation_batch("production-00", track)
+        assert confirmed.exact.sample_cache == confirmed.plan.sample_cache.document() == selected[0]
+        assert len(confirmed.latent_paths) == len(results)
+    assert validations == [
+        "validate_selected_sample_cache", "validate_exact_cache", "_validate_plan_case_binding",
+    ]
 
 
 def test_panel_positive_and_negative_directions_are_required():
