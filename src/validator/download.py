@@ -319,7 +319,7 @@ def download_public_model(
     except RevisionNotFoundError as exc:
         raise ModelDownloadError("REVISION_NOT_FOUND", "revision does not exist") from exc
     except HfHubHTTPError as exc:
-        raise _http_failure(exc.response.status_code) from exc
+        raise _metadata_http_failure(exc.response.status_code) from exc
     except HubTransportError as exc:
         raise ModelDownloadError(
             "DOWNLOAD_TEMPORARY_FAILURE",
@@ -395,7 +395,15 @@ def download_public_model(
         url = hf_hub_url(repo_id, MODEL_FILENAME, revision=revision)
         with client.stream("GET", url) as response:
             if response.status_code >= 400:
-                raise _http_failure(response.status_code)
+                # Anonymous metadata already proved this pinned file exists.
+                # A CDN/access error is not proof that the Miner made it private.
+                # The next bounded attempt rechecks metadata before downloading.
+                raise ModelDownloadError(
+                    "DOWNLOAD_TEMPORARY_FAILURE",
+                    f"model file request returned HTTP {response.status_code} "
+                    "after anonymous metadata verification",
+                    temporary=True,
+                )
             content_length = response.headers.get("content-length")
             if content_length is not None and int(content_length) > max_bytes:
                 raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
@@ -463,7 +471,7 @@ def download_public_model(
             ) from cleanup_error
 
 
-def _http_failure(status_code: int) -> ModelDownloadError:
+def _metadata_http_failure(status_code: int) -> ModelDownloadError:
     if status_code in (401, 403):
         return ModelDownloadError(
             "REPOSITORY_UNAVAILABLE", "repository is not anonymously readable"

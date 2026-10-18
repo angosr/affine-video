@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 
 from validator import chunks
 from validator import download as download_module
@@ -310,14 +311,9 @@ def test_fdopen_failure_closes_the_unclaimed_descriptor(monkeypatch, tmp_path) -
     assert caught.value.errno == errno.EBADF
 
 
-@pytest.mark.parametrize(
-    ("status", "code", "temporary"),
-    [(401, "REPOSITORY_UNAVAILABLE", False), (403, "REPOSITORY_UNAVAILABLE", False),
-     (404, "MODEL_FILE_MISSING", False), (429, "DOWNLOAD_TEMPORARY_FAILURE", True),
-     (500, "DOWNLOAD_TEMPORARY_FAILURE", True), (200, "DOWNLOAD_TEMPORARY_FAILURE", True)],
-)
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 200])
 def test_cleanup_failures_preserve_the_original_download_error(
-    monkeypatch, tmp_path, status, code, temporary
+    monkeypatch, tmp_path, status
 ) -> None:
     primary_failure = OSError(errno.ENOSPC, "original disk full")
     cleanup_calls = []
@@ -362,11 +358,91 @@ def test_cleanup_failures_preserve_the_original_download_error(
             api=FakeApi([sibling(size=6)]),
         )
 
-    assert caught.value.code == code
-    assert caught.value.temporary is temporary
+    assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
+    assert caught.value.temporary is True
     assert cleanup_calls == ["file", "unlink", "client"]
     if status == 200:
         assert caught.value.__cause__ is primary_failure
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+@pytest.mark.parametrize("becomes_private", [False, True])
+def test_payload_access_failure_rechecks_metadata_before_retry(
+    tmp_path, status, becomes_private
+) -> None:
+    class ChangingApi(FakeApi):
+        calls = 0
+
+        def model_info(self, *args, **kwargs):
+            self.calls += 1
+            assert kwargs["token"] is False
+            if becomes_private and self.calls > 1:
+                raise RepositoryNotFoundError(
+                    "repository is no longer public",
+                    response=httpx.Response(
+                        401, request=httpx.Request("GET", "https://hf.test"),
+                    ),
+                )
+            return super().model_info(*args, **kwargs)
+
+    class RecoveringClient(FakeClient):
+        requests = 0
+
+        def stream(self, *args):
+            self.requests += 1
+            response = super().stream(*args)
+            response.status_code = status if self.requests == 1 else 200
+            return response
+
+    api = ChangingApi([sibling(size=6)])
+    client = RecoveringClient()
+    arguments = dict(
+        cache_dir=tmp_path, max_bytes=10, api=api, http_client=client,
+    )
+    with pytest.raises(ModelDownloadError) as first:
+        download_public_model("owner/model", "12" * 20, **arguments)
+    assert first.value.temporary is True
+    assert first.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
+    assert not list(tmp_path.iterdir())
+    if becomes_private:
+        with pytest.raises(ModelDownloadError) as second:
+            download_public_model("owner/model", "12" * 20, **arguments)
+        assert second.value.code == "REPOSITORY_UNAVAILABLE"
+        assert second.value.temporary is False
+        assert client.requests == 1
+    else:
+        result = download_public_model("owner/model", "12" * 20, **arguments)
+        assert result.path.read_bytes() == b"abcdef"
+        assert client.requests == 2
+    assert api.calls == 2
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "temporary"),
+    [(401, "REPOSITORY_UNAVAILABLE", False), (403, "REPOSITORY_UNAVAILABLE", False),
+     (404, "MODEL_FILE_MISSING", False), (429, "DOWNLOAD_TEMPORARY_FAILURE", True),
+     (500, "DOWNLOAD_TEMPORARY_FAILURE", True)],
+)
+def test_anonymous_metadata_failure_keeps_its_admission_classification(
+    tmp_path, status, code, temporary
+) -> None:
+    class DeniedApi:
+        def model_info(self, *_args, **kwargs):
+            assert kwargs["token"] is False
+            raise HfHubHTTPError(
+                "metadata rejected",
+                response=httpx.Response(status, request=httpx.Request("GET", "https://hf.test")),
+            )
+
+    client = FakeClient()
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model", "12" * 20, cache_dir=tmp_path, max_bytes=10,
+            api=DeniedApi(), http_client=client,
+        )
+    assert caught.value.code == code
+    assert caught.value.temporary is temporary
+    assert client.called is False
 
 
 @pytest.mark.parametrize(
