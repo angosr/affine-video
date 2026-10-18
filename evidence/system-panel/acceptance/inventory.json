@@ -758,8 +758,29 @@
           "three_ready_plans_oldest_pending_progress_regression_passed": true,
           "real_interrupted_temp_copy_bytes_reclaimed": 11827811,
           "original_failed_file_and_complete_npz_sha_unchanged": true,
+          "cpu_torch_supplement": {
+            "selected_tests": 14,
+            "passed": 9,
+            "originally_skipped_cpu_cases_now_passed": 7,
+            "skipped_without_cuda": 5,
+            "gpu_devices_used": 0,
+            "scope": "Existing candidate tests on GPU host with exact offline pytest dependencies and original Torch. Two cases were already covered by the clean CPU suite; this is not a single739-pass run or CUDA/new formal runtime acceptance. Initial test-runner import failure preserved, only missing packaged py.py shim added."
+          },
           "deployed": false,
           "scope": "Minimal candidate repair, independent clean CPU suite/build hashes and isolated actual orphan-copy cleanup reviewed. Three-plan scheduling is a controlled regression, not actual three-batch S3 generation or new frozen-image acceptance."
+        },
+        "last_verified_fixed_asset_coverage": {
+          "formal_artifacts": 56,
+          "formal_total_bytes": 97294548471,
+          "artifacts_sha_verified_in_this_audit": 45,
+          "runtime_packages_with_prior_full_sha_evidence": 3,
+          "total_artifacts_with_sha_evidence": 48,
+          "total_bytes_with_sha_evidence": 56033950679,
+          "artifacts_not_yet_fully_preserved": 8,
+          "complete_size_of_unverified_artifacts_bytes": 41260597792,
+          "historical_extra_assets_not_used_by_formal_runtime": 38,
+          "historical_extra_assets_bytes": 67938105720,
+          "scope": "Current formal manifest mapped to actual off-GPU inputs; seven prior length-only shards now fully SHA-read. Corrected receipt preserves raw64-bit metadata exactly, original rounded receipt retained as failed observer evidence. Other eight artifacts remain partial/missing or unverified. Public pinned HF fallback checked for47 base files and one LoRA, not guaranteed permanent. Excludes genesis selector, credentials and private ledger recovery; not whole-host acceptance."
         },
         "current_production_plan_lifecycle": {
           "videos": 16,
@@ -896,6 +917,21 @@
           "path": "private/code-verification-8863972/result.json",
           "sha256": "974fc61917cf16fb33aae88624dd0f932682735417c2e87ce8d98581f89b705e",
           "scope": "Clean committed candidate full732-pass/12-no-Torch-skip suite, Ruff, offline sdist/wheel and exact source bytes. Root independently verified six artifact hashes and JUnit744/0fail/0error/12skip totals; not GPU or formal runtime deployment acceptance."
+        },
+        {
+          "path": "private/torch-cpu-verification-8863972/result.json",
+          "sha256": "bec8355aa088ae3220487cc785e7a1f234b6708571fc68c22a74c08eb67f2001",
+          "scope": "Actual original Torch on GPU host with no CUDA devices: nine candidate unit cases passed, including seven formerly skipped CPU cases; five CUDA cases remain skipped. Separate source/test-dependency overlay, no model files, initial runner import failure and exact shim correction preserved. Temporary container and GPU snapshot removed after off-GPU collection."
+        },
+        {
+          "path": "private/formal-asset-coverage-8863972/result.json",
+          "sha256": "bb61805bba63449eb2f7614c88094911dd66609480d9469013208dcb5f410660",
+          "scope": "Formal56-asset mapping, actual small/current-input SHA reads, historical runtime package proof references, precise HF provenance and legacy38-asset difference. Only SHA/size/path evidence reused; rounded mtime_ns is not evidence of exact metadata agreement."
+        },
+        {
+          "path": "private/formal-asset-coverage-8863972/large-sha-verified.json",
+          "sha256": "902e5ad63daa30faf9228a992de09b4e205af3c25094ada034342e8575747b92",
+          "scope": "Actual full seven-shard36.22GB streaming SHA supplement; root verified exact integer-preserving raw9 events, manifest and all artifact records. Together with parent/prior runtime proofs covers48/56, not full restore. Original rounded observer receipt and failure retained, no rescan to obtain a favorable result."
         }
       ],
       "release_blocker": false,
