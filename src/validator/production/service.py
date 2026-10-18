@@ -435,31 +435,68 @@ class ProducerService:
 
     def _run_locked(self, *, once: bool) -> None:
         workers: WorkerPool | None = None
+        scheduling_failures = 0
+        last_scheduling_alert = float("-inf")
         try:
             while True:
-                with ChallengeStore(
-                    self.config.validator_database,
-                    track_spec_digest=self.track.digest,
-                ) as store:
-                    cursor = store.chain_cursor()
-                    if cursor is not None and cursor[0] > self.track.track_close_block:
-                        return
-                    coordinator = PlanCoordinator(
-                        track=self.track,
-                        store=store,
-                        objects=self.objects,
-                        source_pool=self.pool,
-                    )
-                    created = coordinator.create_next()
-                    pending = next(
-                        (row for row in coordinator.plans() if row[2].state == "PLANNED"),
-                        None,
-                    )
-                    retained = _retained_plan_digests(coordinator.plans())
+                try:
+                    with (
+                        _interrupt_at_deadline(
+                            time.monotonic() + _PRODUCER_ATTEMPT_TIMEOUT_SECONDS
+                        ),
+                        ChallengeStore(
+                            self.config.validator_database,
+                            track_spec_digest=self.track.digest,
+                        ) as store,
+                    ):
+                        cursor = store.chain_cursor()
+                        if cursor is not None and cursor[0] > self.track.track_close_block:
+                            return
+                        coordinator = PlanCoordinator(
+                            track=self.track,
+                            store=store,
+                            objects=self.objects,
+                            source_pool=self.pool,
+                        )
+                        created = coordinator.create_next()
+                        plans = coordinator.plans()
+                        pending = next(
+                            (row for row in plans if row[2].state == "PLANNED"), None,
+                        )
+                        retained = _retained_plan_digests(plans)
+                        attempt = (
+                            None if pending is None
+                            else _reserve_plan_attempt(self.objects, pending[2])
+                        )
+                except (_DeadlineInterrupt, Exception) as exc:
+                    scheduling_failures += 1
+                    now = time.monotonic()
+                    details = {
+                        "failures": scheduling_failures,
+                        "error_type": (
+                            "TimeoutError" if isinstance(exc, _DeadlineInterrupt)
+                            else type(exc).__name__
+                        ),
+                    }
+                    print(json.dumps({"event": "PRODUCER_SCHEDULING_FAILURE", **details}),
+                          flush=True)
+                    if self.alert is not None and (
+                        scheduling_failures in {1, _FAST_PLAN_ATTEMPTS}
+                        or now - last_scheduling_alert >= _PLAN_PROBE_INTERVAL_MS / 1000
+                    ):
+                        self.alert("PRODUCER_SCHEDULING_FAILURE", details)
+                        last_scheduling_alert = now
+                    if once:
+                        raise RuntimeError("producer scheduling failed") from exc
+                    time.sleep(min(
+                        60.0,
+                        self.config.poll_seconds * (2 ** min(scheduling_failures - 1, 20)),
+                    ))
+                    continue
+                scheduling_failures = 0
                 ready_block = None
                 if pending is not None:
                     plan = pending[2]
-                    attempt = _reserve_plan_attempt(self.objects, plan)
                     if attempt is None:
                         if once:
                             raise RuntimeError(

@@ -695,6 +695,112 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
     assert _plan_attempt_count(AttemptObjects(durable), plan) == 9
 
 
+@pytest.mark.parametrize("phase", ["database", "cursor", "create", "list", "reserve", "timeout"])
+@pytest.mark.parametrize("once", [False, True])
+def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
+    monkeypatch, tmp_path, phase, once,
+) -> None:
+    plan = build_plan(
+        track_spec_digest="ab" * 32,
+        generation_block=120,
+        block_hash="0x" + "cd" * 32,
+        track_start_block=100,
+        minimum_generation_delay_blocks=1,
+        generation_interval_blocks=20,
+        exact_challenge_ids=("challenge",),
+        confirmation_challenge_ids=(),
+        source_proofs=(proof(0), proof(1)),
+        scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+    failures = []
+    completed = []
+    alerts = []
+    sleeps = []
+    original_sleep = time.sleep
+
+    def fail(at):
+        if at == phase and len(failures) < 6:
+            failures.append(at)
+            if phase == "timeout":
+                original_sleep(0.1)
+            raise OSError("synthetic scheduling outage")
+
+    class Store:
+        def __init__(self, *_args, **_kwargs):
+            fail("database")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def chain_cursor(self):
+            fail("cursor")
+            return (201 if completed else 120, "0x" + "cd" * 32)
+
+    class Coordinator:
+        def __init__(self, **_kwargs):
+            pass
+
+        def create_next(self):
+            fail("create")
+            return None
+
+        def plans(self):
+            fail("list")
+            fail("timeout")
+            return (("plans/120.json", StoredObject(plan.encode(), "etag"), plan),)
+
+    real_reserve = production_service._reserve_plan_attempt
+
+    def reserve(objects, pending):
+        fail("reserve")
+        return real_reserve(objects, pending)
+
+    def execute(_name, _stored, pending, _workers, **_kwargs):
+        assert pending == plan
+        completed.append(pending.plan_digest)
+        return SimpleNamespace(generation_block=120)
+
+    service = object.__new__(ProducerService)
+    service.config = SimpleNamespace(
+        validator_database="unused.db", poll_seconds=0.01, work_dir=tmp_path,
+    )
+    service.track = SimpleNamespace(digest=plan.track_spec_digest, track_close_block=200)
+    service.objects = AttemptObjects()
+    service.pool = None
+    service.alert = lambda *args: alerts.append(args)
+    service.attempt_timeout_seconds = 10
+    service._execute = execute
+    monkeypatch.setattr(production_service, "ChallengeStore", Store)
+    monkeypatch.setattr(production_service, "PlanCoordinator", Coordinator)
+    monkeypatch.setattr(production_service, "_reserve_plan_attempt", reserve)
+    monkeypatch.setattr(production_service, "_PRODUCER_ATTEMPT_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(production_service.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(
+        production_service, "WorkerPool",
+        lambda *_args: SimpleNamespace(close=lambda: None),
+    )
+
+    if once:
+        with pytest.raises(RuntimeError, match="producer scheduling failed"):
+            service._run_locked(once=True)
+        assert completed == [] and sleeps == []
+        assert _plan_attempt_count(service.objects, plan) == 0
+        assert [details["failures"] for _, details in alerts] == [1]
+    else:
+        service._run_locked(once=False)
+        assert completed == [plan.plan_digest]
+        assert _plan_attempt_count(service.objects, plan) == 1
+        assert len(failures) == 6
+        assert [details["failures"] for _, details in alerts] == [1, 5]
+        assert sleeps and max(sleeps) <= 60
+    assert all(event == "PRODUCER_SCHEDULING_FAILURE" for event, _ in alerts)
+    assert alerts[0][1]["error_type"] == ("TimeoutError" if phase == "timeout" else "OSError")
+
+
 @pytest.mark.parametrize("failure", ["configuration", "restore", "timeout"])
 def test_producer_bootstrap_failures_are_bounded_and_alerted(monkeypatch, failure) -> None:
     alerts = []
