@@ -28,7 +28,7 @@
       "method": "对 float32 在线结果、候选缓存 dtype 和缓存重放做逐项及排名比较",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": false,
+      "release_blocker": true,
       "status": "not_final_runtime_verified",
       "subject": "缓存数值忠实度"
     },
@@ -40,7 +40,7 @@
       "method": "用固定只读self和退化模型运行真实exact及完整视频，核验FIFO、未来confirmation、冠军替换及持久化事实；更广的跨批次、近阈值和排序研究上线后继续，不训练模型",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": false,
+      "release_blocker": true,
       "status": "not_final_runtime_verified",
       "subject": "teacher-state 到完整稀疏 rollout 的分布偏移"
     },
@@ -213,7 +213,7 @@
           "scope": "Partial GPU numerical and cross-card tied-mask checks; excludes complete matches, adversarial inputs and whole-host recovery"
         }
       ],
-      "release_blocker": false,
+      "release_blocker": true,
       "status": "partial_current_runtime_verified",
       "subject": "确定性与异常输入"
     },

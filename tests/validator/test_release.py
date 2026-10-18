@@ -16,13 +16,13 @@ from validator.weights import WeightChainState
 from .test_publication import MemoryS3
 
 
-def test_research_inventory_does_not_gate_startup_or_claim_acceptance():
+def test_inventory_records_required_owner_checks_without_claiming_acceptance():
     directory = Path(__file__).resolve().parents[2] / "evidence/system-panel/acceptance"
     assert sorted(path.name for path in directory.glob("inventory*.json")) == ["inventory.json"]
     inventory = json.loads((directory / "inventory.json").read_bytes())
     checks = inventory["experiments"]
     assert len({check["id"] for check in checks}) == len(checks)
-    assert not any(check["release_blocker"] for check in checks)
+    assert {check["id"] for check in checks if check["release_blocker"]} == {"E2", "E3", "E16"}
     assert inventory["release_accepted"] is False
     assert inventory["scope"] == "requirements_and_gap_inventory_not_acceptance"
 
