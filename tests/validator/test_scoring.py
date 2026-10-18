@@ -306,6 +306,87 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
     assert evaluated["evaluation_batch"]["plan_digest"] == batch.plan_digest
 
 
+def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
+    tmp_path, monkeypatch
+) -> None:
+    architecture = SelectorArchitecture(1, 1, 2, "float32")
+    tensors = {
+        name: np.zeros(spec.shape, dtype=np.float32)
+        for name, spec in architecture.tensor_schema.items()
+    }
+    archived_path = tmp_path / "archived.safetensors"
+    local_path = tmp_path / "corrupt.safetensors"
+    save_file(tensors, archived_path, metadata={"hotkey": "champion-hotkey"})
+    validated = validate_model(
+        archived_path,
+        schema=architecture.tensor_schema,
+        max_bytes=10_000,
+        expected_hotkey="champion-hotkey",
+    )
+    local_path.write_bytes(b"broken")
+    track = SimpleNamespace(
+        digest="ab" * 32,
+        model=SimpleNamespace(tensor_schema=architecture.tensor_schema, max_bytes=10_000),
+    )
+    client = MemoryS3()
+    objects = PrivateObjectStore(client, bucket="private", prefix="tracks/test")
+    objects.put_content(
+        archived_path,
+        sha256=validated.file_sha256,
+        object_name=f"models/{validated.file_sha256}.safetensors",
+    )
+    source = ReadyBatchSource(
+        track=track,
+        objects=objects,
+        cache_dir=tmp_path / "restored",
+    )
+    evaluator = PairedTrackEvaluator(
+        track=track,
+        store=SimpleNamespace(model_path=lambda _challenge_id: str(local_path)),
+        cache_dir=tmp_path / "batches",
+        model_cache=tmp_path / "models",
+        initial_model_path=archived_path,
+        champion_archive_url="https://public.example/models/test",
+        timeout_seconds=30,
+        downloader=lambda *_args, **_kwargs: pytest.fail("private restore contacted HF"),
+        batch_source=source,
+    )
+    incumbent = SimpleNamespace(
+        challenge_id="12" * 32,
+        hotkey="champion-hotkey",
+        repo_id="owner/model",
+        revision="34" * 20,
+        position=ChainPosition(100, 0, 0),
+    )
+    challenges = (
+        {
+            "challenge_id": incumbent.challenge_id,
+            "file_sha256": validated.file_sha256,
+            "model_digest": validated.model_digest,
+            "model_size_bytes": validated.size_bytes,
+        },
+    )
+    monkeypatch.setattr(
+        scoring_module,
+        "download_chunked_file",
+        lambda *_args, **_kwargs: pytest.fail("private restore contacted public storage"),
+    )
+
+    exact_incumbent = evaluator._incumbent_task(incumbent, challenges)
+    client.objects.clear()
+    confirmation_incumbent = evaluator._incumbent_task(incumbent, challenges)
+
+    assert exact_incumbent.model_path == confirmation_incumbent.model_path
+    assert exact_incumbent.model_path != str(local_path)
+    assert exact_incumbent.file_sha256 == validated.file_sha256
+    assert validate_model(
+        exact_incumbent.model_path,
+        schema=architecture.tensor_schema,
+        max_bytes=10_000,
+        expected_hotkey="champion-hotkey",
+    ) == validated
+
+
 def test_initial_champion_file_and_digest_are_verified(monkeypatch, tmp_path) -> None:
     initial = SimpleNamespace(
         hotkey="burn-hotkey",

@@ -448,60 +448,85 @@ class PairedTrackEvaluator:
             path = self.initial_model_path
             expected_digest = self.track.initial_champion.model_digest
             expected_hotkey = None
+            expected_sha256 = self.track.initial_champion.evaluation_file_sha256
+            expected_size = None
+            validated = self._validate_incumbent_candidate(
+                path,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+                expected_digest=expected_digest,
+                expected_hotkey=expected_hotkey,
+            )
         else:
             record = next(
                 item for item in challenges if item["challenge_id"] == incumbent.challenge_id
             )
             expected_digest = record["model_digest"]
             expected_hotkey = incumbent.hotkey
+            expected_sha256 = record["file_sha256"]
+            expected_size = record["model_size_bytes"]
             local_path = self.store.model_path(incumbent.challenge_id)
-            if local_path is None or not Path(local_path).is_file():
-                path = None
-                if self.batch_source is not None:
-                    try:
-                        path = self.batch_source.restore_model(
-                            record["file_sha256"], record["model_size_bytes"]
-                        )
-                    except (OSError, RuntimeError):
-                        path = None
-                try:
-                    if path is None:
-                        path = download_chunked_file(
-                            f"{self.champion_archive_url.rstrip('/')}/{record['file_sha256']}/manifest.json",
-                            cache_dir=self.model_cache / "champions",
-                            expected_sha256=record["file_sha256"],
-                            max_bytes=self.track.model.max_bytes,
-                            suffix=".safetensors",
-                        )
-                except RuntimeError:
-                    try:
-                        downloaded = self.downloader(
-                            incumbent.repo_id,
-                            incumbent.revision,
-                            cache_dir=self.model_cache,
-                            max_bytes=self.track.model.max_bytes,
-                        )
-                    except ModelDownloadError as exc:
-                        raise TemporaryScoringError(
-                            "INCUMBENT_MODEL_UNAVAILABLE", str(exc)
-                        ) from exc
-                    path = Path(downloaded.path)
-            else:
-                path = Path(local_path)
-        try:
-            validated = validate_model(
+            path = None if local_path is None else Path(local_path)
+            validated = self._validate_incumbent_candidate(
                 path,
-                schema=self.track.model.tensor_schema,
-                max_bytes=self.track.model.max_bytes,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+                expected_digest=expected_digest,
                 expected_hotkey=expected_hotkey,
             )
-        except (OSError, ModelValidationError) as exc:
+            if validated is None and self.batch_source is not None:
+                try:
+                    path = self.batch_source.restore_model(expected_sha256, expected_size)
+                except (OSError, RuntimeError):
+                    path = None
+                validated = self._validate_incumbent_candidate(
+                    path,
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
+                    expected_digest=expected_digest,
+                    expected_hotkey=expected_hotkey,
+                )
+            if validated is None:
+                try:
+                    path = download_chunked_file(
+                        f"{self.champion_archive_url.rstrip('/')}/{expected_sha256}/manifest.json",
+                        cache_dir=self.model_cache / "champions",
+                        expected_sha256=expected_sha256,
+                        max_bytes=self.track.model.max_bytes,
+                        suffix=".safetensors",
+                    )
+                except RuntimeError:
+                    path = None
+                validated = self._validate_incumbent_candidate(
+                    path,
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
+                    expected_digest=expected_digest,
+                    expected_hotkey=expected_hotkey,
+                )
+            if validated is None:
+                try:
+                    downloaded = self.downloader(
+                        incumbent.repo_id,
+                        incumbent.revision,
+                        cache_dir=self.model_cache,
+                        max_bytes=self.track.model.max_bytes,
+                    )
+                except ModelDownloadError as exc:
+                    raise TemporaryScoringError(
+                        "INCUMBENT_MODEL_UNAVAILABLE", str(exc)
+                    ) from exc
+                path = Path(downloaded.path)
+                validated = self._validate_incumbent_candidate(
+                    path,
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
+                    expected_digest=expected_digest,
+                    expected_hotkey=expected_hotkey,
+                )
+        if validated is None or path is None:
             raise TemporaryScoringError(
                 "INCUMBENT_MODEL_INVALID", "current champion model cannot be restored"
-            ) from exc
-        if validated.model_digest != expected_digest:
-            raise TemporaryScoringError(
-                "INCUMBENT_MODEL_INVALID", "current champion model digest changed"
             )
         return LeasedChallenge(
             challenge_id=incumbent.challenge_id,
@@ -517,6 +542,40 @@ class PairedTrackEvaluator:
             model_path=str(path),
             file_sha256=validated.file_sha256,
         )
+
+    def _validate_incumbent_candidate(
+        self,
+        path: Path | None,
+        *,
+        expected_sha256: str,
+        expected_size: int | None,
+        expected_digest: str,
+        expected_hotkey: str | None,
+    ) -> ValidatedModel | None:
+        if path is None:
+            return None
+        try:
+            if (
+                not path.is_file()
+                or (expected_size is not None and path.stat().st_size != expected_size)
+                or _file_sha256(path) != expected_sha256
+            ):
+                return None
+            validated = validate_model(
+                path,
+                schema=self.track.model.tensor_schema,
+                max_bytes=self.track.model.max_bytes,
+                expected_hotkey=expected_hotkey,
+            )
+        except (OSError, ModelValidationError):
+            return None
+        if (
+            validated.file_sha256 != expected_sha256
+            or (expected_size is not None and validated.size_bytes != expected_size)
+            or validated.model_digest != expected_digest
+        ):
+            return None
+        return validated
 
 
 @dataclass(frozen=True, slots=True)
