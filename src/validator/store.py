@@ -293,7 +293,7 @@ class ChallengeStore:
         submission_id: str | None,
         legacy_excluded: bool,
     ) -> None:
-        """Record a hotkey's first recognized contest choice permanently."""
+        """Retain the first commitment and every signed old-contest exclusion."""
 
         if not hotkey or not payload:
             raise ValueError("commitment hotkey and payload cannot be empty")
@@ -369,7 +369,7 @@ class ChallengeStore:
                         selected_submission_id,
                     ),
                 )
-            if current is None and legacy_excluded:
+            if legacy_excluded:
                 self._connection.execute(
                     """
                     INSERT INTO competition_exclusions (hotkey, first_block, reason)
@@ -467,6 +467,17 @@ class ChallengeStore:
             and row["repo_id"] is not None
             and row["exclusion_reason"] is None
         ]
+
+    def legacy_excluded_hotkeys(self) -> frozenset[str]:
+        """Return signed old-contest activations, including later contest switches."""
+
+        return frozenset(
+            row["hotkey"]
+            for row in self._connection.execute(
+                "SELECT hotkey FROM competition_exclusions "
+                "WHERE reason = 'LEGACY_CONTEST_ACTIVATED'"
+            )
+        )
 
     def bind_track_spec(self, digest: str) -> None:
         """Bind all future challenges in this database to one frozen spec."""

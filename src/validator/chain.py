@@ -59,18 +59,9 @@ async def scan_finalized_blocks(
         if current is not None and current[0] >= block_height:
             continue
         block_hash = await client._substrate.block_hash(block_height)
-        if submission_end_block is not None and block_height > submission_end_block:
-            try:
-                store.advance_chain_cursor(block_height, block_hash)
-            except ValueError:
-                current = store.chain_cursor()
-                if (
-                    current is None
-                    or current[0] < block_height
-                    or (current[0] == block_height and current[1] != block_hash)
-                ):
-                    raise
-            continue
+        submissions_closed = (
+            submission_end_block is not None and block_height > submission_end_block
+        )
         block = await client._substrate.get_block(block_hash=block_hash)
         if block is None:
             raise RuntimeError(f"finalized block {block_height} is unavailable")
@@ -164,10 +155,16 @@ async def scan_finalized_blocks(
         submissions = tuple(
             submission
             for commitment in commitments
-            if (submission := submission_from_commitment(commitment)) is not None
+            if not submissions_closed
+            and (submission := submission_from_commitment(commitment)) is not None
         )
         submissions_by_position = {submission.position: submission for submission in submissions}
         for commitment in commitments:
+            legacy_excluded = is_valid_legacy_activation(
+                commitment.payload, hotkey=commitment.hotkey, netuid=netuid,
+            )
+            if submissions_closed and not legacy_excluded:
+                continue
             submission = submissions_by_position.get(commitment.position)
             if submission is not None:
                 store.add_submission(submission)
@@ -178,11 +175,7 @@ async def scan_finalized_blocks(
                 position=commitment.position,
                 payload=commitment.payload,
                 submission_id=None if submission is None else submission.submission_id,
-                legacy_excluded=is_valid_legacy_activation(
-                    commitment.payload,
-                    hotkey=commitment.hotkey,
-                    netuid=netuid,
-                ),
+                legacy_excluded=legacy_excluded,
             )
         try:
             store.advance_chain_cursor(block_height, block_hash)

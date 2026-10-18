@@ -174,6 +174,46 @@ def test_scanner_advances_without_recording_commitments_after_track_close(tmp_pa
         assert len(store.public_snapshot()["challenges"]) == 1
 
 
+@pytest.mark.parametrize("timelocked", [False, True])
+@pytest.mark.parametrize("valid_signature", [False, True])
+def test_legacy_exclusion_is_observed_after_track_close(
+    tmp_path, monkeypatch, timelocked, valid_signature,
+) -> None:
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    activation = b"affine2|activate|signed"
+    blocks = {
+        100: chain_block(payload, 100),
+        101: chain_block(payload, 101),
+        102: chain_block(activation, 102),
+    }
+    if timelocked:
+        blocks[102] = (
+            blocks[102][0], {"extrinsics": []}, [{
+                "extrinsic_idx": None, "module_id": "Commitments",
+                "event_id": "CommitmentRevealed", "attributes": {"netuid": 7, "who": HOTKEY},
+            }],
+        )
+    client = FakeClient(blocks)
+    client.revealed = {
+        102: [SimpleNamespace(hotkey=HOTKEY, revealed=[(102, "0x" + activation.hex())])],
+    }
+    monkeypatch.setattr(
+        chain_module, "is_valid_legacy_activation",
+        lambda value, **_kwargs: valid_signature and value == activation,
+    )
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        result = asyncio.run(scan_finalized_blocks(
+            client, store, netuid=7, track_start_block=100, submission_end_block=100,
+        ))
+        assert result.blocks_scanned == 3 and result.submissions_found == 1
+        assert len(store.public_snapshot()["challenges"]) == 1
+        assert store.chain_cursor() == (102, blocks[102][0])
+        assert store.legacy_excluded_hotkeys() == (
+            frozenset({HOTKEY}) if valid_signature else frozenset()
+        )
+        assert bool(store.active_competitors({HOTKEY: 4})) is not valid_signature
+
+
 def test_scanner_does_not_advance_cursor_past_failed_block(tmp_path) -> None:
     payload = ModelSubmission("owner/model", "12" * 20).encode()
     blocks = {height: chain_block(payload, height) for height in range(100, 102)}

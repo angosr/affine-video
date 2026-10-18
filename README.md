@@ -19,8 +19,10 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
    Only that hotkey's first submission on the track is eligible; every later submission is
    terminally rejected, even when the first submission is malformed or fails evaluation.
    The evaluator verifies the signed old-contest activation history before the track starts.
-   A hotkey already in the old contest is rejected, while a hotkey's first recognized choice for
-   the new contest remains fixed even if it later writes unrelated commitments.
+   A valid signed old-contest activation permanently excludes that hotkey from Veda rewards,
+   including an activation after its Veda submission. Historical matches and models remain
+   unchanged; an excluded champion's weight falls back to UID0. Unrelated commitments do not
+   change the selected Veda submission. Old-contest activations remain monitored after closing.
 2. After the fixed publication grace period, the evaluator processes submissions by finalized
    `(block, extrinsic, event)` order. Before any model I/O, each admission-eligible submission
    atomically reserves one of `maximum_effective_challenges` season slots. Deterministic

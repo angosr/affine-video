@@ -208,6 +208,7 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch(tmp_path) -
         chain_cursor=lambda: (300, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": challenges},
         active_competitors=lambda _mapping: competitors,
+        legacy_excluded_hotkeys=lambda: frozenset(),
         model_path=lambda _challenge_id: str(winning_model),
     )
     chain = WeightChainState(

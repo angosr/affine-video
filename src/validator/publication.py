@@ -163,9 +163,16 @@ def build_public_artifacts(
     match_sequence, terminal_match_sha256 = _terminal_match_fence(tournament)
     plan = None
     if not aborted:
+        # Contest switches withdraw rewards without rewriting historical matches.
+        excluded = store.legacy_excluded_hotkeys()
+        eligible_uids = {
+            hotkey: uid
+            for hotkey, uid in chain.uid_by_hotkey.items()
+            if hotkey not in excluded or hotkey == initial.hotkey
+        }
         plan = plan_champion_weight(
             tournament.champion,
-            uid_by_hotkey=chain.uid_by_hotkey,
+            uid_by_hotkey=eligible_uids,
             current_block=chain.finalized_block,
             min_allowed_weights=chain.min_allowed_weights,
             max_weight=chain.max_weight,
@@ -173,7 +180,7 @@ def build_public_artifacts(
         if plan is None and tournament.champion.challenge_id != initial.challenge_id:
             plan = plan_champion_weight(
                 initial,
-                uid_by_hotkey=chain.uid_by_hotkey,
+                uid_by_hotkey=eligible_uids,
                 current_block=chain.finalized_block,
                 min_allowed_weights=chain.min_allowed_weights,
                 max_weight=chain.max_weight,

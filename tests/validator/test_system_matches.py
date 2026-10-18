@@ -146,6 +146,7 @@ def test_repeated_publication_reuses_one_runtime_environment_scan(monkeypatch) -
         chain_cursor=lambda: (track.track_start_block, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": []},
         active_competitors=lambda _mapping: [],
+        legacy_excluded_hotkeys=lambda: frozenset(),
     )
     chain = WeightChainState(
         track.track_start_block,

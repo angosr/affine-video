@@ -413,7 +413,7 @@ def test_second_submission_from_legacy_excluded_hotkey_is_duplicate(tmp_path) ->
         assert store.get_challenge(second_id).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
 
 
-def test_first_new_contest_choice_survives_later_commitments(tmp_path) -> None:
+def test_first_new_choice_ignores_unrelated_but_not_legacy_activation(tmp_path) -> None:
     first = submission_at(100)
     with ChallengeStore(tmp_path / "validator.db") as store:
         store.add_submission(first, occurred_at_ms=10)
@@ -435,6 +435,9 @@ def test_first_new_contest_choice_survives_later_commitments(tmp_path) -> None:
             submission_id=None,
             legacy_excluded=False,
         )
+        assert [item["submission_id"] for item in store.active_competitors({first.hotkey: 4})] == [
+            first.submission_id
+        ]
         store.observe_commitment(
             hotkey=first.hotkey,
             netuid=first.netuid,
@@ -445,9 +448,8 @@ def test_first_new_contest_choice_survives_later_commitments(tmp_path) -> None:
             legacy_excluded=True,
         )
 
-        assert [item["submission_id"] for item in store.active_competitors({first.hotkey: 4})] == [
-            first.submission_id
-        ]
+        assert store.active_competitors({first.hotkey: 4}) == []
+        assert store.legacy_excluded_hotkeys() == frozenset({first.hotkey})
 
 
 def test_current_vda_choice_always_points_to_hotkeys_first_submission(tmp_path) -> None:

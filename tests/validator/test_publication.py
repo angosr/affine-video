@@ -33,7 +33,13 @@ from validator.publication import (
     fetch_weight_artifact,
     validate_public_weights_url,
 )
+from validator.queue import ChainPosition
+from validator.store import ChallengeStore
+from validator.tournament import genesis_champion, resolve_tournament
 from validator.weights import WeightArtifact, WeightChainState, WeightPlan
+
+from .test_store import submission_at
+from .test_tournament import challenge as scored_challenge
 
 
 class MissingObject(Exception):
@@ -798,6 +804,7 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) ->
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
         active_competitors=lambda _mapping: [],
+        legacy_excluded_hotkeys=lambda: frozenset(),
         model_path=lambda _challenge_id: str(model),
     )
     chain = WeightChainState(120, {"alice": 4}, 1, 1.0, 10, {"alice": 0})
@@ -882,6 +889,7 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": [challenge]},
         active_competitors=lambda _mapping: [],
+        legacy_excluded_hotkeys=lambda: frozenset(),
         model_path=lambda _challenge_id: None if cache_state == "forgotten" else str(model),
     )
     chain = WeightChainState(
@@ -939,12 +947,96 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
     assert len(restored) == (cache_state != "valid")
 
 
+@pytest.mark.parametrize("after_close", [False, True])
+def test_legacy_switch_stops_rewards_without_rewriting_or_losing_match_history(
+    tmp_path, after_close,
+) -> None:
+    track = parse_track_spec(valid_spec())
+    record = submission_at(101, hotkey="alice")
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"model")
+    model_sha = hashlib.sha256(model.read_bytes()).hexdigest()
+    switch_block = track.track_close_block + 1 if after_close else 252
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+
+    def observe(store, *, legacy=False):
+        store.observe_commitment(
+            hotkey=record.hotkey, netuid=track.netuid,
+            block_hash="0x" + f"{switch_block:064x}" if legacy else record.block_hash,
+            position=ChainPosition(switch_block, 0, 0) if legacy else record.position,
+            payload=b"signed-old-activation" if legacy else record.payload,
+            submission_id=None if legacy else record.submission_id,
+            legacy_excluded=legacy,
+        )
+
+    def publishable(store, block):
+        return build_public_artifacts(
+            store, track,
+            WeightChainState(block, {track.initial_champion.hotkey: 0, "alice": 4}, 1, 1.0, 10, {}),
+            version_key=0, model_resolver=lambda *_args: model,
+        )
+
+    with ChallengeStore(tmp_path / "original.db", track_spec_digest=track.digest) as store:
+        identifier, _ = store.add_submission(record)
+        observe(store)
+        challenge = {
+            **scored_challenge(1, "alice", score=0.8, incumbent_score=0.7, paired_gain=0.1),
+            "challenge_id": identifier, "submission_id": record.submission_id,
+            "repo_id": record.repo_id, "revision": record.revision,
+            "file_sha256": model_sha, "model_size_bytes": model.stat().st_size,
+        }
+        tournament = resolve_tournament(
+            [challenge], track_id=track.track_id, track_spec_digest=track.digest,
+            netuid=track.netuid, minimum_gain=track.full_video.minimum_gain,
+            minimum_exact_gain=track.scoring.minimum_frontier_gain,
+            minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
+            initial_champion=genesis_champion(track),
+        )
+        store.restore_public_matches(tournament.matches)
+        store.advance_chain_cursor(250, "0x" + f"{250:064x}")
+        before = publishable(store, 250)
+        assert decode_weight_artifact(before.weights).plan.hotkeys == ("alice",)
+        asyncio.run(repository.publish(before))
+
+        observe(store, legacy=True)
+        for height in range(251, switch_block + 1):
+            store.advance_chain_cursor(height, "0x" + f"{height:064x}")
+        after = publishable(store, switch_block)
+        weights = decode_weight_artifact(after.weights)
+        assert weights.plan.hotkeys == (track.initial_champion.hotkey,)
+        assert weights.plan.uids == (0,) and weights.plan.weights == (1.0,)
+        assert after.matches == before.matches
+        assert weights.terminal_match_sha256 == decode_weight_artifact(
+            before.weights
+        ).terminal_match_sha256
+        assert json.loads(after.summary)["champion"]["hotkey"] == "alice"
+        asyncio.run(repository.publish(after))
+
+    ledger = asyncio.run(
+        S3Repository(client, bucket="public-data", prefix="tracks/test").load(track)
+    )
+    with ChallengeStore(tmp_path / "fresh.db", track_spec_digest=track.digest) as store:
+        store.add_submission(record)
+        observe(store)
+        observe(store, legacy=True)
+        # Chain recovery precedes importing historical terminal matches.
+        store.restore_public_matches(ledger.matches)
+        store.advance_chain_cursor(switch_block, "0x" + f"{switch_block:064x}")
+        restored = publishable(store, switch_block)
+        assert restored.weights == after.weights
+        assert restored.matches == after.matches
+        assert restored.summary == after.summary
+        assert store.active_competitors({"alice": 4}) == []
+
+
 def test_empty_track_publishes_uid_zero_veda_as_genesis_champion() -> None:
     track = parse_track_spec(valid_spec())
     store = SimpleNamespace(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": []},
         active_competitors=lambda _mapping: [],
+        legacy_excluded_hotkeys=lambda: frozenset(),
     )
     chain = WeightChainState(
         120,
@@ -993,6 +1085,7 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
         chain_cursor=lambda: (block, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
         active_competitors=lambda _mapping: [],
+        legacy_excluded_hotkeys=lambda: frozenset(),
     )
     chain = WeightChainState(
         block,
@@ -1046,6 +1139,7 @@ def test_track_abort_stops_weight_refresh_after_close_grace() -> None:
         chain_cursor=lambda: (block, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": []},
         active_competitors=lambda _mapping: [],
+        legacy_excluded_hotkeys=lambda: frozenset(),
     )
     recovered = build_public_artifacts(
         recovered_store,
@@ -1096,6 +1190,7 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary(tmp_path)
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
         active_competitors=lambda _mapping: [],
+        legacy_excluded_hotkeys=lambda: frozenset(),
         model_path=lambda _challenge_id: str(model),
     )
     chain = WeightChainState(120, {"alice": 4, "bob": 5}, 1, 1.0, 10, {})
@@ -1490,6 +1585,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
         active_competitors=lambda _mapping: [],
+        legacy_excluded_hotkeys=lambda: frozenset(),
         model_path=lambda _challenge_id: str(model_path),
     )
     track = SimpleNamespace(
@@ -1555,6 +1651,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         chain_cursor=lambda: (121, "0x" + "34" * 32),
         public_snapshot=store.public_snapshot,
         active_competitors=store.active_competitors,
+        legacy_excluded_hotkeys=store.legacy_excluded_hotkeys,
         model_path=store.model_path,
     )
     fallback = build_public_artifacts(fallback_store, track, missing_champion, version_key=9)
