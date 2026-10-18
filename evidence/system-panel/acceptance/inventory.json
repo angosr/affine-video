@@ -622,6 +622,32 @@
           "joint_latent_mismatches": 0,
           "mp4_mismatches": 0,
           "scope": "Actual native producer units in fresh work directories; unchanged producer component versus b81, not b81 whole-host recovery"
+        },
+        "current_fixed_input_envelope": {
+          "samples": 1120,
+          "source_families": 1120,
+          "binding_and_all_fixed_input_file_shas_verified": true,
+          "text_tokens_min": 90,
+          "text_tokens_max": 107,
+          "text_hidden_shape": [
+            108361,
+            5120
+          ],
+          "text_hidden_dtype": "BF16",
+          "text_file_bytes": 1109725169,
+          "maximum_nonempty_production_batches": 40,
+          "required_families_per_production_stratum": 160,
+          "peak_rss_bytes": 40538112,
+          "memory_scope_limit_bytes": 201326592,
+          "gpu_used": false,
+          "tensor_payload_materialized": false,
+          "production_family_counts": {
+            "16:9@37": 239,
+            "1:1@72": 240,
+            "4:3@102": 241,
+            "9:16@37": 240
+          },
+          "scope": "Fixed-byte source-cache integrity and declared input bounds only; not generated-batch throughput, joint GPU capacity or complete host recovery"
         }
       },
       "id": "E18",
@@ -687,6 +713,11 @@
           "path": "evidence/system-panel/acceptance-e91fa0e7/regeneration-batch-gpu7.raw.log",
           "sha256": "41a0e9ad2400b08e4cb22b3f339e72b9b7d8c91d3f62ba17f797fc68e1d05170",
           "scope": "Actual frozen E91/372 cross-card regeneration of eight of sixteen units; original QKV/latent/MP4 SHA identical; not b81 whole-host restoration"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/fixed-input-envelope.json",
+          "sha256": "43c7404630239fd9fb17c5eb2c4808d815bedd4d6e25a05b6139d4c387cf4c5a",
+          "scope": "Actual 192 MiB-capped CPU stream check of all fixed input SHA/Merkle bindings and original encoded text layout; original empty condition spans [0,0], no tensor materialization, inference or full-capacity acceptance"
         }
       ],
       "release_blocker": false,

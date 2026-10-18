@@ -1849,6 +1849,13 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     assert len(unresolved) == 2 and len(set(unresolved)) == 2
     assert still_pending.batch_groups == ()
     assert not any(item.object_name.startswith("batches/") for item in still_pending.files)
+    # A shared batch can stay hidden without delaying an already-decided win.
+    for pending_data in (withheld, still_pending):
+        assert pending_data.weights == metadata.weights
+        assert decode_weight_artifact(pending_data.weights).plan.hotkeys == ("alice",)
+        assert pending_data.matches == metadata.matches
+        assert pending_data.summary == metadata.summary
+        assert pending_data.status == metadata.status
     disclosed = resolve_public_disclosures(
         metadata, terminal_challenge_ids=frozenset({"challenge"}),
         resolver=lambda digest, _terminal: disclosure(digest, ("challenge",)),
