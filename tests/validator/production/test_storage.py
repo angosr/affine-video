@@ -326,7 +326,6 @@ def test_environment_clients_share_s3_region_without_changing_object_paths(monke
         monkeypatch.setenv(f"{prefix}STORAGE_URL", "https://s3.eu-central-1.amazonaws.com")
         monkeypatch.setenv(f"{prefix}ACCESS_KEY", "access")
         monkeypatch.setenv(f"{prefix}SECRET_ACCESS_KEY", "secret")
-    monkeypatch.delenv("VEDA_RELEASE_ACCEPTANCE", raising=False)
     monkeypatch.delenv("VEDA_COORDINATED_RELEASE_DIGEST", raising=False)
     if role == "public":
         store = S3Repository.from_environment(bucket="public", prefix="tracks/main")

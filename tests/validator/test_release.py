@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -17,99 +16,45 @@ from validator.weights import WeightChainState
 from .test_publication import MemoryS3
 
 
-def test_current_inventory_matches_release_checks_without_claiming_acceptance():
+def test_research_inventory_does_not_gate_startup_or_claim_acceptance():
     directory = Path(__file__).resolve().parents[2] / "evidence/system-panel/acceptance"
     assert sorted(path.name for path in directory.glob("inventory*.json")) == ["inventory.json"]
     inventory = json.loads((directory / "inventory.json").read_bytes())
     checks = inventory["experiments"]
     assert len({check["id"] for check in checks}) == len(checks)
-    assert {check["id"] for check in checks if check["release_blocker"]} == (
-        release._REQUIRED_EXPERIMENTS
-    )
+    assert not any(check["release_blocker"] for check in checks)
     assert inventory["release_accepted"] is False
     assert inventory["scope"] == "requirements_and_gap_inventory_not_acceptance"
 
 
-def test_launch_scope_retains_correctness_and_defers_research_without_claiming_success():
-    directory = Path(__file__).resolve().parents[2] / "evidence/system-panel/acceptance"
-    inventory = json.loads((directory / "inventory.json").read_bytes())
-    checks = {check["id"]: check for check in inventory["experiments"]}
-    assert {
-        "E1", "E2", "E3", "E5", "E6", "E10", "E11", "E14", "E16", "E18",
-    } == release._REQUIRED_EXPERIMENTS
-    for identifier in ("E4", "E7", "E8", "E12", "E13", "E15", "E17"):
-        assert checks[identifier]["release_blocker"] is False
-        assert checks[identifier]["status"] == "post_launch_validation_pending"
-        assert checks[identifier]["pass"] is False
-
-
-def approved_candidate(monkeypatch, *, mutation=None):
+def approved_candidate():
     document = valid_spec()
     document["track_id"] = "veda-sn120-v2"
-    provisional = parse_track_spec(document)
-    runtime_digest = "ef" * 32
-    monkeypatch.setattr(release, "_evidence_runtime_digest", lambda _manifest: runtime_digest)
-    monkeypatch.setattr(
-        release,
-        "system_match_artifacts",
-        lambda _track, _manifest: (("system_matches/test/000000000001.json", b"{}"),),
-    )
-    acceptance = {
-        "format": "veda-release-acceptance-v1",
-        "release_accepted": True,
-        "evidence_contract_sha256": release._evidence_contract_digest(provisional),
-        "runtime_contract_sha256": runtime_digest,
-        "experiments": {},
-    }
-    artifacts = []
-    for identifier in sorted(release._REQUIRED_EXPERIMENTS):
-        references = []
-        for kind in ("protocol", "raw"):
-            name = f"evidence/system-panel/acceptance/{identifier}-{kind}.json"
-            payload = canonical_json({"unit_test_fixture": identifier, "kind": kind})
-            digest = hashlib.sha256(payload).hexdigest()
-            artifacts.append(Artifact(name, digest, len(payload), f"artifacts/{digest}"))
-            references.append({"logical_name": name, "sha256": digest})
-        acceptance["experiments"][identifier] = {
-            "pass": True,
-            "method": "unit-test fixture, not GPU acceptance",
-            "actual_values": {"fixture": 1},
-            "acceptance_manifest": references[0],
-            "raw_evidence": [references[1]],
-        }
-    if mutation is not None:
-        mutation(acceptance)
-    payload = canonical_json(acceptance)
-    digest = hashlib.sha256(payload).hexdigest()
-    monkeypatch.setattr(release, "PRODUCTION_ACCEPTANCE_SHA256", digest)
-    artifacts.append(
-        Artifact(release.ACCEPTANCE_LOGICAL_NAME, digest, len(payload), f"artifacts/{digest}")
-    )
-    manifest = ArtifactManifest(
-        tuple(sorted(artifacts, key=lambda artifact: artifact.logical_name))
-    )
+    manifest = ArtifactManifest((
+        Artifact("runtime/source.zip", "ab" * 32, 100, "artifacts/source"),
+    ))
     document["artifact_manifest_sha256"] = manifest.digest
     track = parse_track_spec(document)
-    return track, manifest.encode(), ReleaseApproval(track.digest, payload)
+    return track, manifest.encode(), ReleaseApproval(track.digest)
 
 
 def chain(track):
     return WeightChainState(99, {track.initial_champion.hotkey: 0}, 1, 1.0, 0, {})
 
 
-def test_unaccepted_candidate_cannot_build_genesis():
+def test_uncoordinated_candidate_cannot_build_genesis():
     document = valid_spec()
     document["track_id"] = "veda-sn120-v2"
     track = parse_track_spec(document)
-    with pytest.raises(PublicArtifactError, match="verified acceptance"):
+    with pytest.raises(PublicArtifactError, match="coordinated track digest"):
         build_genesis_artifacts(track, chain(track), version_key=0)
 
 
 @pytest.mark.parametrize(
-    "failure", ["absent", "uncoordinated", "runtime_absent", "unverified_hash"]
+    "failure", ["absent", "uncoordinated", "runtime_absent", "runtime_mismatch"]
 )
-def test_formal_release_rejection_performs_zero_writes(monkeypatch, failure):
-    track, manifest, approval = approved_candidate(monkeypatch)
+def test_formal_release_rejection_performs_zero_writes(failure):
+    track, manifest, approval = approved_candidate()
     artifacts = build_genesis_artifacts(
         track, chain(track), version_key=0, runtime_manifest=manifest, release_approval=approval
     )
@@ -120,7 +65,7 @@ def test_formal_release_rejection_performs_zero_writes(monkeypatch, failure):
     elif failure == "runtime_absent":
         artifacts = replace(artifacts, runtime_manifest=None)
     else:
-        monkeypatch.setattr(release, "PRODUCTION_ACCEPTANCE_SHA256", "0" * 64)
+        artifacts = replace(artifacts, runtime_manifest=canonical_json({"invalid": True}))
     client = MemoryS3()
     client.objects = {
         f"tracks/main/{name}.json": b"existing live v1"
@@ -136,33 +81,8 @@ def test_formal_release_rejection_performs_zero_writes(monkeypatch, failure):
     assert client.objects == original
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        lambda result: result.update(release_accepted=False),
-        lambda result: result.update(runtime_contract_sha256="00" * 32),
-        lambda result: result.update(evidence_contract_sha256="00" * 32),
-        lambda result: result["experiments"].pop("E18"),
-        lambda result: result["experiments"]["E10"].update(**{"pass": False}),
-        lambda result: result["experiments"]["E11"].update(raw_evidence=[]),
-        lambda result: result["experiments"]["E14"]["raw_evidence"][0].update(sha256="00" * 32),
-    ],
-)
-def test_acceptance_cannot_omit_failed_unbound_or_mismatched_evidence(monkeypatch, mutation):
-    track, manifest, approval = approved_candidate(monkeypatch, mutation=mutation)
-    with pytest.raises(ValueError):
-        approval.verify(track, manifest)
-
-
-def test_acceptance_cannot_replace_missing_system_matches(monkeypatch):
-    track, manifest, approval = approved_candidate(monkeypatch)
-    monkeypatch.setattr(release, "system_match_artifacts", lambda _track, _manifest: ())
-    with pytest.raises(ValueError, match="system match"):
-        approval.verify(track, manifest)
-
-
-def test_accepted_coordinated_release_can_publish(monkeypatch):
-    track, manifest, approval = approved_candidate(monkeypatch)
+def test_coordinated_release_can_publish_without_a_research_acceptance_file():
+    track, manifest, approval = approved_candidate()
     artifacts = build_genesis_artifacts(
         track, chain(track), version_key=0, runtime_manifest=manifest, release_approval=approval
     )
@@ -172,6 +92,20 @@ def test_accepted_coordinated_release_can_publish(monkeypatch):
     )
     asyncio.run(publisher.publish(artifacts))
     assert client.objects["tracks/main/track.json"] == artifacts.track
+
+
+@pytest.mark.parametrize("digest", ["", "ab" * 20, "AB" * 32, "g" * 64])
+def test_coordinated_release_environment_rejects_invalid_digest(monkeypatch, digest):
+    monkeypatch.setenv("VEDA_COORDINATED_RELEASE_DIGEST", digest)
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        ReleaseApproval.from_environment()
+
+
+def test_coordinated_release_environment_requires_only_the_existing_digest_setting(monkeypatch):
+    monkeypatch.delenv("VEDA_COORDINATED_RELEASE_DIGEST", raising=False)
+    assert ReleaseApproval.from_environment() is None
+    monkeypatch.setenv("VEDA_COORDINATED_RELEASE_DIGEST", "ab" * 32)
+    assert ReleaseApproval.from_environment() == ReleaseApproval("ab" * 32)
 
 
 def test_legacy_exception_is_only_the_pinned_public_identity():

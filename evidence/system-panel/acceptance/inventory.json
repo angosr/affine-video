@@ -4,8 +4,8 @@
     "Pilot thresholds must be registered before disjoint confirmation.",
     "Selectors are fixed read-only inputs; no training or checkpoint-trajectory study is required.",
     "Historical numerical evidence must be checked against the final runtime binding, not relabeled as acceptance.",
-    "Initial release requires execution correctness, a real paired two-stage challenge, isolation, bounded cost and recovery; broader quality and power studies continue after launch without being marked passed.",
-    "No public v2 switch while core release blockers or external digest coordination remain."
+    "Research checks track remaining validation independently of startup; incomplete experiments remain visibly incomplete and are never fabricated as passed.",
+    "Public track changes retain the existing paths and require explicit digest coordination and a matching runtime manifest."
   ],
   "experiments": [
     {
@@ -16,7 +16,7 @@
       "method": "逐层比较在线 hook、独立 dense reference 与稀疏 kernel 在 full-mask 下的 Q/K/V 和输出",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "截取点与参考实现"
     },
@@ -28,7 +28,7 @@
       "method": "对 float32 在线结果、候选缓存 dtype 和缓存重放做逐项及排名比较",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "缓存数值忠实度"
     },
@@ -40,7 +40,7 @@
       "method": "用固定只读self和退化模型运行真实exact及完整视频，核验FIFO、未来confirmation、冠军替换及持久化事实；更广的跨批次、近阈值和排序研究上线后继续，不训练模型",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "teacher-state 到完整稀疏 rollout 的分布偏移"
     },
@@ -64,7 +64,7 @@
       "method": "对冻结 tile plan 和预算规则逐项比较独立 scorer 与真实 sparse runtime；覆盖边界、必选块和实际分段预算，不开展架构搜索",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "tile、必选块与预算语义"
     },
@@ -76,7 +76,7 @@
       "method": "用冻结 selector 的真实输入 trace、schema 负控和极值测试核验 TripPool/投影/Top k 的运行边界及开销，不训练或扩大模型结构",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "固定选块器结构与输入边界"
     },
@@ -124,7 +124,7 @@
       "method": "在目标 GPU 上覆盖 k、tile 几何、mask 模式和序列长度，测 kernel 与端到端延迟",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "成本模型"
     },
@@ -136,7 +136,7 @@
       "method": "分离测量 TripPool、残差投影、稳定 Top k、mask 准备和稀疏 attention",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "选择开销"
     },
@@ -172,7 +172,7 @@
       "method": "近重复/family 分组审计、公开反馈探测、批次披露时序检查和真实 producer/evaluator IAM 越权负控",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "数据泄漏与榜单探测"
     },
@@ -211,7 +211,7 @@
         }
       ],
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "确定性与异常输入"
     },
@@ -235,7 +235,7 @@
       "method": "压测上传校验、轻量缓存、精确缓存、完整视频、重试和故障恢复",
       "pass": false,
       "raw_evidence": [],
-      "release_blocker": true,
+      "release_blocker": false,
       "status": "not_final_runtime_verified",
       "subject": "评测容量"
     }

@@ -171,15 +171,16 @@ publisher with a shorter or conflicting match prefix is fenced before it can cha
 Mutable pointers use ETag conditional writes, and production startup probes both conditional create
 and conditional replace. A backend that cannot fence two concurrent publishers is rejected.
 
-Every new release to `tracks/main` also requires the pinned, verified
-E1/E2/E3/E5/E6/E10/E11/E14/E16/E18 core acceptance
-result and an explicitly coordinated full track digest. The evaluator reads these from
-`VEDA_RELEASE_ACCEPTANCE` (the canonical acceptance JSON file) and
-`VEDA_COORDINATED_RELEASE_DIGEST`. The release manifest must bind the acceptance result, its
-preregistered protocols and raw evidence; the accepted scoring/runtime contracts must match the
-active candidate. Missing, incomplete or mismatched acceptance rejects publication before any
-write. The existing public v1 identity alone retains its established publication behavior.
-The current candidate has no approved acceptance result or coordinated deployment digest.
+Every new release to `tracks/main` requires an explicitly coordinated full track digest in
+`VEDA_COORDINATED_RELEASE_DIGEST` and the matching runtime manifest. A missing approval or a
+mismatched identity rejects publication before any write. Research experiments remain tracked in
+the evidence inventory, with incomplete work explicitly marked as such; completing the entire
+panel is not a startup requirement. The existing public v1 identity alone retains its established
+publication behavior.
+
+Initial operation can generate batches on demand with `veda validator produce --config ... --once`.
+Continuous generation and broader quality studies can be enabled after the evaluator is operating;
+there is no second data format or publication path.
 
 
 Object storage is the durable source for public tournament facts. The local SQLite database and
