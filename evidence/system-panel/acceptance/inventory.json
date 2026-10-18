@@ -365,7 +365,7 @@
           "scope": "Full existing 550MB-class files checked on GPU host, using original schema/finite/hash validator; declared metadata is not chain/HF authentication. Existing registration file hashes still enforced. No models created or modified."
         },
         "registered_full_layer_study": {
-          "status": "running",
+          "status": "calibration_complete_gates_failed_independent_confirmation_running",
           "runtime_source_commit": "b81bfa8",
           "layers": 50,
           "geometries": 4,
@@ -374,11 +374,18 @@
           "legal_mask_patterns": 4,
           "physical_gpus": [6, 7],
           "expected_sparse_rows_per_phase": 8400,
+          "calibration_rows_completed": 8400,
+          "calibration_contexts": 64,
+          "calibration_e10_contexts_passed": 30,
+          "calibration_e11_contexts_passed": 32,
+          "calibration_maximum_p95_relative_error": 0.10815863582045382,
+          "frozen_fit_sha256": "7dda77e5ac38b8b7ac7338ac076e114a42d59738887ebcd254942eab004102fa",
+          "fit_adopted_in_production": false,
           "calibration_and_confirmation_seeds_disjoint": true,
           "execution_mode": "torch.no_grad, matching formal sparse rollout",
           "timeout_seconds_per_shard": 14400,
           "automatic_restart_or_deadline_extension": false,
-          "scope": "Initial real H200 execution and protocol/source/control bindings verified, with live off-GPU raw collectors. No completed fit, independent confirmation, E10/E11 acceptance or formal cost changes yet."
+          "scope": "Original two H200 calibration shards completed without OOM; all raw file hashes mirrored and checked. Registered CPU fit fails unchanged E10/E11 gates. Independent seed2026101932 confirmation is running against this frozen fit on GPU6/7 with live off-GPU collectors and original four-hour deadlines. No refit, threshold change, live cost change or completed confirmation claim."
         },
         "cost_parameters_changed": false,
         "scope": "Synthetic BF16 packed QKV; original full production selector plus four legal mask probes, not necessarily realizable submitted projections. Original evaluator with live cost shape and optimistic per-geometry scales on the same measurements; not preregistered fit or independent confirmation, not all50 layers or whole-model throughput. All four observed geometry gates failed."
@@ -416,6 +423,16 @@
           "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/first-live-observation.json",
           "sha256": "25c482d6d3733db44915acae20db6a5dec0ff0eaf481e761852d92af40f2c4c1",
           "scope": "Actual GPU6/GPU7 container IDs, deadlines, first completed raw rows, protocol mirrors and source/environment/control identities checked. Running measurements only, not completed calibration or confirmation."
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/analysis/calibration-fit.json",
+          "sha256": "7dda77e5ac38b8b7ac7338ac076e114a42d59738887ebcd254942eab004102fa",
+          "scope": "Frozen registered fit of all8400 calibration rows; only30/64 E10 contexts and32/64 E11 contexts pass. Failed gates retained; provisional costs remain private and are not adopted by the live track."
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/confirmation-execution.json",
+          "sha256": "04af7e83e67593f3dc580536d8ff29d843db73e5a725dcef45de9efbbebbb82f",
+          "scope": "Actual independent confirmation container IDs and commands, fixed seed2026101932 and frozen fit binding. Root checked running handles, original deadlines, mirrored protocols, unchanged source/environment and both active collectors. This is execution evidence, not confirmation acceptance."
         }
       ],
       "release_blocker": false,
@@ -434,6 +451,14 @@
         "observed_cases_above_fixed_10_percent_threshold": 30,
         "maximum_non_attention_over_dense_fraction": 0.10682635913483662,
         "threshold_changed": false,
+        "registered_full_layer_calibration": {
+          "sparse_rows": 8400,
+          "contexts": 64,
+          "e11_contexts_passed": 32,
+          "independent_confirmation_complete": false,
+          "production_parameters_changed": false,
+          "scope": "Original full50-layer calibration completed and registered fit is frozen; half the contexts fail the unchanged overhead gate. Independent confirmation is running, not a production acceptance or threshold relaxation."
+        },
         "scope": "Same final-runtime E10 diagnostic and independent review: first/final layers and text107 only, original profile_components accounting, no claim of all50-layer or full E11 acceptance. Measurement uncertainty and independent confirmation remain unquantified.",
         "static_layout_cache_probe": {
           "paired_cases": 120,
@@ -473,6 +498,11 @@
           "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/threshold-topk-independent-review.json",
           "sha256": "8d788b3c58f86db50819c4de6c0824e0ceb9842d2820e4e5480e1b0db995512d",
           "scope": "CPU306 plus GPU120 original/prototype parity records and independently recomputed wall medians/P95, components and fixed10% misses. Prototype rejected rather than adding slower selection logic; not all50-layer or full-model acceptance."
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/analysis/calibration-fit.json",
+          "sha256": "7dda77e5ac38b8b7ac7338ac076e114a42d59738887ebcd254942eab004102fa",
+          "scope": "Original full50-layer calibration with fixed CUDA component accounting;32/64 E11 contexts pass. Frozen fit retained for independent confirmation; failed overhead gates are not relabeled as accepted."
         }
       ],
       "release_blocker": false,
