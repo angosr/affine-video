@@ -1,0 +1,42 @@
+{
+  "format": "veda-canonical-dense-repeat-status-v1",
+  "scope": "Numerical repeat, fresh-process and cross-GPU verification only; historical canonical cache is not accepted as a current READY artifact.",
+  "code_commit": "ecffae9bca62bec26cd80c97de4ec1883aef5713",
+  "image_id": "sha256:e5bb58ee030cf287afa065cbc16343e28dc655ce359c0900b12a4845564a4a37",
+  "source_sha256": {
+    "scoring.exact": "93c0a7e122e4b0dccb0dd74b14344d5ec5f4f6c9df6d2573442b56eb25c4c9f3",
+    "scoring.torch_backend": "cd8b66d2cbe758c83d03c6eb8a61a5c5c7a993ceb72845930ae8df2f2d311b7e"
+  },
+  "input_cache_sha256": "9e112fd43465254809c603983e7f244b3f2fbadcadf0e1fb7326cfda02fb096e",
+  "input_cache_bytes": 10365755995,
+  "gpu6": {
+    "case_count": 384,
+    "geometry_case_counts": {
+      "16:9@37": 96,
+      "1:1@72": 96,
+      "4:3@102": 96,
+      "9:16@37": 96
+    },
+    "route_count": 8,
+    "passes_per_process": 2,
+    "independent_processes": 2,
+    "bitwise_equal": true,
+    "dense_stream_sha256": "10130e42673e46ab0bf285700ebdecd4355e240378956d0fb1e3d057450c9203",
+    "negative_controls_rejected_per_process": 12,
+    "peak_cuda_bytes": 321863168,
+    "raw_logs": [
+      "gpu6-first.log",
+      "gpu6-fresh-process.log"
+    ]
+  },
+  "gpu7": {
+    "status": "QUEUED_AFTER_EXISTING_COST_CALIBRATION",
+    "container": "veda-dense-gpu7-ecffae9-1",
+    "predecessor": "veda-cost-calibration-3466-a2-gpu7",
+    "allocation": 7,
+    "rule": "Wait for predecessor exit; do not overlap performance calibration.",
+    "result": null
+  },
+  "cross_gpu_acceptance_complete": false,
+  "final_release_accepted": false
+}

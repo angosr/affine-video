@@ -832,7 +832,10 @@ def test_producer_attempt_deadline_interrupts_blocking_post_generation_work(
     assert time.monotonic() - started < 0.5
 
 
-def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("dense_mutation", ["plus100", "lsb", "signed_zero"])
+def test_completed_unit_recovery_requires_bound_valid_artifacts(
+    tmp_path, monkeypatch, dense_mutation
+) -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
     plan = build_plan(
         track_spec_digest="ab" * 32,
@@ -920,9 +923,16 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkey
 
     assert _find_valid_shard(tmp_path, plan, rollout, track) == shard.path
 
+    corrupted_dense = case.dense.astype(np.float16)
+    if dense_mutation == "plus100":
+        corrupted_dense += np.float16(100)
+    else:
+        corrupted_dense.view(np.uint16).flat[0] ^= np.uint16(
+            1 if dense_mutation == "lsb" else 0x8000
+        )
     inconsistent = write_exact_cache_batch(
         tmp_path,
-        (replace(case, dense=case.dense + 100),),
+        (replace(case, dense=corrupted_dense),),
         generated_block=plan.generation_block,
         seed_block_hash=plan.block_hash,
         plan_digest=plan.plan_digest,
@@ -950,7 +960,10 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(tmp_path, monkey
     assert _find_valid_shard(tmp_path, plan, rollout, track) is None
 
 
-def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> None:
+@pytest.mark.parametrize("dense_mutation", ["plus100", "lsb", "signed_zero"])
+def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
+    tmp_path, dense_mutation
+) -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
     planned = build_plan(
         track_spec_digest="ab" * 32,
@@ -1079,9 +1092,16 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(tmp_path) -> Non
     with pytest.raises(CacheLoadError, match="metadata conflicts"):
         _validate_plan_case_binding(invalid.path, invalid_ready, track)
 
+    corrupted_dense = cases[0].dense.astype(np.float16)
+    if dense_mutation == "plus100":
+        corrupted_dense += np.float16(100)
+    else:
+        corrupted_dense.view(np.uint16).flat[0] ^= np.uint16(
+            1 if dense_mutation == "lsb" else 0x8000
+        )
     inconsistent = write(
         tmp_path / "inconsistent",
-        (replace(cases[0], dense=cases[0].dense + 100), *cases[1:]),
+        (replace(cases[0], dense=corrupted_dense), *cases[1:]),
     )
     inconsistent_ready = planned.ready(
         exact=ReadyObject(
