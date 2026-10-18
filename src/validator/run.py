@@ -255,6 +255,10 @@ async def run_evaluator(
     # Public storage can still be down after a restart. Keep ingesting finalized
     # facts, but do not initialize admission/scoring until ledger recovery succeeds.
     with ChallengeStore(database, track_spec_digest=track.digest) as recovery_store:
+        recovery_store.reserve_uid_zero(
+            track.initial_champion.hotkey,
+            track_start_block=track.track_start_block,
+        )
         while True:
             try:
                 ledger = await publisher.load(track)

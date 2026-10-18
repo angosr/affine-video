@@ -446,6 +446,87 @@ def test_production_evaluator_rejects_missing_release_approval(monkeypatch) -> N
         )
 
 
+def test_ledger_outage_scanning_reserves_uid0_before_any_submission(monkeypatch, tmp_path):
+    document = valid_spec()
+    document["initial_champion"]["hotkey"] = HOTKEY
+    track = parse_track_spec(document)
+    blocks = {
+        100: chain_block(ModelSubmission("owner/uid-zero", "12" * 20).encode(), 100),
+        101: empty_chain_block(101),
+    }
+    reports = []
+
+    class Client(FakeClient):
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Publisher(S3Repository):
+        first_load = True
+
+        async def load(self, candidate):
+            if self.first_load:
+                self.first_load = False
+                raise OSError("public ledger temporarily unavailable")
+            return await super().load(candidate)
+
+    async def no_seed(*_args, **_kwargs):
+        pass
+
+    async def chain_state(_client, *, netuid, finalized_block):
+        return WeightChainState(
+            finalized_block=finalized_block, uid_by_hotkey={HOTKEY: 0},
+            min_allowed_weights=1, max_weight=1.0, weights_rate_limit=1,
+            last_update_by_hotkey={},
+        )
+
+    def no_download(*_args, **_kwargs):
+        pytest.fail("UID0 must never reach model I/O, including after public recovery")
+
+    transport = MemoryS3()
+    publisher = Publisher(transport, bucket="test", prefix="isolated/uid-zero")
+    monkeypatch.setattr(run_module, "load_track_spec", lambda _path: track)
+    monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run_module.bt, "Client", lambda *_args, **_kwargs: Client(blocks))
+    monkeypatch.setattr(run_module, "seed_legacy_exclusions", no_seed)
+    monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", no_seed)
+    monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
+    (tmp_path / "batches").mkdir()
+    database = tmp_path / "validator.db"
+    arguments = {
+        "track_spec": "track.json", "database": database,
+        "model_cache": tmp_path / "models", "exact_cache": tmp_path / "batches",
+        "initial_model": tmp_path / "baseline.safetensors", "network": "finney",
+        "archive_endpoints": None, "worker_id": "single-worker", "publisher": publisher,
+        "once": True, "report": reports.append,
+    }
+    original_admission = run_module.process_next_admission
+
+    def admission(store, **kwargs):
+        return original_admission(store, **{**kwargs, "downloader": no_download})
+
+    monkeypatch.setattr(run_module, "process_next_admission", admission)
+    asyncio.run(run_module.run_evaluator(**arguments))
+    with ChallengeStore(database, track_spec_digest=track.digest) as store:
+        snapshot = store.public_snapshot()
+        assert snapshot["challenges"][0]["state"] == ChallengeState.REJECTED_DUPLICATE_HOTKEY
+        assert store.effective_challenge_count() == 0
+        assert store.chain_cursor()[0] == 101
+    assert reports[-1].publication_error == "public ledger temporarily unavailable"
+    asyncio.run(run_module.run_evaluator(**arguments))
+    assert reports[-1].published_block == 101
+    weights = decode_weight_artifact(transport.objects["isolated/uid-zero/weights.json"])
+    assert weights.plan.uids == (0,)
+    assert weights.match_sequence == 1
+    match = json.loads(transport.objects[
+        f"isolated/uid-zero/matches/{track.track_id}/000000000001.json"
+    ])
+    assert match["outcome"] == MatchOutcome.CHALLENGE_FAILED
+    assert match["evaluation"]["state"] == ChallengeState.REJECTED_DUPLICATE_HOTKEY
+
+
 def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_path) -> None:
     class StopLoop(BaseException):
         pass
