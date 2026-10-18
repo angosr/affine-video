@@ -797,13 +797,42 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "完整视频真实 Top k 的精确阶段保留率 ≥99%，否则扩大精确缓存、调整晋级门或取消该低成本门",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "registered_fixed_control_comparison": {
+          "independent_videos": 16,
+          "existing_controls": ["mean_pool", "perturbed_baseline"],
+          "exact_cases_per_control": 384,
+          "new_full_video_control_cells": 96,
+          "baseline_budget32_parity_replays": 16,
+          "exact_rejected_controls_included": true,
+          "preflight_passed": true,
+          "preflight_gpu_devices_requested": false,
+          "preflight_memory_limit_bytes": 2147483648,
+          "control_wait_services_started": true,
+          "new_cuda_measurements_started": false,
+          "timeout_seconds_per_gpu_attempt": 7200,
+          "automatic_retry": false,
+          "scope": "Actual frozen-image CPU preflight validates all16 original future-cohort shard/latent pairs and all three selector identities with read-only mounts and no GPU. Two control-host wait services reserve GPU6/7 only after both exact registered cost handles terminate successfully and complete. Four fixed identities including existing baseline/shuffled evidence do not establish99% population retention or complete E12/E17 acceptance. No training, generation, scoring/track change or public match."
+        }
+      },
       "id": "E17",
       "method": "对同一冻结只读模型面板同时运行精确评分与完整视频确认，包括 exact 未通过的模型，防止只验证幸存者",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "private/fixed-control-video-860-20261019/registration.json",
+          "sha256": "ef9329ad4865a5868fed4744b6da39d9c799de0eed24d5eb7037d5917c150cf7",
+          "scope": "Frozen complete GPU harness, source/model/data identities, both immutable cost wait handles, bounded no-retry controller and exact launch arguments. Every original future video retained irrespective of exact score; original full-video baseline SHA replay checks registered before CUDA execution."
+        },
+        {
+          "path": "private/fixed-control-video-860-20261019/preflight.json",
+          "sha256": "b99ab3b74e945b1f0053c85d0e0f59b05099ce6d9f59aa50876c1daad2d10841",
+          "scope": "Actual H200-host CPU-only container, frozen formal image/source/environment, full model file/tensor validation and all16 original unit bindings checked; exit0/OOMfalse, zero requested GPUs,2GiB cap and all mounts read-only. Not completed CUDA inference or retention acceptance."
+        }
+      ],
       "release_blocker": false,
-      "status": "post_launch_validation_pending",
+      "status": "fixed_control_preflight_passed_waiting_for_registered_cost_handles",
       "subject": "精确晋级误杀"
     },
     {
