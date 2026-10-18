@@ -388,6 +388,17 @@
           "scope": "Original two H200 calibration shards completed without OOM; all raw file hashes mirrored and checked. Registered CPU fit fails unchanged E10/E11 gates. Independent seed2026101932 confirmation is running against this frozen fit on GPU6/7 with live off-GPU collectors and original four-hour deadlines. No refit, threshold change, live cost change or completed confirmation claim."
         },
         "cost_parameters_changed": false,
+        "frozen_fit_score_axis_sensitivity": {
+          "live_normalized_middle_cost_position": 0.4453378970983849,
+          "fit_normalized_middle_cost_position": 0.38813482262871285,
+          "single_selector_auc_uniform_bound": 0.028601537234836022,
+          "paired_gain_same_draw_quantile_uniform_bound": 0.057203074469672044,
+          "original_full_video_control_lower_bound": 0.04190771739740623,
+          "same_cells_fitted_cost_control_lower_bound": 0.04044671587122214,
+          "observed_full_video_control_outcome_flip": false,
+          "arbitrary_models_or_regenerated_batches_protected": false,
+          "scope": "All64 paired bounded-curve vertices verify the algebraic bound, not64 realizable selectors. Original48 budget cells per fixed control and bootstrap are recomputed bit-identically before applying frozen fitted costs. That one control outcome does not flip; the uniform bound is too wide to protect arbitrary near-threshold decisions. A new track digest can also select different data. Initial failed blanket-protection assertion and original harness retained, no fitting, threshold relaxation, GPU rerun or live changes."
+        },
         "scope": "Synthetic BF16 packed QKV; original full production selector plus four legal mask probes, not necessarily realizable submitted projections. Original evaluator with live cost shape and optimistic per-geometry scales on the same measurements; not preregistered fit or independent confirmation, not all50 layers or whole-model throughput. All four observed geometry gates failed."
       },
       "id": "E10",
@@ -433,6 +444,11 @@
           "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/confirmation-execution.json",
           "sha256": "04af7e83e67593f3dc580536d8ff29d843db73e5a725dcef45de9efbbebbb82f",
           "scope": "Actual independent confirmation container IDs and commands, fixed seed2026101932 and frozen fit binding. Root checked running handles, original deadlines, mirrored protocols, unchanged source/environment and both active collectors. This is execution evidence, not confirmation acceptance."
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/analysis/auc-sensitivity-proof.json",
+          "sha256": "310d252b02cd8f0a81622b078b09be9bab0f3166d3889ba8eef9cf9f55ee4bf0",
+          "scope": "General same-input three-budget AUC/paired empirical-quantile sensitivity and64 corner checks; actual fixed full-video control replay under live versus frozen fitted costs. No flip for that pair, no universal near-threshold or regenerated-data protection. Failed initial expectation, original and amended harnesses retained; not E10/E11 acceptance or production adoption."
         }
       ],
       "release_blocker": false,
