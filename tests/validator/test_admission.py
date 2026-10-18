@@ -682,6 +682,53 @@ def test_archive_failure_defers_without_consuming_the_submission(tmp_path) -> No
         ]
 
 
+def test_archive_retry_after_restart_reuses_validated_download_without_hf(tmp_path) -> None:
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
+    archived = []
+
+    def archive(task, path, validated):
+        archived.append((task.challenge_id, path, validated.file_sha256))
+        if len(archived) == 1:
+            raise RuntimeError("temporary object-storage outage")
+
+    configured = replace(settings(tmp_path), archive=archive, maximum_effective_challenges=1)
+    database = tmp_path / "validator.db"
+    with ChallengeStore(database) as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        first = process_next_admission(
+            store,
+            worker_id="admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=100,
+            downloader=model_downloader(model),
+        )
+        assert first is not None and first.code == "MODEL_ARCHIVE_UNAVAILABLE"
+        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_DEFERRED
+        assert store.effective_challenge_count() == 1
+
+    def no_repository_access(*_args, **_kwargs):
+        raise AssertionError("cached validation retry must not depend on HF availability")
+
+    with ChallengeStore(database) as restored:
+        result = process_next_admission(
+            restored,
+            worker_id="restarted-admission",
+            settings=configured,
+            current_finalized_block=10_000,
+            now_ms=30_100,
+            downloader=no_repository_access,
+        )
+        assert result is not None and result.status is AdmissionStatus.ACCEPTED
+        assert restored.get_challenge(identifier).state is ChallengeState.SCORING
+        assert restored.effective_challenge_count() == 1
+        assert restored.leaderboard() == []
+
+    assert len(archived) == 2
+    assert archived[0] == archived[1]
+
+
 def test_corrupted_cached_model_is_recovered_instead_of_blaming_participant(tmp_path) -> None:
     model = tmp_path / "selector.safetensors"
     write_model(model, "hk1")

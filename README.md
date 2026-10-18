@@ -245,19 +245,28 @@ copying public weights and changing their hotkey still produces the same duplica
 The production netuid defaults to `120` and the network defaults to `finney`; both can be overridden.
 Because only the hotkey's first commitment is eligible, the command sends exactly one transaction
 and never retries it. Add `--dry-run` to validate the fields and inspect the encoded payload without
-opening a chain connection. The model revision may be private at commit time, but it must be public
-when its grace period expires.
+opening a chain connection. The model revision may be private at commit time. Anonymous access
+must work when FIFO admission reaches it after the grace period; keep the fixed revision and model
+file public until admission finishes and its durable archive is confirmed by the `SCORING` state.
 
 Run the evaluator:
 
+The public write endpoint must pass the conditional-create/replace probe and serve the fixed public
+read prefix. The existing Supabase S3 endpoint fails that probe for candidate production; configuring
+a private R2 store alone does not fix public publication, and changing a write endpoint does not
+redirect the existing public URL. Resolve that deployment mapping and coordinate the accepted track
+digest with the external weight-setter before launch. Keep the existing URL and digest unchanged
+until that coordination is complete.
+
 ```bash
 uv sync --extra storage
-export STORAGE_URL=https://project.storage.supabase.co/storage/v1/s3
+export STORAGE_URL=...
 export ACCESS_KEY=...
 export SECRET_ACCESS_KEY=...
 export EVALUATOR_PRIVATE_STORAGE_URL=https://account.r2.cloudflarestorage.com
 export EVALUATOR_PRIVATE_ACCESS_KEY=...
 export EVALUATOR_PRIVATE_SECRET_ACCESS_KEY=...
+export VEDA_ALERT_WEBHOOK_URL=...
 
 uv run --extra storage veda validator evaluate \
   --track-spec /data/track.json \
@@ -288,9 +297,11 @@ The production configuration also uses a separate `evaluator_artifact_root`; it 
 without the producer artifact root, source-pool file, complete production/audit SampleCache, or
 producer work directory.
 
-Set `VEDA_ALERT_WEBHOOK_URL` to an HTTPS push endpoint before continuous operation. Admission has
-five attempts; scoring and full-video confirmation allow nine attempts with bounded exponential
-delays, and scoring stages and complete producer attempts have a four-hour wall-clock limit.
+Configure `VEDA_ALERT_WEBHOOK_URL` in both service environments before continuous operation.
+It must be an absolute HTTPS endpoint without URL credentials or fragments. Producer bootstrap,
+scoring stages and complete producer attempts each have a four-hour wall-clock limit; bootstrap
+failures emit a separate startup alert. Admission has five attempts; scoring and full-video
+confirmation allow nine attempts with bounded exponential delays.
 Production reserves each plan attempt in private object storage before GPU work, retries at most
 five times even across process or GPU-host loss, and sends a push alert on the first and final
 reported failure. Admission and
