@@ -336,25 +336,65 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "预测延迟 Spearman ≥0.95，中位相对误差 ≤5%，P95 ≤10%；否则改用可校准的规则布局或 kernel 后重测，第一版不承担逐提交全量计时",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "runtime_source_commit": "b81bfa8",
+        "physical_gpu": 7,
+        "diagnostic_cases": 120,
+        "geometries": 4,
+        "layers": [0, 49],
+        "text_tokens": 107,
+        "matched_budget_curve_spearman_min": 1.0,
+        "live_cost_shape_median_relative_error_range": [0.15809427335877607, 0.21173196183345233],
+        "live_cost_shape_p95_relative_error_range": [0.2371847097625259, 0.3197362491308101],
+        "cost_parameters_changed": false,
+        "scope": "Synthetic BF16 packed QKV; original full production selector plus four legal mask probes, not necessarily realizable submitted projections. Original evaluator with live cost shape and optimistic per-geometry scales on the same measurements; not preregistered fit or independent confirmation, not all50 layers or whole-model throughput. All four observed geometry gates failed."
+      },
       "id": "E10",
       "method": "在目标 GPU 上覆盖 k、tile 几何、mask 模式和序列长度，测 kernel 与端到端延迟",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/result.json",
+          "sha256": "4c8f595916cb38f6d4a91643288eaa78b0dead60da37fe0ca5ed1d07dbb3f2fb",
+          "scope": "Actual 120-case final-runtime H200 cost diagnostic, complete synchronized wall samples and CUDA components; fixed preregistration and source identity, no hidden data or model training"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/independent-review.json",
+          "sha256": "8a2f54a43b4ce3f332f8acff63f74ee8090791e41f5d5d2781b36ee9efa2b857",
+          "scope": "Root independently rehashed result/raw/registration and recomputed all 120 aggregates and observed fixed-shape cost errors with original analysis helper; not independent GPU cohort or complete allocation-proof reconstruction"
+        }
+      ],
       "release_blocker": false,
-      "status": "not_final_runtime_verified",
+      "status": "final_runtime_diagnostic_failed_cost_shape_confirmation_pending",
       "subject": "成本模型"
     },
     {
       "acceptance_manifest": null,
       "acceptance_rule": "全部计入端到端成本；若非 attention 开销超过被加速层耗时 10%，调整预算或取消赛道",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "diagnostic_cases": 120,
+        "warmup": 5,
+        "repeats": 20,
+        "component_repeats": 5,
+        "observed_cases_above_fixed_10_percent_threshold": 30,
+        "maximum_non_attention_over_dense_fraction": 0.10682635913483662,
+        "threshold_changed": false,
+        "scope": "Same final-runtime E10 diagnostic and independent review: first/final layers and text107 only, original profile_components accounting, no claim of all50-layer or full E11 acceptance. Measurement uncertainty and independent confirmation remain unquantified."
+      },
       "id": "E11",
       "method": "分离测量 TripPool、残差投影、稳定 Top k、mask 准备和稀疏 attention",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/cost-diagnostic-20261019/independent-review.json",
+          "sha256": "8a2f54a43b4ce3f332f8acff63f74ee8090791e41f5d5d2781b36ee9efa2b857",
+          "scope": "Original CUDA component spans and wall medians independently recomputed; observed threshold misses retained without GPU reruns, threshold relaxation, source/parameter change or complete E11 claim"
+        }
+      ],
       "release_blocker": false,
-      "status": "not_final_runtime_verified",
+      "status": "final_runtime_diagnostic_observed_threshold_misses_confirmation_pending",
       "subject": "选择开销"
     },
     {
@@ -406,13 +446,38 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "每个提交只用其最终确认后生成的数据；production/audit 和已披露 family 零交叉；整组终态前不能通过公开对象或 producer 权限取得 exact、视频和 dense latents",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "runtime_source_commit": "b81bfa8",
+        "controlled_challenges_sharing_production_plan": 2,
+        "actual_plan_coordinator_and_service_assembly": true,
+        "new_videos_generated": 0,
+        "reused_actual_production_videos": 16,
+        "zero_or_either_one_terminal_returns_no_disclosure": true,
+        "nonterminal_payload_calls": 0,
+        "all_terminal_disclosure_file_count": 35,
+        "actual_gpu_files_sha_verified_by_native_run": true,
+        "root_actual_s3_ready_and_derived_mapping_verified": true,
+        "public_s3_writes": false,
+        "scope": "Original Reader and real READY content; controlled admissions and terminal states, not real HF ownership or scoring. Native verified full payload SHA; root independently verified metadata and zero/either-one-terminal guards. Not full source-family similarity/privacy audit, IAM acceptance or whole-host recovery."
+      },
       "id": "E14",
       "method": "近重复/family 分组审计、公开反馈探测、批次披露时序检查和真实 producer/evaluator IAM 越权负控",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "private/production-plan-860-20261019-0205/shared-group/gpu-small/result.json",
+          "sha256": "75da11f026b70b1bf13578b4f0290cf1bddb3c63e388c49389cce04ae8992adf",
+          "scope": "Actual two-ID production plan, fresh bound assembly and native all-terminal 35-file SHA verification, reusing original sixteen real units; original single-ID facts unchanged, failed first harness and final registration explicitly linked"
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/shared-group/controller-independent-check.json",
+          "sha256": "c76eb3ecd2b8de46d3aa602cc7439a7d11ccb553be4396f81706b6820588a1a8",
+          "scope": "Root actual TLS S3 read, original zero/either-one-terminal Reader guard with zero payload calls, all 35 public mapping identities derived exactly from READY; no hidden bulk copied or public writes"
+        }
+      ],
       "release_blocker": false,
-      "status": "not_final_runtime_verified",
+      "status": "shared_batch_disclosure_verified_full_privacy_acceptance_pending",
       "subject": "数据泄漏与榜单探测"
     },
     {

@@ -15,9 +15,11 @@ own `SetWeights` transaction. No service or direct Miner-to-Validator protocol e
 
 The live SN120/mech-1 [track specification](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/track.json)
 uses digest `8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34`
-and frozen evaluator source `b81bfa8`. Public paths are unchanged. The new image has passed
-H200 numerical, repeatability, CUDA tie-order and error checks; its fresh two-stage validation
-continues after deployment, without relabeling earlier runtime evidence.
+and frozen evaluator source `b81bfa8`. Public paths are unchanged. This image has passed
+H200 numerical, repeatability, CUDA tie-order and error checks, plus an isolated accelerated
+two-stage FIFO/recovery check with fixed controls. Evidence scope and remaining validation are
+tracked in the [acceptance inventory](evidence/system-panel/acceptance/inventory.json);
+isolated checks do not establish real-miner admission or complete host-loss recovery.
 
 ## Competition flow
 
@@ -76,10 +78,11 @@ A selector that produces non-finite logits or sparse latents receives zero quali
 case. This rule is applied independently to the challenger and incumbent, so a pathological model
 cannot turn its own numerical failure into an infrastructure retry that blocks the FIFO queue.
 
-Initial launch requires real H200 scorer/runtime parity, fixed self and degraded-model controls,
-a two-stage FIFO challenge, measured budget costs, data isolation and durable recovery. Immutable
-control summaries are published under `system_matches/` when their recorded contract matches
-the live runtime, without affecting rewards. Broader
+Current evidence covers real H200 scorer/runtime parity, fixed self and degraded-model controls,
+two-stage FIFO decisions, durable stage/retry recovery and shared-batch disclosure gates.
+Complete cost calibration, end-to-end isolation and host-loss recovery remain tracked validation
+work, not completed acceptance claims. Immutable control summaries are published under
+`system_matches/` when their recorded contract matches the live runtime, without affecting rewards. Broader
 ten-batch stability, near-threshold power, proxy-ranking and human-quality studies continue after
 launch; pending research is not marked passed. Bootstrap alpha is a calibration target, not a
 proved finite-sample guarantee. Unit tests and intermediate GPU checks alone do not establish
