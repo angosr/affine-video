@@ -200,11 +200,12 @@ revisions or verified off-host copies; duplicating every recoverable asset is no
 
 Unrevealed videos, exact QKV, dense latents and selected per-batch inputs stay on the GPU in one
 content-addressed directory shared by producer and evaluator. They are not mirrored to private S3
-before scoring. After GPU loss, resume generation from the durable plan or record an interrupted
-attempt and reevaluate unfinished work on verifiable replacement data. Never reuse an old hash for
-different bytes, overwrite completed stage facts or published results, consume a Miner's chance,
-or change FIFO order because local data was lost. Upload the actual used data through the existing
-public disclosure paths only after its entire challenge group is terminal.
+before scoring. After GPU loss, resume generation from the durable plan and verify every output
+against its immutable READY hash. Byte-mismatched regeneration remains an explicit system
+interruption: automatic reassignment to replacement data is not implemented. Never reuse an old
+hash for different bytes, overwrite completed stage facts or published results, consume a Miner's
+chance, or change FIFO order because local data was lost. Upload the actual used data through the
+existing public disclosure paths only after its entire challenge group is terminal.
 
 The manifest must cover a restorable OCI image, the exact producer/scorer source bundle and its
 dependency lock. The source bundle is a ZIP whose `cli.py`, `miner/`, `scoring/`, `validator/` and
