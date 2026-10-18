@@ -21,6 +21,7 @@ from scoring.cache import (
 from scoring.exact import GLOBAL_SEGMENT, REFERENCE_SEGMENT, TARGET_SEGMENT
 from scoring.model import ValidatedModel
 from scoring.spec import TrackSpec
+from validator.admission import RejectedAdmission
 from validator.download import DownloadedModel
 from validator.production.commitment import canonical_json, verify_source_proof
 from validator.production.plan import (
@@ -113,6 +114,16 @@ class ReadyBatchSource:
         self.validation_device = validation_device
         self._validated_exact: set[str] = set()
 
+    def _admission_identity(self, task: object) -> dict[str, object]:
+        return {
+            "track_spec_digest": self.track.digest,
+            "challenge_id": task.challenge_id,
+            "submission_id": task.submission_id,
+            "hotkey": task.hotkey,
+            "repo_id": task.repo_id,
+            "revision": task.revision,
+        }
+
     def archive_model(
         self,
         task: object,
@@ -130,12 +141,7 @@ class ReadyBatchSource:
         )
         document = {
             "format": "veda-admission-model-v1",
-            "track_spec_digest": self.track.digest,
-            "challenge_id": task.challenge_id,
-            "submission_id": task.submission_id,
-            "hotkey": task.hotkey,
-            "repo_id": task.repo_id,
-            "revision": task.revision,
+            **self._admission_identity(task),
             "file_sha256": validated.file_sha256,
             "model_digest": validated.model_digest,
             "size_bytes": validated.size_bytes,
@@ -145,8 +151,22 @@ class ReadyBatchSource:
             _json(document),
         )
 
-    def restore_admission(self, task: object) -> DownloadedModel | None:
-        """Restore a previously accepted admission without contacting its repository."""
+    def archive_rejection(self, task: object, rejection: RejectedAdmission) -> None:
+        """Preserve an observed repository/model failure before changing local state."""
+
+        document = {
+            "format": "veda-admission-rejection-v1",
+            **self._admission_identity(task),
+            "error_code": rejection.code,
+            "error_summary": rejection.summary,
+            "score_block": rejection.score_block,
+            "file_sha256": rejection.file_sha256,
+            "model_size_bytes": rejection.model_size_bytes,
+        }
+        self.objects.create_plan(self._admission_name(task.challenge_id), _json(document))
+
+    def restore_admission(self, task: object) -> DownloadedModel | RejectedAdmission | None:
+        """Restore the immutable admission outcome without contacting its repository."""
 
         stored = self.objects.get_optional(self._admission_name(task.challenge_id))
         if stored is None:
@@ -157,13 +177,39 @@ class ReadyBatchSource:
             raise RuntimeError("archived admission model is invalid") from exc
         identity = {
             "format": "veda-admission-model-v1",
-            "track_spec_digest": self.track.digest,
-            "challenge_id": task.challenge_id,
-            "submission_id": task.submission_id,
-            "hotkey": task.hotkey,
-            "repo_id": task.repo_id,
-            "revision": task.revision,
+            **self._admission_identity(task),
         }
+        if isinstance(document, dict) and document.get("format") == "veda-admission-rejection-v1":
+            identity["format"] = "veda-admission-rejection-v1"
+            if (
+                _json(document) != stored.body
+                or set(document) != set(identity) | {
+                    "error_code", "error_summary", "score_block", "file_sha256", "model_size_bytes",
+                }
+                or any(document.get(key) != value for key, value in identity.items())
+                or not isinstance(document.get("error_code"), str)
+                or not document["error_code"]
+                or not isinstance(document.get("error_summary"), str)
+                or type(document.get("score_block")) is not int
+                or document["score_block"] < task.position.block
+                or (
+                    (document.get("file_sha256") is None)
+                    != (document.get("model_size_bytes") is None)
+                )
+                or (
+                    document.get("file_sha256") is not None
+                    and (
+                        not _digest(document["file_sha256"])
+                        or type(document["model_size_bytes"]) is not int
+                        or document["model_size_bytes"] < 0
+                    )
+                )
+            ):
+                raise RuntimeError("archived admission rejection conflicts with its challenge")
+            return RejectedAdmission(
+                document["error_code"], document["error_summary"], document["score_block"],
+                document["file_sha256"], document["model_size_bytes"],
+            )
         file_sha256 = document.get("file_sha256") if isinstance(document, dict) else None
         model_digest = document.get("model_digest") if isinstance(document, dict) else None
         size_bytes = document.get("size_bytes") if isinstance(document, dict) else None

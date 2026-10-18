@@ -1681,11 +1681,24 @@ class ChallengeStore:
         error_summary: str | None = None,
         lease_token: str | None = None,
         score_block: int | None = None,
+        file_sha256: str | None = None,
+        model_size_bytes: int | None = None,
     ) -> None:
         """Commit a terminal state and its decision block atomically."""
 
         if target not in TERMINAL_STATES:
             raise ValueError("target is not terminal")
+        if (file_sha256 is None) != (model_size_bytes is None):
+            raise ValueError("rejected model identity must include both digest and size")
+        if file_sha256 is not None and (
+            target is not ChallengeState.PARTICIPANT_FAILED
+            or not isinstance(file_sha256, str)
+            or len(file_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in file_sha256)
+            or type(model_size_bytes) is not int
+            or model_size_bytes < 0
+        ):
+            raise ValueError("rejected model identity is invalid")
         if target is ChallengeState.SUCCEEDED:
             if final_score is None:
                 raise ValueError("successful challenge requires a score")
@@ -1731,10 +1744,12 @@ class ChallengeStore:
             self._connection.execute(
                 """
                 UPDATE challenges
-                SET final_score = ?, score_block = ?
+                SET final_score = ?, score_block = ?,
+                    file_sha256 = COALESCE(?, file_sha256),
+                    model_size_bytes = COALESCE(?, model_size_bytes)
                 WHERE challenge_id = ?
                 """,
-                (final_score, effective_score_block, identifier),
+                (final_score, effective_score_block, file_sha256, model_size_bytes, identifier),
             )
 
             if target is ChallengeState.PARTICIPANT_FAILED and row["state"] in {

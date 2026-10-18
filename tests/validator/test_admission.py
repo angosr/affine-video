@@ -1,9 +1,11 @@
 import errno
 import hashlib
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from safetensors.numpy import save_file
 
 from scoring.model import TensorSpec
@@ -11,9 +13,12 @@ from validator import download as download_module
 from validator.admission import (
     AdmissionSettings,
     AdmissionStatus,
+    RejectedAdmission,
     process_next_admission,
 )
 from validator.download import DownloadedModel, ModelDownloadError
+from validator.production.batches import ReadyBatchSource
+from validator.production.commitment import canonical_json
 from validator.production.retries import PrivateRetryStore
 from validator.production.storage import PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState, submission_id
@@ -73,6 +78,159 @@ def settings(tmp_path) -> AdmissionSettings:
         retry_base_ms=30_000,
         retry_max_ms=120_000,
     )
+
+
+@pytest.mark.parametrize("validation_failure", [False, True])
+@pytest.mark.parametrize("crash_before_local_commit", [False, True])
+def test_admission_rejection_survives_loss_of_local_database(
+    tmp_path, validation_failure, crash_before_local_commit,
+) -> None:
+    objects = PrivateObjectStore(MemoryS3(), bucket="private-data", prefix="test")
+    source = ReadyBatchSource(
+        track=SimpleNamespace(digest="ab" * 32), objects=objects, cache_dir=tmp_path / "archive",
+    )
+    configured = replace(
+        settings(tmp_path), archive=source.archive_model, restore=source.restore_admission,
+        archive_rejection=source.archive_rejection,
+    )
+    record = submission_at(100, "hk1")
+
+    def not_public(*_args, **_kwargs):
+        raise ModelDownloadError("REPOSITORY_NOT_PUBLIC", "repository was not public")
+
+    downloader = not_public
+    expected_code = "REPOSITORY_NOT_PUBLIC"
+    expected_digest = expected_size = None
+    if validation_failure:
+        invalid = tmp_path / "invalid.safetensors"
+        write_model(invalid, "other-hotkey")
+        downloader = model_downloader(invalid)
+        expected_code = "MODEL_OWNER_MISMATCH"
+        expected_digest = hashlib.sha256(invalid.read_bytes()).hexdigest()
+        expected_size = invalid.stat().st_size
+
+    def archive_then_lose_host(task, rejection):
+        source.archive_rejection(task, rejection)
+        raise SystemExit("simulated host loss before local completion")
+
+    with ChallengeStore(tmp_path / "original.db") as store:
+        identifier, _ = store.add_submission(record, occurred_at_ms=1)
+        original_settings = configured
+        if crash_before_local_commit:
+            original_settings = replace(configured, archive_rejection=archive_then_lose_host)
+        def run_original():
+            return process_next_admission(
+                store, worker_id="original", settings=original_settings,
+                current_finalized_block=110, now_ms=10, downloader=downloader,
+            )
+        if crash_before_local_commit:
+            with pytest.raises(SystemExit, match="host loss"):
+                run_original()
+        else:
+            assert run_original().status is AdmissionStatus.FAILED
+
+    model = tmp_path / "now-public.safetensors"
+    write_model(model, "hk1")
+    downloads = []
+
+    def now_public(*args, **kwargs):
+        downloads.append(True)
+        return model_downloader(model)(*args, **kwargs)
+
+    with ChallengeStore(tmp_path / "fresh.db") as store:
+        store.add_submission(record, occurred_at_ms=20)
+        result = process_next_admission(
+            store, worker_id="recovered", settings=configured,
+            current_finalized_block=120, now_ms=30, downloader=now_public,
+        )
+        assert result.status is AdmissionStatus.FAILED
+        assert result.code == expected_code
+        assert store.get_challenge(identifier).score_block == 110
+        row = store.public_challenge(identifier)
+        assert row["file_sha256"] == expected_digest
+        assert row["model_size_bytes"] == expected_size
+        assert downloads == []
+    if crash_before_local_commit:
+        with ChallengeStore(tmp_path / "original.db") as store:
+            result = process_next_admission(
+                store, worker_id="restarted", settings=configured,
+                current_finalized_block=120, now_ms=100_000, downloader=now_public,
+            )
+            assert result.status is AdmissionStatus.FAILED
+            assert result.code == expected_code
+            assert store.get_challenge(identifier).score_block == 110
+            assert store.public_challenge(identifier)["file_sha256"] == expected_digest
+            assert downloads == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"hotkey": "another-hotkey"}, {"score_block": True},
+    {"file_sha256": "ab" * 32}, {"file_sha256": "ab" * 32, "model_size_bytes": -1},
+])
+def test_archived_admission_rejection_rejects_invalid_identity(tmp_path, changes) -> None:
+    client = MemoryS3()
+    objects = PrivateObjectStore(client, bucket="private-data", prefix="test")
+    source = ReadyBatchSource(
+        track=SimpleNamespace(digest="ab" * 32), objects=objects, cache_dir=tmp_path,
+    )
+    task = SimpleNamespace(
+        challenge_id="cd" * 32, submission_id="ef" * 32, hotkey="hk1",
+        repo_id="owner/model", revision="12" * 20, position=ChainPosition(100, 0, 0),
+    )
+    source.archive_rejection(task, RejectedAdmission("REPOSITORY_NOT_PUBLIC", "not public", 110))
+    key = ("private-data", f"test/admissions/{task.challenge_id}.json")
+    raw, etag, metadata = client.objects[key]
+    document = json.loads(raw)
+    document.update(changes)
+    client.objects[key] = (canonical_json(document), etag, metadata)
+    with pytest.raises(RuntimeError, match="rejection conflicts"):
+        source.restore_admission(task)
+
+
+def test_admission_rejection_archive_failure_is_infrastructure_failure(tmp_path) -> None:
+    def unavailable(*_args):
+        raise OSError("private storage unavailable")
+
+    def not_public(*_args, **_kwargs):
+        raise ModelDownloadError("REPOSITORY_NOT_PUBLIC", "repository was not public")
+
+    configured = replace(
+        settings(tmp_path), restore=lambda _task: None, archive_rejection=unavailable,
+    )
+    with ChallengeStore(tmp_path / "state.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        result = process_next_admission(
+            store, worker_id="test", settings=configured, current_finalized_block=110,
+            now_ms=10, downloader=not_public,
+        )
+        assert result.status is AdmissionStatus.DEFERRED
+        assert result.code == "ADMISSION_ARCHIVE_UNAVAILABLE"
+        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_DEFERRED
+        assert store.get_challenge(identifier).score_block is None
+
+
+def test_restored_admission_rejection_waits_for_finalized_head(tmp_path) -> None:
+    rejection = RejectedAdmission("REPOSITORY_NOT_PUBLIC", "original decision", 110)
+    configured = replace(settings(tmp_path), restore=lambda _task: rejection)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("restoring a decision must not contact the repository")
+
+    with ChallengeStore(tmp_path / "state.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        result = process_next_admission(
+            store, worker_id="test", settings=configured, current_finalized_block=105,
+            now_ms=10, downloader=forbidden,
+        )
+        assert result.status is AdmissionStatus.DEFERRED
+        assert result.code == "ADMISSION_ARCHIVE_AHEAD"
+        assert store.get_challenge(identifier).score_block is None
+        result = process_next_admission(
+            store, worker_id="test", settings=configured, current_finalized_block=120,
+            now_ms=100_000, downloader=forbidden,
+        )
+        assert result.status is AdmissionStatus.FAILED
+        assert store.get_challenge(identifier).score_block == 110
 
 
 def test_model_can_be_published_during_frozen_block_grace(tmp_path) -> None:

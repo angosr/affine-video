@@ -38,6 +38,15 @@ class AdmissionStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class RejectedAdmission:
+    code: str
+    summary: str
+    score_block: int
+    file_sha256: str | None = None
+    model_size_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionSettings:
     cache_dir: Path
     max_model_bytes: int
@@ -51,7 +60,8 @@ class AdmissionSettings:
     max_attempts: int = 5
     alert: Callable[[str, Mapping[str, object]], None] | None = None
     archive: Callable[[object, str | Path, ValidatedModel], None] | None = None
-    restore: Callable[[object], DownloadedModel | None] | None = None
+    archive_rejection: Callable[[object, RejectedAdmission], None] | None = None
+    restore: Callable[[object], DownloadedModel | RejectedAdmission | None] | None = None
     restore_retry: RetryRestore | None = None
     record_retry: RetryRecorder | None = None
 
@@ -77,6 +87,8 @@ class AdmissionSettings:
             raise ValueError("publication grace blocks must be positive")
         if (self.restore_retry is None) != (self.record_retry is None):
             raise ValueError("durable admission retry callbacks must be configured together")
+        if self.archive_rejection is not None and self.restore is None:
+            raise ValueError("archived admission rejections require a restore callback")
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,27 +186,26 @@ def process_next_admission(
             reference_owner,
         )
 
+    downloaded = None
+    if settings.restore is not None:
+        try:
+            downloaded = settings.restore(task)
+        except Exception:
+            error = ModelDownloadError(
+                "MODEL_ARCHIVE_UNAVAILABLE",
+                "archived admission could not be restored",
+                temporary=True,
+            )
+            status = _defer_or_fail(store, task, settings, now, error)
+            return AdmissionOutcome(task.challenge_id, status, error.code)
+    if isinstance(downloaded, RejectedAdmission):
+        return _reject_participant(
+            store, task, settings, downloaded,
+            current_finalized_block=current_finalized_block, now_ms=now,
+        )
     model_path = Path(task.model_path) if task.model_path is not None else None
     expected_file_sha256 = task.file_sha256
     if task.state is ChallengeState.FETCHING:
-        downloaded = None
-        if settings.restore is not None:
-            try:
-                downloaded = settings.restore(task)
-            except Exception:
-                error = ModelDownloadError(
-                    "MODEL_ARCHIVE_UNAVAILABLE",
-                    "archived admission model could not be restored",
-                    temporary=True,
-                )
-                status = _defer_or_fail(
-                    store,
-                    task,
-                    settings,
-                    now,
-                    error,
-                )
-                return AdmissionOutcome(task.challenge_id, status, error.code)
         try:
             if downloaded is None:
                 downloaded = downloader(
@@ -213,16 +224,11 @@ def process_next_admission(
                     exc,
                 )
                 return AdmissionOutcome(task.challenge_id, status, exc.code)
-            store.complete_challenge(
-                task.challenge_id,
-                ChallengeState.PARTICIPANT_FAILED,
-                error_code=exc.code,
-                error_summary=str(exc),
-                occurred_at_ms=now,
-                lease_token=task.lease_token,
-                score_block=current_finalized_block,
+            return _reject_participant(
+                store, task, settings,
+                _observed_rejection(store, task, exc.code, str(exc), current_finalized_block),
+                current_finalized_block=current_finalized_block, now_ms=now,
             )
-            return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, exc.code)
         store.record_downloaded_model(
             task.challenge_id,
             task.lease_token,
@@ -298,16 +304,11 @@ def process_next_admission(
                 now_ms=now,
                 summary="cached model changed during validation",
             )
-        store.complete_challenge(
-            task.challenge_id,
-            ChallengeState.PARTICIPANT_FAILED,
-            error_code=exc.code,
-            error_summary=str(exc),
-            occurred_at_ms=now,
-            lease_token=task.lease_token,
-            score_block=current_finalized_block,
+        return _reject_participant(
+            store, task, settings,
+            _observed_rejection(store, task, exc.code, str(exc), current_finalized_block),
+            current_finalized_block=current_finalized_block, now_ms=now,
         )
-        return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, exc.code)
 
     if expected_file_sha256 is not None and validated.file_sha256 != expected_file_sha256:
         return _defer_cached_model(
@@ -363,6 +364,52 @@ def process_next_admission(
             now_ms=now,
         )
     return AdmissionOutcome(task.challenge_id, AdmissionStatus.ACCEPTED)
+
+
+def _observed_rejection(
+    store: ChallengeStore, task: LeasedChallenge, code: str, summary: str, score_block: int,
+) -> RejectedAdmission:
+    row = store.public_challenge(task.challenge_id)
+    return RejectedAdmission(
+        code, summary, score_block, row["file_sha256"], row["model_size_bytes"],
+    )
+
+
+def _reject_participant(
+    store: ChallengeStore,
+    task: LeasedChallenge,
+    settings: AdmissionSettings,
+    rejection: RejectedAdmission,
+    *,
+    current_finalized_block: int,
+    now_ms: int,
+) -> AdmissionOutcome:
+    if rejection.score_block > current_finalized_block:
+        error = ModelDownloadError(
+            "ADMISSION_ARCHIVE_AHEAD", "archived admission is ahead of the finalized head",
+            temporary=True,
+        )
+    else:
+        try:
+            if settings.archive_rejection is not None:
+                settings.archive_rejection(task, rejection)
+        except Exception:
+            error = ModelDownloadError(
+                "ADMISSION_ARCHIVE_UNAVAILABLE", "admission rejection could not be persisted",
+                temporary=True,
+            )
+        else:
+            store.complete_challenge(
+                task.challenge_id, ChallengeState.PARTICIPANT_FAILED,
+                error_code=rejection.code, error_summary=rejection.summary,
+                occurred_at_ms=now_ms, lease_token=task.lease_token,
+                score_block=rejection.score_block,
+                file_sha256=rejection.file_sha256,
+                model_size_bytes=rejection.model_size_bytes,
+            )
+            return AdmissionOutcome(task.challenge_id, AdmissionStatus.FAILED, rejection.code)
+    status = _defer_or_fail(store, task, settings, now_ms, error)
+    return AdmissionOutcome(task.challenge_id, status, error.code)
 
 
 def _defer_cached_model(

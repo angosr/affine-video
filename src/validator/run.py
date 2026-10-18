@@ -270,6 +270,7 @@ async def run_evaluator(
         last_submission_block=track.last_submission_block,
         alert=alert,
         archive=None if batch_source is None else batch_source.archive_model,
+        archive_rejection=None if batch_source is None else batch_source.archive_rejection,
         restore=None if batch_source is None else batch_source.restore_admission,
         restore_retry=None if retry_store is None else retry_store.restore,
         record_retry=None if retry_store is None else retry_store.record_failure,
