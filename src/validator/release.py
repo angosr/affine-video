@@ -10,7 +10,11 @@ from pathlib import Path
 from scoring.spec import TrackSpec
 from validator.production.commitment import ArtifactManifest, decode_canonical_json
 from validator.system_match_data import PRODUCTION_ACCEPTANCE_SHA256
-from validator.system_matches import _evidence_contract_digest, _evidence_runtime_digest
+from validator.system_matches import (
+    _evidence_contract_digest,
+    _evidence_runtime_digest,
+    system_match_artifacts,
+)
 
 ACCEPTANCE_LOGICAL_NAME = "evidence/system-panel/acceptance/accepted.json"
 _REQUIRED_EXPERIMENTS = frozenset(f"E{index}" for index in range(1, 19) if index != 9)
@@ -65,6 +69,8 @@ class ReleaseApproval:
             raise ValueError(
                 "release acceptance does not match active scoring and runtime contracts"
             )
+        if not system_match_artifacts(track, runtime_manifest):
+            raise ValueError("formal release has no bound system match artifacts")
         experiments = result.get("experiments")
         if not isinstance(experiments, dict) or set(experiments) != _REQUIRED_EXPERIMENTS:
             raise ValueError("release acceptance is missing mandatory design experiments")

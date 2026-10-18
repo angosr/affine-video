@@ -21,6 +21,11 @@ def approved_candidate(monkeypatch, *, mutation=None):
     provisional = parse_track_spec(document)
     runtime_digest = "ef" * 32
     monkeypatch.setattr(release, "_evidence_runtime_digest", lambda _manifest: runtime_digest)
+    monkeypatch.setattr(
+        release,
+        "system_match_artifacts",
+        lambda _track, _manifest: (("system_matches/test/000000000001.json", b"{}"),),
+    )
     acceptance = {
         "format": "veda-release-acceptance-v1",
         "release_accepted": True,
@@ -118,6 +123,13 @@ def test_formal_release_rejection_performs_zero_writes(monkeypatch, failure):
 def test_acceptance_cannot_omit_failed_unbound_or_mismatched_evidence(monkeypatch, mutation):
     track, manifest, approval = approved_candidate(monkeypatch, mutation=mutation)
     with pytest.raises(ValueError):
+        approval.verify(track, manifest)
+
+
+def test_acceptance_cannot_replace_missing_system_matches(monkeypatch):
+    track, manifest, approval = approved_candidate(monkeypatch)
+    monkeypatch.setattr(release, "system_match_artifacts", lambda _track, _manifest: ())
+    with pytest.raises(ValueError, match="system match"):
         approval.verify(track, manifest)
 
 
