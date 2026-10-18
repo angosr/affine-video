@@ -623,6 +623,35 @@
           "mp4_mismatches": 0,
           "scope": "Actual native producer units in fresh work directories; unchanged producer component versus b81, not b81 whole-host recovery"
         },
+        "current_production_plan_lifecycle": {
+          "videos": 16,
+          "exact_cases": 384,
+          "generation_workers": 2,
+          "physical_gpus": [6, 7],
+          "actual_service_constructors": 3,
+          "actual_same_etag_cas_winners": 1,
+          "actual_same_etag_cas_rejections": 1,
+          "candidate_ready_bytes_identical": true,
+          "complete_candidate_npz_bytes_identical": true,
+          "exact_size_bytes": 10364189042,
+          "original_reader_cuda_validation_passed": true,
+          "generation_and_assembly_seconds": 1165.6932299672626,
+          "root_actual_s3_ready_readback_passed": true,
+          "nonterminal_disclosure_restored_payload": false,
+          "scope": "Real production-partition plan, two-worker generation and two-process full assembly/READY race. B reused A's sixteen actual units. Single controlled admission only; not two-challenge disclosure, real HF admission, interruption, joint capacity or whole-host recovery."
+        },
+        "current_actual_s3_admission_retry": {
+          "temporary_download_failures": 5,
+          "fresh_sqlite_databases": 6,
+          "configured_fast_retry_ceiling": 5,
+          "actual_remote_checkpoint_restored_after_each_database_loss": true,
+          "same_lease_replay_does_not_increment_attempts": true,
+          "same_original_submission_claimable_after_cooldown": true,
+          "later_fifo_submission_cannot_bypass": true,
+          "permanent_miner_failure": false,
+          "actual_https_push_delivery": false,
+          "scope": "Actual admission/store/retry classes and off-GPU TLS S3; only downloader outage injected, explicit simulated retry timestamps. Failed observers and a shell transport error are retained; original first attempt was preserved, not reset. Not successful HF/model admission, scheduler loop or whole-host recovery."
+        },
         "current_fixed_input_envelope": {
           "samples": 1120,
           "source_families": 1120,
@@ -718,10 +747,30 @@
           "path": "evidence/system-panel/acceptance-8608cf5d/fixed-input-envelope.json",
           "sha256": "43c7404630239fd9fb17c5eb2c4808d815bedd4d6e25a05b6139d4c387cf4c5a",
           "scope": "Actual 192 MiB-capped CPU stream check of all fixed input SHA/Merkle bindings and original encoded text layout; original empty condition spans [0,0], no tensor materialization, inference or full-capacity acceptance"
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/gpu-small/result.json",
+          "sha256": "b80369cf2648201d9fabae6932f1f191717b9cad22846e33071a3196259212fd",
+          "scope": "Final frozen 860 runtime production plan, actual generation, two-process same-ETag race, complete local NPZ byte comparison and original CUDA reader; raw execution and registration hashes included in sealed independent review"
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/independent-review.json",
+          "sha256": "8c75360605d3a69b530ce69dbffb8ce0651f6c38b8dcf591755895aa367710c1",
+          "scope": "Independent real S3/bootstrap/source-proof/plan/SQLite verification; three small objects only, no hidden bulk uploaded or copied off GPU"
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/controller-ready-check.json",
+          "sha256": "bc6a1192bc7e2b94ad9eb892e672a4e7f48b831ee3bbd62a3fdc961192399963",
+          "scope": "Root independently read real READY via TLS S3, checked both candidate bytes and original nonterminal disclosure fence; metadata-only, no full NPZ re-read or two-ID partial terminal claim"
+        },
+        {
+          "path": "private/production-plan-860-20261019-0205/controller-retry-independent-check.json",
+          "sha256": "5f21fad43718c5d8cac1b5acd857646f445574f278017f707d7a1182f920ccc9",
+          "scope": "Root actual S3 checkpoint GET plus SHA/quick_check of six sealed SQLite databases; real retry ceiling/idempotency/cold-state restoration and original FIFO eligibility at simulated cooldown expiry; failed observer/raw hashes retained, no retry reset or claimed push delivery"
         }
       ],
       "release_blocker": false,
-      "status": "native_component_regeneration_passed_full_recovery_pending",
+      "status": "production_plan_cas_and_cold_retry_components_passed_full_recovery_pending",
       "subject": "评测容量"
     }
   ],
