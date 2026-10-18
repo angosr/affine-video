@@ -26,11 +26,11 @@ from scoring.model import ModelValidationError
 from scoring.selector import SelectorArchitecture, load_selector, route_indices, route_name
 from scoring.spec import BudgetSpec
 from scoring.torch_selector import (
+    gather_and_pool,
     runtime_block_mask,
     selector_logits,
 )
 from scoring.torch_selector import segmented_top_k as segmented_torch_mask
-from scoring.torch_selector import trip_pool as torch_trip_pool
 from validator.production.plan import select_query_tiles
 
 
@@ -539,16 +539,9 @@ def _selector_attention(torch, attention_module, clip, plan, projections, budget
 
     class SelectorAttention(attention_module.SparseStudent):
         def _attend(self, q, k, v, layer_index, tile_layout, heads, out):
-            tiles = [attention_module._gather(value, tile_layout, heads) for value in (q, k, v)]
-            q_tiles, k_tiles, v_tiles = tiles
-            q_features, k_features = (
-                torch_trip_pool(
-                    torch,
-                    value.view(tile_layout.n_tiles, 128, heads.numel(), -1).permute(2, 0, 1, 3),
-                    tile_layout.valid_count,
-                )
-                for value in (q_tiles, k_tiles)
-            )
+            q_tiles, q_features = gather_and_pool(q, tile_layout, heads)
+            k_tiles, k_features = gather_and_pool(k, tile_layout, heads)
+            v_tiles = attention_module._gather(v, tile_layout, heads)
             logits = selector_logits(
                 torch, q_features[:, :tile_layout.n_video_tiles], k_features,
                 projections[f"layers.{layer_index}.proj_q"].index_select(0, heads),
@@ -627,8 +620,8 @@ def verify_runtime_trace(
     logits_delta = float(np.max(np.abs(runtime_logits.detach().cpu().numpy() - expected_logits)))
     if descriptor_delta > descriptor_atol or logits_delta > logits_atol:
         raise RuntimeError("cached predictor arithmetic diverges from the Miowtion runtime")
-    production_q = torch_trip_pool(torch, q[None], query_layout.valid_count)
-    production_k = torch_trip_pool(torch, k[None], key_layout.valid_count)
+    _, production_q = gather_and_pool(q.reshape(-1, 1, architecture.head_dim), query_layout)
+    _, production_k = gather_and_pool(k.reshape(-1, 1, architecture.head_dim), key_layout)
     production_descriptor_delta = max(
         float((production_q[0] - exact_scorer.q_descriptors).abs().max()),
         float((production_k[0] - exact_scorer.k_descriptors).abs().max()),
@@ -762,6 +755,9 @@ def _pool_layout(counts: np.ndarray, device: Any, torch: Any) -> Any:
     valid_count = torch.as_tensor(counts, dtype=torch.long, device=device)
     return SimpleNamespace(
         n_tiles=len(counts),
+        num_slots=len(counts) * 128,
+        gather_index=torch.arange(len(counts) * 128, device=device),
+        slot_valid=(torch.arange(128, device=device)[None, :] < valid_count[:, None]).flatten(),
         valid_count=valid_count,
         partial_tiles=torch.nonzero(valid_count < 128, as_tuple=False).flatten(),
         kv_ok=valid_count > 0,

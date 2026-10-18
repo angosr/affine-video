@@ -7,9 +7,18 @@ require the GPU environment. NumPy arithmetic remains an independent reference.
 from __future__ import annotations
 
 from math import sqrt
+from types import SimpleNamespace
 from typing import Any
 
 from scoring.model import ModelValidationError
+
+
+def gather_and_pool(packed: Any, layout: Any, heads: Any = None) -> tuple[Any, Any]:
+    """Gather and pool in one pass using the pinned runtime's CUDA kernel."""
+
+    from miowtion.kernels.tile_gather_triton import gather_and_pool as fused_pool
+
+    return fused_pool(packed, layout, heads)
 
 
 def trip_pool(torch: Any, tiles: Any, counts: Any) -> Any:
@@ -20,6 +29,22 @@ def trip_pool(torch: Any, tiles: Any, counts: Any) -> Any:
     if bool(((counts < 0) | (counts > tiles.shape[-2])).any()):
         raise ValueError("tile valid prefixes are out of range")
     valid = torch.arange(tiles.shape[-2], device=tiles.device)[None, :] < counts[:, None]
+    if tiles.is_cuda:
+        if tiles.shape[-2] != 128:
+            raise ValueError("CUDA selector pooling requires 128-token tiles")
+        # Cached single-head cases and full-video packed heads must use the
+        # same reduction kernel, not merely the same algebraic expression.
+        packed = (
+            tiles.reshape(-1, 1, tiles.shape[-1]) if tiles.ndim == 3
+            else tiles.permute(1, 2, 0, 3).reshape(-1, tiles.shape[0], tiles.shape[-1])
+        )
+        layout = SimpleNamespace(
+            n_tiles=counts.numel(), num_slots=counts.numel() * 128,
+            gather_index=torch.arange(counts.numel() * 128, device=tiles.device),
+            slot_valid=valid.flatten(), valid_count=counts,
+        )
+        _, features = gather_and_pool(packed, layout)
+        return features[0] if tiles.ndim == 3 else features
     mean = tiles.masked_fill(~valid[..., None], 0).sum(dim=-2, dtype=torch.float32)
     mean = mean / counts.clamp(min=1)[:, None].float()
     maximum = tiles.masked_fill(~valid[..., None], float("-inf")).amax(dim=-2).float()

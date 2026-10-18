@@ -46,7 +46,8 @@ def test_non_finite_gpu_logits_are_a_participant_failure() -> None:
 
 
 def test_exact_and_video_use_the_same_production_selector_functions():
-    assert torch_backend.trip_pool is runtime.torch_trip_pool is torch_selector.trip_pool
+    assert torch_backend.trip_pool is torch_selector.trip_pool
+    assert runtime.gather_and_pool is torch_selector.gather_and_pool
     assert (
         torch_backend.selector_logits is runtime.selector_logits is torch_selector.selector_logits
     )
@@ -134,7 +135,7 @@ def test_runtime_mask_uses_shared_semantics_for_full_and_sampled_rows(torch):
         )
 
 
-def test_video_attention_adapter_passes_the_shared_mask_to_the_kernel(torch):
+def test_video_attention_adapter_passes_the_shared_mask_to_the_kernel(torch, monkeypatch):
     """Real tensor arithmetic through the adapter; kernel transport is observed."""
 
     counts = torch.tensor([128, 17, 128, 53, 2])
@@ -173,6 +174,15 @@ def test_video_attention_adapter_passes_the_shared_mask_to_the_kernel(torch):
         _gather=lambda value, _layout, selected_heads: value[:, selected_heads],
         _scatter_=scatter,
     )
+
+    def cpu_gather_and_pool(value, tile_layout, selected_heads):
+        gathered = module._gather(value, tile_layout, selected_heads)
+        features = trip_pool(
+            torch, gathered.view(5, 128, 2, 2).permute(2, 0, 1, 3), tile_layout.valid_count,
+        )
+        return gathered, features
+
+    monkeypatch.setattr(runtime, "gather_and_pool", cpu_gather_and_pool)
     attention = runtime._selector_attention(
         torch, module, SimpleNamespace(config=config), object(), projections, budget,
     )
@@ -235,3 +245,43 @@ def test_cuda_tie_order_and_sampled_video_masks_match_independent_reference(torc
         for head in range(3):
             np.testing.assert_array_equal(full[head, :13].cpu().numpy(), expected)
         assert full[:, 13:].all()
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32"])
+def test_cuda_cached_pool_matches_fused_runtime_with_permuted_heads(torch, dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for fused runtime pooling")
+    device = "cuda:0"
+    generator = torch.Generator(device=device).manual_seed(20261018)
+    values = torch.randn((7 * 128, 4, 128), generator=generator, device=device).to(
+        getattr(torch, dtype),
+    )
+    counts = torch.tensor([128, 17, 1, 0, 127, 5, 128], device=device)
+    permutation = torch.randperm(7 * 128, generator=generator, device=device)
+    layout = SimpleNamespace(
+        n_tiles=7, num_slots=7 * 128, gather_index=permutation,
+        slot_valid=(torch.arange(128, device=device)[None, :] < counts[:, None]).flatten(),
+        valid_count=counts,
+    )
+    heads = torch.tensor([3, 0, 2], device=device)
+    gathered, features = torch_selector.gather_and_pool(values, layout, heads)
+    expected_rows = values[permutation][:, heads].masked_fill(
+        ~layout.slot_valid[:, None, None], 0,
+    )
+    assert torch.equal(gathered, expected_rows)
+    tiles = gathered.view(7, 128, 3, 128).permute(2, 0, 1, 3)
+    assert torch.equal(features, trip_pool(torch, tiles, counts))
+    assert not features[:, counts == 0].count_nonzero()
+    for head in range(3):
+        cached = tiles[head].float()
+        # Widening cache inputs can change Triton's reduction lowering; the
+        # formal descriptor tolerance is 1e-6, not cross-dtype bitwise equality.
+        torch.testing.assert_close(
+            features[head], trip_pool(torch, cached, counts), rtol=1e-6, atol=1e-6,
+        )
+        nonempty = counts > 0
+        np.testing.assert_allclose(
+            features[head, nonempty].cpu().numpy(),
+            numpy_trip_pool(cached[nonempty].cpu().numpy(), counts[nonempty].cpu().numpy()),
+            rtol=1e-6, atol=1e-6,
+        )
