@@ -334,6 +334,11 @@
         "model_archive_probe_sha256_verified": true,
         "model_archive_probe_temporary_objects_deleted": 2,
         "whole_model_archive_throughput_measured": false,
+        "observed_regenerated_mp4_hash_mismatches": 2,
+        "shard_and_latent_hashes_equal_in_both_mismatches": true,
+        "decoded_video_equal_for_one_mismatching_pair": true,
+        "decoded_audio_equal_for_that_pair": false,
+        "whole_batch_regeneration_passed": false,
         "whole_host_recovery_proven": false
       },
       "id": "E18",
@@ -349,10 +354,25 @@
           "path": "evidence/system-panel/acceptance-d1b38764/model-transport-40m.raw.log",
           "sha256": "f94a669d45403d44b432e24ec767be1e45dd3762d574524a0187c64e3a5e42ef",
           "scope": "Actual 40 MiB PrivateObjectStore.put_content upload and full SHA-256 readback through the formal TLS/SSH endpoint; both temporary probe objects deleted; not whole-model admission or recovery"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-batch-gpu6-resume.raw.log",
+          "sha256": "9f2aa150c7899aaca2fac85a5a70a180ea6a2cb075e83d1524642b44a428214b",
+          "scope": "Failed expanded recovery probe: one regenerated unit has equal QKV/latent hashes but a different MP4 hash. Earlier probe logging failure is retained and linked; original outputs were not overwritten or resampled"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/regeneration-batch-gpu7-resume.raw.log",
+          "sha256": "59cc0f41bc501f58b2457222ffba45cdd918bbef06dc9e534f0502c4147b0d8b",
+          "scope": "Independent H200 counterexample: regenerated QKV and latent bytes equal original, encoded MP4 differs; genuine failure is retained rather than marked accepted"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-d1b38764/mp4-regeneration-comparison.raw.log",
+          "sha256": "b3f1352b8abc782fa084f3fddc9d1033b4edd7699e9df67f1433d3e9652651ab",
+          "scope": "Actual FFmpeg decoded-stream comparison of one failed regeneration pair: decoded video hash equal, decoded audio hash different. Not a repaired recovery path or proof about all remaining rollouts"
         }
       ],
       "release_blocker": false,
-      "status": "partial_unit_regeneration_and_archive_chunk_verified",
+      "status": "recovery_mp4_byte_identity_counterexample_found",
       "subject": "评测容量"
     }
   ],
