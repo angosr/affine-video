@@ -629,22 +629,28 @@ def _worker_loop(
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         from validator.production.runtime import DenseRolloutRuntime
 
-        runtime = DenseRolloutRuntime(
-            model_root=str(config.artifact_path(config.runtime.model_root)),
-            adapter_path=str(config.artifact_path(config.runtime.adapter)),
-            predictor_bundle=str(config.artifact_path(config.runtime.predictor)),
-            sample_cache=str(config.artifact_path(config.runtime.sample_cache)),
-            offload_blocks=config.runtime.offload_blocks,
-            prefetch=config.runtime.prefetch,
-            mlp_chunk_rows=config.runtime.mlp_chunk_rows,
-        )
+        runtime = None
+
+        def get_runtime():
+            nonlocal runtime
+            if runtime is None:
+                runtime = DenseRolloutRuntime(
+                    model_root=str(config.artifact_path(config.runtime.model_root)),
+                    adapter_path=str(config.artifact_path(config.runtime.adapter)),
+                    predictor_bundle=str(config.artifact_path(config.runtime.predictor)),
+                    sample_cache=str(config.artifact_path(config.runtime.sample_cache)),
+                    offload_blocks=config.runtime.offload_blocks,
+                    prefetch=config.runtime.prefetch,
+                    mlp_chunk_rows=config.runtime.mlp_chunk_rows,
+                )
+            return runtime
         while True:
             task = tasks.get()
             if task is None:
                 return
             plan, rollout = task
             try:
-                results.put(("ok", _produce_unit(runtime, config, track, plan, rollout)))
+                results.put(("ok", _produce_unit(get_runtime, config, track, plan, rollout)))
             except Exception as exc:  # worker boundary must return a useful failure
                 results.put(("error", f"{type(exc).__name__}: {exc}"))
     except Exception as exc:
@@ -652,13 +658,12 @@ def _worker_loop(
 
 
 def _produce_unit(
-    runtime: Any,
+    get_runtime: Callable[[], Any],
     config: ProducerConfig,
     track: TrackSpec,
     plan: BatchPlan,
     rollout: RolloutPlan,
 ) -> UnitResult:
-    runtime.verify_trajectory_schedule(track.scoring.trajectory_schedule.sigmas)
     root = config.work_dir / plan.plan_digest / "units" / rollout.rollout_id
     root.mkdir(parents=True, exist_ok=True)
     existing = _find_valid_shard(root, plan, rollout, track, dense_device="cuda:0")
@@ -666,6 +671,8 @@ def _produce_unit(
     latent = root / f"{rollout.rollout_id}.safetensors"
     if existing is not None:
         return UnitResult(rollout.rollout_id, str(existing), str(video), str(latent), 0.0, 0.0)
+    runtime = get_runtime()
+    runtime.verify_trajectory_schedule(track.scoring.trajectory_schedule.sigmas)
     capture = runtime.capture(
         sample_id=rollout.source_id,
         source_id=rollout.source_id,

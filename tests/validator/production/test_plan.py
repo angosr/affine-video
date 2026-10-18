@@ -703,6 +703,68 @@ def test_producer_bootstrap_guard_ends_before_running_batches(monkeypatch, runti
     assert alerts == []
 
 
+def test_cached_producer_worker_does_not_construct_teacher(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "prior")
+    plan = SimpleNamespace(plan_digest="ab" * 32)
+    rollout = SimpleNamespace(rollout_id="cd" * 32)
+    config = SimpleNamespace(work_dir=tmp_path)
+    tasks, results = queue.Queue(), queue.Queue()
+    tasks.put((plan, rollout))
+    tasks.put(None)
+    validated = []
+
+    def find(root, received_plan, received_rollout, track, *, dense_device):
+        validated.append((received_plan, received_rollout, dense_device))
+        return root / "cached.npz"
+
+    def forbidden_teacher(**_kwargs):
+        raise AssertionError("valid completed units must not load the teacher")
+
+    monkeypatch.setattr(production_service, "_find_valid_shard", find)
+    monkeypatch.setattr("validator.production.runtime.DenseRolloutRuntime", forbidden_teacher)
+    production_service._worker_loop(2, config, "track", tasks, results)
+
+    kind, result = results.get_nowait()
+    assert kind == "ok"
+    assert result.rollout_id == rollout.rollout_id
+    assert result.elapsed_seconds == 0
+    assert validated == [(plan, rollout, "cuda:0")]
+
+
+def test_producer_worker_constructs_teacher_once_on_first_cache_miss(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "prior")
+    calls = []
+    instance = object()
+    config = SimpleNamespace(
+        artifact_path=lambda value: tmp_path / value,
+        runtime=SimpleNamespace(
+            model_root="model", adapter="adapter", predictor="predictor", sample_cache="samples",
+            offload_blocks=0, prefetch=1, mlp_chunk_rows=1,
+        ),
+    )
+    tasks, results = queue.Queue(), queue.Queue()
+    tasks.put(("plan", "first"))
+    tasks.put(("plan", "second"))
+    tasks.put(None)
+
+    def construct(**_kwargs):
+        calls.append("construct")
+        return instance
+
+    def produce(get_runtime, received_config, track, plan, rollout):
+        calls.append(rollout)
+        assert get_runtime() is instance
+        assert get_runtime() is instance
+        return rollout
+
+    monkeypatch.setattr("validator.production.runtime.DenseRolloutRuntime", construct)
+    monkeypatch.setattr(production_service, "_produce_unit", produce)
+    production_service._worker_loop(2, config, "track", tasks, results)
+
+    assert calls == ["first", "construct", "second"]
+    assert [results.get_nowait(), results.get_nowait()] == [("ok", "first"), ("ok", "second")]
+
+
 def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch) -> None:
     plan = build_plan(
         track_spec_digest="ab" * 32,
