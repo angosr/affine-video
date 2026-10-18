@@ -756,8 +756,9 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
 
 @pytest.mark.parametrize("state", ["PLANNED", "READY"])
 @pytest.mark.parametrize("initially_closed", [False, True])
+@pytest.mark.parametrize("newer_ready_count", [0, 2])
 def test_producer_close_stops_pending_work_and_releases_workers(
-    monkeypatch, tmp_path, state, initially_closed,
+    monkeypatch, tmp_path, state, initially_closed, newer_ready_count,
 ) -> None:
     plan = build_plan(
         track_spec_digest="ab" * 32, generation_block=120,
@@ -783,12 +784,45 @@ def test_producer_close_stops_pending_work_and_releases_workers(
     abandoned = tmp_path / plan.plan_digest / "batch" / "tmpinterrupted.tmp"
     abandoned.parent.mkdir(parents=True)
     abandoned.write_bytes(b"prior failed assembly must be reclaimed before the next attempt")
+    saved_unit = tmp_path / plan.plan_digest / "units" / "saved-unit.npz"
+    saved_unit.parent.mkdir()
+    saved_unit.write_bytes(b"completed unit progress")
+    newer = []
+    for block in (140, 160)[:newer_ready_count]:
+        item = build_plan(
+            track_spec_digest=plan.track_spec_digest, generation_block=block,
+            block_hash="0x" + f"{block:064x}", track_start_block=100,
+            minimum_generation_delay_blocks=1, generation_interval_blocks=20,
+            exact_challenge_ids=(f"challenge-{block}",), confirmation_challenge_ids=(),
+            source_proofs=(proof(0), proof(1)), scoring=scoring(),
+            available_routes=("route-0", "route-1", "route-2"),
+        )
+        newer.append(item.ready(
+            exact=ReadyObject(f"exact/{block}.npz", "12" * 32, 100),
+            dense_references=tuple(
+                DenseReference(
+                    rollout.rollout_id,
+                    ReadyObject(f"videos/{block}-{index}.mp4", "34" * 32, 100),
+                    ReadyObject(f"latents/{block}-{index}.safetensors", "56" * 32, 100),
+                )
+                for index, rollout in enumerate(item.rollouts)
+            ),
+            sample_cache=ready_sample_cache(),
+        ))
     database = tmp_path / "validator.db"
     with ChallengeStore(database, track_spec_digest=plan.track_spec_digest) as store:
         store.advance_chain_cursor(201 if initially_closed else 200, "0x" + "cd" * 32)
-    objects = AttemptObjects({"plans/120.json": plan.encode()})
+    objects = AttemptObjects({
+        f"plans/{item.generation_block}.json": item.encode() for item in (plan, *newer)
+    })
     original = objects.get("plans/120.json")
     executions, closed_workers, stale_before_execution = [], [], []
+    progress_before_execution = []
+    rows = tuple(
+        (f"plans/{item.generation_block}.json",
+         objects.get(f"plans/{item.generation_block}.json"), item)
+        for item in (plan, *newer)
+    )
 
     class Coordinator:
         def __init__(self, **_kwargs):
@@ -798,7 +832,7 @@ def test_producer_close_stops_pending_work_and_releases_workers(
             return None
 
         def plans(self):
-            return (("plans/120.json", original, plan),)
+            return rows
 
     service = object.__new__(ProducerService)
     service.config = SimpleNamespace(
@@ -809,10 +843,11 @@ def test_producer_close_stops_pending_work_and_releases_workers(
     service.pool = None
     service.alert = None
     service.attempt_timeout_seconds = 10
-    service._needs_regeneration = lambda _plan: True
+    service._needs_regeneration = lambda candidate: candidate.plan_digest == plan.plan_digest
 
     def execute(*_args, **_kwargs):
         stale_before_execution.append(abandoned.exists())
+        progress_before_execution.append(saved_unit.read_bytes() if saved_unit.exists() else None)
         executions.append(plan.plan_digest)
         assert len(executions) == 1, "no attempt may start after the close cursor"
         with ChallengeStore(database, track_spec_digest=plan.track_spec_digest) as store:
@@ -837,7 +872,10 @@ def test_producer_close_stops_pending_work_and_releases_workers(
     assert _plan_attempt_count(objects, plan) == expected
     assert objects.get("plans/120.json") == original
     assert stale_before_execution == ([] if initially_closed else [False])
+    assert progress_before_execution == ([] if initially_closed else [b"completed unit progress"])
+    assert saved_unit.read_bytes() == b"completed unit progress"
     assert abandoned.exists() is initially_closed
+    assert all(objects.get(name) == stored for name, stored, _plan in rows)
 
 
 def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(

@@ -472,6 +472,8 @@ class ProducerService:
                              or self._needs_regeneration(row[2])), None,
                         )
                         retained = _retained_plan_digests(plans)
+                        if pending is not None:
+                            retained |= {pending[2].plan_digest}
                         _prune_local_work(self.config.work_dir, retained)
                         attempt = (
                             None if pending is None
