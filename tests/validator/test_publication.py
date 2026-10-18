@@ -638,6 +638,125 @@ def test_storage_publishes_large_files_as_bounded_verified_chunks(tmp_path, monk
         )
 
 
+@pytest.mark.parametrize("operation", ["load", "existing_upload", "resumed_upload"])
+@pytest.mark.parametrize("corruption", ["same_size", "truncated", "oversized", "complete_digest"])
+def test_public_file_verification_reads_actual_bytes(tmp_path, monkeypatch, operation, corruption):
+    monkeypatch.setattr(chunks, "CHUNK_BYTES", 4)
+    source = tmp_path / "model.safetensors"
+    source.write_bytes(b"abcdefghij")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    name = f"models/{digest}/manifest.json"
+    artifact = PublicFile(name, source, digest)
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    repository._put_file_immutable(artifact)
+    manifest_key = f"tracks/test/{name}"
+    part_key = f"tracks/test/{chunks.chunk_object_name(name, 'part-00001')}"
+    if corruption == "complete_digest":
+        manifest = chunks.ChunkManifest.decode(client.objects[manifest_key])
+        digest = "ff" * 32
+        client.objects[manifest_key] = chunks.ChunkManifest(
+            digest, manifest.size, manifest.parts,
+        ).encode()
+        artifact = PublicFile(name, source, digest)
+    else:
+        client.objects[part_key] = {
+            "same_size": b"XXXX", "truncated": b"X", "oversized": b"XXXXX",
+        }[corruption]
+        # Length and SHA metadata can describe the original bytes even when
+        # object content is corrupted; none of it is proof of integrity.
+        assert client.metadata[part_key]["sha256"] == hashlib.sha256(b"efgh").hexdigest()
+
+    restarted = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    if operation == "resumed_upload":
+        if corruption == "complete_digest":
+            # Preserve individually valid chunks under a false complete digest.
+            monkeypatch.setattr(
+                publication_module, "build_chunk_manifest",
+                lambda _path: chunks.ChunkManifest(digest, manifest.size, manifest.parts),
+            )
+        del client.objects[manifest_key]
+    with pytest.raises(PublicArtifactError):
+        if operation == "load":
+            restarted._verify_public_file(name, digest, 10)
+        else:
+            restarted._put_file_immutable(artifact)
+    assert name not in restarted._confirmed_immutable
+    if operation == "resumed_upload":
+        assert manifest_key not in client.objects
+
+
+def test_public_upload_verifies_bytes_before_committing_manifest(tmp_path):
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(b"model")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    name = f"models/{digest}/manifest.json"
+    client = MemoryS3()
+
+    def corrupt_upload(arguments):
+        if arguments["Key"].endswith("part-00000"):
+            arguments["Body"] = b"other"
+
+    client.before_put = corrupt_upload
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    with pytest.raises(PublicArtifactError, match="conflicts with manifest"):
+        repository._put_file_immutable(PublicFile(name, path, digest))
+    assert f"tracks/test/{name}" not in client.objects
+    assert name not in repository._confirmed_immutable
+
+
+def test_public_chunk_verification_streams_and_closes_bodies(tmp_path):
+    path = tmp_path / "batch.npz"
+    path.write_bytes(b"x" * 150_000)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    name = f"batches/{digest}/manifest.json"
+    bodies = []
+
+    class BoundedBody(io.BytesIO):
+        def read(self, size=-1):
+            assert 0 < size <= 64 * 1024
+            return super().read(size)
+
+    class StreamingS3(MemoryS3):
+        def get_object(self, *, Bucket, Key):
+            response = super().get_object(Bucket=Bucket, Key=Key)
+            if Key.endswith("part-00000"):
+                response["Body"] = BoundedBody(self.objects[Key])
+                bodies.append(response["Body"])
+            return response
+
+    client = StreamingS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    repository._put_file_immutable(PublicFile(name, path, digest))
+    S3Repository(client, bucket="public-data", prefix="tracks/test")._verify_public_file(
+        name, digest, path.stat().st_size,
+    )
+    assert len(bodies) == 2
+    assert all(body.closed for body in bodies)
+
+
+def test_invalid_model_restore_cannot_publish_an_archive(tmp_path):
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(b"broken")
+    digest = hashlib.sha256(b"correct").hexdigest()
+    name = f"models/{digest}/manifest.json"
+    calls = []
+
+    def restore():
+        calls.append(True)
+        path.write_bytes(b"also broken")
+        return path
+
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    for _ in range(2):
+        with pytest.raises(PublicArtifactError, match="restored public file digest changed"):
+            repository._put_file_immutable(PublicFile(name, path, digest, restore))
+    assert len(calls) == 2
+    assert not client.objects
+    assert name not in repository._confirmed_immutable
+
+
 def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) -> None:
     track = parse_track_spec(valid_spec())
     model = tmp_path / "model.safetensors"
@@ -712,10 +831,16 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) ->
         asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
 
 
-def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "cache_state", ["valid", "missing", "forgotten", "same_size_corruption", "truncated"]
+)
+def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
+    tmp_path, cache_state
+) -> None:
     track = parse_track_spec(valid_spec())
     model = tmp_path / "retained-challenger.safetensors"
-    model.write_bytes(b"retained challenger")
+    archived_bytes = b"retained challenger"
+    model.write_bytes(archived_bytes)
     model_sha256 = hashlib.sha256(model.read_bytes()).hexdigest()
     batch = {
         "sha256": "de" * 32,
@@ -757,7 +882,7 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(tmp_path
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": [challenge]},
         active_competitors=lambda _mapping: [],
-        model_path=lambda _challenge_id: str(model),
+        model_path=lambda _challenge_id: None if cache_state == "forgotten" else str(model),
     )
     chain = WeightChainState(
         120,
@@ -768,7 +893,23 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(tmp_path
         {},
     )
 
-    artifacts = build_public_artifacts(store, track, chain, version_key=0)
+    restored = []
+
+    def restore(sha256, size_bytes):
+        assert (sha256, size_bytes) == (model_sha256, len(archived_bytes))
+        restored.append(sha256)
+        model.write_bytes(archived_bytes)
+        return model
+
+    if cache_state in {"missing", "forgotten"}:
+        model.unlink()
+    elif cache_state == "same_size_corruption":
+        model.write_bytes(b"X" * len(archived_bytes))
+    elif cache_state == "truncated":
+        model.write_bytes(b"short")
+    artifacts = build_public_artifacts(
+        store, track, chain, version_key=0, model_resolver=restore,
+    )
 
     assert artifacts is not None
     assert json.loads(artifacts.matches[0][1])["outcome"] == "CHAMPION_RETAINED"
@@ -776,7 +917,26 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(tmp_path
     assert artifacts.files[0].object_name == (
         f"models/{track.track_id}/{model_sha256}/manifest.json"
     )
-    assert artifacts.files[0].path == model
+    assert artifacts.files[0].path == (None if cache_state == "forgotten" else model)
+
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    asyncio.run(repository.publish(artifacts))
+    assert model.read_bytes() == archived_bytes
+    assert len(restored) == (cache_state != "valid")
+    assert asyncio.run(repository.load(track)).matches[0].document["outcome"] == "CHAMPION_RETAINED"
+
+    # A fresh publisher verifies the remote archive without restoring or hashing
+    # the same historical local model on every weight refresh.
+    model.write_bytes(b"corrupt after publication")
+    repeated = build_public_artifacts(
+        store, track, chain, version_key=0, model_resolver=restore,
+    )
+    restarted = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    asyncio.run(restarted.publish(repeated))
+    assert len(restored) == (cache_state != "valid")
+    asyncio.run(restarted.publish(repeated))
+    assert len(restored) == (cache_state != "valid")
 
 
 def test_empty_track_publishes_uid_zero_veda_as_genesis_champion() -> None:

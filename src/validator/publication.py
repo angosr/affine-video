@@ -10,6 +10,7 @@ import re
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -78,8 +79,9 @@ class PublicArtifacts:
 @dataclass(frozen=True, slots=True)
 class PublicFile:
     object_name: str
-    path: Path
+    path: Path | None
     sha256: str
+    restore: Callable[[], Path] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,14 +246,15 @@ def build_public_artifacts(
         if object_name is not None:
             path_value = store.model_path(match.challenge_id)
             path = None if path_value is None else Path(path_value)
-            if path is None or not path.is_file():
-                if model_resolver is None:
-                    raise PublicArtifactError("scored model has no durable archive source")
-                path = model_resolver(evaluation["file_sha256"], evaluation["model_size_bytes"])
             files[object_name] = PublicFile(
                 object_name,
                 path,
                 evaluation["file_sha256"],
+                None if model_resolver is None else partial(
+                    model_resolver,
+                    evaluation["file_sha256"],
+                    evaluation["model_size_bytes"],
+                ),
             )
     return PublicArtifacts(
         source_block=chain.finalized_block,
@@ -773,11 +776,24 @@ class S3Repository:
             self._confirmed_immutable[artifact.object_name] = artifact.sha256
             return
 
-        if not artifact.path.is_file():
-            raise PublicArtifactError(f"public file source is missing: {artifact.object_name}")
-        manifest = build_chunk_manifest(artifact.path)
-        if manifest.sha256 != artifact.sha256:
-            raise PublicArtifactError(f"public file digest changed: {artifact.object_name}")
+        path = artifact.path
+        try:
+            manifest = None if path is None else build_chunk_manifest(path)
+        except (OSError, ValueError):
+            manifest = None
+        if manifest is None or manifest.sha256 != artifact.sha256:
+            if artifact.restore is None:
+                raise PublicArtifactError(f"public file source is invalid: {artifact.object_name}")
+            # Only unpublished models need local recovery. Already verified public
+            # archives return above without re-reading historical local models.
+            if path is not None:
+                path.unlink(missing_ok=True)
+            path = artifact.restore()
+            manifest = build_chunk_manifest(path)
+            if manifest.sha256 != artifact.sha256:
+                raise PublicArtifactError(
+                    f"restored public file digest changed: {artifact.object_name}"
+                )
         for index, part in enumerate(manifest.parts):
             name = chunk_object_name(artifact.object_name, part.name)
             key = f"{self._prefix}/{name}"
@@ -798,26 +814,22 @@ class S3Repository:
             self._client.put_object(
                 Bucket=self._bucket,
                 Key=key,
-                Body=read_part(artifact.path, index, part.size),
+                Body=read_part(path, index, part.size),
                 ContentType="application/octet-stream",
                 CacheControl="public, max-age=31536000, immutable",
                 Metadata={"sha256": part.sha256},
                 IfNoneMatch="*",
             )
-            uploaded = self._client.head_object(Bucket=self._bucket, Key=key)
-            if (
-                uploaded.get("Metadata", {}).get("sha256") != part.sha256
-                or uploaded.get("ContentLength") != part.size
-            ):
-                raise PublicArtifactError("public chunk upload verification failed")
+        self._verify_public_chunks(artifact.object_name, manifest)
         self._put(artifact.object_name, manifest.encode(), True, if_none_match="*")
         self._confirmed_immutable[artifact.object_name] = artifact.sha256
 
     def _verify_public_chunks(self, manifest_name: str, manifest: ChunkManifest) -> None:
+        complete = hashlib.sha256()
         for part in manifest.parts:
             name = chunk_object_name(manifest_name, part.name)
             try:
-                uploaded = self._client.head_object(
+                response = self._client.get_object(
                     Bucket=self._bucket,
                     Key=f"{self._prefix}/{name}",
                 )
@@ -827,11 +839,24 @@ class S3Repository:
                 if str(code) in {"404", "NoSuchKey", "NotFound"}:
                     raise PublicArtifactError(f"immutable public chunk is missing: {name}") from exc
                 raise
-            if (
-                uploaded.get("Metadata", {}).get("sha256") != part.sha256
-                or uploaded.get("ContentLength") != part.size
-            ):
+            body = response.get("Body")
+            if body is None or not callable(getattr(body, "read", None)):
+                raise PublicArtifactError("public chunk response has no readable body")
+            received = 0
+            digest = hashlib.sha256()
+            try:
+                while content := body.read(min(64 * 1024, part.size - received + 1)):
+                    if not isinstance(content, bytes) or len(content) > part.size - received:
+                        raise PublicArtifactError("immutable public chunk exceeds manifest size")
+                    received += len(content)
+                    digest.update(content)
+                    complete.update(content)
+            finally:
+                body.close()
+            if received != part.size or digest.hexdigest() != part.sha256:
                 raise PublicArtifactError("immutable public chunk conflicts with manifest")
+        if complete.hexdigest() != manifest.sha256:
+            raise PublicArtifactError("immutable public file conflicts with its complete digest")
 
     async def load(self, track: TrackSpec) -> PublicLedger:
         """Load and verify the committed public tournament ledger from object storage."""

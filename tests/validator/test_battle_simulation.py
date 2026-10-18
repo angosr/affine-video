@@ -264,6 +264,7 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch(tmp_path) -
 
     def restore_model(sha256, size_bytes):
         resolved.append((sha256, size_bytes))
+        restored.write_bytes(winning_model.read_bytes())
         return restored
 
     store.model_path = lambda _challenge_id: None
@@ -275,12 +276,17 @@ def test_complete_fifo_battle_publication_recovery_and_weight_switch(tmp_path) -
         model_resolver=restore_model,
     )
     assert with_files is not None
-    assert resolved == [(winning_digest, winning_model.stat().st_size)] * 3
+    assert resolved == []
     assert sum(item.object_name.startswith("models/") for item in with_files.files) == 1
 
     remote = MemoryS3()
     repository = S3Repository(remote, bucket="public-data", prefix="tracks/battle-test")
-    asyncio.run(repository.publish(artifacts))
+    asyncio.run(repository.publish(with_files))
+    assert resolved == [(winning_digest, winning_model.stat().st_size)]
+    # Rebuilding with no local model paths must use the verified public archive
+    # rather than restoring all three historical scored models again.
+    asyncio.run(repository.publish(with_files))
+    assert resolved == [(winning_digest, winning_model.stat().st_size)]
     recovered = asyncio.run(repository.load(track))
     assert len(recovered.matches) == 5
     assert recovered.matches[-1].champion_after.hotkey == "dave"
