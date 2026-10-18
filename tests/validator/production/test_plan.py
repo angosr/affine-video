@@ -840,6 +840,28 @@ def test_producer_bootstrap_failures_are_bounded_and_alerted(monkeypatch, failur
     assert alerts == [("PRODUCER_STARTUP_FAILURE", {"error_type": expected_type})]
 
 
+def test_continuous_producer_starts_without_external_webhook(monkeypatch, caplog):
+    monkeypatch.delenv("VEDA_ALERT_WEBHOOK_URL", raising=False)
+    config = object()
+    runs = []
+    monkeypatch.setattr(production_service, "load_producer_config", lambda _path: config)
+
+    def create(value, *, alert):
+        assert value is config and callable(alert)
+
+        def run(*, once):
+            runs.append(once)
+            alert("PRODUCER_PLAN_FAILURE", {"attempts": 5})
+
+        return SimpleNamespace(run=run)
+
+    monkeypatch.setattr(production_service, "ProducerService", create)
+    production_service.run_producer("producer.json")
+    assert runs == [False]
+    assert "push alerts are not configured" in caplog.text
+    assert "PRODUCER_PLAN_FAILURE" in caplog.text
+
+
 @pytest.mark.parametrize("runtime_failure", [False, True])
 def test_producer_bootstrap_guard_ends_before_running_batches(monkeypatch, runtime_failure):
     alerts = []

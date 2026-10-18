@@ -646,9 +646,7 @@ class ProducerService:
 
 def run_producer(config_path: str | Path, *, once: bool = False) -> None:
     alert_url = os.environ.get("VEDA_ALERT_WEBHOOK_URL")
-    if not once and not alert_url:
-        raise ValueError("a push alert webhook is required for the continuous producer")
-    alert = webhook_alerter(alert_url, service="veda-producer") if alert_url is not None else None
+    alert = webhook_alerter(alert_url, service="veda-producer")
     try:
         with _interrupt_at_deadline(time.monotonic() + _PRODUCER_ATTEMPT_TIMEOUT_SECONDS):
             service = ProducerService(load_producer_config(config_path), alert=alert)

@@ -43,6 +43,20 @@ from .test_chain import HOTKEY, FakeClient, chain_block
 from .test_publication import MemoryS3
 
 
+def test_continuous_evaluator_reaches_track_loading_without_external_webhook(monkeypatch):
+    def load(_path):
+        raise RuntimeError("reached track loading")
+
+    monkeypatch.setattr(run_module, "load_track_spec", load)
+    with pytest.raises(RuntimeError, match="reached track loading"):
+        asyncio.run(run_module.run_evaluator(
+            track_spec="track.json", database="unused.db", model_cache="unused-models",
+            exact_cache="unused-batches", initial_model=None, network="finney",
+            archive_endpoints=None, worker_id="test", publisher=SimpleNamespace(),
+            alert_webhook_url=None,
+        ))
+
+
 async def _complete_cycle(
     client, store, *, admission_settings, scoring_settings, evaluator, worker_id,
     downloader=run_module.download_public_model, model_validator=run_module.validate_model,

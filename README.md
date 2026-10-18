@@ -278,7 +278,8 @@ export SECRET_ACCESS_KEY=...
 export EVALUATOR_PRIVATE_STORAGE_URL=...
 export EVALUATOR_PRIVATE_ACCESS_KEY=...
 export EVALUATOR_PRIVATE_SECRET_ACCESS_KEY=...
-export VEDA_ALERT_WEBHOOK_URL=...
+# Optional HTTPS push notifications; failures are logged when this is unset.
+# export VEDA_ALERT_WEBHOOK_URL=...
 
 uv run --extra storage veda validator evaluate \
   --track-spec /data/track.json \
@@ -315,8 +316,9 @@ The production configuration also uses a separate `evaluator_artifact_root`; it 
 without the producer artifact root, source-pool file, complete production/audit SampleCache, or
 producer work directory.
 
-Configure `VEDA_ALERT_WEBHOOK_URL` in both service environments before continuous operation.
-It must be an absolute HTTPS endpoint without URL credentials or fragments. Producer bootstrap,
+Failure events are logged when `VEDA_ALERT_WEBHOOK_URL` is unset; no external notification service
+is required to start. To enable push notifications, configure it in both service environments as an
+absolute HTTPS endpoint without URL credentials or fragments. Producer bootstrap,
 scoring stages and complete producer attempts each have a four-hour wall-clock limit; bootstrap
 failures emit a separate startup alert. Admission has five fast attempts; scoring and full-video
 confirmation allow nine fast attempts with bounded exponential delays.
@@ -330,7 +332,7 @@ an attempt; a batch still missing one complete generation interval after its sch
 bounded scoring retries. Exhaustion enters visible `SYSTEM_BLOCKED` cooldown without becoming a
 Miner loss. Admission
 automatically probes again every 30 minutes; scoring and confirmation every hour, with another
-push alert on a failed probe. Retry counts and deadlines survive local state loss. FIFO order is
+alert on a failed probe. Retry counts and deadlines survive local state loss. FIFO order is
 preserved, and recovery resumes the original stage without an operator reset. To request an earlier
 retry after repairing the cause:
 
@@ -340,7 +342,8 @@ veda validator retry <challenge-id> --database /data/validator.db \
 ```
 
 Public publication failures are counted in the same SQLite database across restarts. The first
-and fifth failure send push alerts. Five consecutive failures stop new admission and scoring;
+and fifth failure emit alerts through the configured channel. Five consecutive failures stop new
+admission and scoring;
 finalized chain scanning and immutable facts remain intact. Recovery probes continue at the poll
 interval, and only successful publication of the complete continuous match prefix and its pointers
 clears the gate. Reading the ledger successfully or skipping publication does not clear it.

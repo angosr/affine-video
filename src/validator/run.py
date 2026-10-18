@@ -268,11 +268,7 @@ async def run_evaluator(
         raise ValueError("poll interval must be positive")
     if version_key < 0:
         raise ValueError("version identifier must be non-negative")
-    if not once and not alert_webhook_url:
-        raise ValueError("a push alert webhook is required for the continuous evaluator")
-    alert = (
-        webhook_alerter(alert_webhook_url, service="veda-evaluator") if alert_webhook_url else None
-    )
+    alert = webhook_alerter(alert_webhook_url, service="veda-evaluator")
     track = load_track_spec(track_spec)
     if production_config is not None:
         verify_public_storage = getattr(publisher, "verify_conditional_writes", None)

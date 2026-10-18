@@ -21,12 +21,26 @@ from validator import alerts
         "https://user:password@alerts.example/hook",
         "https://alerts.example/hook#secret",
         "https://alerts.example:invalid",
-        None,
     ],
 )
 def test_webhook_rejects_invalid_or_ambiguous_urls(url):
     with pytest.raises(ValueError, match="HTTPS"):
         alerts.webhook_alerter(url, service="veda-evaluator")
+
+
+def test_missing_webhook_logs_failure_without_network_or_claiming_delivery(monkeypatch, caplog):
+    def unexpected_post(*_args, **_kwargs):
+        pytest.fail("a missing webhook must not make a network request")
+
+    monkeypatch.setattr(alerts.httpx, "post", unexpected_post)
+    with caplog.at_level(logging.WARNING, logger="validator.alerts"):
+        callback = alerts.webhook_alerter(None, service="veda-evaluator")
+        callback("SCORING_RETRY_EXHAUSTED", {"challenge_id": "example", "attempts": 5})
+    assert "push alerts are not configured" in caplog.text
+    assert "SCORING_RETRY_EXHAUSTED" in caplog.text
+    assert "example" in caplog.text
+    assert caplog.records[-1].alert_service == "veda-evaluator"
+    assert caplog.records[-1].alert_event == "SCORING_RETRY_EXHAUSTED"
 
 
 @pytest.mark.parametrize("failure", ["http_status", "transport", "unexpected"])
