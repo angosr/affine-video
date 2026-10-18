@@ -341,7 +341,7 @@ def build_genesis_artifacts(
 def _verify_candidate_release(
     track: TrackSpec, runtime_manifest: bytes | None, approval: ReleaseApproval | None
 ) -> None:
-    if track.track_id != PRODUCTION_TRACK_ID:
+    if track.track_id != PRODUCTION_TRACK_ID and approval is None:
         return
     try:
         require_release_approval(track, runtime_manifest, approval)

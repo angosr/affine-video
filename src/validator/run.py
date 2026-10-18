@@ -39,6 +39,7 @@ from validator.publication import (
     validate_public_weights_url,
 )
 from validator.queue import TERMINAL_STATES, ChallengeState
+from validator.release import require_release_approval
 from validator.scoring import (
     EvaluatedStage,
     PairedTrackEvaluator,
@@ -77,6 +78,23 @@ class ArtifactRepository(Protocol):
     async def publish(self, artifacts: PublicArtifacts) -> None: ...
 
     async def load(self, track: TrackSpec) -> PublicLedger: ...
+
+
+def _require_production_release(
+    track: TrackSpec,
+    runtime_manifest: bytes,
+    publisher: ArtifactRepository,
+) -> None:
+    """Fail before evaluation when a production repository lacks release approval."""
+
+    try:
+        require_release_approval(
+            track,
+            runtime_manifest,
+            getattr(publisher, "release_approval", None),
+        )
+    except ValueError as exc:
+        raise ValueError(f"formal evaluator release rejected: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +200,7 @@ async def run_evaluator(
         manifest = ArtifactManifest.decode(runtime_manifest_payload)
         if manifest.digest != track.artifact_manifest_sha256:
             raise ValueError("artifact manifest does not match the track commitment")
+        _require_production_release(track, runtime_manifest_payload, publisher)
         evaluator_artifacts = data_config.evaluator_artifact_names(manifest)
         hidden_artifacts = tuple(
             artifact

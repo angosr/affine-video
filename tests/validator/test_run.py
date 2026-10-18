@@ -42,6 +42,32 @@ def test_release_defaults_target_sn120_initial_state() -> None:
     assert run_module.DEFAULT_MECHID == 1
 
 
+def test_production_evaluator_checks_release_for_custom_repository(monkeypatch) -> None:
+    track = SimpleNamespace(track_id="future-track", digest="ab" * 32)
+    publisher = SimpleNamespace(release_approval=object())
+    calls = []
+
+    def require(candidate, manifest, approval):
+        calls.append((candidate, manifest, approval))
+
+    monkeypatch.setattr(run_module, "require_release_approval", require)
+    run_module._require_production_release(track, b"manifest", publisher)
+    assert calls == [(track, b"manifest", publisher.release_approval)]
+
+
+def test_production_evaluator_rejects_missing_release_approval(monkeypatch) -> None:
+    def reject(*_args):
+        raise ValueError("formal publication requires approval")
+
+    monkeypatch.setattr(run_module, "require_release_approval", reject)
+    with pytest.raises(ValueError, match="formal evaluator release rejected"):
+        run_module._require_production_release(
+            SimpleNamespace(track_id="future-track", digest="ab" * 32),
+            b"manifest",
+            SimpleNamespace(),
+        )
+
+
 def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_path) -> None:
     class StopLoop(BaseException):
         pass
