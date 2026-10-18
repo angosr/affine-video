@@ -296,13 +296,46 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "独立确认中实际误晋级/误拒绝及其不确定性满足预注册门槛，并满足 E13；重复 route/step/query 不增加独立视频数，增加 bootstrap 次数不能代替 source 样本量",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "runtime_source_commit": "b81bfa8",
+        "synthetic_only": true,
+        "incumbent_score": 0.8,
+        "challenger_common_score": 0.806,
+        "challenger_rare_score": 0.0,
+        "rare_probability": 0.009,
+        "true_population_gain": -0.0012539999999999774,
+        "all_common_exact_and_full_lower_bounds": 0.006000000000000005,
+        "both_gates_pass_without_observed_rare_failure": true,
+        "probability_of_no_rare_video_in_two_stages": 0.7487846684395062,
+        "monte_carlo_trials": 1000000,
+        "monte_carlo_no_rare_frequency": 0.748829,
+        "actual_selector_realizability_verified": false,
+        "live_parameters_changed": false,
+        "scope": "Native frozen gate functions confirm a synthetic rare-tail limitation. The no-rare event is a lower bound for false promotion under this synthetic law, not an observed miner exploit rate or overall acceptance."
+      },
       "id": "E15",
       "method": "在冻结样本预算和 season alpha/M 下，对 source 聚类、近阈值、偏态和稀有严重失败进行功效/覆盖率实验，并报告计算成本",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/statistical-tail-diagnostic.json",
+          "sha256": "53556add2debb78ab2b2cb7aa4b443562a3c11069738ce9230efe9e3db3ba4d1",
+          "scope": "Preregistered no-GPU synthetic diagnostic using the actual frozen exact/full bootstrap functions and live parameters; links immutable registration and raw execution, not an actual submitted selector or a production change"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/statistical-tail-independent-review.json",
+          "sha256": "aeca8251a2f20d977cb2fb3511ea40af51b2dcf8809083f04a57b0aea8fa7e41",
+          "scope": "Independent read-only source, artifact and analytical probability review; does not establish actual-selector realizability"
+        },
+        {
+          "path": "evidence/system-panel/acceptance-8608cf5d/fixed-perturbation-exact-gpu6.raw.log",
+          "sha256": "b49ffb26f8eba1c4083d278758d59c794f94db384a193c72e0c68b3353a4b81a",
+          "scope": "Preregistered fixed pre-existing control, actual final-runtime H200 FilePairedEvaluator with spawn isolation, 384 cases from 16 fresh audit videos; baseline 0.9491625628902893, control 0.9489611529896794, gain lower bound -0.0013461398597907877, below the unchanged 0.005 gate. Exit zero, no remaining child processes, no training or public writes. One exact batch only, not full-video or ten-batch calibration."
+        }
+      ],
       "release_blocker": false,
-      "status": "post_launch_validation_pending",
+      "status": "synthetic_rare_tail_limit_confirmed_real_models_pending",
       "subject": "样本量"
     },
     {

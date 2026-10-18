@@ -85,6 +85,10 @@ launch; pending research is not marked passed. Bootstrap alpha is a calibration 
 proved finite-sample guarantee. Unit tests and intermediate GPU checks alone do not establish
 release acceptance.
 
+A frozen-runtime synthetic rare-failure check confirms this statistical limitation: small paired
+batches can miss uncommon severe regressions even when both bootstrap gates pass. This is not a
+demonstrated selector exploit; actual-model coverage and power remain under post-launch validation.
+
 ## Public object-storage state
 
 The public contract uses one fixed prefix:
