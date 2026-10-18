@@ -51,7 +51,7 @@ from validator.scoring import (
     evaluate_next_scoring,
     verify_initial_champion,
 )
-from validator.store import ChallengeStore, LeasedChallenge
+from validator.store import MAX_PUBLICATION_FAILURES, ChallengeStore, LeasedChallenge
 from validator.system_matches import PRODUCTION_NETUID
 from validator.tournament import MatchRecord
 from validator.weights import (
@@ -159,7 +159,31 @@ async def run_evaluator(
         if verify_public_storage is None:
             raise ValueError("production publisher must verify conditional writes")
         await asyncio.to_thread(verify_public_storage)
-    ledger = await publisher.load(track)
+    # Public storage can still be down after a restart. Keep ingesting finalized
+    # facts, but do not initialize admission/scoring until ledger recovery succeeds.
+    with ChallengeStore(database, track_spec_digest=track.digest) as recovery_store:
+        while True:
+            try:
+                ledger = await publisher.load(track)
+                break
+            except Exception as exc:
+                _record_publication_failure(recovery_store, alert, exc)
+                async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
+                    scan = await scan_finalized_blocks(
+                        client, recovery_store, netuid=track.netuid,
+                        track_start_block=track.track_start_block,
+                        submission_end_block=track.track_close_block,
+                        max_blocks=max_scan_blocks,
+                    )
+                    finalized_block = await client.finalized_block()
+                if report is not None:
+                    report(EvaluationCycleResult(
+                        finalized_block, scan, None, None,
+                        publication_error=str(exc) or type(exc).__name__,
+                    ))
+                if once:
+                    return
+                await asyncio.sleep(poll_seconds)
     disclosed_plan_digests = set(getattr(ledger, "disclosed_plan_digests", ()))
     cache_dir = Path(exact_cache)
     if not cache_dir.is_dir():
@@ -277,7 +301,6 @@ async def run_evaluator(
         recovery_index = 0
         track_aborted = ledger.aborted
         consecutive_cycle_errors = 0
-        consecutive_publication_errors = 0
         while True:
             try:
                 async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
@@ -297,7 +320,12 @@ async def run_evaluator(
                             runtime_manifest=runtime_manifest_payload,
                             release_approval=getattr(publisher, "release_approval", None),
                         )
-                        await publisher.publish(artifacts)
+                        try:
+                            await publisher.publish(artifacts)
+                        except Exception as exc:
+                            _record_publication_failure(store, alert, exc)
+                            raise
+                        store.publication_succeeded()
                         if report is not None:
                             report(
                                 EvaluationCycleResult(
@@ -368,6 +396,9 @@ async def run_evaluator(
                                 )
                                 if artifacts is not None:
                                     await publisher.publish(artifacts)
+                                    # publish() completes the full continuous match prefix,
+                                    # disclosures and fenced pointers before clearing this gate.
+                                    store.publication_succeeded()
                                     disclosed_plan_digests.update(
                                         name.removeprefix("batch_groups/").removesuffix(".json")
                                         for name, _ in artifacts.batch_groups
@@ -391,6 +422,7 @@ async def run_evaluator(
                                         published_block=artifacts.source_block,
                                     )
                             except Exception as exc:
+                                _record_publication_failure(store, alert, exc)
                                 result = EvaluationCycleResult(
                                     result.finalized_block,
                                     result.scan,
@@ -401,21 +433,6 @@ async def run_evaluator(
                                 )
                         if report is not None:
                             report(result)
-                        if result.publication_error is None:
-                            consecutive_publication_errors = 0
-                        else:
-                            consecutive_publication_errors += 1
-                            if alert is not None and (
-                                consecutive_publication_errors == 3
-                                or consecutive_publication_errors % 10 == 0
-                            ):
-                                alert(
-                                    "PUBLICATION_FAILURE",
-                                    {
-                                        "consecutive_failures": consecutive_publication_errors,
-                                        "error": result.publication_error[:500],
-                                    },
-                                )
                         consecutive_cycle_errors = 0
                         if once:
                             return
@@ -446,6 +463,23 @@ async def run_evaluator(
                         },
                     )
                 await asyncio.sleep(poll_seconds)
+
+
+def _record_publication_failure(
+    store: ChallengeStore,
+    alert: Callable[[str, dict[str, Any]], None] | None,
+    error: Exception,
+) -> None:
+    previous, current = store.record_publication_failure()
+    if alert is not None and current != previous and current in {1, MAX_PUBLICATION_FAILURES}:
+        alert(
+            "PUBLICATION_FAILURE",
+            {
+                "consecutive_failures": current,
+                "blocked": current >= MAX_PUBLICATION_FAILURES,
+                "error": (str(error) or type(error).__name__)[:500],
+            },
+        )
 
 
 async def _refresh_seed_block_hashes(
@@ -631,7 +665,10 @@ async def process_cycle(
             admission_settings.last_submission_block,
             decision_block=finalized_block,
         )
-    if track_aborted or track_closed:
+    if (
+        track_aborted or track_closed
+        or store.publication_failures() >= MAX_PUBLICATION_FAILURES
+    ):
         return EvaluationCycleResult(
             finalized_block,
             scan,

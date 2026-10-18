@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from validator.tournament import MatchRecord
 
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
+MAX_PUBLICATION_FAILURES = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +505,37 @@ class ChallengeStore:
         """Return effective challenges plus pending admission reservations."""
 
         return int(self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0])
+
+    def publication_failures(self) -> int:
+        row = self._connection.execute(
+            "SELECT value FROM store_metadata WHERE key = 'publication_failures'"
+        ).fetchone()
+        return 0 if row is None else int(row["value"])
+
+    def record_publication_failure(self) -> tuple[int, int]:
+        """Persist the circuit breaker before alert delivery or process exit."""
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            previous = self.publication_failures()
+            current = min(MAX_PUBLICATION_FAILURES, previous + 1)
+            self._connection.execute(
+                "INSERT INTO store_metadata (key, value) VALUES ('publication_failures', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(current),),
+            )
+            self._connection.commit()
+            return previous, current
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def publication_succeeded(self) -> None:
+        """Open the gate only after the entire contiguous snapshot was published."""
+
+        with self._connection:
+            self._connection.execute(
+                "DELETE FROM store_metadata WHERE key = 'publication_failures'"
+            )
 
     def has_season_slot(self, identifier: str) -> bool:
         """Return whether a challenge reserves or permanently consumed a season slot."""

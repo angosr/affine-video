@@ -344,3 +344,24 @@ def test_validator_run_needs_no_track_or_storage_configuration(monkeypatch) -> N
     assert called["wallet_name"] == "default"
     assert called["hotkey_name"] == "default"
     assert called["once"] is True
+
+
+def test_evaluator_policy_cli_roundtrip_and_fail_closed(tmp_path):
+    from validator.production.storage import evaluator_iam_policy
+
+    path = tmp_path / "evaluator.json"
+    args = ["validator", "evaluator-policy", "--bucket", "private", "--prefix", "test/track"]
+    main([*args, "--write", str(path)])
+    original = path.read_bytes()
+    assert json.loads(original) == evaluator_iam_policy(bucket="private", prefix="test/track")
+    main([*args, "--verify", str(path)])
+    with pytest.raises(SystemExit) as stopped:
+        main([*args, "--write", str(path)])
+    assert stopped.value.code == 1
+    assert path.read_bytes() == original
+    policy = json.loads(original)
+    policy["Statement"].append({"Effect": "Allow", "Action": "s3:*", "Resource": "*"})
+    path.write_text(json.dumps(policy))
+    with pytest.raises(SystemExit) as stopped:
+        main([*args, "--verify", str(path)])
+    assert stopped.value.code == 1

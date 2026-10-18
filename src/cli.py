@@ -67,6 +67,14 @@ def _parser() -> argparse.ArgumentParser:
     produce = validator_commands.add_parser("produce", help="produce private evaluation batches")
     produce.add_argument("--config", required=True)
     produce.add_argument("--once", action="store_true")
+    policy = validator_commands.add_parser(
+        "evaluator-policy", help="generate or verify the evaluator storage IAM contract"
+    )
+    policy.add_argument("--bucket", required=True)
+    policy.add_argument("--prefix", required=True)
+    policy_action = policy.add_mutually_exclusive_group(required=True)
+    policy_action.add_argument("--write", type=Path)
+    policy_action.add_argument("--verify", type=Path)
     leaderboard = validator_commands.add_parser("leaderboard")
     leaderboard.add_argument("--database", required=True)
     challenges = validator_commands.add_parser("challenges")
@@ -207,6 +215,27 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
 
 
 def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
+    if arguments.command == "evaluator-policy":
+        from validator.production.commitment import canonical_json
+        from validator.production.storage import evaluator_iam_policy, verify_evaluator_iam_policy
+
+        try:
+            if arguments.verify is not None:
+                verify_evaluator_iam_policy(
+                    json.loads(arguments.verify.read_text(encoding="utf-8")),
+                    bucket=arguments.bucket,
+                    prefix=arguments.prefix,
+                )
+            else:
+                payload = canonical_json(evaluator_iam_policy(
+                    bucket=arguments.bucket, prefix=arguments.prefix,
+                )) + b"\n"
+                with arguments.write.open("xb") as stream:
+                    stream.write(payload)
+        except (OSError, ValueError) as exc:
+            parser.exit(1, f"error: {exc}\n")
+        return
+
     if arguments.command == "produce":
         try:
             from validator.production.service import run_producer

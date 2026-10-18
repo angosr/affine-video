@@ -97,8 +97,9 @@ def video_spec() -> FullVideoSpec:
 
 @pytest.mark.parametrize("cache_loss", ["none", "deleted", "corrupt"])
 @pytest.mark.parametrize("stage", ["exact", "confirmation"])
+@pytest.mark.parametrize("corrupt_incumbent", [False, True])
 def test_paired_evaluator_restores_challenger_for_both_stages(
-    tmp_path, monkeypatch, cache_loss, stage
+    tmp_path, monkeypatch, cache_loss, stage, corrupt_incumbent
 ) -> None:
     architecture = SelectorArchitecture(1, 1, 2, "float32")
     tensors = {
@@ -249,6 +250,37 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
             cache_dir=tmp_path / "restored",
         )
         source.archive_model(lease, challenger_path, challenger)
+        if corrupt_incumbent:
+            incumbent_path = tmp_path / "incumbent.safetensors"
+            save_file(tensors, incumbent_path, metadata={"hotkey": "hk2"})
+            incumbent_model = validate_model(
+                incumbent_path, schema=architecture.tensor_schema,
+                max_bytes=10_000, expected_hotkey="hk2",
+            )
+            incumbent = replace(
+                lease, challenge_id="55" * 32, hotkey="hk2",
+                model_path=str(incumbent_path), file_sha256=incumbent_model.file_sha256,
+            )
+            source.archive_model(incumbent, incumbent_path, incumbent_model)
+            snapshot = store.public_snapshot
+
+            def with_incumbent():
+                value = snapshot()
+                value["challenges"].append({
+                    "challenge_id": incumbent.challenge_id,
+                    "file_sha256": incumbent_model.file_sha256,
+                    "model_size_bytes": incumbent_model.size_bytes,
+                    "model_digest": incumbent_model.model_digest,
+                })
+                return value
+
+            monkeypatch.setattr(store, "public_snapshot", with_incumbent)
+            monkeypatch.setattr(store, "model_path", lambda _id: str(incumbent_path))
+            monkeypatch.setattr(
+                scoring_module, "resolve_tournament",
+                lambda *_a, **_k: SimpleNamespace(champion=incumbent),
+            )
+            incumbent_path.write_bytes(b"corrupt promoted champion")
         if cache_loss == "deleted":
             challenger_path.unlink()
         elif cache_loss == "corrupt":
@@ -276,6 +308,12 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
                     max_bytes=10_000, expected_hotkey="hk1",
                 )
                 assert recovered == challenger
+                if corrupt_incumbent:
+                    assert validate_model(
+                        kwargs["incumbent_path"], schema=architecture.tensor_schema,
+                        max_bytes=10_000, expected_hotkey="hk2",
+                    ) == incumbent_model
+                    assert not incumbent_path.exists()
                 calls.append(kwargs)
                 return SimpleNamespace(
                     challenger_score=0.5, incumbent_score=0.5, gain_lower_bound=0.0,
@@ -299,6 +337,8 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
             now_ms=5,
         )
         assert scoring is not None and scoring.state is ChallengeState.SUCCEEDED
+        if corrupt_incumbent:
+            assert not incumbent_path.exists()
         evaluated = store.public_challenge(identifier)
 
     assert evaluated["final_score"] == pytest.approx(evaluated["incumbent_score"])

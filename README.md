@@ -273,6 +273,17 @@ role can use plan/stage CAS and read READY-selected objects, while reads of
 `bootstrap/source_pool.json`, the `source-pool/` prefix, and the committed full source cache are
 denied, including every `<manifest>.parts/part-*` object and its list prefix. Evaluator credentials
 never fall back to the producer credentials.
+Generate and verify the policy through the validator CLI before installing it on the backend:
+
+```bash
+veda validator evaluator-policy --bucket private --prefix evaluation/tracks/<track-digest> \
+  --write evaluator-policy.json
+veda validator evaluator-policy --bucket private --prefix evaluation/tracks/<track-digest> \
+  --verify evaluator-policy.json
+```
+
+Policy generation refuses to overwrite an existing file; verification rejects extra grants.
+This document check does not replace live credential denial probes against the target backend.
 The production configuration also uses a separate `evaluator_artifact_root`; it must be mounted
 without the producer artifact root, source-pool file, complete production/audit SampleCache, or
 producer work directory.
@@ -293,6 +304,12 @@ cause, resume its original stage with:
 veda validator retry <challenge-id> --database /data/validator.db \
   --production-config /data/production.json
 ```
+
+Public publication failures are counted in the same SQLite database across restarts. The first
+and fifth failure send push alerts. Five consecutive failures stop new admission and scoring;
+finalized chain scanning and immutable facts remain intact. Recovery probes continue at the poll
+interval, and only successful publication of the complete continuous match prefix and its pointers
+clears the gate. Reading the ledger successfully or skipping publication does not clear it.
 
 After the track close grace block, unfinished system work first publishes an irreversible
 `weights.json` fence with `track_aborted=true` and no weight plan, then the immutable

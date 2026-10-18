@@ -633,3 +633,113 @@ def test_cycle_releases_scoring_lease_when_fresh_finalized_head_is_unavailable(t
         challenge = store.get_challenge(cycle.scoring.challenge_id)
         assert challenge.state is ChallengeState.SYSTEM_DEFERRED
         assert store.claim_next_scoring("recovery", lease_ms=100, now_ms=10**18) is not None
+
+
+def test_publication_gate_survives_restarts_and_republishes_before_work(monkeypatch, tmp_path):
+    from scoring.spec import parse_track_spec
+    from tests.scoring.test_spec import valid_spec
+    from validator.store import MAX_PUBLICATION_FAILURES
+
+    track = parse_track_spec(valid_spec())
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    blocks = {100: chain_block(payload, 100), 101: empty_chain_block(101)}
+    events = []
+    alerts = []
+    fail = True
+    load_fail = False
+    skip_snapshot = False
+    prefix = (("matches/1.json", b"first"), ("matches/2.json", b"second"))
+
+    class Client(FakeClient):
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+    class Publisher:
+        async def load(self, _track):
+            if load_fail:
+                raise RuntimeError("public ledger unavailable on restart")
+            return SimpleNamespace(matches=(), required_finalized_block=0, aborted=False)
+
+        async def publish(self, artifacts):
+            assert artifacts.matches == prefix
+            events.append("publish-prefix")
+            if fail:
+                raise RuntimeError("public storage unavailable after partial upload")
+
+    async def no_op(*_args, **_kwargs):
+        pass
+
+    async def chain_state(*_args, **_kwargs):
+        return SimpleNamespace(finalized_block=101)
+
+    def work(*_args, **_kwargs):
+        events.append("work")
+        return None
+
+    def build(*_args, **_kwargs):
+        if skip_snapshot:
+            return None
+        return SimpleNamespace(matches=prefix, source_block=101, batch_groups=(), abort=None)
+
+    monkeypatch.setattr(run_module, "load_track_spec", lambda _: track)
+    monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_a, **_k: None)
+    monkeypatch.setattr(run_module.bt, "Client", lambda *_a, **_k: Client(blocks))
+    monkeypatch.setattr(run_module, "seed_legacy_exclusions", no_op)
+    monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", no_op)
+    monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
+    monkeypatch.setattr(run_module, "process_next_admission", work)
+    monkeypatch.setattr(run_module, "evaluate_next_scoring", work)
+    monkeypatch.setattr(run_module, "build_public_artifacts", build)
+    monkeypatch.setattr(
+        run_module, "webhook_alerter", lambda *_a, **_k: lambda *a: alerts.append(a)
+    )
+    cache = tmp_path / "exact"
+    cache.mkdir()
+    database = tmp_path / "validator.db"
+
+    def restart():
+        asyncio.run(run_module.run_evaluator(
+            track_spec="track.json", database=database, model_cache=tmp_path / "models",
+            exact_cache=cache, initial_model=tmp_path / "baseline", network="test",
+            archive_endpoints=None, worker_id="test", publisher=Publisher(), once=True,
+            alert_webhook_url="https://alerts.example/test",
+        ))
+
+    for count in range(1, MAX_PUBLICATION_FAILURES + 1):
+        restart()
+        with ChallengeStore(database) as store:
+            assert store.publication_failures() == count
+    assert events.count("work") == 2 * MAX_PUBLICATION_FAILURES
+    events.clear()
+    restart()
+    assert events == ["publish-prefix"]
+    assert [row[1]["consecutive_failures"] for row in alerts] == [1, MAX_PUBLICATION_FAILURES]
+    assert alerts[-1][1]["blocked"] is True
+    load_fail = True
+    events.clear()
+    restart()
+    assert events == []
+    with ChallengeStore(database) as store:
+        assert store.chain_cursor()[0] == 101
+        assert store.publication_failures() == MAX_PUBLICATION_FAILURES
+    load_fail = False
+
+    # A cycle with no publication is not a successful recovery.
+    skip_snapshot = True
+    restart()
+    with ChallengeStore(database) as store:
+        assert store.publication_failures() == MAX_PUBLICATION_FAILURES
+        assert store.chain_cursor()[0] == 101
+        assert len(store.public_snapshot()["challenges"]) == 1
+    skip_snapshot = False
+    fail = False
+    events.clear()
+    restart()
+    assert events == ["publish-prefix"]
+    with ChallengeStore(database) as store:
+        assert store.publication_failures() == 0
+    restart()
+    assert events == ["publish-prefix", "work", "work", "publish-prefix"]

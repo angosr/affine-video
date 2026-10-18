@@ -474,6 +474,13 @@ class PairedTrackEvaluator:
                 expected_digest=expected_digest,
                 expected_hotkey=expected_hotkey,
             )
+            if validated is None and path is not None and path.is_file():
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    raise TemporaryScoringError(
+                        "INCUMBENT_MODEL_UNAVAILABLE", "cannot discard corrupt champion cache"
+                    ) from exc
             if validated is None and self.batch_source is not None:
                 try:
                     path = self.batch_source.restore_model(expected_sha256, expected_size)
