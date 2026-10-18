@@ -365,6 +365,7 @@ class PairedTrackEvaluator:
             )
             if batch.plan.generation_block != expected_block:
                 raise RuntimeError("confirmation batch does not follow the exact decision block")
+            self._require_finalized_seed_hash(batch.plan.generation_block, batch.plan.block_hash)
             result = self.confirmation_pool.run(
                 challenger_path=challenger.model_path or "",
                 incumbent_path=incumbent.model_path or "",
@@ -419,17 +420,21 @@ class PairedTrackEvaluator:
                 )
                 if batch.generated_block != expected_block:
                     raise CacheLoadError("challenge READY plan uses the wrong generation block")
-            if self.seed_block_hashes is not None:
-                expected_hash = self.seed_block_hashes.get(batch.generated_block)
-                if expected_hash is None or batch.seed_block_hash.lower() != expected_hash.lower():
-                    raise CacheLoadError(
-                        "cache seed hash does not match its finalized generation block"
-                    )
+            self._require_finalized_seed_hash(batch.generated_block, batch.seed_block_hash)
             if self.track.cache.generator != "veda-private-rollout-v1":
                 raise CacheLoadError("track cache generator is unsupported")
             return batch
         except (CacheLoadError, RuntimeError) as exc:
             raise TemporaryScoringError("SCORING_CACHE_UNAVAILABLE", str(exc)) from exc
+
+    def _require_finalized_seed_hash(self, generated_block: int, seed_block_hash: str) -> None:
+        """Reject both stages unless their seed matches the finalized chain snapshot."""
+
+        expected_hash = (
+            None if self.seed_block_hashes is None else self.seed_block_hashes.get(generated_block)
+        )
+        if not isinstance(expected_hash, str) or seed_block_hash.lower() != expected_hash.lower():
+            raise CacheLoadError("cache seed hash does not match its finalized generation block")
 
     def _incumbent_task(
         self,

@@ -243,6 +243,7 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
             "https://public.example/models/paired",
             30,
             downloader=lambda *_args, **_kwargs: pytest.fail("archive recovery contacted HF"),
+            seed_block_hashes={batch.generated_block: batch.seed_block_hash},
         )
         source = ReadyBatchSource(
             track=track,
@@ -425,6 +426,62 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
         max_bytes=10_000,
         expected_hotkey="champion-hotkey",
     ) == validated
+
+
+@pytest.mark.parametrize("stage", ["exact", "confirmation"])
+@pytest.mark.parametrize("hash_state", ["unavailable", "missing", "wrong_height", "wrong", "valid"])
+def test_both_stages_require_the_finalized_generation_hash(
+    tmp_path, monkeypatch, stage, hash_state,
+) -> None:
+    block_hash = "0x" + "ab" * 32
+    expected = {
+        "unavailable": None,
+        "missing": {},
+        "wrong_height": {102: block_hash},
+        "wrong": {101: "0x" + "cd" * 32},
+        "valid": {101: block_hash.upper()},
+    }[hash_state]
+    plan = SimpleNamespace(generation_block=101, block_hash=block_hash, plan_digest="12" * 32)
+    exact = SimpleNamespace(generated_block=101, seed_block_hash=block_hash, sha256="34" * 32)
+    batch = SimpleNamespace(plan=plan, exact=exact)
+    source = SimpleNamespace(exact_batch=lambda _id: exact, confirmation_batch=lambda _id: batch)
+    calls = []
+
+    def confirm(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            challenger_score=0.5, incumbent_score=0.5, gain_lower_bound=0.0,
+            challenger_cells=(1,),
+        )
+
+    evaluator = PairedTrackEvaluator(
+        track=SimpleNamespace(track_start_block=1, cache=cache_spec(), scoring=object()),
+        store=SimpleNamespace(stage_score=lambda *_a: SimpleNamespace(score_block=100)),
+        cache_dir=tmp_path, model_cache=tmp_path, initial_model_path=tmp_path / "unused",
+        champion_archive_url="unused", timeout_seconds=1,
+        seed_block_hashes=expected, batch_source=source,
+        confirmation_pool=SimpleNamespace(run=confirm),
+    )
+    monkeypatch.setattr(scoring_module, "_load_task_selector", lambda *_a: None)
+    task = replace(sample_task(), position=ChainPosition(100, 0, 0))
+
+    def run():
+        return evaluator._batch(task) if stage == "exact" else evaluator._confirm(task, task)
+
+    if hash_state == "valid":
+        outcome = run()
+        if stage == "exact":
+            assert outcome is exact
+        else:
+            assert outcome.score == 0.5
+        assert len(calls) == (1 if stage == "confirmation" else 0)
+    else:
+        with pytest.raises(TemporaryScoringError, match="finalized generation block") as caught:
+            run()
+        assert caught.value.code == (
+            "SCORING_CACHE_UNAVAILABLE" if stage == "exact" else "CONFIRMATION_BATCH_UNAVAILABLE"
+        )
+        assert calls == []
 
 
 def test_initial_champion_file_and_digest_are_verified(monkeypatch, tmp_path) -> None:
