@@ -187,14 +187,19 @@ downloaded model cache are disposable execution state: after loss, finalized cha
 verified published matches reconstruct completed work, and remaining submissions can be evaluated
 again.
 
-Private S3-compatible object storage is the durable source for unrevealed plans, the committed
-source pool, the artifact manifest, every runtime artifact, exact batches, validated selectors,
-admission refusals and
-recoverable scoring stages.
-Both production services verify conditional-write support before starting, seed missing immutable
-objects from a complete local runtime, and restore missing local bytes by committed size and SHA-256.
-Verified archives on an independent storage backend are required before GPU-local state is disposable;
-same-host storage alone does not establish recovery after loss of the GPU machine.
+Private S3-compatible object storage preserves unrevealed plans, the committed source pool and
+artifact manifest, validated selector archives, admission refusals, scoring stages and retry state.
+Both production services verify conditional-write support for these authoritative facts before
+starting. Fixed runtime assets are verified against the manifest and recovered from pinned upstream
+revisions or verified off-host copies; duplicating every recoverable asset is not a startup gate.
+
+Unrevealed videos, exact QKV, dense latents and selected per-batch inputs stay on the GPU in one
+content-addressed directory shared by producer and evaluator. They are not mirrored to private S3
+before scoring. After GPU loss, resume generation from the durable plan or record an interrupted
+attempt and reevaluate unfinished work on verifiable replacement data. Never reuse an old hash for
+different bytes, overwrite completed stage facts or published results, consume a Miner's chance,
+or change FIFO order because local data was lost. Upload the actual used data through the existing
+public disclosure paths only after its entire challenge group is terminal.
 
 The manifest must cover a restorable OCI image, the exact producer/scorer source bundle and its
 dependency lock. The source bundle is a ZIP whose `cli.py`, `miner/`, `scoring/`, `validator/` and
@@ -314,7 +319,8 @@ Policy generation refuses to overwrite an existing file; verification rejects ex
 This document check does not replace live credential denial probes against the target backend.
 The production configuration also uses a separate `evaluator_artifact_root`; it must be mounted
 without the producer artifact root, source-pool file, complete production/audit SampleCache, or
-producer work directory.
+producer work tree. Mount only the producer's `work_dir/content` subdirectory read-only at the same
+configured path in the evaluator, so it can read selected batch data without access to the full pool.
 
 Failure events are logged when `VEDA_ALERT_WEBHOOK_URL` is unset; no external notification service
 is required to start. To enable push notifications, configure it in both service environments as an
