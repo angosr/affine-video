@@ -1250,6 +1250,16 @@
           "path": "private/public-chunk-recovery-860-20261019/result.json",
           "sha256": "25cf4e32c805cbac9c80c9e7bcdb45f8ff5a0b219fa4afec1533831e22b0ebe6",
           "scope": "Actual frozen formal public S3 chunk publication, first-part lost-response resume without duplicate upload, no-local-source verification, anonymous complete-byte SHA and independent cleanup of three exact owned keys. Synthetic bytes, no hidden data or mutable pointers, not whole-batch/tournament acceptance."
+        },
+        {
+          "path": "private/candidate-b5f9712/archive-preservation-registration.json",
+          "sha256": "05efd74adf5fb948fe285c44f7317725646134bb3ce417df8851ef7e3a28ae5b",
+          "scope": "Preregistered 384MiB/30-minute standard rsync archive preservation, immutable donor and separate non-hardlinked destination; no custom storage protocol or GPU request."
+        },
+        {
+          "path": "private/candidate-b5f9712/archive-preservation.raw.log",
+          "sha256": "cc67782779b167e44c3736a423f45aa0772ee8423a200ce3dd4690eda1924f4f",
+          "scope": "Completed off-GPU copy of the actual historical C488 measured image: all17,418,646,528 bytes SHA-verified against GPU and tar config verified against OCI ID; donor unchanged. Rsync reused17,414,356,992 bytes and transferred4,289,536 literal bytes in344.08s. Unit exited0, no retry or formal mutation; not current-source acceptance, complete56-asset preservation or whole-host restore."
         }
       ],
       "release_blocker": false,
