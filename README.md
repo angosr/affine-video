@@ -288,7 +288,19 @@ uv run ruff check src tests
 uv run pytest
 ```
 
-Commit a Miner model reference with the wallet hotkey and wait for finalization:
+Prepare a Miner submission in this order. First bind the trained weights to the submitting hotkey,
+before uploading or choosing the repository revision:
+
+```bash
+uv run veda miner prepare \
+  --model trained.safetensors \
+  --output selector.safetensors \
+  --hotkey-address 5...
+```
+
+Upload the prepared `selector.safetensors` at the repository root and obtain that upload's complete
+40-character commit SHA. Do not change the file after choosing the revision. Then commit that
+repository and revision with the matching wallet hotkey and wait for finalization:
 
 ```bash
 uv run veda miner commit \
@@ -296,15 +308,6 @@ uv run veda miner commit \
   --revision 0123456789abcdef0123456789abcdef01234567 \
   --wallet-name default \
   --hotkey default
-```
-
-Before uploading, bind the only allowed metadata field to the submitting hotkey:
-
-```bash
-uv run veda miner prepare \
-  --model trained.safetensors \
-  --output selector.safetensors \
-  --hotkey-address 5...
 ```
 
 The ownership metadata is checked separately from the canonical tensor digest. Consequently,
