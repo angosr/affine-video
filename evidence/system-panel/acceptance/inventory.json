@@ -288,13 +288,83 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "声明的固定输入、FP32 predictor 和权重 schema 与实际 runtime 一致；无额外输入、可执行代码或隐藏状态；合法边界模型均在资源限制内执行",
-      "actual_values": null,
+      "actual_values": {
+        "input_track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "input_scope": "One historical16-video audit cache,384 cases; repeated calls do not add independent videos",
+        "legal_fp16_maximum": {
+          "weight_value": 65504.0,
+          "file_sha256": "896a6363958724afa46e33f9f40baf17418e9069a028d722d8f30c3f290598c1",
+          "model_digest": "f990fb6ddc5466e7f1621880330e57543c68f982bd868060352bc3f06d3d9bb9",
+          "tensor_count": 100,
+          "metadata_keys": ["hotkey"],
+          "formal_source_sha256": "3fdf7148a4da81119ee51b6557e2a08066c4ffdc69bdb759fd567e524ab0c025",
+          "candidate_source_sha256": "4dbf65f15395027e68ec4f3806e366d1ddc1fde0c7c7db84eb7c0f636f81db03",
+          "both_image_results_identical": true,
+          "score": 0.7554924686950942,
+          "incumbent_score": 0.9491625628902893,
+          "gain_lower_bound": -0.3020475285994256,
+          "following_baseline_score_delta": 0.0,
+          "children_remaining_after_each_call": 0,
+          "temporary_model_deleted": true,
+          "oom_killed": false,
+          "timeout_seconds_per_spawn": 300,
+          "automatic_retry": false
+        },
+        "candidate_exact_controls": {
+          "source_commit": "b5f9712",
+          "image_id": "sha256:c4884377fb18d6b9c456bff5ff4292cac05bee3521e87f37bfb13c173f9cb915",
+          "self_gain_lower_bound": 0.0,
+          "shuffled_negative_gain_lower_bound": -0.2561681043494346,
+          "baseline_positive_gain_lower_bound": 0.09963065729838526,
+          "original_report_scores_and_bounds_reproduced": true,
+          "formal_deployment_or_new_version_authorized": false
+        },
+        "conditional_logit_magnitude_proof": {
+          "finite_cached_inputs_and_weights_dtype": "float16",
+          "predictor_arithmetic_dtype": "float32",
+          "unscaled_logit_abs_bound": 3.4753901058388516e26,
+          "fp32_headroom_factor": 9.791198578451245e11,
+          "full_video_backbone_trajectories_bounded": false
+        },
+        "scope": "Actual installed formal/candidate spawned scorers plus a conservative arithmetic bound for fixed finite-FP16 cached inputs. Not every legal file, malformed parser input, full-video trajectory, live admission or queue recovery; no training or new sources."
+      },
       "id": "E6",
       "method": "用冻结 selector 的真实输入 trace、schema 负控和极值测试核验 TripPool/投影/Top k 的运行边界及开销，不训练或扩大模型结构",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "private/model-boundary-replay-20261019/registration.json",
+          "sha256": "717beac83e87fa4edefe2e2b9da86dc37d748febb52856194bdef2a5d05ce6f8",
+          "scope": "One frozen no-retry harness, two distinct actual images/lab GPUs, exact input/report/model identities and bounded real spawned scoring. Temporary constant weights are a fixed boundary fixture, not model training or a submission."
+        },
+        {
+          "path": "private/model-boundary-replay-20261019/result.json",
+          "sha256": "7763c11b3820cdf58ea11190c38fd90f148d287b4f98119836c04d5c4a493a05",
+          "scope": "All six scheduled paired calls succeed: formal/candidate maximum-FP16 and following baseline agree exactly; candidate also reproduces the original positive/negative bounds. Records all identities, actual peak process RSS, temporary-file removal and complete analysis harness. Not future data, full-video safety or final release acceptance."
+        },
+        {
+          "path": "private/model-boundary-replay-20261019/terminal-observation.json",
+          "sha256": "c6bfca21a8e254e938dc5318922d33a4deefc0c8ccf9bd459deddd45546ff450",
+          "scope": "Both original Docker IDs exit0/OOMfalse within1200s; complete result hashes match the off-GPU controller logs and all input mounts are read-only."
+        },
+        {
+          "path": "private/model-boundary-replay-20261019/live.raw.log",
+          "sha256": "1c32cf92164f7a18ba3c8b721b282516e065f526a2fd482304a44d50afaf3be8",
+          "scope": "Current formal3fdf/3749 image, legal550MB maximum-FP16 file, actual384-case evaluation and following baseline; no live queue or public writes."
+        },
+        {
+          "path": "private/model-boundary-replay-20261019/candidate.raw.log",
+          "sha256": "de2f816e8375312b21b76298b1a33bef547d2ac67458749e5fda3db6f7051aab",
+          "scope": "Actual installed4dbf/c488 candidate, same maximum-FP16 and baseline results plus fixed self/negative/positive paired controls. These identities cannot authorize source changes made after this run."
+        },
+        {
+          "path": "private/model-boundary-replay-20261019/fp16-logit-bound.json",
+          "sha256": "d0e81a438abdc41e9373096ae7648a4d88089ddf699d212b1885a3d311eb00b8",
+          "scope": "Decimal derivation using conservative FP32 rounding bounds and exact numeric-source byte comparisons against both frozen bundles. Excludes logit overflow only under the stated finite-FP16 cached-input/weight assumptions; not full-video or resource-safety acceptance."
+        }
+      ],
       "release_blocker": false,
-      "status": "not_final_runtime_verified",
+      "status": "legal_fp16_boundary_and_candidate_exact_replay_verified_full_runtime_pending",
       "subject": "固定选块器结构与输入边界"
     },
     {

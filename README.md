@@ -297,9 +297,11 @@ copying public weights and changing their hotkey still produces the same duplica
 The production netuid defaults to `120` and the network defaults to `finney`; both can be overridden.
 Because only the hotkey's first commitment is eligible, the command sends exactly one transaction
 and never retries it. Add `--dry-run` to validate the fields and inspect the encoded payload without
-opening a chain connection. The model revision may be private at commit time. Anonymous access
-must work when FIFO admission reaches it after the grace period; keep the fixed revision and model
-file public until admission finishes and its durable archive is confirmed by the `SCORING` state.
+opening a chain connection. To prevent another hotkey copying and committing your tensors first,
+keep the repository private until your commitment finalizes. Then make the pinned revision
+anonymously readable before FIFO admission reaches it after the grace period. Keep the fixed
+revision and model file public until admission finishes and its durable archive is confirmed by
+the `SCORING` state. Hotkey metadata alone does not establish who created public weights first.
 
 Run the evaluator:
 
