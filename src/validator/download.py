@@ -351,26 +351,45 @@ def download_public_model(
     try:
         declared_size = sibling.size
         lfs = sibling.lfs
+        blob_id = getattr(sibling, "blob_id", None)
     except AttributeError as exc:
         raise ModelDownloadError(
             "DOWNLOAD_TEMPORARY_FAILURE",
             "Hugging Face returned invalid model file metadata",
             temporary=True,
         ) from exc
-    if declared_size is None and lfs is not None:
-        if not isinstance(lfs, Mapping):
-            raise ModelDownloadError(
-                "DOWNLOAD_TEMPORARY_FAILURE",
-                "Hugging Face returned invalid model file metadata",
-                temporary=True,
-            )
-        declared_size = lfs.get("size")
     if declared_size is not None and (type(declared_size) is not int or declared_size < 0):
         raise ModelDownloadError(
             "DOWNLOAD_TEMPORARY_FAILURE",
             "Hugging Face returned invalid model size metadata",
             temporary=True,
         )
+    expected_sha256 = None
+    expected_blob_id = None
+    if lfs is not None:
+        if (
+            not isinstance(lfs, Mapping)
+            or not isinstance(lfs.get("sha256"), str)
+            or not _DIGEST.fullmatch(lfs["sha256"])
+            or type(lfs.get("size")) is not int
+            or lfs["size"] < 0
+            or (declared_size is not None and declared_size != lfs["size"])
+        ):
+            raise ModelDownloadError(
+                "DOWNLOAD_TEMPORARY_FAILURE",
+                "Hugging Face returned invalid model file metadata",
+                temporary=True,
+            )
+        declared_size = lfs["size"]
+        expected_sha256 = lfs["sha256"]
+    else:
+        if not isinstance(blob_id, str) or re.fullmatch(r"[0-9a-f]{40}", blob_id) is None:
+            raise ModelDownloadError(
+                "DOWNLOAD_TEMPORARY_FAILURE",
+                "Hugging Face returned invalid model file metadata",
+                temporary=True,
+            )
+        expected_blob_id = blob_id
     if declared_size is not None and declared_size > max_bytes:
         raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
 
@@ -427,6 +446,24 @@ def download_public_model(
         output = None
 
         file_sha256 = digest.hexdigest()
+        if expected_sha256 is not None and file_sha256 != expected_sha256:
+            raise ModelDownloadError(
+                "DOWNLOAD_TEMPORARY_FAILURE",
+                "downloaded model does not match the pinned LFS SHA-256",
+                temporary=True,
+            )
+        if expected_blob_id is not None:
+            blob_digest = hashlib.sha1(f"blob {received}\0".encode(), usedforsecurity=False)
+            with temporary.open("rb") as downloaded_file:
+                actual_blob_id = hashlib.file_digest(
+                    downloaded_file, lambda: blob_digest,
+                ).hexdigest()
+            if actual_blob_id != expected_blob_id:
+                raise ModelDownloadError(
+                    "DOWNLOAD_TEMPORARY_FAILURE",
+                    "downloaded model does not match the pinned Git blob",
+                    temporary=True,
+                )
         target = cache / f"{file_sha256}.safetensors"
         if target.exists() and _sha256(target) == file_sha256:
             temporary.unlink()

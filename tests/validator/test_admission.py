@@ -5,6 +5,7 @@ import time
 from dataclasses import replace
 from types import SimpleNamespace
 
+import httpx
 import numpy as np
 import pytest
 from safetensors.numpy import save_file
@@ -1199,6 +1200,7 @@ def test_disk_full_during_download_preparation_uses_durable_retry_ceiling(
                 rfilename="selector.safetensors",
                 size=6,
                 lfs=None,
+                blob_id=hashlib.sha1(b"blob 6\0abcdef", usedforsecurity=False).hexdigest(),
             )
             return SimpleNamespace(siblings=[sibling], sha="12" * 20)
 
@@ -1272,3 +1274,51 @@ def test_permanent_download_failure_records_no_authoritative_score(tmp_path) -> 
         assert challenge.final_score is None
         assert challenge.score_block == 10_000
         assert store.leaderboard() == []
+
+
+@pytest.mark.parametrize("metadata_type", ("lfs", "git"))
+def test_pinned_content_mismatch_retries_and_preserves_same_admission(
+    tmp_path, metadata_type,
+) -> None:
+    model = tmp_path / "expected.safetensors"
+    write_model(model, "hk1")
+    payload = model.read_bytes()
+    corrupt = bytes([payload[0] ^ 1]) + payload[1:]
+    item = SimpleNamespace(rfilename="selector.safetensors", size=len(payload), lfs=None)
+    if metadata_type == "lfs":
+        item.lfs = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+    else:
+        header = f"blob {len(payload)}\0".encode()
+        item.blob_id = hashlib.sha1(header + payload, usedforsecurity=False).hexdigest()
+    api = SimpleNamespace(
+        model_info=lambda *_args, **_kwargs: SimpleNamespace(siblings=[item], sha="12" * 20),
+    )
+    actual = [corrupt]
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, content=actual[0]),
+    )
+    with httpx.Client(transport=transport) as client:
+        def downloader(repo_id, revision, **kwargs):
+            return download_module.download_public_model(
+                repo_id, revision, api=api, http_client=client, **kwargs,
+            )
+
+        with ChallengeStore(tmp_path / "content-binding.db") as store:
+            identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+            failed = process_next_admission(
+                store, worker_id="admission", settings=settings(tmp_path),
+                current_finalized_block=10_000, now_ms=100, downloader=downloader,
+            )
+            assert failed.status is AdmissionStatus.DEFERRED
+            challenge = store.get_challenge(identifier)
+            assert challenge.state is ChallengeState.SYSTEM_DEFERRED
+            assert challenge.final_score is None and challenge.score_block is None
+            assert not list((tmp_path / "cache").iterdir())
+            actual[0] = payload
+            restored = process_next_admission(
+                store, worker_id="admission", settings=settings(tmp_path),
+                current_finalized_block=10_000, now_ms=30_100, downloader=downloader,
+            )
+            assert restored.challenge_id == identifier
+            assert restored.status is AdmissionStatus.ACCEPTED
+            assert store.get_challenge(identifier).state is ChallengeState.SCORING

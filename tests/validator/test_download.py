@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+from huggingface_hub.hf_api import BlobLfsInfo
 
 from validator import chunks
 from validator import download as download_module
@@ -99,7 +100,10 @@ class AssetClient:
 
 
 def sibling(*, size: int | None):
-    return SimpleNamespace(rfilename="selector.safetensors", size=size, lfs=None)
+    return SimpleNamespace(
+        rfilename="selector.safetensors", size=size, lfs=None,
+        blob_id=hashlib.sha1(b"blob 6\0abcdef", usedforsecurity=False).hexdigest(),
+    )
 
 
 def test_chunked_public_asset_is_reassembled_and_fully_verified(tmp_path) -> None:
@@ -518,6 +522,86 @@ def test_revision_resolution_must_match_submitted_commit(tmp_path) -> None:
 
     assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
     assert caught.value.temporary is True
+
+
+@pytest.mark.parametrize("metadata_type", ("lfs-dict", "lfs-sdk", "git", "git-unknown-size"))
+@pytest.mark.parametrize("matching", (True, False))
+def test_downloaded_bytes_must_match_pinned_revision_file_digest(
+    tmp_path, metadata_type, matching,
+) -> None:
+    payload = b"abcdef" if matching else b"ABCDEF"
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    item = sibling(size=None if metadata_type == "git-unknown-size" else 6)
+    if metadata_type.startswith("lfs"):
+        values = {"size": 6, "sha256": expected_sha256, "pointer_size": 128}
+        item.lfs = BlobLfsInfo(**values) if metadata_type == "lfs-sdk" else values
+    else:
+        item.blob_id = hashlib.sha1(b"blob 6\0" + payload, usedforsecurity=False).hexdigest()
+    arguments = dict(
+        cache_dir=tmp_path, max_bytes=10,
+        api=FakeApi([item]), http_client=FakeClient(),
+    )
+    if matching:
+        downloaded = download_public_model("owner/model", "12" * 20, **arguments)
+        assert downloaded.path.read_bytes() == payload
+        assert downloaded.file_sha256 == expected_sha256
+    else:
+        with pytest.raises(ModelDownloadError) as caught:
+            download_public_model("owner/model", "12" * 20, **arguments)
+        assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
+        assert caught.value.temporary is True
+        assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("declared_size", (None, 6))
+@pytest.mark.parametrize(
+    "lfs",
+    (
+        "bad", {}, {"size": 6}, {"size": 6, "sha256": "bad"},
+        {"size": True, "sha256": "ab" * 32},
+        {"size": -1, "sha256": "ab" * 32},
+        {"size": "6", "sha256": "ab" * 32},
+    ),
+)
+def test_invalid_lfs_binding_is_temporary_before_download(tmp_path, declared_size, lfs) -> None:
+    item = sibling(size=declared_size)
+    item.lfs = lfs
+    client = FakeClient()
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model", "12" * 20, cache_dir=tmp_path, max_bytes=10,
+            api=FakeApi([item]), http_client=client,
+        )
+    assert caught.value.temporary is True
+    assert client.called is False
+    assert not list(tmp_path.iterdir())
+
+
+def test_conflicting_lfs_size_is_temporary_before_download(tmp_path) -> None:
+    item = sibling(size=7)
+    item.lfs = {"size": 6, "sha256": hashlib.sha256(b"abcdef").hexdigest()}
+    client = FakeClient()
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model", "12" * 20, cache_dir=tmp_path, max_bytes=10,
+            api=FakeApi([item]), http_client=client,
+        )
+    assert caught.value.temporary is True
+    assert client.called is False
+
+
+@pytest.mark.parametrize("blob_id", (None, 123, "invalid", "ab" * 19, "ab" * 21))
+def test_invalid_git_blob_binding_is_temporary_before_download(tmp_path, blob_id) -> None:
+    item = sibling(size=6)
+    item.blob_id = blob_id
+    client = FakeClient()
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model", "12" * 20, cache_dir=tmp_path, max_bytes=10,
+            api=FakeApi([item]), http_client=client,
+        )
+    assert caught.value.temporary is True
+    assert client.called is False
 
 
 def test_truncated_download_is_temporary_instead_of_participant_failure(tmp_path) -> None:
