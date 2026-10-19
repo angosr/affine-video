@@ -136,8 +136,8 @@ directly comparable; promotion uses the paired comparison with the incumbent.
 ## Watch the competition
 
 ```bash
-uv run veda validator monitor
-uv run veda validator monitor --watch 30
+uv run veda monitor
+uv run veda monitor --watch 30
 ```
 
 The read-only CLI shows UIDs, hotkey prefixes, champion, queue positions, match numbers, scores,
@@ -162,8 +162,10 @@ can consume the same file; do not run a second weight-setting process for the sa
 
 Code boundaries are [`miner`](src/miner) (one-shot submission), [`scoring`](src/scoring)
 (selector validation and metrics), and [`validator`](src/validator) (evaluation, publication
-and independent weight setting). The evaluator and data producer run separately; miners and
-ordinary validators do not run them.
+and independent weight setting). Public viewing uses `veda monitor`; evaluator-only operations
+use `veda evaluator run`, `produce`, `policy`, `retry`, `leaderboard`, `challenges` and `challenge`
+(see `uv run veda evaluator --help`). The evaluator and data producer run separately; miners
+and ordinary validators do not run them.
 
 ```bash
 uv run ruff check src tests

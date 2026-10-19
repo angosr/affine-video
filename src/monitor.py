@@ -1,4 +1,4 @@
-"""Read-only terminal monitor for the public competition status."""
+"""Read-only public competition viewer, independent of participant roles."""
 
 from __future__ import annotations
 

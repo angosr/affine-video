@@ -28,7 +28,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/miner", "src/validator", "src/scoring", "src/cli.py"]
+packages = ["src/miner", "src/validator", "src/scoring", "src/cli.py", "src/monitor.py"]
 
 [tool.pytest.ini_options]
 addopts = "-q --import-mode=importlib"

@@ -1,6 +1,6 @@
 import pytest
 
-from validator.monitor import render_status
+from monitor import render_status
 
 
 def test_monitor_renders_all_active_competitors_in_uid_order() -> None:

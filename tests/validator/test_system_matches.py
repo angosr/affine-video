@@ -11,10 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from monitor import render_status
 from scoring.spec import parse_track_spec, track_spec_dict
 from tests.scoring.test_spec import valid_spec
 from validator import system_matches as matches
-from validator.monitor import render_status
 from validator.production.commitment import Artifact, ArtifactManifest
 from validator.publication import (
     PublicArtifactError,

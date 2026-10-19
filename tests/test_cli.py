@@ -9,6 +9,89 @@ from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
 
 
+def test_public_monitor_needs_no_miner_or_validator_setup(monkeypatch, capsys) -> None:
+    calls = []
+
+    async def fetch(url, *, client):
+        calls.append(url)
+        return {
+            "netuid": 120,
+            "source_block": 12345,
+            "track_phase": "ACCEPTING",
+            "participants": [],
+        }
+
+    def unexpected_role(*_args):
+        raise AssertionError("public monitor entered a participant role")
+
+    monkeypatch.setattr(cli_module, "fetch_status", fetch)
+    monkeypatch.setattr(cli_module, "_run_miner", unexpected_role)
+    monkeypatch.setattr(cli_module, "_run_validator", unexpected_role)
+    monkeypatch.setattr(cli_module, "_run_evaluator", unexpected_role)
+
+    main(["monitor"])
+
+    assert calls == [cli_module.DEFAULT_PUBLIC_STATUS_URL]
+    assert "ACCEPTING" in capsys.readouterr().out
+
+
+def test_public_monitor_watch_and_custom_url(monkeypatch, capsys) -> None:
+    calls = []
+
+    async def fetch(url, *, client):
+        calls.append(url)
+        return {"netuid": 120, "participants": []}
+
+    async def stop_after_refresh(interval):
+        assert interval == 30
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_module, "fetch_status", fetch)
+    monkeypatch.setattr(cli_module.asyncio, "sleep", stop_after_refresh)
+
+    main(["monitor", "--status-url", "https://example.com/status.json", "--watch", "30"])
+
+    assert calls == ["https://example.com/status.json"]
+    assert "No participants yet" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("interval", ["0", "-1", "nan", "inf"])
+def test_public_monitor_rejects_nonpositive_watch_before_fetch(monkeypatch, capsys, interval):
+    async def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("invalid interval opened a status request")
+
+    monkeypatch.setattr(cli_module, "fetch_status", unexpected_fetch)
+    with pytest.raises(SystemExit) as stopped:
+        main(["monitor", "--watch", interval])
+
+    assert stopped.value.code == 1
+    assert "watch interval must be positive" in capsys.readouterr().err
+
+
+def test_public_monitor_reports_fetch_errors(monkeypatch, capsys):
+    async def unavailable(*_args, **_kwargs):
+        raise RuntimeError("public status could not be fetched")
+
+    monkeypatch.setattr(cli_module, "fetch_status", unavailable)
+    with pytest.raises(SystemExit) as stopped:
+        main(["monitor"])
+
+    assert stopped.value.code == 1
+    assert "public status could not be fetched" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "command", ["monitor", "evaluate", "produce", "evaluator-policy", "retry",
+                "leaderboard", "challenges", "challenge"],
+)
+def test_validator_does_not_expose_public_or_evaluator_commands(capsys, command):
+    with pytest.raises(SystemExit) as stopped:
+        main(["validator", command])
+
+    assert stopped.value.code == 2
+    assert f"invalid choice: '{command}'" in capsys.readouterr().err
+
+
 def test_miner_dry_run_does_not_open_chain(monkeypatch, capsys) -> None:
     async def unexpected_submit(*_args, **_kwargs):
         raise AssertionError("dry-run opened the chain")
@@ -135,8 +218,8 @@ def test_removed_miner_submit_command_is_rejected(capsys) -> None:
 def test_formal_evaluator_defaults_to_cuda_zero() -> None:
     arguments = cli_module._parser().parse_args(
         [
-            "validator",
-            "evaluate",
+            "evaluator",
+            "run",
             "--track-spec",
             "track.json",
             "--database",
@@ -153,7 +236,7 @@ def test_formal_evaluator_defaults_to_cuda_zero() -> None:
     assert arguments.scoring_device == "cuda:0"
 
 
-def test_validator_challenges_reads_local_database(tmp_path, capsys) -> None:
+def test_evaluator_challenges_reads_local_database(tmp_path, capsys) -> None:
     database = tmp_path / "validator.db"
     position = ChainPosition(100, 0, 0)
     block_hash = "0x" + "ab" * 32
@@ -172,25 +255,25 @@ def test_validator_challenges_reads_local_database(tmp_path, capsys) -> None:
             occurred_at_ms=10,
         )
 
-    main(["validator", "challenges", "--database", str(database)])
+    main(["evaluator", "challenges", "--database", str(database)])
 
     output = json.loads(capsys.readouterr().out)
     assert output[0]["repo_id"] == "owner/model"
     assert output[0]["state"] == "QUEUED"
 
 
-def test_validator_query_does_not_create_a_missing_database(tmp_path, capsys) -> None:
+def test_evaluator_query_does_not_create_a_missing_database(tmp_path, capsys) -> None:
     database = tmp_path / "missing.db"
 
     with pytest.raises(SystemExit) as stopped:
-        main(["validator", "leaderboard", "--database", str(database)])
+        main(["evaluator", "leaderboard", "--database", str(database)])
 
     assert stopped.value.code == 1
     assert "does not exist" in capsys.readouterr().err
     assert not database.exists()
 
 
-def test_validator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch, capsys) -> None:
+def test_evaluator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch, capsys) -> None:
     from validator.production import config as config_module
     from validator.production import retries as retries_module
     from validator.production import storage as storage_module
@@ -255,7 +338,7 @@ def test_validator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch,
 
     main(
         [
-            "validator",
+            "evaluator",
             "retry",
             "challenge-1",
             "--database",
@@ -286,8 +369,8 @@ def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_p
     )
     main(
         [
-            "validator",
-            "evaluate",
+            "evaluator",
+            "run",
             "--track-spec",
             str(tmp_path / "track.json"),
             "--database",
@@ -346,11 +429,30 @@ def test_validator_run_needs_no_track_or_storage_configuration(monkeypatch) -> N
     assert called["once"] is True
 
 
+def test_evaluator_produce_forwards_config_without_validator_setup(monkeypatch):
+    from validator.production import service
+
+    called = {}
+
+    def produce(config, *, once):
+        called.update(config=config, once=once)
+
+    def unexpected_validator(*_args):
+        raise AssertionError("producer entered validator weight setting")
+
+    monkeypatch.setattr(service, "run_producer", produce)
+    monkeypatch.setattr(cli_module, "_run_validator", unexpected_validator)
+
+    main(["evaluator", "produce", "--config", "production.json", "--once"])
+
+    assert called == {"config": "production.json", "once": True}
+
+
 def test_evaluator_policy_cli_roundtrip_and_fail_closed(tmp_path):
     from validator.production.storage import evaluator_iam_policy
 
     path = tmp_path / "evaluator.json"
-    args = ["validator", "evaluator-policy", "--bucket", "private", "--prefix", "test/track"]
+    args = ["evaluator", "policy", "--bucket", "private", "--prefix", "test/track"]
     main([*args, "--write", str(path)])
     original = path.read_bytes()
     assert json.loads(original) == evaluator_iam_policy(bucket="private", prefix="test/track")

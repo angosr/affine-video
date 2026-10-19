@@ -8,6 +8,16 @@ from validator.production import environment
 from validator.production.commitment import canonical_json
 
 
+def test_public_monitor_is_included_in_the_frozen_source(monkeypatch):
+    assert "monitor" in environment._SOURCE_MODULES
+    monkeypatch.setattr(environment, "_SOURCE_MODULES", ("monitor",))
+
+    sources = environment._active_source_files()
+
+    assert set(sources) == {"monitor.py"}
+    assert sources["monitor.py"].is_file()
+
+
 def test_source_bundle_detects_active_source_changes(tmp_path) -> None:
     source = tmp_path / "active" / "example.py"
     source.parent.mkdir()
@@ -52,7 +62,7 @@ def test_source_bundle_builder_is_deterministic(tmp_path, monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("name", [
-    "cli.py", "miner/submit.py", "scoring/exact.py", "validator/system_matches.py",
+    "cli.py", "monitor.py", "miner/submit.py", "scoring/exact.py", "validator/system_matches.py",
     "validator/release.py", "miowtion/runtime.py",
 ])
 def test_evaluation_source_digest_and_bundle_bind_every_runtime_source(

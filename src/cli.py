@@ -1,4 +1,4 @@
-"""Command-line entry point for the three Veda modules."""
+"""Public competition tools and miner/validator command-line entry points."""
 
 from __future__ import annotations
 
@@ -8,13 +8,14 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from math import isfinite
 from pathlib import Path
 
 from miner.chain import ChainSubmissionError, submit_model
 from miner.prepare import prepare_model
 from miner.submit import ModelSubmission, SubmissionFormatError
+from monitor import fetch_status, render_status
 from scoring.spec import load_track_spec
-from validator.monitor import fetch_status, render_status
 from validator.publication import S3Repository
 from validator.retries import retry_stage
 from validator.run import (
@@ -36,6 +37,15 @@ DEFAULT_PUBLIC_STATUS_URL = DEFAULT_PUBLIC_WEIGHTS_URL.removesuffix("weights.jso
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="veda")
     modules = parser.add_subparsers(dest="module", required=True)
+
+    monitor = modules.add_parser("monitor", help="watch the public ranking and queue")
+    monitor.add_argument("--status-url", default=DEFAULT_PUBLIC_STATUS_URL)
+    monitor.add_argument(
+        "--watch",
+        metavar="SECONDS",
+        type=float,
+        help="refresh continuously at this positive interval",
+    )
 
     miner = modules.add_parser("miner", help="commit a pinned model reference")
     miner_commands = miner.add_subparsers(dest="command", required=True)
@@ -62,43 +72,34 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--hotkey-address", required=True)
 
-    validator = modules.add_parser("validator", help="evaluate models or set chain weights")
-    validator_commands = validator.add_subparsers(dest="command", required=True)
-    produce = validator_commands.add_parser("produce", help="produce private evaluation batches")
+    evaluator = modules.add_parser("evaluator", help="operate evaluation and data production")
+    evaluator_commands = evaluator.add_subparsers(dest="command", required=True)
+    produce = evaluator_commands.add_parser("produce", help="produce private evaluation batches")
     produce.add_argument("--config", required=True)
     produce.add_argument("--once", action="store_true")
-    policy = validator_commands.add_parser(
-        "evaluator-policy", help="generate or verify the evaluator storage IAM contract"
+    policy = evaluator_commands.add_parser(
+        "policy", help="generate or verify the evaluator storage IAM contract"
     )
     policy.add_argument("--bucket", required=True)
     policy.add_argument("--prefix", required=True)
     policy_action = policy.add_mutually_exclusive_group(required=True)
     policy_action.add_argument("--write", type=Path)
     policy_action.add_argument("--verify", type=Path)
-    leaderboard = validator_commands.add_parser("leaderboard")
+    leaderboard = evaluator_commands.add_parser("leaderboard", help="inspect local rankings")
     leaderboard.add_argument("--database", required=True)
-    challenges = validator_commands.add_parser("challenges")
+    challenges = evaluator_commands.add_parser("challenges", help="inspect local challenges")
     challenges.add_argument("--database", required=True)
-    challenge = validator_commands.add_parser("challenge")
+    challenge = evaluator_commands.add_parser("challenge", help="inspect one local challenge")
     challenge.add_argument("challenge_id")
     challenge.add_argument("--database", required=True)
-    retry = validator_commands.add_parser(
+    retry = evaluator_commands.add_parser(
         "retry", help="resume one challenge stopped after infrastructure retries"
     )
     retry.add_argument("challenge_id")
     retry.add_argument("--database", required=True)
     retry.add_argument("--production-config", required=True)
-    monitor = validator_commands.add_parser("monitor", help="watch the public ranking and queue")
-    monitor.add_argument("--status-url", default=DEFAULT_PUBLIC_STATUS_URL)
-    monitor.add_argument(
-        "--watch",
-        metavar="SECONDS",
-        type=float,
-        help="refresh continuously at this positive interval",
-    )
-
-    evaluate = validator_commands.add_parser(
-        "evaluate", help="evaluate submissions and publish public artifacts"
+    evaluate = evaluator_commands.add_parser(
+        "run", help="evaluate submissions and publish public artifacts"
     )
     evaluate.add_argument("--track-spec", required=True)
     evaluate.add_argument("--database", required=True)
@@ -132,6 +133,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument("--once", action="store_true")
 
+    validator = modules.add_parser("validator", help="apply public weights on-chain")
+    validator_commands = validator.add_subparsers(dest="command", required=True)
     run = validator_commands.add_parser("run", help="fetch public weights and submit them on-chain")
     run.add_argument("--public-weights-url", default=DEFAULT_PUBLIC_WEIGHTS_URL)
     run.add_argument("--network", default="finney")
@@ -147,8 +150,19 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     arguments = parser.parse_args(argv)
+    if arguments.module == "monitor":
+        try:
+            asyncio.run(_run_monitor(arguments.status_url, arguments.watch))
+        except KeyboardInterrupt:
+            return
+        except (RuntimeError, ValueError) as exc:
+            parser.exit(1, f"error: {exc}\n")
+        return
     if arguments.module == "validator":
         _run_validator(parser, arguments)
+        return
+    if arguments.module == "evaluator":
+        _run_evaluator(parser, arguments)
         return
     _run_miner(parser, arguments)
 
@@ -214,8 +228,8 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
     print(json.dumps(output, sort_keys=True))
 
 
-def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
-    if arguments.command == "evaluator-policy":
+def _run_evaluator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
+    if arguments.command == "policy":
         from validator.production.commitment import canonical_json
         from validator.production.storage import evaluator_iam_policy, verify_evaluator_iam_policy
 
@@ -277,16 +291,7 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
         )
         return
 
-    if arguments.command == "monitor":
-        try:
-            asyncio.run(_run_monitor(arguments.status_url, arguments.watch))
-        except KeyboardInterrupt:
-            return
-        except (RuntimeError, ValueError) as exc:
-            parser.exit(1, f"error: {exc}\n")
-        return
-
-    if arguments.command == "evaluate":
+    if arguments.command == "run":
         publisher = None
         try:
             publisher = S3Repository.from_environment(
@@ -328,30 +333,9 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
                 close()
         return
 
-    if arguments.command == "run":
-        try:
-            asyncio.run(
-                run_validator(
-                    public_weights_url=arguments.public_weights_url,
-                    network=arguments.network,
-                    wallet_name=arguments.wallet_name,
-                    hotkey_name=arguments.hotkey,
-                    wallet_path=arguments.wallet_path,
-                    poll_seconds=arguments.poll_seconds,
-                    max_staleness_blocks=arguments.max_staleness_blocks,
-                    once=arguments.once,
-                    report=_print_weight_cycle,
-                )
-            )
-        except KeyboardInterrupt:
-            return
-        except (RuntimeError, OSError, ValueError) as exc:
-            parser.exit(1, f"error: {exc}\n")
-        return
-
     database = Path(arguments.database)
     if not database.is_file():
-        parser.exit(1, f"error: validator database does not exist: {database}\n")
+        parser.exit(1, f"error: evaluator database does not exist: {database}\n")
     try:
         with ChallengeStore(database) as store:
             if arguments.command == "leaderboard":
@@ -365,8 +349,29 @@ def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
     print(json.dumps(output, sort_keys=True, ensure_ascii=False))
 
 
+def _run_validator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
+    try:
+        asyncio.run(
+            run_validator(
+                public_weights_url=arguments.public_weights_url,
+                network=arguments.network,
+                wallet_name=arguments.wallet_name,
+                hotkey_name=arguments.hotkey,
+                wallet_path=arguments.wallet_path,
+                poll_seconds=arguments.poll_seconds,
+                max_staleness_blocks=arguments.max_staleness_blocks,
+                once=arguments.once,
+                report=_print_weight_cycle,
+            )
+        )
+    except KeyboardInterrupt:
+        return
+    except (RuntimeError, OSError, ValueError) as exc:
+        parser.exit(1, f"error: {exc}\n")
+
+
 async def _run_monitor(url: str, interval: float | None) -> None:
-    if interval is not None and interval <= 0:
+    if interval is not None and (not isfinite(interval) or interval <= 0):
         raise ValueError("watch interval must be positive")
     import httpx
 

@@ -16,7 +16,7 @@ from typing import Any
 
 from validator.production.commitment import canonical_json, decode_canonical_json
 
-_SOURCE_MODULES = ("cli", "miner", "scoring", "validator", "miowtion")
+_SOURCE_MODULES = ("cli", "monitor", "miner", "scoring", "validator", "miowtion")
 _DISTRIBUTION_NAME = re.compile(r"[-_.]+")
 
 
