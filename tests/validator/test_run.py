@@ -325,14 +325,16 @@ def test_worker_setup_failure_alerts_and_does_not_poison_next_task(pending_evalu
     asyncio.run(execute())
 
 
+@pytest.mark.parametrize("benchmark_refresh", ["normal", "slow", "error"])
 def test_evaluator_loop_publishes_while_worker_owns_its_connection(
-    pending_evaluation, monkeypatch, tmp_path,
+    pending_evaluation, monkeypatch, tmp_path, benchmark_refresh,
 ):
     case = pending_evaluation
     entered, release = threading.Event(), threading.Event()
     admission_gate = threading.Event()
     calls, reports, failures = [], [], []
     snapshots = []
+    benchmark_calls = []
     original_admission = run_module.process_next_admission
     original_scoring = run_module.evaluate_next_scoring
     owner = threading.get_ident()
@@ -350,11 +352,21 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     client = Client(case.client._substrate.blocks)
     client._finalized = 102
 
+    if benchmark_refresh != "normal":
+        async def load_benchmarks(_track, _manifest):
+            benchmark_calls.append(benchmark_refresh)
+            if benchmark_refresh == "error":
+                raise OSError("informational benchmark read unavailable")
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(case.publisher, "load_system_matches", load_benchmarks)
+
     async def no_seed(*_args, **_kwargs):
         pass
 
-    async def chain_state(_client, *, netuid, finalized_block):
+    async def chain_state(_client, *, netuid, mechid, finalized_block):
         assert netuid == case.track.netuid
+        assert mechid == case.track.mechid
         return WeightChainState(
             finalized_block=finalized_block,
             uid_by_hotkey={case.track.initial_champion.hotkey: 0, HOTKEY: 1},
@@ -450,6 +462,8 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     assert not failures
     assert len(calls) == 1
     assert len(reports) == 3
+    if benchmark_refresh != "normal":
+        assert benchmark_calls == [benchmark_refresh]
     first_height = [payload for height, payload in snapshots if height == 102]
     assert len(first_height) >= 2 and len(set(first_height)) == 1
     assert next(
@@ -646,7 +660,8 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     async def no_seed(*_args, **_kwargs):
         pass
 
-    async def chain_state(_client, *, netuid, finalized_block):
+    async def chain_state(_client, *, netuid, mechid, finalized_block):
+        assert mechid == case.track.mechid
         return WeightChainState(
             finalized_block, {case.track.initial_champion.hotkey: 0, HOTKEY: 1,
                               "second-hotkey": 2}, 1, 1.0, 1, {},
@@ -888,7 +903,8 @@ def test_ledger_outage_scanning_reserves_uid0_and_recovers_from_chain_failure(
     async def no_seed(*_args, **_kwargs):
         pass
 
-    async def chain_state(_client, *, netuid, finalized_block):
+    async def chain_state(_client, *, netuid, mechid, finalized_block):
+        assert mechid == track.mechid
         return WeightChainState(
             finalized_block=finalized_block, uid_by_hotkey={HOTKEY: 0},
             min_allowed_weights=1, max_weight=1.0, weights_rate_limit=1,
@@ -1094,8 +1110,9 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
     )
     submitted = {}
 
-    async def read_state(_client, *, netuid: int):
+    async def read_state(_client, *, netuid: int, mechid: int):
         assert netuid == 120
+        assert mechid == 1
         return chain
 
     async def submit(plan, **kwargs):

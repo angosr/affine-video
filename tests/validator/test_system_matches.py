@@ -1,3 +1,6 @@
+"""CPU mechanism fixtures only; no recorded GPU scores are shipped with runtime code."""
+
+import asyncio
 import hashlib
 import json
 from copy import deepcopy
@@ -8,602 +11,399 @@ from types import SimpleNamespace
 
 import pytest
 
-from scoring.spec import load_track_spec
-from validator import publication as publication_module
-from validator import system_matches as system_matches_module
+from scoring.spec import parse_track_spec, track_spec_dict
+from tests.scoring.test_spec import valid_spec
+from validator import system_matches as matches
+from validator.monitor import render_status
 from validator.production.commitment import Artifact, ArtifactManifest
-from validator.release import PRODUCTION_NETUID, PRODUCTION_TRACK_ID
-from validator.system_matches import system_match_artifacts, system_match_summaries
+from validator.publication import (
+    PublicArtifactError,
+    S3Repository,
+    build_genesis_artifacts,
+    decode_weight_artifact,
+)
 from validator.weights import WeightChainState
 
+from .test_publication import MemoryS3
 
-def _runtime_manifest(
-    *,
-    asset_sha256: str = "ab" * 32,
-    package_sha256: str = "cd" * 32,
-    evidence_sha256: str | None = None,
-    evidence_name: str = "evidence/system-panel/raw.json",
-) -> bytes:
-    artifacts = [
-        Artifact("runtime/source.zip", package_sha256, 10, "artifacts/" + package_sha256),
-        Artifact(
-            "weights/predictor.safetensors",
-            asset_sha256,
-            20,
-            "artifacts/" + asset_sha256,
-        ),
-    ]
-    if evidence_sha256 is not None:
-        artifacts.append(
-            Artifact(
-                evidence_name,
-                evidence_sha256,
-                30,
-                "artifacts/" + evidence_sha256,
+
+@pytest.fixture
+def benchmark(monkeypatch):
+    """One fixed synthetic record, never a measured model or pending release."""
+
+    calls = {"source": 0, "environment": 0}
+
+    @lru_cache(maxsize=1)
+    def source():
+        calls["source"] += 1
+        return "41" * 32
+
+    @lru_cache(maxsize=1)
+    def environment():
+        calls["environment"] += 1
+        return "42" * 32
+
+    monkeypatch.setattr(matches, "evaluation_source_digest", source)
+    monkeypatch.setattr(matches, "evaluation_environment_digest", environment)
+    matches._evidence_runtime_digest.cache_clear()
+    manifest = ArtifactManifest(
+        tuple(
+            sorted(
+                (
+                    Artifact("runtime/source.zip", "51" * 32, 10, "artifacts/source"),
+                    Artifact("weights/reference", "11" * 32, 100, "artifacts/reference"),
+                    Artifact("weights/control", "21" * 32, 100, "artifacts/control"),
+                ),
+                key=lambda item: item.logical_name,
             )
         )
-    return ArtifactManifest(tuple(sorted(artifacts, key=lambda item: item.logical_name))).encode()
+    ).encode()
+    raw = valid_spec()
+    raw["track_id"] = "benchmark-test-track"
+    raw["artifact_manifest_sha256"] = hashlib.sha256(manifest).hexdigest()
+    track = parse_track_spec(raw)
+    record = {
+        "sequence": 1,
+        "track_id": track.track_id,
+        "netuid": track.netuid,
+        "track_spec_digest": track.digest,
+        "track_contract_sha256": matches._evidence_contract_digest(track),
+        "runtime_contract_sha256": matches._evidence_runtime_digest(manifest),
+        "source_sha256": source(),
+        "environment_sha256": environment(),
+        "image_sha256": "52" * 32,
+        "hardware": "CPU synthetic fixture",
+        "scope": "unit_test_not_gpu_acceptance",
+        "phase": "exact",
+        "confidence": track.match_confidence,
+        "minimum_gain": track.scoring.minimum_frontier_gain,
+        "budgets": tuple(budget.target_blocks for budget in track.scoring.budgets),
+        "cluster_unit": "source_video",
+        "reference": {
+            "model_id": "reference-fixture",
+            "label": "Reference fixture",
+            "sha256": "11" * 32,
+            "model_digest": "12" * 32,
+        },
+        "challenger": {
+            "model_id": "control-fixture",
+            "label": "Control fixture",
+            "sha256": "21" * 32,
+            "model_digest": "22" * 32,
+        },
+        "batches": (
+            {
+                "cohort": "synthetic-cohort",
+                "partition": "audit",
+                "generation_block": 100,
+                "plan_digest": "31" * 32,
+                "cache_sha256": "32" * 32,
+                "ready_sha256": "33" * 32,
+                "evidence_sha256": "34" * 32,
+                "cases": 16,
+                "independent_videos": 4,
+                "independent_videos_per_stratum": 4,
+                "reference_score": 0.8,
+                "challenger_score": 0.7,
+                "reference_gain_lower_bound": 0.05,
+                "challenger_gain_lower_bound": -0.2,
+            },
+        ),
+    }
+    context = SimpleNamespace(track=track, manifest=manifest, record=record, calls=calls)
+    context.artifacts = matches.system_match_artifacts(track, manifest, (record,))
+    context.chain = WeightChainState(99, {track.initial_champion.hotkey: 0}, 1, 1.0, 0, {})
+    yield context
+    matches._evidence_runtime_digest.cache_clear()
 
 
-def _bind_evidence(monkeypatch, track, runtime_manifest: bytes) -> None:
-    system_matches_module._evidence_runtime_digest.cache_clear()
-    monkeypatch.setattr(system_matches_module, "evaluation_source_digest", lambda: "12" * 32)
-    monkeypatch.setattr(
-        system_matches_module,
-        "evaluation_environment_digest",
-        lambda: "34" * 32,
+def genesis(case, *, system_matches=()):
+    return build_genesis_artifacts(
+        case.track,
+        case.chain,
+        version_key=0,
+        runtime_manifest=case.manifest,
+        system_matches=system_matches,
     )
-    records = deepcopy(system_matches_module.BENCHMARKS)
-    for record in records:
-        record["track_contract_sha256"] = system_matches_module._evidence_contract_digest(track)
-        record["source_sha256"] = "12" * 32
-        record["environment_sha256"] = "34" * 32
-        record["runtime_contract_sha256"] = system_matches_module._evidence_runtime_digest(
-            runtime_manifest
+
+
+def test_no_builtin_results_and_constructor_preserves_original_schema(benchmark):
+    case = benchmark
+    assert matches.system_match_artifacts(case.track, case.manifest) == ()
+    assert not hasattr(matches, "BENCHMARKS")
+    assert not Path(matches.__file__).with_name("system_match_data.py").exists()
+    name, payload = case.artifacts[0]
+    assert name == f"system_matches/{case.track.track_id}/000000000001.json"
+    document = json.loads(payload)
+    assert document["record_type"] == "SYSTEM_BENCHMARK"
+    assert document["affects_tournament"] is document["reward_eligible"] is False
+    assert document["evaluation"]["batch_count"] == 1
+    assert document["evaluation"]["cases_per_batch"] == 16
+    assert document["scores"] == {"reference": 0.8, "challenger": 0.7}
+    assert matches.validate_system_match_artifact(case.track, case.manifest, name, payload) == (
+        name,
+        payload,
+    )
+
+
+def test_r2_roundtrip_cold_recovery_and_cli_do_not_change_rewards(benchmark):
+    case = benchmark
+    client = MemoryS3()
+    first = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    plain = genesis(case)
+    populated = genesis(case, system_matches=case.artifacts)
+    assert populated.weights == plain.weights
+    assert populated.matches == plain.matches == ()
+    assert populated.summary == plain.summary
+    asyncio.run(first.publish(populated))
+    assert client.objects[f"tracks/test/{case.artifacts[0][0]}"] == case.artifacts[0][1]
+
+    # All local result state is gone; the only surviving fact is the S3 object.
+    cold = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    recovered = asyncio.run(cold.load_system_matches(case.track, case.manifest))
+    assert recovered == case.artifacts
+    assert matches.system_match_artifacts(case.track, case.manifest) == ()
+    puts_before = len(client.calls)
+    next_snapshot = genesis(case, system_matches=recovered)
+    asyncio.run(cold.publish(next_snapshot))
+    assert len(client.calls) == puts_before
+    status = json.loads(client.objects["tracks/test/status.json"])
+    rendered = render_status(status, color=False)
+    assert "SYSTEM BENCHMARKS" in rendered and "(exact)" in rendered
+    assert decode_weight_artifact(client.objects["tracks/test/weights.json"]).plan.uids == (0,)
+
+
+@pytest.mark.parametrize("failure", ["missing", "json", "identity", "network", "changed"])
+def test_refresh_failure_retains_last_valid_summary_and_weights(benchmark, caplog, failure):
+    case = benchmark
+
+    class Transport(MemoryS3):
+        broken = False
+
+        def get_object(self, **kwargs):
+            if self.broken and "/system_matches/" in kwargs["Key"]:
+                raise OSError("benchmark transport unavailable")
+            return super().get_object(**kwargs)
+
+    client = Transport()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    snapshot = genesis(case, system_matches=case.artifacts)
+    asyncio.run(repository.publish(snapshot))
+    assert asyncio.run(repository.load_system_matches(case.track, case.manifest)) == case.artifacts
+    key = f"tracks/test/{case.artifacts[0][0]}"
+    if failure == "missing":
+        del client.objects[key]
+    elif failure == "json":
+        client.objects[key] = b"{bad-json"
+    elif failure == "identity":
+        document = json.loads(case.artifacts[0][1])
+        document["netuid"] += 1
+        client.objects[key] = matches._json_bytes(document)
+    elif failure == "changed":
+        record = deepcopy(case.record)
+        record["batches"][0]["challenger_score"] = 0.6
+        client.objects[key] = matches.system_match_artifacts(case.track, case.manifest, (record,))[
+            0
+        ][1]
+    else:
+        client.broken = True
+    restored = asyncio.run(repository.load_system_matches(case.track, case.manifest))
+    assert restored == case.artifacts
+    asyncio.run(repository.publish(genesis(case, system_matches=restored)))
+    assert decode_weight_artifact(client.objects["tracks/test/weights.json"]).plan.uids == (0,)
+    assert len(json.loads(client.objects["tracks/test/status.json"])["system_matches"]) == 1
+    assert "system benchmark" in caplog.text
+
+
+def test_bad_record_or_failed_information_put_cannot_block_weights(benchmark, caplog):
+    case = benchmark
+
+    class Transport(MemoryS3):
+        def put_object(self, **kwargs):
+            if "/system_matches/" in kwargs["Key"]:
+                raise OSError("benchmark PUT unavailable")
+            return super().put_object(**kwargs)
+
+    client = Transport()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    asyncio.run(repository.publish(genesis(case, system_matches=case.artifacts)))
+    assert decode_weight_artifact(client.objects["tracks/test/weights.json"]).plan.uids == (0,)
+    assert json.loads(client.objects["tracks/test/status.json"])["system_matches"] == []
+    assert "system benchmark publication skipped" in caplog.text
+    # Invalid deployment metadata is also non-fatal at the public artifact boundary.
+    invalid = ((case.artifacts[0][0], b"not-json"),)
+    assert genesis(case, system_matches=invalid).system_matches == ()
+
+
+def test_information_retry_cannot_rewrite_a_frozen_status_or_weaken_its_guard(benchmark):
+    case = benchmark
+
+    class Transport(MemoryS3):
+        fail_benchmark = True
+
+        def put_object(self, **kwargs):
+            if self.fail_benchmark and "/system_matches/" in kwargs["Key"]:
+                raise OSError("temporary benchmark write outage")
+            return super().put_object(**kwargs)
+
+    client = Transport()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    snapshot = genesis(case, system_matches=case.artifacts)
+    asyncio.run(repository.publish(snapshot))
+    original_status = client.objects["tracks/test/status.json"]
+    assert json.loads(original_status)["system_matches"] == []
+    client.fail_benchmark = False
+    asyncio.run(repository.publish(snapshot))
+    assert client.objects["tracks/test/status.json"] == original_status
+    # The background reader can complete after this head was already published.
+    asyncio.run(repository.publish(genesis(case)))
+    assert client.objects["tracks/test/status.json"] == original_status
+    changed = json.loads(snapshot.status)
+    changed["participants"] = [{"hotkey": "changed-real-participant"}]
+    with pytest.raises(PublicArtifactError):
+        asyncio.run(repository.publish(replace(snapshot, status=matches._json_bytes(changed))))
+    assert client.objects["tracks/test/status.json"] == original_status
+
+    case.chain = replace(case.chain, finalized_block=100)
+    asyncio.run(repository.publish(genesis(case)))
+    assert len(json.loads(client.objects["tracks/test/status.json"])["system_matches"]) == 1
+    assert decode_weight_artifact(client.objects["tracks/test/weights.json"]).plan.uids == (0,)
+
+
+def test_cold_reader_skips_bad_record_then_reads_next_without_an_index(benchmark):
+    case = benchmark
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    client.objects[f"tracks/test/{case.artifacts[0][0]}"] = b"not-json"
+    second = matches.system_match_artifacts(
+        case.track, case.manifest, ({**case.record, "sequence": 2},)
+    )
+    for name, payload in second:
+        repository._put_immutable(name, payload)
+    assert asyncio.run(repository.load_system_matches(case.track, case.manifest)) == second
+    assert {call["Key"] for call in client.calls} == {f"tracks/test/{second[0][0]}"}
+
+
+def test_reader_is_bounded_and_stops_at_first_missing_sequence(benchmark):
+    case = benchmark
+
+    class Transport(MemoryS3):
+        def __init__(self):
+            super().__init__()
+            self.reads = []
+
+        def get_object(self, **kwargs):
+            self.reads.append(kwargs["Key"])
+            return super().get_object(**kwargs)
+
+    client = Transport()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    for sequence in range(1, matches.MAX_SYSTEM_MATCHES + 1):
+        name, payload = matches.system_match_artifacts(
+            case.track, case.manifest, ({**case.record, "sequence": sequence},)
+        )[0]
+        client.objects[f"tracks/test/{name}"] = payload
+    loaded = asyncio.run(repository.load_system_matches(case.track, case.manifest))
+    assert len(loaded) == matches.MAX_SYSTEM_MATCHES
+    assert len(client.reads) == matches.MAX_SYSTEM_MATCHES
+    del client.objects[f"tracks/test/system_matches/{case.track.track_id}/000000000002.json"]
+    cold = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    client.reads.clear()
+    assert len(asyncio.run(cold.load_system_matches(case.track, case.manifest))) == 1
+    assert len(client.reads) == 2
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "track_id",
+        "netuid",
+        "track_contract_sha256",
+        "source_sha256",
+        "environment_sha256",
+        "runtime_contract_sha256",
+    ],
+)
+def test_identity_and_every_measured_contract_are_fail_closed(benchmark, identity, caplog):
+    case = benchmark
+    document = json.loads(case.artifacts[0][1])
+    if identity == "track_id":
+        document["track_id"] = "another-track"
+    elif identity == "netuid":
+        document["netuid"] += 1
+    else:
+        document["evaluation"][identity] = "ef" * 32
+    bad = ((case.artifacts[0][0], matches._json_bytes(document)),)
+    assert matches.validated_system_matches(case.track, case.manifest, bad) == ()
+    assert "system benchmark skipped" in caplog.text
+
+
+@pytest.mark.parametrize("field", ["sha256", "model_digest"])
+def test_both_model_fingerprints_and_exact_canonical_body_are_required(benchmark, field):
+    case = benchmark
+    document = json.loads(case.artifacts[0][1])
+    document["challenger"][field] = "missing"
+    with pytest.raises(ValueError):
+        matches.validate_system_match_artifact(
+            case.track, case.manifest, case.artifacts[0][0], matches._json_bytes(document)
         )
-    monkeypatch.setattr(system_matches_module, "BENCHMARKS", records)
-
-
-def test_runtime_evidence_contract_is_computed_once(monkeypatch) -> None:
-    runtime_manifest = _runtime_manifest()
-    calls = {"environment": 0, "source": 0}
-
-    def environment_digest() -> str:
-        calls["environment"] += 1
-        return "12" * 32
-
-    def source_digest() -> str:
-        calls["source"] += 1
-        return "34" * 32
-
-    system_matches_module._evidence_runtime_digest.cache_clear()
-    monkeypatch.setattr(
-        system_matches_module,
-        "evaluation_environment_digest",
-        environment_digest,
-    )
-    monkeypatch.setattr(system_matches_module, "evaluation_source_digest", source_digest)
-
-    first = system_matches_module._evidence_runtime_digest(runtime_manifest)
-    assert system_matches_module._evidence_runtime_digest(runtime_manifest) == first
-    assert calls == {"environment": 1, "source": 1}
-    system_matches_module._evidence_runtime_digest.cache_clear()
-
-
-def test_repeated_publication_reuses_one_runtime_environment_scan(monkeypatch) -> None:
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    runtime_manifest = _runtime_manifest()
-    track = replace(
-        track,
-        artifact_manifest_sha256=hashlib.sha256(runtime_manifest).hexdigest(),
-    )
-    calls = {"artifacts": 0, "environment": 0, "source": 0}
-
-    @lru_cache(maxsize=1)
-    def environment_digest() -> str:
-        calls["environment"] += 1
-        return "12" * 32
-
-    @lru_cache(maxsize=1)
-    def source_digest() -> str:
-        calls["source"] += 1
-        return "34" * 32
-
-    system_matches_module._evidence_runtime_digest.cache_clear()
-    monkeypatch.setattr(
-        system_matches_module,
-        "evaluation_environment_digest",
-        environment_digest,
-    )
-    monkeypatch.setattr(system_matches_module, "evaluation_source_digest", source_digest)
-    runtime_digest = system_matches_module._evidence_runtime_digest(runtime_manifest)
-    records = deepcopy(system_matches_module.BENCHMARKS)
-    for record in records:
-        record["track_contract_sha256"] = system_matches_module._evidence_contract_digest(track)
-        record["runtime_contract_sha256"] = runtime_digest
-        record["source_sha256"] = "34" * 32
-        record["environment_sha256"] = "12" * 32
-    monkeypatch.setattr(system_matches_module, "BENCHMARKS", records)
-    system_matches_module._evidence_runtime_digest.cache_clear()
-    environment_digest.cache_clear()
-    source_digest.cache_clear()
-    calls["environment"] = calls["source"] = 0
-    real_artifacts = system_matches_module.system_match_artifacts
-
-    def counted_artifacts(track, manifest):
-        calls["artifacts"] += 1
-        return real_artifacts(track, manifest)
-
-    monkeypatch.setattr(publication_module, "system_match_artifacts", counted_artifacts)
-    monkeypatch.setattr(
-        publication_module,
-        "_verify_candidate_release",
-        lambda _track, _manifest, _approval: None,
-    )
-    store = SimpleNamespace(
-        chain_cursor=lambda: (track.track_start_block, "0x" + "12" * 32),
-        public_snapshot=lambda: {"challenges": []},
-        active_competitors=lambda _mapping: [],
-        legacy_excluded_hotkeys=lambda: frozenset(),
-    )
-    chain = WeightChainState(
-        track.track_start_block,
-        {track.initial_champion.hotkey: 0},
-        1,
-        1.0,
-        10,
-        {track.initial_champion.hotkey: 0},
-    )
-
-    try:
-        first = publication_module.build_public_artifacts(
-            store,
-            track,
-            chain,
-            version_key=0,
-            runtime_manifest=runtime_manifest,
-        )
-        second = publication_module.build_public_artifacts(
-            store,
-            track,
-            chain,
-            version_key=0,
-            runtime_manifest=runtime_manifest,
+    with pytest.raises(ValueError, match="canonical"):
+        matches.validate_system_match_artifact(
+            case.track, case.manifest, case.artifacts[0][0], b" " + case.artifacts[0][1]
         )
 
-        assert first is not None and second is not None
-        assert len(first.system_matches) == len(second.system_matches) == 4
-        assert len(json.loads(first.status)["system_matches"]) == 4
-        assert calls == {"artifacts": 2, "environment": 1, "source": 1}
-        monkeypatch.setattr(system_matches_module, "BENCHMARKS", ())
-        without_benchmarks = publication_module.build_public_artifacts(
-            store, track, chain, version_key=0, runtime_manifest=runtime_manifest
-        )
-        assert without_benchmarks is not None
-        for field in ("weights", "summary", "matches", "abort", "batch_groups"):
-            assert getattr(first, field) == getattr(without_benchmarks, field)
-    finally:
-        system_matches_module._evidence_runtime_digest.cache_clear()
+
+def test_another_track_has_its_own_sequence_one_and_original_record_is_immutable(benchmark):
+    case = benchmark
+    raw = track_spec_dict(case.track)
+    raw["track_id"] = "other-benchmark-track"
+    other = parse_track_spec(raw)
+    record = {
+        **deepcopy(case.record),
+        "track_id": other.track_id,
+        "track_spec_digest": other.digest,
+        "track_contract_sha256": matches._evidence_contract_digest(other),
+    }
+    other_artifacts = matches.system_match_artifacts(other, case.manifest, (case.record, record))
+    assert len(other_artifacts) == 1 and "/other-benchmark-track/" in other_artifacts[0][0]
+    assert matches.system_match_artifacts(case.track, case.manifest, (case.record, record)) == (
+        case.artifacts
+    )
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    for name, payload in (*case.artifacts, *other_artifacts):
+        repository._put_immutable(name, payload)
+    assert asyncio.run(repository.load_system_matches(other, case.manifest)) == other_artifacts
+    assert asyncio.run(repository.load_system_matches(case.track, case.manifest)) == case.artifacts
 
 
-def test_mechanism_formats_bound_stage_records_without_reward_effects(monkeypatch) -> None:
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    runtime_manifest = _runtime_manifest()
-    assert track.track_id == PRODUCTION_TRACK_ID
-    monkeypatch.setattr(system_matches_module, "evaluation_source_digest", lambda: "ef" * 32)
-    assert system_match_artifacts(track, runtime_manifest) == ()
-    _bind_evidence(monkeypatch, track, runtime_manifest)
-    artifacts = system_match_artifacts(track, runtime_manifest)
-
-    assert [name for name, _payload in artifacts] == [
-        f"system_matches/{PRODUCTION_TRACK_ID}/000000000001.json",
-        f"system_matches/{PRODUCTION_TRACK_ID}/000000000002.json",
-        f"system_matches/{PRODUCTION_TRACK_ID}/000000000003.json",
-        f"system_matches/{PRODUCTION_TRACK_ID}/000000000004.json",
-    ]
-    documents = [json.loads(payload) for _name, payload in artifacts]
-    for document in documents:
-        assert document["record_type"] == "SYSTEM_BENCHMARK"
-        assert document["affects_tournament"] is False
-        assert document["reward_eligible"] is False
+def test_repeated_publication_does_not_rescan_the_environment(benchmark):
+    case = benchmark
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    snapshot = genesis(case, system_matches=case.artifacts)
+    for _ in range(3):
+        asyncio.run(repository.publish(snapshot))
         assert (
-            document["track_spec_digest"]
-            == system_matches_module.BENCHMARKS[0]["track_spec_digest"]
+            asyncio.run(repository.load_system_matches(case.track, case.manifest)) == case.artifacts
         )
-        assert document["evaluation"]["track_contract_sha256"] == (
-            system_matches_module._evidence_contract_digest(track)
-        )
-        assert document["evaluation"]["runtime_contract_sha256"] == (
-            system_matches_module._evidence_runtime_digest(runtime_manifest)
-        )
-        assert document["outcome"] in {"REFERENCE_RETAINED", "REFERENCE_WON"}
-        assert document["evaluation"]["batch_count"] == 1
-        assert len(document["evaluation"]["batches"]) == 1
-        assert "model_digest" in document["reference"]
-        assert "model_digest" in document["challenger"]
-        assert "runtime_trace" not in document["evaluation"]
-        assert all(
-            batch["challenger_gain_lower_bound"] < document["evaluation"]["minimum_gain"]
-            for batch in document["evaluation"]["batches"]
-        )
-
-    assert documents[0]["scores"]["reference"] == 0.9491625628902893
-    assert documents[0]["scores"]["challenger"] == 0.9491625628902893
-    assert documents[1]["scores"]["challenger"] == 0.7885866430037899
-    assert all(
-        batch["reference_gain_lower_bound"] > 0.005
-        for batch in documents[1]["evaluation"]["batches"]
-    )
-    assert documents[2]["scores"]["reference"] == 0.7619235479211722
-    assert documents[3]["scores"]["challenger"] == 0.6570879920438147
-    assert [item["evaluation"]["phase"] for item in documents] == [
-        "exact",
-        "exact",
-        "full_video",
-        "full_video",
-    ]
-    assert [item["evaluation"]["cases_per_batch"] for item in documents] == [384, 384, 48, 48]
-    assert len(system_match_summaries(artifacts)) == 4
+    assert case.calls == {"source": 1, "environment": 1}
 
 
-def test_candidate_track_keeps_the_exact_runtime_schedule() -> None:
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-
-    assert track.scoring.trajectory_schedule.sigmas == (
-        1.0,
-        0.9882352941176471,
-        0.972972972972973,
-        0.9523809523809523,
-        0.9230769230769231,
-        0.8780487804878049,
-        0.8,
-        0.631578947368421,
-        0.0,
-    )
-
-
-def test_system_evidence_binding_does_not_depend_on_release_artifact_hash(monkeypatch) -> None:
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    runtime_manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, runtime_manifest)
-    rebuilt = replace(
-        track,
-        artifact_manifest_sha256="ef" * 32,
-        digest="cd" * 32,
-    )
-
-    assert system_match_artifacts(rebuilt, runtime_manifest) == system_match_artifacts(
-        track, runtime_manifest
-    )
-
-
-def test_system_evidence_rejects_changed_scoring_assets_but_not_repackaging(monkeypatch) -> None:
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    runtime_manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, runtime_manifest)
-
-    assert system_match_artifacts(track, _runtime_manifest(package_sha256="ef" * 32))
-    assert system_match_artifacts(track, _runtime_manifest(evidence_sha256="ef" * 32))
-    assert system_match_artifacts(track, _runtime_manifest(asset_sha256="ef" * 32)) == ()
-    assert system_match_artifacts(track, None) == ()
-
-
-def test_only_the_canonical_panel_namespace_is_excluded_from_runtime_semantics(
-    monkeypatch,
-) -> None:
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    runtime_manifest = _runtime_manifest(evidence_sha256="56" * 32)
-    _bind_evidence(monkeypatch, track, runtime_manifest)
-
-    assert system_match_artifacts(track, _runtime_manifest(evidence_sha256="ef" * 32))
-    for name in (
-        "release/evidence/system-panel/raw.json",
-        "evidence/system-panelish/raw.json",
-        "other/evidence/system-panel/raw.json",
+def test_schema_phase_metrics_and_private_fields_are_not_relaxed(benchmark):
+    case = benchmark
+    for mutate in (
+        lambda doc: doc.update(reward_eligible=True),
+        lambda doc: doc["evaluation"].update(phase="pending"),
+        lambda doc: doc["evaluation"].update(batch_count=10),
+        lambda doc: doc["scores"].update(challenger=0.9),
+        lambda doc: doc["evaluation"]["batches"][0].update(source_ids=["private-source"]),
     ):
+        document = json.loads(case.artifacts[0][1])
+        mutate(document)
         assert (
-            system_match_artifacts(
-                track,
-                _runtime_manifest(evidence_sha256="ef" * 32, evidence_name=name),
+            matches.validated_system_matches(
+                case.track, case.manifest, ((case.artifacts[0][0], matches._json_bytes(document)),)
             )
             == ()
         )
-
-
-def test_system_matches_are_not_attached_to_another_track(monkeypatch) -> None:
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    runtime_manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, runtime_manifest)
-
-    assert system_match_artifacts(track, runtime_manifest)
-    assert system_match_artifacts(replace(track, track_id="another-track"), runtime_manifest) == ()
-    assert (
-        system_match_artifacts(replace(track, netuid=PRODUCTION_NETUID + 1), runtime_manifest) == ()
-    )
-    assert (
-        system_match_artifacts(
-            replace(
-                track,
-                scoring=replace(track.scoring, minimum_frontier_gain=0.006),
-            ),
-            runtime_manifest,
-        )
-        == ()
-    )
-
-
-def test_system_evidence_is_invalidated_by_source_pool_changes(monkeypatch) -> None:
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    runtime_manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, runtime_manifest)
-
-    assert system_match_artifacts(track, runtime_manifest)
-    assert (
-        system_match_artifacts(
-            replace(track, source_pool_merkle_root="ef" * 32),
-            runtime_manifest,
-        )
-        == ()
-    )
-    assert (
-        system_match_artifacts(
-            replace(
-                track,
-                source_commitments=(
-                    replace(track.source_commitments[0], sha256="ef" * 32),
-                    *track.source_commitments[1:],
-                ),
-            ),
-            runtime_manifest,
-        )
-        == ()
-    )
-
-
-def test_historical_records_preserve_real_report_identity_without_authorizing_candidate():
-    """CPU formatting checks only: this is not a new GPU or release acceptance."""
-    records = system_matches_module.BENCHMARKS
-    documents = [system_matches_module._match_document(record) for record in records]
-    assert {record["source_sha256"] for record in records} == {
-        "3fdf7148a4da81119ee51b6557e2a08066c4ffdc69bdb759fd567e524ab0c025"
-    }
-    assert len(records) == 4
-    assert {row["challenger"]["model_id"] for row in records} == {
-        "veda_baseline",
-        "shuffled_heads_control",
-    }
-    assert documents[1]["evaluation"]["evidence_sha256"] == (
-        "4a2f9c84bef9067522a83d80b8674d2eba7438439aa8495cc0c550852fa66809"
-    )
-    full = documents[3]["evaluation"]
-    assert full["evidence_sha256"] == (
-        "59b6aba46debcb3001848ca667443106b25fc075bc7071acf0487ceb5d37057e"
-    )
-    assert full["batches"][0]["reference_gain_lower_bound"] == 0.04190771739740623
-    assert full["scope"] == "isolated_accelerated_chain_fixture"
-    assert {item["evaluation"]["batches"][0]["generation_block"] for item in documents} == {
-        9311300,
-        9312500,
-    }
-    for document in (documents[0], documents[2]):
-        assert document["scores"]["reference"] == document["scores"]["challenger"]
-        assert document["evaluation"]["batches"][0]["challenger_gain_lower_bound"] == 0
-        assert document["outcome"] == "REFERENCE_RETAINED"
-
-
-@pytest.mark.parametrize("changed", ["source", "environment"])
-def test_measured_runtime_changes_do_not_reuse_evidence(monkeypatch, changed):
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, manifest)
-    assert system_match_artifacts(track, manifest)
-    system_matches_module._evidence_runtime_digest.cache_clear()
-    monkeypatch.setattr(system_matches_module, f"evaluation_{changed}_digest", lambda: "ef" * 32)
-    assert system_match_artifacts(track, manifest) == ()
-    system_matches_module._evidence_runtime_digest.cache_clear()
-
-
-def test_source_mismatch_never_scans_the_environment(monkeypatch):
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, manifest)
-    monkeypatch.setattr(system_matches_module, "evaluation_source_digest", lambda: "ef" * 32)
-    monkeypatch.setattr(
-        system_matches_module,
-        "evaluation_environment_digest",
-        lambda: pytest.fail("old source must not trigger environment hashing"),
-    )
-    system_matches_module._evidence_runtime_digest.cache_clear()
-    assert system_match_artifacts(track, manifest) == ()
-
-
-def test_batch_count_and_scores_follow_measured_cohorts_not_an_old_panel_size():
-    record = deepcopy(system_matches_module.BENCHMARKS[1])
-    second = {**record["batches"][0], "cohort": "second-cohort", "generation_block": 9312500}
-    second["reference_score"] = 0.9
-    record["batches"] = (*record["batches"], second)
-    document = system_matches_module._match_document(record)
-    assert document["evaluation"]["batch_count"] == 2
-    assert len(document["evaluation"]["batches"]) == 2
-    assert document["scores"]["reference"] == (0.9491625628902893 + 0.9) / 2
-    assert "evidence_sha256" not in document["evaluation"]
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [("phase", "pending"), ("batches", ()), ("source_sha256", "0" * 64)],
-)
-def test_unmeasured_or_placeholder_records_are_rejected(field, value):
-    record = deepcopy(system_matches_module.BENCHMARKS[0])
-    record[field] = value
-    with pytest.raises(ValueError, match="system benchmark"):
-        system_matches_module._match_document(record)
-
-
-@pytest.mark.parametrize("role", ["reference", "challenger"])
-@pytest.mark.parametrize("field", ["sha256", "model_digest"])
-def test_both_model_fingerprints_are_required(role, field):
-    record = deepcopy(system_matches_module.BENCHMARKS[0])
-    record[role][field] = "missing"
-    with pytest.raises(ValueError, match="SHA-256"):
-        system_matches_module._match_document(record)
-
-
-def test_repackaging_and_appending_cannot_rewrite_an_immutable_record(monkeypatch):
-    from tests.validator.test_publication import MemoryS3
-    from validator.monitor import render_status
-    from validator.publication import PublicArtifactError, S3Repository
-
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, manifest)
-    initial = system_match_artifacts(track, manifest)
-    client = MemoryS3()
-    publisher = S3Repository(client, bucket="public-data", prefix="tracks/test")
-    for name, payload in initial:
-        publisher._put_immutable(name, payload)
-    original_calls = len(client.calls)
-    rebuilt = replace(track, digest="ef" * 32, artifact_manifest_sha256="ab" * 32)
-    repackaged = system_match_artifacts(rebuilt, _runtime_manifest(package_sha256="56" * 32))
-    assert repackaged == initial
-    for name, payload in repackaged:
-        publisher._put_immutable(name, payload)
-    assert len(client.calls) == original_calls
-
-    records = deepcopy(system_matches_module.BENCHMARKS)
-    added = {**records[0], "sequence": 5}
-    monkeypatch.setattr(system_matches_module, "BENCHMARKS", (*records, added))
-    appended = system_match_artifacts(track, manifest)
-    assert appended[: len(initial)] == initial
-    assert appended[-1][0].endswith("000000000005.json")
-    for name, payload in appended:
-        publisher._put_immutable(name, payload)
-    assert len(client.calls) == original_calls + 1
-
-    records[0]["batches"][0]["evidence_sha256"] = "ab" * 32
-    monkeypatch.setattr(system_matches_module, "BENCHMARKS", records)
-    modified_name, modified_payload = system_match_artifacts(track, manifest)[0]
-    with pytest.raises(PublicArtifactError, match="immutable"):
-        publisher._put_immutable(modified_name, modified_payload)
-    assert client.objects[f"tracks/test/{initial[0][0]}"] == initial[0][1]
-    rendered = render_status(
-        {"participants": [], "system_matches": system_match_summaries(initial)}, color=False
-    )
-    assert "SYSTEM BENCHMARKS" in rendered
-    assert "(exact)" in rendered and "(full_video)" in rendered
-
-
-def test_duplicate_sequences_are_not_silently_renumbered(monkeypatch):
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    records = deepcopy(system_matches_module.BENCHMARKS)
-    records[1]["sequence"] = records[0]["sequence"]
-    monkeypatch.setattr(system_matches_module, "BENCHMARKS", records)
-    with pytest.raises(ValueError, match="sequences"):
-        system_match_artifacts(track, _runtime_manifest())
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [("confidence", 0.95), ("minimum_gain", 0.001), ("budgets", (16, 32))],
-)
-def test_report_context_cannot_disagree_with_the_bound_track(monkeypatch, field, value):
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, manifest)
-    records = deepcopy(system_matches_module.BENCHMARKS)
-    records[0][field] = value
-    monkeypatch.setattr(system_matches_module, "BENCHMARKS", records)
-    with pytest.raises(ValueError, match="context differs"):
-        system_match_artifacts(track, manifest)
-
-
-def test_only_public_summary_fields_are_serialized():
-    record = deepcopy(system_matches_module.BENCHMARKS[0])
-    record["reference"]["local_path"] = "PRIVATE-MODEL-PATH"
-    record["batches"][0]["source_ids"] = ["PRIVATE-SOURCE-ID"]
-    record["batches"][0]["input_path"] = "PRIVATE-INPUT-PATH"
-    payload = system_matches_module._json_bytes(system_matches_module._match_document(record))
-    assert b"PRIVATE-" not in payload
-
-
-@pytest.mark.parametrize("field", ["reference_score", "challenger_gain_lower_bound"])
-def test_self_checks_cannot_be_relabelled_as_wins(field):
-    record = deepcopy(system_matches_module.BENCHMARKS[0])
-    record["batches"][0][field] = 0.1
-    with pytest.raises(ValueError, match="self comparison"):
-        system_matches_module._match_document(record)
-
-
-def test_historical_four_records_keep_their_exact_serialized_body_bytes():
-    # Captured before cross-version identity decoupling; not a new GPU measurement.
-    expected = (
-        "6956fb402e1500930e33fa11eeda149b16ce126317bf0bdebdd4e18b97c90041",
-        "eb512217955a93cdd1906af29a79235b6651afbf1fd2c8cacb0bab3fc65bbfad",
-        "0fedc0dcdfdfaafe823ec07755e36a22f3a10901a6a315ba2b6c0de090ff39f4",
-        "4ad5ef3acd7ffa5432c714ed043d701fa576f15cde8eefb58a94e94bde65e94e",
-    )
-    assert (
-        tuple(
-            hashlib.sha256(
-                system_matches_module._json_bytes(system_matches_module._match_document(record))
-            ).hexdigest()
-            for record in system_matches_module.BENCHMARKS
-        )
-        == expected
-    )
-
-
-def test_different_tracks_can_each_have_sequence_one_without_relabelling(monkeypatch):
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, manifest)
-    original = system_match_artifacts(track, manifest)
-    # Synthetic CPU gate fixture only, never a pending release's measured record.
-    other_track = replace(track, track_id="benchmark-test-track", netuid=121, digest="ef" * 32)
-    records = deepcopy(system_matches_module.BENCHMARKS)
-    other_record = {
-        **deepcopy(records[0]),
-        "track_id": other_track.track_id,
-        "netuid": other_track.netuid,
-        "track_spec_digest": other_track.digest,
-        "track_contract_sha256": system_matches_module._evidence_contract_digest(other_track),
-        "sequence": 1,
-    }
-    monkeypatch.setattr(system_matches_module, "BENCHMARKS", (*records, other_record))
-
-    assert system_match_artifacts(track, manifest) == original
-    other_artifacts = system_match_artifacts(other_track, manifest)
-    assert len(other_artifacts) == 1
-    assert other_artifacts[0][0] == "system_matches/benchmark-test-track/000000000001.json"
-    document = json.loads(other_artifacts[0][1])
-    assert document["track_id"] == other_track.track_id
-    assert document["netuid"] == other_track.netuid
-    assert document["track_spec_digest"] == other_track.digest
-    assert document["affects_tournament"] is document["reward_eligible"] is False
-
-    other_record["track_contract_sha256"] = records[0]["track_contract_sha256"]
-    assert system_match_artifacts(other_track, manifest) == ()
-    assert system_match_artifacts(track, manifest) == original
-
-
-@pytest.mark.parametrize("identity", ["track_id", "netuid"])
-def test_matching_contract_cannot_override_the_recorded_identity(monkeypatch, identity):
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, manifest)
-    records = deepcopy(system_matches_module.BENCHMARKS)
-    for record in records:
-        record[identity] = "another-track" if identity == "track_id" else track.netuid + 1
-    monkeypatch.setattr(system_matches_module, "BENCHMARKS", records)
-    assert system_match_artifacts(track, manifest) == ()
-
-
-def test_sequences_cannot_be_reused_in_one_track_path_even_on_another_netuid(monkeypatch):
-    track = load_track_spec(Path(__file__).parents[2] / "track.json")
-    manifest = _runtime_manifest()
-    _bind_evidence(monkeypatch, track, manifest)
-    records = deepcopy(system_matches_module.BENCHMARKS)
-    collision = {**records[0], "netuid": track.netuid + 1}
-    monkeypatch.setattr(system_matches_module, "BENCHMARKS", (*records, collision))
-    with pytest.raises(ValueError, match="sequences"):
-        system_match_artifacts(track, manifest)

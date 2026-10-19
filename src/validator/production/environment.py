@@ -70,14 +70,10 @@ def build_source_bundle(destination: str | Path) -> Path:
 
 @lru_cache(maxsize=1)
 def evaluation_source_digest() -> str:
-    """Hash every score-affecting source byte without benchmark result constants."""
+    """Hash all committed first-party and scoring runtime source bytes."""
 
     rows = []
     for name, path in sorted(_active_source_files().items()):
-        if not name.startswith(("scoring/", "validator/", "miowtion/")):
-            continue
-        if name == "validator/system_match_data.py":
-            continue
         rows.append({"name": name, "sha256": _file_sha256(path)})
     if not rows:
         raise ValueError("evaluation source contract cannot be empty")

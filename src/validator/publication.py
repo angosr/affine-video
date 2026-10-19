@@ -6,6 +6,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
@@ -37,7 +38,12 @@ from validator.queue import TERMINAL_STATES, ChallengeState
 from validator.release import PRODUCTION_TRACK_ID, ReleaseApproval, require_release_approval
 from validator.s3 import client_config
 from validator.store import ChallengeStore
-from validator.system_matches import system_match_artifacts, system_match_summaries
+from validator.system_matches import (
+    MAX_SYSTEM_MATCHES,
+    system_match_summaries,
+    validate_system_match_artifact,
+    validated_system_matches,
+)
 from validator.tournament import (
     Champion,
     MatchRecord,
@@ -60,6 +66,7 @@ _STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MAX_WEIGHT_ARTIFACT_BYTES = 1024 * 1024
 _MAX_PUBLIC_OBJECT_BYTES = 1024 * 1024
 _SUMMARY_LEADERBOARD_LIMIT = 100
+_LOG = logging.getLogger(__name__)
 _LEGACY_UNFENCED_WEIGHT_TRACK = (
     "veda-sn120-v1",
     "0fcae991aef29f87b97fbb07cf79c49e5eb9cc2a5d9aecdd2a566443e2b81dd5",
@@ -132,6 +139,7 @@ def build_public_artifacts(
     runtime_manifest: bytes | None = None,
     track_aborted: bool = False,
     release_approval: ReleaseApproval | None = None,
+    system_matches: tuple[tuple[str, bytes], ...] = (),
 ) -> PublicArtifacts | None:
     """Build bounded metadata without restoring or uploading disclosure payloads."""
 
@@ -203,7 +211,7 @@ def build_public_artifacts(
         terminal_match_sha256=terminal_match_sha256,
     )
     summary = _summary_document(track, chain.finalized_block, tournament)
-    system_matches = system_match_artifacts(track, runtime_manifest)
+    system_matches = validated_system_matches(track, runtime_manifest, system_matches)
     status = _status_document(
         track,
         chain.finalized_block,
@@ -306,6 +314,7 @@ def build_genesis_artifacts(
     version_key: int,
     runtime_manifest: bytes | None = None,
     release_approval: ReleaseApproval | None = None,
+    system_matches: tuple[tuple[str, bytes], ...] = (),
 ) -> PublicArtifacts:
     """Build the complete pre-launch snapshot with UID0 as champion."""
 
@@ -340,7 +349,7 @@ def build_genesis_artifacts(
         match_sequence=0,
         terminal_match_sha256=None,
     )
-    system_matches = system_match_artifacts(track, runtime_manifest)
+    system_matches = validated_system_matches(track, runtime_manifest, system_matches)
     return PublicArtifacts(
         source_block=chain.finalized_block,
         track=_json_bytes({"track_spec_digest": track.digest, "spec": track_spec_dict(track)}),
@@ -628,6 +637,7 @@ class S3Repository:
         self.release_approval = release_approval
         self._confirmed_immutable: dict[str, str] = {}
         self._writer_lock: Any | None = None
+        self._system_match_cache: dict[tuple[str, str], dict[str, bytes]] = {}
 
     def acquire_writer_lock(self, database: str | Path) -> None:
         """Hold the one evaluator deployment's filesystem lock until close or process exit."""
@@ -753,8 +763,7 @@ class S3Repository:
             await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
         for artifact in artifacts.files:
             await asyncio.to_thread(self._put_file_immutable, artifact)
-        for name, payload in artifacts.system_matches:
-            await asyncio.to_thread(self._put_immutable, name, payload)
+        await self._stage_system_matches(artifacts)
         for name, payload in artifacts.matches:
             await asyncio.to_thread(self._put_immutable, name, payload)
         for name, payload in artifacts.batch_groups:
@@ -767,8 +776,99 @@ class S3Repository:
         if artifacts.abort is not None:
             await asyncio.to_thread(self._put_immutable, *artifacts.abort)
         await asyncio.to_thread(self._put_mutable, "summary.json", artifacts.summary)
-        if artifacts.status is not None:
-            await asyncio.to_thread(self._put_mutable, "status.json", artifacts.status)
+        status = artifacts.status
+        if status is not None and (artifacts.system_matches or self._system_match_cache):
+            try:
+                document = _decode_canonical_object(artifacts.track, "track")
+                manifest = (
+                    None if artifacts.runtime_manifest is None else artifacts.runtime_manifest[1]
+                )
+                key = (document["track_spec_digest"], hashlib.sha256(manifest or b"").hexdigest())
+                visible = tuple(sorted(self._system_match_cache.get(key, {}).items()))
+                if artifacts.system_matches or visible:
+                    status_document = _decode_canonical_object(status, "status")
+                    status_document["system_matches"] = system_match_summaries(visible)
+                    status = _json_bytes(status_document)
+            except Exception as exc:
+                _LOG.warning("system benchmark status skipped: %s", exc)
+                status = None
+        if status is not None:
+            try:
+                await asyncio.to_thread(self._put_mutable, "status.json", status)
+            except PublicArtifactError:
+                current = await asyncio.to_thread(self._get_optional, "status.json")
+                if current is None:
+                    raise
+                before = _decode_canonical_object(current, "status")
+                after = _decode_canonical_object(status, "status")
+                if before.pop("system_matches", None) == after.pop("system_matches", None):
+                    raise
+                if before != after:
+                    raise
+                # Never rewrite a frozen source-block snapshot for new information.
+                _LOG.warning("system benchmark status deferred until a new block")
+
+    async def load_system_matches(
+        self, track: TrackSpec, runtime_manifest: bytes | None,
+    ) -> tuple[tuple[str, bytes], ...]:
+        """Read a bounded immutable sequence; retain this runtime's last valid facts."""
+
+        if runtime_manifest is None:
+            return ()
+        key = (track.digest, hashlib.sha256(runtime_manifest).hexdigest())
+        known = self._system_match_cache.setdefault(key, {})
+        if known:
+            valid = await asyncio.to_thread(
+                validated_system_matches, track, runtime_manifest, tuple(known.items()),
+            )
+            known.clear()
+            known.update(valid)
+        for sequence in range(1, MAX_SYSTEM_MATCHES + 1):
+            name = f"system_matches/{track.track_id}/{sequence:012d}.json"
+            try:
+                payload = await asyncio.to_thread(self._get_optional, name)
+            except Exception as exc:
+                _LOG.warning("system benchmark read failed: %s (%s)", name, exc)
+                break
+            if payload is None:
+                if name in known:
+                    _LOG.warning("system benchmark missing; retaining last valid record: %s", name)
+                break
+            try:
+                await asyncio.to_thread(
+                    validate_system_match_artifact, track, runtime_manifest, name, payload,
+                )
+                if name in known and known[name] != payload:
+                    raise ValueError("immutable system benchmark changed")
+                known[name] = payload
+                self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
+            except Exception as exc:
+                _LOG.warning("system benchmark skipped: %s (%s)", name, exc)
+        return tuple(sorted(known.items()))
+
+    async def _stage_system_matches(self, artifacts: PublicArtifacts) -> None:
+        if not artifacts.system_matches:
+            return
+        try:
+            document = _decode_track_document(artifacts.track)
+            track = parse_track_spec(document["spec"])
+            manifest = None if artifacts.runtime_manifest is None else artifacts.runtime_manifest[1]
+            key = (track.digest, hashlib.sha256(manifest or b"").hexdigest())
+            known = self._system_match_cache.setdefault(key, {})
+        except Exception as exc:
+            _LOG.warning("system benchmark publication skipped: %s", exc)
+            return
+        for name, payload in artifacts.system_matches:
+            try:
+                await asyncio.to_thread(
+                    validate_system_match_artifact, track, manifest, name, payload,
+                )
+                if name in known and known[name] != payload:
+                    raise ValueError("immutable system benchmark changed")
+                await asyncio.to_thread(self._put_immutable, name, payload)
+                known[name] = payload
+            except Exception as exc:
+                _LOG.warning("system benchmark publication skipped: %s (%s)", name, exc)
 
     def _put_file_immutable(self, artifact: PublicFile) -> None:
         if self._confirmed_immutable.get(artifact.object_name) == artifact.sha256:

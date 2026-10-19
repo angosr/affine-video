@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AsyncExitStack
@@ -73,6 +74,7 @@ DEFAULT_PUBLIC_WEIGHTS_URL = f"{PUBLIC_STORAGE_URL}/weights.json"
 DEFAULT_BASELINE_MANIFEST_URL = f"{PUBLIC_STORAGE_URL}/assets/veda_baseline_f16/manifest.json"
 DEFAULT_NETUID = PRODUCTION_NETUID
 DEFAULT_MECHID = 1
+_LOG = logging.getLogger(__name__)
 
 
 class ArtifactRepository(Protocol):
@@ -81,6 +83,10 @@ class ArtifactRepository(Protocol):
     async def publish(self, artifacts: PublicArtifacts) -> None: ...
 
     async def load(self, track: TrackSpec) -> PublicLedger: ...
+
+    async def load_system_matches(
+        self, track: TrackSpec, runtime_manifest: bytes | None,
+    ) -> tuple[tuple[str, bytes], ...]: ...
 
     async def finalize_abort(self, track: TrackSpec) -> None: ...
 
@@ -443,6 +449,35 @@ async def run_evaluator(
         pending_artifacts: PublicArtifacts | None = None
         publication_task: asyncio.Task[PublicArtifacts] | None = None
         once_result: EvaluationCycleResult | None = None
+        system_matches: tuple[tuple[str, bytes], ...] = ()
+        system_match_task: asyncio.Task[tuple[tuple[str, bytes], ...]] | None = None
+        next_system_match_refresh = 0.0
+        system_match_loader = getattr(publisher, "load_system_matches", None)
+
+        def refresh_system_matches() -> None:
+            nonlocal system_match_task, system_matches, next_system_match_refresh
+            if system_match_task is not None and system_match_task.done():
+                try:
+                    system_matches = system_match_task.result()
+                except Exception as exc:
+                    _LOG.warning(
+                        "system benchmark refresh failed; retaining last valid summary: %s", exc,
+                    )
+                system_match_task = None
+            now = asyncio.get_running_loop().time()
+            if (
+                not track_aborted and system_match_loader is not None
+                and system_match_task is None and now >= next_system_match_refresh
+            ):
+                system_match_task = asyncio.create_task(
+                    system_match_loader(track, runtime_manifest_payload),
+                )
+                next_system_match_refresh = now + 300.0
+
+        async def close_system_match_refresh() -> None:
+            if system_match_task is not None:
+                system_match_task.cancel()
+                await asyncio.gather(system_match_task, return_exceptions=True)
 
         def start_publication() -> asyncio.Task[PublicArtifacts]:
             assert pending_artifacts is not None
@@ -479,11 +514,14 @@ async def run_evaluator(
                             _record_publication_failure(store, alert, retry_exc)
 
         resources.push_async_callback(finish_publication)
+        resources.push_async_callback(close_system_match_refresh)
         consecutive_cycle_errors = 0
         while True:
             try:
+                refresh_system_matches()
                 async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
                     while True:
+                        refresh_system_matches()
                         finalized_block = await client.finalized_block()
                         if finalized_block >= track.track_start_block:
                             break
@@ -495,6 +533,7 @@ async def run_evaluator(
                         chain = await read_weight_chain_state(
                             client,
                             netuid=track.netuid,
+                            mechid=track.mechid,
                             finalized_block=finalized_block,
                         )
                         artifacts = build_genesis_artifacts(
@@ -503,6 +542,7 @@ async def run_evaluator(
                             version_key=version_key,
                             runtime_manifest=runtime_manifest_payload,
                             release_approval=getattr(publisher, "release_approval", None),
+                            system_matches=system_matches,
                         )
                         try:
                             await publisher.publish(artifacts)
@@ -530,6 +570,7 @@ async def run_evaluator(
                         before_block=track.track_start_block - 1,
                     )
                     while True:
+                        refresh_system_matches()
                         await _refresh_seed_block_hashes(client, evaluator)
                         result = await process_cycle(
                             client,
@@ -556,6 +597,7 @@ async def run_evaluator(
                             track_aborted=track_aborted,
                         )
                         recovery_index += result.restored_matches
+                        refresh_system_matches()
                         cursor = store.chain_cursor()
                         if (
                             cursor is not None
@@ -566,6 +608,7 @@ async def run_evaluator(
                                 chain = await read_weight_chain_state(
                                     client,
                                     netuid=track.netuid,
+                                    mechid=track.mechid,
                                     finalized_block=result.finalized_block,
                                 )
                                 stage_error = None
@@ -600,6 +643,7 @@ async def run_evaluator(
                                             else batch_source.restore_model
                                         ),
                                         "runtime_manifest": runtime_manifest_payload,
+                                        "system_matches": system_matches,
                                         "track_aborted": track_aborted,
                                         "release_approval": getattr(
                                             publisher, "release_approval", None,
@@ -835,7 +879,7 @@ async def process_weight_cycle(
     artifact = await fetch_weight_artifact(public_weights_url, client=http_client)
     if artifact.track_id != track.track_id:
         raise ValueError("public weights target a different track")
-    chain = await read_weight_chain_state(client, netuid=track.netuid)
+    chain = await read_weight_chain_state(client, netuid=track.netuid, mechid=track.mechid)
     plan = validate_weight_artifact(
         artifact,
         chain,

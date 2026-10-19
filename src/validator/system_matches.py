@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from functools import lru_cache
 from math import fsum, isfinite
 from typing import Any
@@ -14,21 +15,25 @@ from validator.production.environment import (
     evaluation_environment_digest,
     evaluation_source_digest,
 )
-from validator.system_match_data import BENCHMARKS
+
+_LOG = logging.getLogger(__name__)
+MAX_SYSTEM_MATCHES = 64
 
 
 def system_match_artifacts(
     track: TrackSpec,
     runtime_manifest: bytes | None,
+    records: tuple[dict[str, Any], ...] = (),
 ) -> tuple[tuple[str, bytes], ...]:
     """Never relabel old measurements or renumber records on a packaging rebuild."""
 
     if runtime_manifest is None:
         return ()
-    namespace = [record for record in BENCHMARKS if record["track_id"] == track.track_id]
+    namespace = [record for record in records if record["track_id"] == track.track_id]
     sequences = [record["sequence"] for record in namespace]
     if any(
-        type(sequence) is not int or sequence < 1 for sequence in sequences
+        type(sequence) is not int or not 1 <= sequence <= MAX_SYSTEM_MATCHES
+        for sequence in sequences
     ) or sequences != sorted(set(sequences)):
         raise ValueError("system benchmark sequences must be unique and increasing")
     contract = _evidence_contract_digest(track)
@@ -70,6 +75,63 @@ def system_match_artifacts(
         for record in candidates
         if record["runtime_contract_sha256"] == runtime
     )
+
+
+def validate_system_match_artifact(
+    track: TrackSpec,
+    runtime_manifest: bytes | None,
+    name: str,
+    payload: bytes,
+) -> tuple[str, bytes]:
+    """Verify the original JSON body through the same constructor and runtime gate."""
+
+    if not isinstance(payload, bytes) or not payload or len(payload) > 1024 * 1024:
+        raise ValueError("system benchmark payload size is invalid")
+    document = json.loads(payload)
+    evaluation = document["evaluation"]
+    record = {
+        **evaluation,
+        **{
+            key: document[key]
+            for key in (
+                "sequence",
+                "track_id",
+                "track_spec_digest",
+                "netuid",
+                "reference",
+                "challenger",
+            )
+        },
+        "batches": tuple(
+            {key: value for key, value in batch.items() if key != "batch"}
+            for batch in evaluation["batches"]
+        ),
+    }
+    if _json_bytes(_match_document(record)) != payload:
+        raise ValueError("system benchmark is not the canonical measured record")
+    artifacts = system_match_artifacts(track, runtime_manifest, (record,))
+    if artifacts != ((name, payload),):
+        raise ValueError("system benchmark identity or measured runtime differs")
+    return name, payload
+
+
+def validated_system_matches(
+    track: TrackSpec,
+    runtime_manifest: bytes | None,
+    artifacts: tuple[tuple[str, bytes], ...],
+) -> tuple[tuple[str, bytes], ...]:
+    """Informational evidence must never fail a real competition publication."""
+
+    verified = {}
+    for name, payload in artifacts:
+        try:
+            validate_system_match_artifact(track, runtime_manifest, name, payload)
+            if name in verified and verified[name] != payload:
+                raise ValueError("system benchmark sequence has conflicting bodies")
+            verified[name] = payload
+        except Exception as exc:
+            _LOG.warning("system benchmark skipped: %s (%s)", name, exc)
+    return tuple(sorted(verified.items()))
 
 
 def system_match_summaries(

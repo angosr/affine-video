@@ -142,22 +142,20 @@ tracks/main/
 - `track.json` is the stable pointer to the current canonical track specification and digest. An
   active `track_id` has one fixed specification; an upgrade uses a new `track_id`, while the URL
   remains unchanged.
-- `system_matches/*.json` are immutable launch checks produced from real GPU panels. They compare
-  the VEDA baseline with fixed control models, but never enter the Miner queue, tournament rank, or
-  chain weights. A panel is attached only when its track contract, score-affecting source bytes,
-  third-party environment and committed model/source assets match; rebuilding the same release
-  packaging does not invalidate it. Panel-only selectors, runner bytes and raw results live under
-  the manifest's `evidence/system-panel/` namespace. They remain content-addressed and recoverable
-  but are excluded from the non-circular runtime digest because production scoring never reads them.
-  Each row records its measured phase, cohort, actual batch dimensions, both model file hashes and
-  tensor digests, and original report/runtime identities. Exact and full-video scores are separate;
-  self checks are not promotions. Sequences are explicit and append-only. Repackaging must preserve
-  existing row bytes, including the report's original full track digest, rather than relabeling them
-  with the newest wrapper digest. The data-only table currently preserves historical b81/860 self
-  and shuffled-heads reports; it does not authorize a changed scoring runtime. Candidate rows need
-  actual measurements under that candidate's frozen source, environment and asset contract before
-  binding. Updating result data still requires a rebuilt, verified source bundle, dependency lock
-  and image; it cannot be hot-mounted into an older release.
+- `system_matches/<track_id>/<12-digit-sequence>.json` are authoritative immutable S3 facts from
+  real GPU benchmarks, not Python constants or Miner match history. They never affect rewards.
+  Deployment code constructs records with `system_match_artifacts(..., records=...)` and passes
+  the tuple to the existing genesis builder or `PublicArtifacts.system_matches` for publication.
+  The evaluator asynchronously reads the original sequence every five minutes, starting at one,
+  stopping at the first missing object and reading at most 64 records; no index or local result
+  file is needed for cold recovery. Each original body must match its track identity, full scoring
+  contract, protected source, environment and committed runtime assets, with both model file and
+  tensor digests, measured phase/cohort, dimensions, metrics and report hashes validated. Exact and
+  full-video scores remain separate; self checks are not promotions. Bad or unavailable benchmark
+  records warn and retain the last valid summary without blocking weights or the real FIFO.
+  Sequences are append-only within a track namespace: never relabel a historical record with a
+  newer track/runtime identity. Publishing a result does not rebuild the image, manifest or track;
+  every runtime source byte remains protected by the normal source bundle and digest checks.
 - `events/<track_id>/track-aborted.json` is the immutable stop fact created when system work remains
   unfinished after the close grace block. It survives loss of local state and prevents that track
   from resuming evaluation or weight refresh.
