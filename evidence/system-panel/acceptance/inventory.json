@@ -249,7 +249,7 @@
           ],
           "scope": "Actual isolated FilePairedEvaluator with a fixed existing schema-valid model; exact-only on two disjoint cached batches, not full-video, live submission or broad ranking acceptance"
         },
-        "external_fixed_control_discovery": {
+        "external_fixed_control": {
           "repo_id": "Veda-Sparse/Minimax-H3-R2VA-Veda-Preview",
           "revision": "1598b407905b7c0af85aa0c13acdfa6f01ff2982",
           "filename": "minimax_h3_r2va_veda_preview_fp8.safetensors",
@@ -259,11 +259,22 @@
           "projection_shapes_checked": 100,
           "per_head_scale_shapes_checked": 100,
           "architecture": {"num_layers": 50, "num_heads": 56, "head_dim": 128},
-          "whole_file_validated": false,
-          "legal_fp16_export_validated": false,
+          "whole_file_validated": true,
+          "legal_fp16_export_validated": true,
+          "export_file_sha256": "b2424160c9316ca035e9fc74f19f664e58212db61af478a618890404df2bd33e",
+          "export_model_digest": "7d6e2d6ebf9a181bacd867da04e25128b9313397841781315c22bc0ae929f38c",
+          "export_bytes": 550511720,
+          "export_tensor_count": 100,
+          "max_abs_bf16_to_fp16_delta": 2.9802322387695312e-08,
+          "independent_scalar_values_bitwise_compared": 275251200,
+          "independent_conversion_mismatches": 0,
+          "preparation_elapsed_seconds": 27.486384564079344,
+          "preparation_peak_rss_kib": 2432508,
+          "cuda_devices": 0,
+          "duplicate_of_genesis_tensors": false,
           "quality_evaluated": false,
           "training": false,
-          "scope": "Official public fixed candidate located through its API and bounded data-only header read. Shapes match the plain predictor. No external code imported, full-byte or legal-export verification yet; no claim of better quality or a changed genesis model."
+          "scope": "Pinned official public FP8 data verified in full and converted with the unchanged installed reader into the legal FP16 projection schema. Independent CPU-only formula reproduces all100 tensors bitwise. Original source plans/budgets are not imported into the tournament. No remote code, training, quality or chain-admission claim; the declared owner is a benchmark identity, not a genesis replacement."
         }
       },
       "id": "E4",
@@ -299,10 +310,35 @@
           "path": "private/maintenance-v2-r1/external-control-discovery.json",
           "sha256": "9c62d21ef4e7475bd5e2b8db2321117281b2afa1ff1f3c7bddebbf58de43e5e4",
           "scope": "Pinned official R2VA candidate, canonical URLs, API and bounded header hashes, all200 tensor descriptors and metadata retained. Not a full download, legal selector validation, runtime or quality result."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-preparation-registration.json",
+          "sha256": "c046bc55202ee85ce3fdf3fcf9ac34a14cb5095927a8706edd74d24cd9d1968d",
+          "scope": "Original frozen CPU preparation harness, pinned275MB source/hash/header, legal projection-only export and no training, scoring, remote code or retries."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-preparation-result.json",
+          "sha256": "1183316281634950821a9bad4268eafcbd79706ce698f39011c96d177b87f0f9",
+          "scope": "Complete original source SHA matches, legal550MB FP16 export validated, all100 per-tensor rounding deltas retained; CPU only, quality not evaluated."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-conversion-registration.json",
+          "sha256": "beac2ed67507da964979e6465cdb51bbc1ce7fe8dbe734eceb103109b237a4b8",
+          "scope": "Separate preregistered CPU formula verifier, no reuse of bundle loader, network or GPU; expects bitwise equality for all275251200 scalar values."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-conversion-result.json",
+          "sha256": "07468ea4fbe0e70eefddc1f709c5c9e242e4ac261b893849c0ca9cc9f69dc298",
+          "scope": "Independent per-head FP8/BF16/FP16 derivation matches every exported scalar bitwise;100 projections, zero mismatches, zero CUDA devices."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-preparation-verification.json",
+          "sha256": "fa7a4fa859943a68327fec450d2dd85b797a96a3652c4c73a543f2e78d22176b",
+          "scope": "Original independent verifier exits0/OOMfalse; source/export complete SHA remain unchanged, parent preparation and both raw/registration identities bound. Format/provenance only, not quality or promotion."
         }
       ],
       "release_blocker": false,
-      "status": "fixed_controls_completed_external_candidate_header_verified_headroom_pending",
+      "status": "fixed_controls_completed_external_legal_export_verified_quality_and_headroom_pending",
       "subject": "可竞争空间"
     },
     {
