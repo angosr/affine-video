@@ -210,10 +210,17 @@ a newer pointer on a backend that ignores conditions; subsequent verification/re
 this risk but cannot undo rewards already allocated by another validator.
 
 Every new release to `tracks/main` requires an explicitly coordinated full track digest in
-`VEDA_COORDINATED_RELEASE_DIGEST` and the matching runtime manifest. A missing approval or a
-mismatched identity rejects publication before any write. Research experiments remain tracked in
-the evidence inventory, with incomplete work explicitly marked as such; completing the entire
-panel is not a startup requirement.
+`VEDA_COORDINATED_RELEASE_DIGEST`, the matching runtime manifest, and the canonical acceptance
+report identified by `VEDA_RELEASE_ACCEPTANCE`. The runtime manifest must bind that report and
+its referenced evidence by content hash. E2 (numerical fidelity), E3 (two-stage GPU execution)
+and E16 (determinism/error handling) must pass, with recorded methods, measurements and raw
+evidence; the scoring and runtime contracts must match. Missing, failed or mismatched acceptance
+rejects publication before any storage write. Existing startup checks also enforce storage,
+runtime integrity, data isolation and track consistency. The broader experiment inventory is
+not a startup checklist: E10/E11 remain failed research checks, not fabricated passes or a
+reason to disable authorized initial operation.
+This restored gate is a source change for the next coordinated runtime. The already-running
+frozen `364c0ca` image predates it; it has not been replaced under the existing track digest.
 
 Initial operation can generate batches on demand with `veda validator produce --config ... --once`.
 Continuous generation and broader quality studies can be enabled after the evaluator is operating;

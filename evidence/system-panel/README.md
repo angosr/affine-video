@@ -1,100 +1,83 @@
-This is the canonical launch-only evidence namespace. Its contents are excluded from the scoring runtime contract, and must be bound by the eventual release manifest and track. The current inventory is not release acceptance.
+# Runtime verification
 
-The repository retains maintained verification tools in `launch/`, live preservation tooling in `operations/`, and the research requirements in `acceptance/`. Raw logs, intermediate tracks and measurement outputs belong in the off-repository evidence store, not the source tree.
+The live track is `veda-sn120-v2-r1` on SN120/mech1. Public paths stay under
+`tracks/main/`; there is one `weights.json`.
 
-Startup checks the coordinated track digest, matching runtime artifacts, schema and existing operational safeguards. Runtime `364c0ca` is deployed at the original public paths as `veda-sn120-v2-r1`, digest `cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3`. Its image is `sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b`, with source digest `f86ddf56a3eeb4e0a37781a089f37961fb3542da5ac967d50f85ba6de1086eed`. CPU and actual H200 tests jointly cover all 797 test IDs. Current-image E2 verifies 288 numerical rows from 96 recaptured cases with zero mask mismatches and maximum sparse-output RSE 7.42e-18. A new exact control batch covers 16 independent audit videos and 384 paired cases: baseline 0.90561352, shuffled heads 0.77041673, reverse positive lower bound 0.09890599, negative lower bound -0.16761291 and self bound zero. The independent future sixteen-video full batch now passes: baseline 0.75562305, shuffled heads 0.62200248, positive lower bound 0.04680055, negative lower bound -0.25285228 and self zero. The registered SQLite/FIFO/recovery fixture also passes; an independent TLS S3 reader matches five complete stage bodies against ten saved SQLite snapshots and their public-ledger projections. Independent standard-library aggregation reproduces both exact reports and the full-video bounds. Six same-card repeat pairs and nine cross-card video cells match scores and output hashes exactly. The actual deployed-resource WorkerPool and restricted ConfirmationWorkerPool now both exit zero without OOM: GPUs2–5 regenerate all16 same-plan videos with48 matching complete file hashes, while GPUs0–1 reproduce all96 full-video scores and output hashes exactly. Both pools use256GiB/16CPU limits and all six GPUs were observed computing concurrently. This is one complete plan per pool, not sustained-capacity or whole-host recovery acceptance. These controls use an isolated accelerated clock, not real Miner/HF admission. Private bootstrap, baseline bytes, both-role CAS and hidden-source denial probes have passed on the deployed backend. The complete frozen image and source bundle are preserved off GPU. The external weight-setter's actual pin and transaction remain unverified; this is not an overall research release GO.
+- Track digest: `cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3`.
+- Frozen source: `364c0ca5e8ea0483cfc1417238cb19daa34dbb5d`.
+- Source digest: `f86ddf56a3eeb4e0a37781a089f37961fb3542da5ac967d50f85ba6de1086eed`.
+- Image: `sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b`.
 
-Two further current-image components now pass. An empty-cache restore retrieves all 550,511,648
-baseline bytes from off-GPU private TLS S3 without HF or a model mount; independent full-file SHA
-verification matches, elapsed 1442.70 s and peak RSS 81144 KiB. The native tile/mask check covers
-32 deterministic cases, 8 sampled routes, 4 geometries, 2 fixed models and 3 budgets: 384
-native/production comparisons have zero mask differences. Its initial anonymous-only diagnostic
-loader failure is preserved; supplying the fixed control's owner changes no numerical code,
-model, case or tolerance. All 64 result rows match the complete raw log. This is sampled component
-coverage, not all 2800 architecture routes or whole-host recovery.
+## Release checks
 
-A current-image legal-FP16-maximum boundary smoke also completes nine full-video cells in 502.56 s
-without timeout or OOM. At each budget, baseline -> fixed extreme weights -> baseline reproduces
-the existing baseline score and output hash exactly; all extreme-model scores are finite. The
-temporary weight file is deleted. This covers one historical video, not broad adversarial or
-all-geometry acceptance. No model training, parameter search or production change is involved.
+The [inventory](acceptance/inventory.json) contains the three launch checks, not a seventeen-item
+research completion target. Existing startup checks separately enforce runtime integrity,
+storage capabilities, data isolation and track consistency.
 
-All 56 current-manifest assets (97.3 GB) now have off-GPU preserved paths: 53 shared assets and
-the current source/lock/OCI triple. Root verifies the original full-byte SHA facts and exact current
-mapping without rereading the entire payload. Whole-host restoration remains unverified. At the
-first live generation boundary, an empty queue creates no private plan or formal GPU load while
-the original public weights continue refreshing; the read-only before/after check is indexed.
-The current production config is also preserved byte-for-byte off GPU. All 15 role environment
-values match control-host sources, and both active commands match the archived launch arguments;
-the receipt retains no credentials or value digests. This is input coverage, not a cold restart.
+| Check | Current frozen-runtime evidence |
+| --- | --- |
+| E2: numerical fidelity | 96 historical cases, three controls, 288 comparisons; zero mask mismatches; maximum sparse-output RSE 7.42e-18 |
+| E3: two-stage execution | Sixteen independent videos per phase; self retains the champion, degraded challengers lose, the reference defeats a degraded incumbent; both gates are required |
+| E16: determinism and errors | Actual CUDA tie-order regressions, six same-card repeat pairs and nine cross-card cells; identical scores and output hashes |
 
-The current-image CPU-only assembly interruption test also passes: a real SIGKILL leaves an
-11.6 MB incomplete NPZ, unchanged pruning reclaims it while retaining an unrelated canary,
-and the original 16 units rebuild all 384 cases into the same 10,304,413,828-byte file hash.
-Elapsed 81.40 s and peak child RSS 150,692 KiB; no GPU or object-store writes. This is not whole-host,
-unit-generation, scheduler/CAS or full-disclosure acceptance. Eight superseded local image
-archives (139.3 GB) have been removed; all 56 current assets and small historical provenance remain.
+E3 uses an isolated accelerated chain fixture with real GPU computation, SQLite and off-GPU
+TLS S3. It is not a real Miner commitment or a wallet transaction. E2/E16 retain their historical,
+quarantined input identities rather than being relabeled as new competition batches.
 
-The pinned official R2VA control now completes both exact cohorts (768 cases) and all 16 future
-full-video cases (48 candidate cells plus 8 baseline hash replays), with no training or inference
-retry. Its small positive exact mean gains do not pass either exact bound. Full-video mean is
-0.73021895 versus baseline 0.75562305, lower bound -0.09536131, and also rejects promotion.
-Independent standard-library integration and video-cluster resampling agree within 1e-12.
-The single zero budget32 cell remains in the complete result. A separate fresh GPU6 process
-reproduces all three original GPU7 scores/output hashes in baseline -> candidate -> baseline
-order. Finite candidate output with no black frames has motion ratio 2.011214 versus the frozen
-2.0 threshold, so its otherwise 0.741026 weighted fidelity is zeroed. This exposes hard-gate
-sensitivity, not a numerical failure or proof of severe perceptual flicker. Eight-frame contact
-sheets do not validate temporal quality; further calibration remains open, with no parameter or
-original-result changes.
+[Public E2/E16 original logs, registrations, test reports and SHA-256 values](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r1/evidence/README.md)
+are anonymously readable. All thirteen objects were independently read and matched byte-for-byte.
+The E2 summary additionally references three private E3/audit logs: those are not in this public
+package and must not be recursively disclosed. No private source pool, current audit inputs,
+encoded text, QKV, latents, videos or credentials are included.
 
-External-control summaries are now published as immutable system benchmarks 5 (two-cohort exact)
-and 6 (full video) through the existing namespace. Anonymous bytes match the canonical records;
-the normal five-minute refresh adds them to the existing status/CLI without a service restart.
-They do not change the real match sequence, UID0 weights, track digest or public pointer paths.
+The restored source `validator.release` gate requires canonical acceptance of E2/E3/E16,
+bound by the runtime manifest and matching scoring/runtime contracts. Missing, failed or
+mismatched reports reject formal publication before storage writes. This source change has
+not been installed into the already-running frozen image or published under its old digest.
 
-A small CPU boundary diagnostic also runs the actual metric's five AST-extracted gate statements
-on nine predetermined uint8 frame cases. A monotone drift of at most one gray level from a static
-reference rejects, while a constant one-level offset accepts. This isolates denominator-floor
-sensitivity and is distinct from the real R2VA case (dense motion 1.0174, not epsilon-limited).
-No feature/model/VAE or human-quality validation is implied; no replacement rule is adopted.
+## Operational evidence and limits
 
-Recovery transport also has a measured limit: a 32 MiB direct control-to-GPU SSH stream takes
-82.96 s (0.404 MB/s), with matching source/receiver prefix hashes and no receiver file. The same
-rate would require about 67 hours for all 97.3 GB, so the proposed three-hour copy is not started.
-This is one directional pilot, not sustained throughput or evidence of lost backup data; rapid
-whole-host restoration remains unverified while existing off-GPU sources are assessed.
+The deployed split is GPUs0–1 for evaluation, GPUs2–5 for generation, and GPUs6–7 for diagnostics.
+At the actual 256GiB/16CPU pool limits, production regenerated sixteen videos with all48 file
+hashes matching; confirmation reproduced all96 scores/output hashes. All six production GPUs
+were observed computing concurrently without OOM. These are real pool checks, not sustained
+capacity guarantees.
 
-The previous `b81bfa8`/`8608cf5d` runtime passed E2, repeatability, CUDA ordering, and a two-stage SQLite/FIFO/off-GPU S3 control fixture. The new image retains byte-identical numerical scoring/runtime/full-video code, but those historical runs keep their original identities. The intermediate E91 regeneration and 16-case synthetic full-mask diagnostic likewise remain component evidence, not relabeled current acceptance.
+The current manifest's56 static assets, 97,296,695,944 bytes, have off-GPU copies, together with
+the current configuration and role-credential sources. Eight obsolete image archives were
+removed without changing the current assets. An empty-cache baseline restore recovered all
+550,511,648 bytes from off-GPU private S3 with the correct full SHA. Killing the assembler mid-NPZ
+and retrying reproduced the original10.30GB hash while pruning its incomplete file.
 
-`launch/runner.py` implements the broader research panel and requires an explicit runtime binding for every data-producing command. Its six identities run on ten production and eight audit exact batches, followed by five production and two audit full-video batches. Both replay orders reuse the same five exact labels and the same confirmation labels. All six identities receive full-video cells, covering every dynamic-incumbent path. Directional gates reject self or degenerate promotion and require the reverse VEDA-versus-shuffled positive to promote on every production batch. Aggregation binds the complete fixed model roster to the exact-summary hash and recomputes full-video bounds from raw cells. Completing this entire research panel is not required before initial release.
+A fresh public-HF restore also recovered one605,429,308-byte fixed model file to an empty tree
+without an original-model mount:144.48 seconds,4.19MB/s, independently rehashed. The completed
+container and duplicate scratch were removed. Two small runtime packaging files have now been
+backed up to the existing private cloud bucket and independently read back; all descriptor/part
+anonymous reads were denied. The17GB cloud-image backup has not been performed. None of these
+component results is described as a complete host-loss drill.
 
-The runtime binding records `format=veda-panel-launch-binding-v1`, `frozen=true`, `evidence_root`, `release_root`, `source_pool`, `source_binding`, `evidence_contract_sha256`, `runtime_contract_sha256`, and `runner_sha256`. Only create it after the final image, dependency lock, scoring parameters and launch prerequisites are verified. The runner independently checks the active scoring/runtime contracts. Keep intermediate raw batches bound to their original track and manifest; a later release attaches them only through matching stable contracts.
+The single32MiB control-to-GPU SSH pilot measured0.404MB/s, while one complete anonymous40MiB
+public-S3 read measured112MB/s. Different directions, cache states and object sizes prevent
+extrapolating either into a full-restore promise. The original three-hour97GB transfer was not run.
 
-The binding also requires `cost_confirmation`, containing `registration`, `calibration`, and `confirmation` references, each with a `path` and exact file `sha256`. These are the registration and the two bounded outputs of the registered `cost_analysis.py`; replay all registered raw measurements with that analyzer before binding its reports. Every panel command checks both reports' complete group/budget dimensions and numerical gates, the frozen costs/scales, and the active source/environment identities before loading private sources or scoring. A `frozen` flag or aggregate success boolean alone cannot authorize a panel. This prerequisite covers E10/E11 only and does not claim complete release acceptance.
+No real Miner has completed the chain-to-reward lifecycle, and the external weight-setter's
+actual pin and transaction remain unverified. Public system-match summaries do not affect rewards.
+Private state uses verified CAS; public Supabase uses one managed writer, monotonic checks and
+readback, not a distributed atomic-write guarantee. Proactive HTTPS alerts still require a real
+receiver; log/status monitoring is not described as delivered push notification.
 
-Historical configurations and numerical runs remain in Git history and the off-repository evidence archive. The current inventory describes validation gaps for the active runtime; historical results are not current acceptance evidence.
+## Development diagnostics
 
-The current research requirements and gaps are recorded once in `acceptance/inventory.json`; `validator.release` checks the coordinated public identity and runtime manifest, not research pass flags. This inventory is not acceptance and does not replace preregistered protocols, raw evidence or recomputation. E3 checks real exact and independent future full-video execution with fixed read-only self/degraded controls, FIFO and durable decisions. No training, checkpoint-trajectory study or architecture search is required. E13/E15 must test actual coverage and power, including skewed and rare catastrophic failures: nominal bootstrap alpha is not a finite-sample guarantee. The six-identity panel is one component of continued validation, not complete acceptance.
+The previous broad research inventory is preserved outside the source repository; its exact
+reference is in the active inventory. It is not an additional release checklist.
 
-Unrevealed videos, exact QKV, dense latents and per-batch inputs are disposable GPU-local data; no off-host mirror is required before evaluation. Small authoritative plans, source-generation inputs, admissions, stages, retries and selector archives remain durable off the GPU. Losing local data is a system interruption, never a Miner loss or permission to change completed results. Publish the actual used batch through the existing public paths only when its entire challenge group is terminal.
+Exploratory cost prediction and ten-percent overhead targets were not met in every context.
+The failed fit was not adopted, and the fixed score-axis costs do not promise exact end-to-end
+GPU latency. These are disclosed limitations, not fabricated passes or automatic launch blockers.
+Fixed self/degraded/external controls have complete exact and video measurements; no operator
+model training is required. Wider ranking, sample-power and perceptual calibration can continue
+against actual operation rather than delaying launch for an idealized complete research program.
 
-The tied-mask probe is run inside the selected OCI on GPUs 6–7. A Docker build patch makes the pinned Miowtion selection use stable descending sort with ascending key-index ties, matching the authoritative scorer. The actual patched dependency bytes are included in the runtime source bundle and dependency lock; the patch is not a runtime fallback.
-
-Historical runtime `4e2182b` has off-repository GPU evidence for 96 recaptured exact cases across all four geometries, eight routes and three budgets: no selected-mask mismatches, per-case control ranking Spearman 1, and maximum sparse-output cache RSE below 1e-3. Fifteen same-card full-video repeats and nine cross-card comparisons had identical scores and output hashes. GPUs 6 and 7 also matched tied masks at budgets 4, 8, 16, 32 and 64. These records retain their original runtime identity; they are not relabeled as acceptance of `18e9c5c`, general model rankings or complete failure recovery.
-
-Cost calibration uses `launch/cost_calibration.py`, `cost_patterns.py`, and the single `cost_analysis.py` analyzer. Register their exact hashes, runtime artifacts, candidate contract, control identities, geometry/text/layer/budget dimensions and disjoint phase seeds before launch. Calibration fits one shared budget-cost shape using median matched latency ratios; geometry/text scale factors are fitted once on calibration. Confirmation never refits. Every geometry/text/model group and each budget must pass median/P95 error gates, and every matched budget curve must pass Spearman. The E11 denominator is the matching installed dense H3/FA4 attention call; the numerator is complete sparse latency minus sparse attention excluding mask packing. The old 02c5774 pilot's sparse-denominator E11 flags are historical diagnostics, not acceptance.
-
-Measurements execute the tournament's shared `SelectorAttention` path, including fused pooling, FP32 projections and stable masks. Allocation probes inject precomputed legal logits only after the real projections execute, verify complete boolean masks against an independent NumPy allocation, and check replayed query-row identities after each timing interval. Identical complete proof documents are verified once per analysis; any changed document is independently checked.
-
-Clustered, spread, padding/boundary and repeated-key probes use that same production selector and native attention kernel. An untimed dry call primes the ordered query-row sequence, GPU logits and allocation proofs. Timed calls replay the sequence without host conversion; complete row equality is checked after timing, including rejection of swapped equal-shaped chunks. Allocation proofs count kept blocks rather than padded index width: the installed budget 16 can return width 17 with exactly 16 kept.
-
-The cost-independent track contract omits only calibrated costs and the release manifest hash. Confirmation requires every other track field and the exact frozen fitted costs; manifest-only packaging changes are permitted. Each run retains its own full provisional track digest. Final acceptance must bind the confirmed stable evidence contract and exact costs without relabeling raw provenance.
-
-`collect_cost_evidence.py` persists hash-checked, immutable raw events from detached container logs on the non-GPU control host. The control-host root is `/home/aiuser/work/veda-evidence`, with logical paths beneath `evidence/system-panel/`. Reconnecting replays identical events safely and conflicting bytes fail closed. Both raw copies must be retained and bound by the eventual release manifest. None of these scripts authorizes public publication.
-
-After the private asset mirror writes its final `SHA256SUMS`, run `launch/verify_control_assets.py --root PRIVATE_ASSETS --registration REGISTRATION --registration-sha256 REGISTERED_SHA256 --output RECEIPT`. It requires the exact seven-file checksum inventory, validates every selector tensor/file identity, and streams the predictor hash. The immutable receipt records the verifier and selector registry hashes and is recovery evidence only.
-
-The registered 2026-10-19 cost study is closed: both calibration and disjoint confirmation contain all 8,400 sparse measurements. Confirmation passed E10 in 29/64 groups and E11 in 32/64 groups, so its frozen fit is not adopted. The completion receipt, raw measurements, independent recomputation and complete terminal logs remain in the off-repository evidence store. The three registered measurement/analysis helpers remain unchanged for replay; no cost-attempt observer service is running.
-
-The separate live-runtime fixed-control comparison is also complete: all 16 original future videos include mean-pool and fixed-perturbation controls even though exact rejects them. All 96 new full-video cells and 16 baseline output-hash replays completed. Neither control clears the full-video gain gate. There are no above-baseline full winners in this panel, so retention is undefined, not 100%; broad ranking and retention remain unverified. E12/E17 index the complete results, including a near-copy mean-order reversal that passes neither confidence gate.
+`launch/` retains replay and measurement tools used by existing evidence; they do not run as
+services or authorize publication. `operations/` contains the maintained asset-preservation tool.
+Raw experiments and intermediate outputs remain outside the repository.
