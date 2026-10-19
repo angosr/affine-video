@@ -13,7 +13,7 @@
     "minimum_generation_delay_blocks": 301,
     "storage_dtype": "float16"
   },
-  "artifact_manifest_sha256": "ae66c14d7008ea98785260b1c64e4b026fe7ab8d52379071b61226eece1e5d9c",
+  "artifact_manifest_sha256": "e612352e59f63389efdd3d9ee6e6b586bb9a6371de26138354c784d237e30b67",
   "source_pool_merkle_root": "11844a47d2e1ee5192a8b4b170fd396941313b4de9abdbbd5d0493f2b9026477",
   "maximum_generation_batches": 80,
   "maximum_effective_challenges": 20,
@@ -130,8 +130,8 @@
       ]
     }
   },
-  "track_id": "veda-sn120-v2",
-  "track_start_block": 9310100,
+  "track_id": "veda-sn120-v2-r1",
+  "track_start_block": 9314300,
   "source_commitments": {
     "audit": {
       "16:9@37": [

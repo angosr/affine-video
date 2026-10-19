@@ -14,10 +14,13 @@ lightweight process: fetch `weights.json`, validate it against finalized chain s
 own `SetWeights` transaction. No service or direct Miner-to-Validator protocol exists.
 
 The live SN120/mech-1 [track specification](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/track.json)
-uses digest `8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34`
-and frozen evaluator source `b81bfa8`. Public paths are unchanged. This image has passed
-H200 numerical, repeatability, CUDA tie-order and error checks, plus an isolated accelerated
-two-stage FIFO/recovery check with fixed controls. Evidence scope and remaining validation are
+uses digest `cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3`
+and frozen evaluator source `364c0ca` (`veda-sn120-v2-r1`). Public paths are unchanged.
+CPU and H200 checks cover all 797 tests, including the CUDA tie-order test. The frozen image
+also passes cache/runtime precision checks and a sixteen-video exact-stage control batch.
+The scoring and full-video numerical implementation is unchanged from the previously validated
+runtime; a fresh full-video and durable FIFO/recovery check continues after deployment.
+Evidence scope and remaining validation are
 tracked in the [acceptance inventory](evidence/system-panel/acceptance/inventory.json);
 isolated checks do not establish real-miner admission or complete host-loss recovery.
 
