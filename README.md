@@ -17,9 +17,10 @@ The live SN120/mech-1 [track specification](https://iblosevwkuiootbbgnsy.storage
 uses digest `cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3`
 and frozen evaluator source `364c0ca` (`veda-sn120-v2-r1`). Public paths are unchanged.
 CPU and H200 checks cover all 797 tests, including the CUDA tie-order test. The frozen image
-also passes cache/runtime precision checks and a sixteen-video exact-stage control batch.
-The scoring and full-video numerical implementation is unchanged from the previously validated
-runtime; a fresh full-video and durable FIFO/recovery check continues after deployment.
+also passes cache/runtime precision checks, independent sixteen-video exact and full-video
+control batches, and a two-stage SQLite/FIFO/off-GPU S3 recovery fixture. Current-image
+same-card and cross-card video repeats have identical scores and output hashes.
+The restricted production confirmation-pool diagnostic continues separately after deployment.
 Evidence scope and remaining validation are
 tracked in the [acceptance inventory](evidence/system-panel/acceptance/inventory.json);
 isolated checks do not establish real-miner admission or complete host-loss recovery.

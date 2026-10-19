@@ -17,8 +17,14 @@
         "image_id": "sha256:3749e5b063b50d66c4d676dd2c79c10c460e5d7f1de9e7713f7444428bcc2c2c",
         "cases": 16,
         "geometries": 4,
-        "text_token_counts": [1, 257],
-        "layers": [0, 49],
+        "text_token_counts": [
+          1,
+          257
+        ],
+        "layers": [
+          0,
+          49
+        ],
         "heads": 56,
         "physical_gpu": 6,
         "max_relative_squared_error": 7.626704394121098e-06,
@@ -49,15 +55,15 @@
     },
     {
       "acceptance_manifest": {
-        "path": "evidence/system-panel/acceptance-8608cf5d/e2-cache-fidelity.json",
-        "sha256": "2a920c2a32c8da4892b271030778ab25716e20aa101ea40152b65bdda1627d55"
+        "path": "private/maintenance-v2-r1/e2-cache-fidelity.json",
+        "sha256": "5c61eed9c3a14e47137239fa6b9e0025c78923592cc95c99ea42a3222c830c89"
       },
       "acceptance_rule": "排名 Spearman ≥0.999，缓存引入的输出 RSE ≤1e-3，Top k 一致率达到清单门槛",
       "actual_values": {
-        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
-        "runtime_source_commit": "b81bfa8",
-        "image_id": "sha256:3749e5b063b50d66c4d676dd2c79c10c460e5d7f1de9e7713f7444428bcc2c2c",
-        "source_sha256": "3fdf7148a4da81119ee51b6557e2a08066c4ffdc69bdb759fd567e524ab0c025",
+        "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+        "runtime_source_commit": "364c0ca",
+        "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
+        "source_sha256": "f86ddf56a3eeb4e0a37781a089f37961fb3542da5ac967d50f85ba6de1086eed",
         "budgets": [
           16,
           32,
@@ -65,7 +71,7 @@
         ],
         "cases": 96,
         "controls": 3,
-        "elapsed_seconds": 381.5401019109413,
+        "elapsed_seconds": 381.07998078130186,
         "geometries": 4,
         "global_spearman": 0.999999981394532,
         "independent_source_videos": 4,
@@ -73,14 +79,14 @@
         "max_abs_quality_delta": 5.314612807727492e-06,
         "max_dense_reference_rse": 4.397595680954343e-08,
         "max_sparse_output_rse": 7.414164965213606e-18,
-        "minimum_per_case_budget_spearman": 1,
+        "minimum_per_case_budget_spearman": 1.0,
         "peak_cuda_bytes": 50630709760,
         "routes": 8,
-        "steps_per_route": 3,
+        "numerical_rows": 288,
         "limitations": [
-          "Four historical disclosed source videos, not 96 independent videos",
-          "Three fixed controls only; not a population ranking guarantee",
-          "No future batch, E3, full-host recovery or overall release acceptance claim"
+          "Four historical disclosed source videos, not96 independent videos",
+          "Three fixed controls, not population-ranking acceptance",
+          "Input provenance retains its original track identity; tested runtime is the current frozen image"
         ]
       },
       "id": "E2",
@@ -88,33 +94,38 @@
       "pass": true,
       "raw_evidence": [
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/runtime-checks-gpu6.raw.log",
-          "sha256": "3849403500e573727528be63db5b451c72e1491d31d2a45221175240ff18b53e",
-          "scope": "Actual frozen b81bfa8/3749/860 GPU execution; limitations in linked receipt"
+          "path": "private/maintenance-v2-r1/runtime-checks-registration.json",
+          "sha256": "25317f8bbd99a669a3a11b0300d38eda7033b5ed42939c5282a1fabdc1e1d52d",
+          "scope": "Frozen instrumentation and actual current-image invocation"
+        },
+        {
+          "path": "private/maintenance-v2-r1/runtime-checks-gpu6.raw.log",
+          "sha256": "93dca4eae05f65c1dbb23e11395ac01bf1df8fe8fb3455fce8a3245f144694f2",
+          "scope": "Actual H200:288 numeric rows, zero mask mismatches"
         }
       ],
       "release_blocker": true,
-      "status": "registered_cache_fidelity_checks_passed",
+      "status": "current_runtime_registered_cache_fidelity_passed",
       "subject": "缓存数值忠实度"
     },
     {
       "acceptance_manifest": {
-        "path": "evidence/system-panel/acceptance-8608cf5d/sqlite-final/result.json",
-        "sha256": "54d774dba6e60b45b7ec8b5872aa922a13ddb3269ac3d4a32436620821770687"
+        "path": "private/maintenance-v2-r1/sqlite-final/run/result.json",
+        "sha256": "ebb0bb3b02e6ed93b4b784018841b643e7db52a1261fa23cb6d82179c656971b"
       },
       "acceptance_rule": "真实GPU执行固定self和退化对照，完成一次两阶段FIFO闭环；self不能晋级，较好基线能战胜可控退化，两阶段均过线才替换冠军，confirmation使用exact决策之后的新批次；报告局部与完整视频分数差异，不宣称已证明总体排序一致",
       "actual_values": {
-        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
-        "runtime_source_commit": "b81bfa8",
-        "image_id": "sha256:3749e5b063b50d66c4d676dd2c79c10c460e5d7f1de9e7713f7444428bcc2c2c",
-        "source_sha256": "3fdf7148a4da81119ee51b6557e2a08066c4ffdc69bdb759fd567e524ab0c025",
+        "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+        "runtime_source_commit": "364c0ca",
+        "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
+        "source_sha256": "f86ddf56a3eeb4e0a37781a089f37961fb3542da5ac967d50f85ba6de1086eed",
         "independent_videos_per_phase": 16,
         "exact_cases_per_phase": 384,
         "full_video_cells": 96,
-        "exact_gain_lower_bound": 0.09963065729838526,
-        "full_video_baseline_score": 0.7619235479211722,
-        "full_video_shuffled_score": 0.6570879920438147,
-        "full_video_gain_lower_bound": 0.04190771739740623,
+        "exact_gain_lower_bound": 0.09890598780424399,
+        "full_video_baseline_score": 0.7556230476023633,
+        "full_video_shuffled_score": 0.622002479661849,
+        "full_video_gain_lower_bound": 0.04680054524618486,
         "minimum_gain": 0.005,
         "self_gain_lower_bound": 0.0,
         "phase_source_families_disjoint": true,
@@ -124,57 +135,57 @@
         "private_s3_stage_objects_independently_verified": 5,
         "saved_sqlite_databases_verified": 10,
         "memory_s3_used": false,
-        "clock": "user-approved isolated accelerated chain fixture",
+        "clock": "isolated accelerated chain fixture",
         "real_chain_admission_or_weight_transaction_claimed": false,
-        "scope": "Fixed self/degraded controls and actual two-stage SQLite/S3 lifecycle only; not overall ranking, whole-host recovery or release acceptance"
+        "scope": "Actual current-image GPU reports and durable lifecycle. Positive fixture starts with a degraded incumbent; not formal genesis defeat, HF admission, whole-host recovery, general rankings or the separately running restricted production-pool diagnostic."
       },
       "id": "E3",
       "method": "用固定只读self和退化模型运行真实exact及完整视频，核验FIFO、未来confirmation、冠军替换及持久化事实；更广的跨批次、近阈值和排序研究上线后继续，不训练模型",
       "pass": true,
       "raw_evidence": [
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/registration.json",
-          "sha256": "b2ea42e559398b52a365491311c29077f69adc8c95c8f5c55d2536cb4fc0b188",
-          "scope": "Preregistration of the exact frozen runtime and phase identities"
+          "path": "private/maintenance-v2-r1/acceptance-registration.json",
+          "sha256": "3ccdfaf30f90a1b222ca762affb6dab1bad324f5696e692a2860578070defb77",
+          "scope": "Frozen identities and sixteen videos per phase; fixture clock explicit"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/exact-result.json",
-          "sha256": "4a2f9c84bef9067522a83d80b8674d2eba7438439aa8495cc0c550852fa66809",
-          "scope": "Actual 16-video first-stage GPU report"
+          "path": "private/maintenance-v2-r1/acceptance/exact-result.json",
+          "sha256": "16d9890bde474d3dac4c69010e85016a98214b8464490def0af20bc0cc41ec35",
+          "scope": "Actual384-case first-stage GPU report"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/confirmation-result.json",
-          "sha256": "59b6aba46debcb3001848ca667443106b25fc075bc7071acf0487ceb5d37057e",
-          "scope": "Independent future 16-video complete video report, disjoint source families"
+          "path": "private/maintenance-v2-r1/acceptance/confirmation-result.json",
+          "sha256": "cef234fad9470f8ee0a1319317c9ebdcc2832af076897e31301930e65b49d5f0",
+          "scope": "Actual96 full-video cells, independent future sixteen-video batch"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/exact-aggregate-independent-review.json",
-          "sha256": "0eea4323a33b56b6cff031b0e3d80a1843c809bee1d86e3b18441ba8c2aa1174",
-          "scope": "Independent frozen-source recomputation of all 384 exact cells"
+          "path": "private/maintenance-v2-r1/confirmation-gpu6.raw.log",
+          "sha256": "a4aa6cb8c38120e879bd6291347276311070f79f6a611b40a2395415a3758ac2",
+          "scope": "Original H200 complete-video execution on GPU6"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/full-video-aggregate-independent-review.json",
-          "sha256": "2624dfff2064e57784af9db51f79978d8993b96a66d183dbe18c822b903b789e",
-          "scope": "Independent frozen-source recomputation of 96 full-video cells"
+          "path": "private/maintenance-v2-r1/confirmation-gpu7.raw.log",
+          "sha256": "e12cc1117a5c0045c8a54a21283cdb61ef943c40fc2bb876e2a86aabb500d000",
+          "scope": "Original H200 complete-video execution on GPU7"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/sqlite-final/result.json",
-          "sha256": "54d774dba6e60b45b7ec8b5872aa922a13ddb3269ac3d4a32436620821770687",
-          "scope": "Actual frozen-runtime GPU reports to SQLite FIFO, two-stage promotion, real off-GPU S3 archives and loss-before-commit recovery; isolated accelerated chain fixture, not HF admission or formal-genesis defeat"
+          "path": "private/maintenance-v2-r1/aggregate-independent-review.json",
+          "sha256": "b26b2b301413e75e5ea523cde1bf944f203e693ead24abfcc2edbdc2ade803f9",
+          "scope": "Independent standard-library means, AUC and bootstrap recomputation"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/sqlite-final.raw.log",
-          "sha256": "cc16e97cd66c071afb68000395d761721a1284b7b80a1ba632033e883f77754e",
-          "scope": "Actual isolated SQLite/S3 execution exited zero, no public writes or chain transactions"
+          "path": "private/maintenance-v2-r1/confirmation-sqlite.raw.log",
+          "sha256": "eb6b71edeb0cb7878028d1471aa6ee4fac73fbd3fe70b914298d85b458a4f4c0",
+          "scope": "Actual isolated SQLite/S3 execution exited zero"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/sqlite-final/independent-s3-check.json",
-          "sha256": "01affe0848568ad8a1443e1cffb11b30528ed675806ecb223ffbeea87ce6dfca",
-          "scope": "Independent actual S3 GET of five full private stage bodies against ten saved SQLite databases; public projections separately verified"
+          "path": "private/maintenance-v2-r1/sqlite-final/independent-s3-check.json",
+          "sha256": "dcac1f7dec6869c5ce63c2c905f95fe15cb107e57f95aec92871f1b8e846302b",
+          "scope": "Independent TLS GET of five full stages against ten SQLite snapshots and public projections"
         }
       ],
       "release_blocker": true,
-      "status": "final_runtime_registered_two_stage_controls_and_sqlite_s3_passed",
+      "status": "current_runtime_two_stage_gpu_controls_and_real_sqlite_s3_recovery_passed",
       "subject": "teacher-state 到完整稀疏 rollout 的分布偏移"
     },
     {
@@ -296,7 +307,9 @@
           "file_sha256": "896a6363958724afa46e33f9f40baf17418e9069a028d722d8f30c3f290598c1",
           "model_digest": "f990fb6ddc5466e7f1621880330e57543c68f982bd868060352bc3f06d3d9bb9",
           "tensor_count": 100,
-          "metadata_keys": ["hotkey"],
+          "metadata_keys": [
+            "hotkey"
+          ],
           "formal_source_sha256": "3fdf7148a4da81119ee51b6557e2a08066c4ffdc69bdb759fd567e524ab0c025",
           "candidate_source_sha256": "4dbf65f15395027e68ec4f3806e366d1ddc1fde0c7c7db84eb7c0f636f81db03",
           "both_image_results_identical": true,
@@ -322,8 +335,8 @@
         "conditional_logit_magnitude_proof": {
           "finite_cached_inputs_and_weights_dtype": "float16",
           "predictor_arithmetic_dtype": "float32",
-          "unscaled_logit_abs_bound": 3.4753901058388516e26,
-          "fp32_headroom_factor": 9.791198578451245e11,
+          "unscaled_logit_abs_bound": 3.4753901058388516e+26,
+          "fp32_headroom_factor": 979119857845.1245,
           "full_video_backbone_trajectories_bounded": false
         },
         "scope": "Actual installed formal/candidate spawned scorers plus a conservative arithmetic bound for fixed finite-FP16 cached inputs. Not every legal file, malformed parser input, full-video trajectory, live admission or queue recovery; no training or new sources."
@@ -412,15 +425,27 @@
         "physical_gpu": 7,
         "diagnostic_cases": 120,
         "geometries": 4,
-        "layers": [0, 49],
+        "layers": [
+          0,
+          49
+        ],
         "text_tokens": 107,
         "matched_budget_curve_spearman_min": 1.0,
-        "live_cost_shape_median_relative_error_range": [0.15809427335877607, 0.21173196183345233],
-        "live_cost_shape_p95_relative_error_range": [0.2371847097625259, 0.3197362491308101],
+        "live_cost_shape_median_relative_error_range": [
+          0.15809427335877607,
+          0.21173196183345233
+        ],
+        "live_cost_shape_p95_relative_error_range": [
+          0.2371847097625259,
+          0.3197362491308101
+        ],
         "recorded_control_sensitivity": {
           "measured_global_cost_curves_replayed": 40,
           "full_video_control_outcome_flips": 0,
-          "positive_full_video_lower_bound_range": [0.039722235385358365, 0.04107226488683644],
+          "positive_full_video_lower_bound_range": [
+            0.039722235385358365,
+            0.04107226488683644
+          ],
           "recorded_exact_positive_lipschitz_floor": 0.01432551403343861,
           "minimum_gain_unchanged": 0.005,
           "scope": "One fixed 16-video control pair, original seed/resamples and frozen source. Finite recorded-statistic sensitivity only, not coverage or robustness of all legal/near-threshold models; no timing inference or live cost changes."
@@ -439,10 +464,16 @@
           "runtime_source_commit": "b81bfa8",
           "layers": 50,
           "geometries": 4,
-          "text_token_counts": [90, 107],
+          "text_token_counts": [
+            90,
+            107
+          ],
           "fixed_controls": 3,
           "legal_mask_patterns": 4,
-          "physical_gpus": [6, 7],
+          "physical_gpus": [
+            6,
+            7
+          ],
           "expected_sparse_rows_per_phase": 8400,
           "calibration_rows_completed": 8400,
           "calibration_contexts": 64,
@@ -627,13 +658,28 @@
       "actual_values": {
         "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
         "completed_fixed_model_comparison": {
-          "models": ["baseline_self", "shuffled_heads", "mean_pool", "perturbed_baseline"],
+          "models": [
+            "baseline_self",
+            "shuffled_heads",
+            "mean_pool",
+            "perturbed_baseline"
+          ],
           "independent_videos": 16,
           "exact_cases_per_model": 384,
           "full_video_budget_cells_per_model": 48,
           "model_mean_rank_spearman": 0.8,
-          "exact_mean_order": ["perturbed_baseline", "baseline_self", "mean_pool", "shuffled_heads"],
-          "full_video_mean_order": ["baseline_self", "perturbed_baseline", "mean_pool", "shuffled_heads"],
+          "exact_mean_order": [
+            "perturbed_baseline",
+            "baseline_self",
+            "mean_pool",
+            "shuffled_heads"
+          ],
+          "full_video_mean_order": [
+            "baseline_self",
+            "perturbed_baseline",
+            "mean_pool",
+            "shuffled_heads"
+          ],
           "scope": "Every preregistered video and exact-rejected control included. The near-copy swaps mean order but passes neither confidence gate. Four fixed identities and one full-video cohort do not prove a population rank-correlation bound or human quality; full data and provenance are indexed under E17."
         },
         "same_cohort_diagnostic": {
@@ -642,7 +688,10 @@
           "exact_cases": 384,
           "video_budget_cells": 96,
           "paired_gain_spearman_across_videos": -0.2323529411764706,
-          "stratified_video_bootstrap_95_percent_interval": [-0.6385318869165023, 0.2053581468194474],
+          "stratified_video_bootstrap_95_percent_interval": [
+            -0.6385318869165023,
+            0.2053581468194474
+          ],
           "within_stratum_demeaned_spearman": -0.011764705882352941,
           "per_video_gain_sign_disagreements": 0,
           "scope": "All original confirmation videos, baseline versus shuffled-head control. Local and full-video ordering agree on all16 videos, but improvement magnitudes do not correlate reliably. This is cross-video paired-gain evidence, not cross-model ranking, near-baseline retention, human visual quality or E12/E17 acceptance. No GPU call, inference, training or scoring change."
@@ -803,140 +852,63 @@
     },
     {
       "acceptance_manifest": {
-        "path": "evidence/system-panel/acceptance-8608cf5d/e16-determinism-and-errors.json",
-        "sha256": "64b73d7349ea54178ec34b0e7e69de1477891fe7a1ff9b3e4f45b9057d3a71b3"
+        "path": "private/maintenance-v2-r1/e16-determinism-and-errors.json",
+        "sha256": "8f0a787d740bdc6886c04b54714de4711e6e495db79d59d67da4e1b99995b4fa"
       },
       "acceptance_rule": "mask 完全一致；分数差 ≤1e-6；所有非法输入按固定错误码拒绝",
       "actual_values": {
-        "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
-        "runtime_source_commit": "b81bfa8",
-        "image_id": "sha256:3749e5b063b50d66c4d676dd2c79c10c460e5d7f1de9e7713f7444428bcc2c2c",
-        "source_sha256": "3fdf7148a4da81119ee51b6557e2a08066c4ffdc69bdb759fd567e524ab0c025",
-        "cross_card_cells": 9,
-        "finite_fp32_overflow_zero_quality": true,
-        "following_valid_call_succeeds": true,
-        "gpu_uuids": [
-          "afb8e554-5536-1248-6a11-04f3dc6ca84a",
-          "872a1df0-b9f2-8d2c-2be9-7b66109693d7"
-        ],
-        "invalid_prefixes_rejected": 2,
-        "max_score_delta": 0,
-        "non_finite_inputs_rejected": 3,
-        "output_sha256_mismatches": 0,
-        "padding_max_abs": 1.1920928955078125e-07,
+        "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+        "runtime_source_commit": "364c0ca",
+        "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
+        "source_sha256": "f86ddf56a3eeb4e0a37781a089f37961fb3542da5ac967d50f85ba6de1086eed",
         "physical_gpus": [
           6,
           7
         ],
-        "remaining_spawn_children": 0,
         "same_card_repeat_pairs": 6,
-        "spawn_timeouts": 2,
-        "tie_budgets": [
-          4,
-          8,
-          16,
-          32,
-          64
-        ],
-        "tie_mask_mismatches": 0,
+        "cross_card_cells": 9,
+        "max_score_delta": 0.0,
+        "output_sha256_mismatches": 0,
+        "independent_source_videos": 1,
+        "independent_selectors": 2,
+        "baseline_repeat_is_alias": true,
+        "h200_pytest_passed": 14,
         "limitations": [
-          "One historical source video, two independent selectors and one baseline repeat alias; not general ranking or future batch acceptance",
-          "Timeouts interrupt real spawned workers during startup, not a hung CUDA kernel",
-          "Overflow probe modifies in-memory FP32 values; not a legal FP16 submitted file",
-          "Original batch driver exits with a registration-key error before starting adversarial probe; only that missing probe was subsequently run separately, and all listed individual GPU processes exited zero"
+          "One historical source and two independent fixed selectors; no population or ten-batch stability claim",
+          "Actual current H200 regressions cover CUDA ties, dtype/projection parity, allocation replay and non-finite participant errors; not a real hung CUDA-kernel recovery run",
+          "Separate CPU/H200 runs jointly cover all797 case IDs, not one complete GPU-suite run",
+          "No wallet or chain transaction; restricted production-pool integration remains a separate running diagnostic"
         ],
-        "supplemental_cuda_regressions": {
-          "candidate_source_commit": "8863972",
-          "physical_gpu": 6,
-          "passed": 5,
-          "skipped": 0,
-          "gpu6_calibration_completed_before_tests": true,
-          "relevant_scoring_files_byte_identical_to_live_b81": true,
-          "verified_unit_collection_commit": "8e21c4b",
-          "verified_unit_collection_case_ids": 770,
-          "all_case_ids_passed_across_three_runs": true,
-          "single_full_gpu_suite_claimed": false,
-          "scope": "Real H200 tie-order, three-dtype fused/cached pooling and legal allocation replay. Exact source/test identity checked against live numerical files; offline pytest and explicit candidate source overlay, not a frozen new production image, ranking or match acceptance."
-        },
-        "latest_maintenance_candidate": {
-          "source_commit": "b5f9712",
-          "source_sha256": "4dbf65f15395027e68ec4f3806e366d1ddc1fde0c7c7db84eb7c0f636f81db03",
-          "image_id": "sha256:c4884377fb18d6b9c456bff5ff4292cac05bee3521e87f37bfb13c173f9cb915",
-          "deployed": false,
-          "cpu_passed": 774,
-          "cpu_skipped": 12,
-          "h200_passed": 14,
-          "h200_skipped": 0,
-          "distinct_case_ids_covered": 786,
-          "remaining_uncovered_case_ids": 0,
-          "scope": "Actual installed candidate application, pristine source/lock/environment verified before the exact offline test-runner overlay. Separate CPU/H200 XML inventories cover all786 cases, including every CPU skip and CUDA tie order. Not one complete GPU-suite run, full-video quality acceptance or deployed-runtime evidence."
-        },
-        "historical_d1b_fp16_probe": {
-          "file_sha256": "7f476b03c39069de4ba24f650a5d74c1d76feab80c3803bb806dc7435f2eb7c1",
-          "weight_value": 65504.0,
-          "independent_source_videos": 16,
-          "cases": 384,
-          "score": 0.7393190167587981,
-          "incumbent_score": 0.9378653370691498,
-          "paired_gain_lower_bound": -0.25871346670004053,
-          "following_baseline_score_delta": 0.0,
-          "children_remaining_after_each_score": 0,
-          "temporary_model_deleted": true,
-          "live_chain_admission_tested": false
-        }
+        "distinct_current_test_case_ids_covered": 797,
+        "single_full_gpu_suite_claimed": false
       },
       "id": "E16",
       "method": "同机复跑、同型号跨卡、并列 logits、极值、padding、NaN/Inf、超时和损坏文件",
       "pass": true,
       "raw_evidence": [
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/full-video-repeat-gpu6.raw.log",
-          "sha256": "2cbdde59baf1b9640ee63cf6210707aa8e42a4d93395c657a5c75c28a29955ff",
-          "scope": "Actual frozen b81bfa8/3749/860 GPU execution; limitations in linked receipt"
+          "path": "private/maintenance-v2-r1/code-verification.json",
+          "sha256": "fa7753df26a0e9da0fd797feccf64d3b341d1602c3df5b29beeb7b483d222ead",
+          "scope": "Exact source/test identities and CPU/H200 XML union covering all797 case IDs"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/runtime-checks-gpu7.raw.log",
-          "sha256": "cd05f5f8e9dfd0fa51b1eb1d98c6561b6d0b1564e6f5bff95770d201a0c8f92a",
-          "scope": "Actual frozen b81bfa8/3749/860 GPU execution; limitations in linked receipt"
+          "path": "private/maintenance-v2-r1/cuda-test-execution.raw.log",
+          "sha256": "9a912e1f12671e83961ca95fad33572a1a69487ef395d9ef898a831c5e03fa06",
+          "scope": "Current frozen H200 runner:14 tests, including native CUDA tie order"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/tie-timeout-gpu6.raw.log",
-          "sha256": "bbfc891b197bbe443625ae6629edab4e9e02bd0bcc370ed94525b5d73b5a4d35",
-          "scope": "Actual frozen b81bfa8/3749/860 GPU execution; limitations in linked receipt"
+          "path": "private/maintenance-v2-r1/full-repeat-gpu6.raw.log",
+          "sha256": "3d913531d3eed9cac5146d35a190590f6112d3b6025e9af9da5adfc14fca0972",
+          "scope": "Nine full-video cells including three baseline repeats on one historical portrait"
         },
         {
-          "path": "evidence/system-panel/acceptance-8608cf5d/tie-timeout-gpu7.raw.log",
-          "sha256": "e68944e20fb3d8ffa3456771e65f6ba61571c9442cc4af8b8b0c8a0d12c45fcb",
-          "scope": "Actual frozen b81bfa8/3749/860 GPU execution; limitations in linked receipt"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-8608cf5d/adversarial-gpu7.raw.log",
-          "sha256": "f77dc9389ad84789c38ab06cd721820b854eaf252d17a3296ad7f5744f959008",
-          "scope": "Actual frozen b81bfa8/3749/860 GPU execution; limitations in linked receipt"
-        },
-        {
-          "path": "evidence/system-panel/acceptance-d1b38764/fp16-maximum-exact-gpu6.raw.log",
-          "sha256": "5339061b3c8f9a69733789abc79fb683af22a25acde1f39d309d8f7e9fd54203",
-          "scope": "Historical D1B only, not current 860 acceptance: Supplemental actual spawned scoring of one schema-valid 100-tensor FP16 selector with all weights 65504 and hotkey metadata on a fresh 16-video exact batch; normal baseline then reproduces reference exactly, with no remaining child and the temporary file deleted; not all extreme models, full-video scoring, or live chain admission"
-        },
-        {
-          "path": "private/torch-cuda-verification-8863972/result.json",
-          "sha256": "1ca5620acc097d401d864167de061297bab82426d668c55945617b7242e52b8b",
-          "scope": "Five original CUDA tests actually pass on H200 GPU6, no skips or overlap with that card's cost measurement. Source/Git and three verified JUnit collections cover all770 8e21 case IDs, not a single770-pass GPU run. Numerical modules and regressions match live b81; source/testing overlay, not a new formal runtime."
-        },
-        {
-          "path": "private/code-verification-b5f9712/result.json",
-          "sha256": "3aa93cb474db2ee5d1be5d3828d5b28a058e8d57ed159b929fe9c8d56e481269",
-          "scope": "Unified maintenance candidate actually built and frozen; installed scoring/runtime numeric modules match the live parent. CPU774 plus H20014 successful cases independently cover all786 registered IDs. Includes real CUDA tie-order, zero GPU skips, terminal exit0/OOMfalse and runner-overlay limitations; candidate not deployed."
-        },
-        {
-          "path": "private/candidate-b5f9712/cuda-test-execution.raw.log",
-          "sha256": "d97a0ba9effcdd866f85da4bafa381bfa1c6082b3995bb21dec58e0788c4afa5",
-          "scope": "Actual candidate H200 GPU7 stdout and precise execution timestamps, including pristine-runtime verification, installed application path and14 successful tests. No model training, hidden-data generation or public mutation."
+          "path": "private/maintenance-v2-r1/full-repeat-gpu7.raw.log",
+          "sha256": "8ad190cba64f7bb1c9ed8f74208d24b89681607d3e16a9fb5f6c11e3236f6af8",
+          "scope": "Same protocol on other H200, all nine corresponding score/output hashes identical"
         }
       ],
       "release_blocker": true,
-      "status": "registered_determinism_and_error_checks_passed",
+      "status": "current_runtime_cuda_regressions_and_complete_video_repeatability_passed",
       "subject": "确定性与异常输入"
     },
     {
@@ -946,7 +918,10 @@
         "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
         "registered_fixed_control_comparison": {
           "independent_videos": 16,
-          "existing_controls": ["mean_pool", "perturbed_baseline"],
+          "existing_controls": [
+            "mean_pool",
+            "perturbed_baseline"
+          ],
           "exact_cases_per_control": 384,
           "new_full_video_control_cells": 96,
           "baseline_budget32_parity_replays": 16,
