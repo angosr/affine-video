@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 import bittensor as bt
 from bittensor.intents import normalize as normalize_weights
+from bittensor.settings import GLOBAL_MAX_SUBNET_COUNT
 
 _HEX_32 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -82,9 +83,8 @@ class WeightArtifact:
         if self.match_sequence == 0:
             if self.terminal_match_sha256 is not None:
                 raise ValueError("empty match history cannot have a terminal match hash")
-        elif (
-            not isinstance(self.terminal_match_sha256, str)
-            or not _HEX_32.fullmatch(self.terminal_match_sha256)
+        elif not isinstance(self.terminal_match_sha256, str) or not _HEX_32.fullmatch(
+            self.terminal_match_sha256
         ):
             raise ValueError("weight artifact terminal match hash is invalid")
         if self.plan is not None and self.plan.source_block != self.source_block:
@@ -114,12 +114,15 @@ async def read_weight_chain_state(
     client: Any,
     *,
     netuid: int,
+    mechid: int = 0,
     finalized_block: int | None = None,
 ) -> WeightChainState:
     """Read all planning inputs from one finalized chain snapshot."""
 
     if netuid < 0 or netuid > 0xFFFF:
         raise ValueError("netuid must fit in an unsigned 16-bit integer")
+    if type(mechid) is not int or not 0 <= mechid <= 0xFF:
+        raise ValueError("mechid must fit in an unsigned 8-bit integer")
     finalized = await client.finalized_block() if finalized_block is None else finalized_block
     if finalized < 0:
         raise ValueError("finalized block must be non-negative")
@@ -139,19 +142,32 @@ async def read_weight_chain_state(
     if type(rate_limit) is not int or rate_limit < 0:
         raise RuntimeError("chain returned an invalid weights_rate_limit value")
 
+    # The metagraph runtime API returns mechanism-zero last updates. Other
+    # mechanisms have their own rate-limit clock in LastUpdate storage.
+    mechanism_updates = None
+    if mechid:
+        mechanism_updates = await snapshot.query(
+            bt.storage.SubtensorModule.LastUpdate,
+            [mechid * GLOBAL_MAX_SUBNET_COUNT + netuid],
+        )
+        if not isinstance(mechanism_updates, (list, tuple)):
+            raise RuntimeError("chain returned invalid mechanism last-update blocks")
+
     uid_by_hotkey: dict[str, int] = {}
     last_update_by_hotkey: dict[str, int] = {}
     seen_uids: set[int] = set()
     for neuron in graph.neurons:
         hotkey = neuron.hotkey
         uid = neuron.uid
-        last_update = neuron.last_update
         if not isinstance(hotkey, str) or not hotkey:
             raise RuntimeError("metagraph contains an invalid hotkey")
         if type(uid) is not int or not 0 <= uid <= 0xFFFF:
             raise RuntimeError("metagraph contains an invalid UID")
         if hotkey in uid_by_hotkey or uid in seen_uids:
             raise RuntimeError("metagraph hotkey and UID mapping is not unique")
+        if mechanism_updates is not None and uid >= len(mechanism_updates):
+            raise RuntimeError("mechanism last-update blocks do not cover registered UIDs")
+        last_update = neuron.last_update if mechanism_updates is None else mechanism_updates[uid]
         if type(last_update) is not int or last_update < 0 or last_update > finalized:
             raise RuntimeError("metagraph contains an invalid last-update block")
         uid_by_hotkey[hotkey] = uid

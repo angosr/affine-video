@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from bittensor.settings import GLOBAL_MAX_SUBNET_COUNT
 
 from validator.queue import ChainPosition
 from validator.tournament import Champion
@@ -50,7 +51,8 @@ def artifact(*, source: int = 120, plan: WeightPlan | None = None) -> WeightArti
     )
 
 
-def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
+@pytest.mark.parametrize("mechid", [0, 1, 2])
+def test_weight_chain_inputs_come_from_one_finalized_snapshot(mechid: int) -> None:
     calls: list[object] = []
 
     class FakeSubnets:
@@ -65,6 +67,14 @@ def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
 
     class FakeSnapshot:
         subnets = FakeSubnets()
+
+        async def query(self, item, parameters):
+            assert item.container == "SubtensorModule"
+            assert item.name == "LastUpdate"
+            assert parameters == [mechid * GLOBAL_MAX_SUBNET_COUNT + 7]
+            assert mechid != 0
+            calls.append(("mechanism_last_update", parameters))
+            return [5, 0, 0, 6]
 
         async def read(self, name: str, **parameters):
             calls.append((name, parameters))
@@ -82,15 +92,52 @@ def test_weight_chain_inputs_come_from_one_finalized_snapshot() -> None:
             calls.append(("at", block))
             return FakeSnapshot()
 
-    state = asyncio.run(read_weight_chain_state(FakeClient(), netuid=7, finalized_block=123))
+    state = asyncio.run(
+        read_weight_chain_state(FakeClient(), netuid=7, mechid=mechid, finalized_block=123)
+    )
 
     assert state.finalized_block == 123
     assert state.uid_by_hotkey == {"alice": 0, "bob": 3}
-    assert state.last_update_by_hotkey == {"alice": 100, "bob": 110}
+    assert state.last_update_by_hotkey == (
+        {"alice": 100, "bob": 110} if mechid == 0 else {"alice": 5, "bob": 6}
+    )
     assert state.min_allowed_weights == 2
     assert state.max_weight == pytest.approx(32768 / 65535)
     assert state.weights_rate_limit == 100
     assert calls[0] == ("at", 123)
+
+
+@pytest.mark.parametrize("mechid", [-1, 256, True, 1.0])
+def test_weight_chain_rejects_invalid_mechanism_before_chain_access(mechid) -> None:
+    with pytest.raises(ValueError, match="mechid"):
+        asyncio.run(read_weight_chain_state(object(), netuid=120, mechid=mechid))
+
+
+@pytest.mark.parametrize("updates", [None, {}, [], [124], [-1], [True], [1.0]])
+def test_weight_chain_rejects_invalid_mechanism_last_updates(updates) -> None:
+    class Snapshot:
+        subnets = SimpleNamespace()
+
+        async def read(self, name, **parameters):
+            return {"min_allowed_weights": 1, "max_weight_limit": 65535, "weights_rate_limit": 10}[
+                name
+            ]
+
+        async def query(self, item, parameters):
+            return updates
+
+    async def metagraph(netuid, *, commitments):
+        return SimpleNamespace(neurons=[SimpleNamespace(uid=0, hotkey="alice", last_update=1)])
+
+    Snapshot.subnets.metagraph = metagraph
+
+    class Client:
+        async def at(self, block):
+            assert block == 123
+            return Snapshot()
+
+    with pytest.raises(RuntimeError, match="last-update"):
+        asyncio.run(read_weight_chain_state(Client(), netuid=120, mechid=1, finalized_block=123))
 
 
 def test_champion_plan_assigns_all_weight_to_uid_zero_baseline() -> None:
@@ -133,9 +180,9 @@ def test_champion_plan_resolves_current_uid_and_fails_closed_on_infeasible_rules
         "current_block": 120,
     }
 
-    assert plan_champion_weight(
-        **arguments, min_allowed_weights=1, max_weight=1.0
-    ) == WeightPlan(120, ("burn-hotkey",), (4,), (1.0,))
+    assert plan_champion_weight(**arguments, min_allowed_weights=1, max_weight=1.0) == WeightPlan(
+        120, ("burn-hotkey",), (4,), (1.0,)
+    )
     assert plan_champion_weight(**arguments, min_allowed_weights=2, max_weight=1.0) is None
 
 
