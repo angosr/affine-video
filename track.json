@@ -13,7 +13,7 @@
     "minimum_generation_delay_blocks": 301,
     "storage_dtype": "float16"
   },
-  "artifact_manifest_sha256": "fea4f6a29a23b07e3b135fa7c4b34c63730476c4a40d4a4a5319c83ed6ae3c63",
+  "artifact_manifest_sha256": "ae66c14d7008ea98785260b1c64e4b026fe7ab8d52379071b61226eece1e5d9c",
   "source_pool_merkle_root": "11844a47d2e1ee5192a8b4b170fd396941313b4de9abdbbd5d0493f2b9026477",
   "maximum_generation_batches": 80,
   "maximum_effective_challenges": 20,
