@@ -272,9 +272,32 @@
           "preparation_peak_rss_kib": 2432508,
           "cuda_devices": 0,
           "duplicate_of_genesis_tensors": false,
-          "quality_evaluated": false,
+          "exact_proxy_evaluated": true,
+          "full_video_quality_complete": false,
           "training": false,
-          "scope": "Pinned official public FP8 data verified in full and converted with the unchanged installed reader into the legal FP16 projection schema. Independent CPU-only formula reproduces all100 tensors bitwise. Original source plans/budgets are not imported into the tournament. No remote code, training, quality or chain-admission claim; the declared owner is a benchmark identity, not a genesis replacement."
+          "paired_audit_study": {
+            "registration_sha256": "01cadc3da588845cac2a4981c3caee7535f082fa1773134ce2843df081f91aa4",
+            "complete_exact_cases": 768,
+            "independent_source_videos": 32,
+            "original_baseline_case_differences": 0,
+            "first_exact": {
+              "challenger_score": 0.9088229772325374,
+              "incumbent_score": 0.9056135199464086,
+              "gain_lower_bound": -0.0013048620456658573,
+              "clears_frozen_exact_gate": false
+            },
+            "future_exact": {
+              "challenger_score": 0.9305067389899514,
+              "incumbent_score": 0.9289662578473995,
+              "gain_lower_bound": -0.0010192119728979394,
+              "clears_frozen_exact_gate": false
+            },
+            "independent_exact_statistics_reproduced": true,
+            "full_video_complete": false,
+            "full_video_runs_regardless_of_exact_result": true,
+            "scope": "Both complete existing CF audit exact cohorts, with known original baseline labels. Small positive mean gains do not clear either frozen confidence gate. Full sixteen-video candidate inference is still running independently; no video-quality, promotion, general ranking or live reward claim."
+          },
+          "scope": "Pinned official public FP8 data verified in full and converted with the unchanged installed reader into the legal FP16 projection schema. Independent CPU-only formula reproduces all100 tensors bitwise. Original source plans/budgets are not imported into the tournament. Proxy observations are recorded separately; full-video comparison remains incomplete. No remote code, training, actual Miner admission or genesis replacement."
         }
       },
       "id": "E4",
@@ -335,6 +358,21 @@
           "path": "private/maintenance-v2-r1/external-control-preparation-verification.json",
           "sha256": "fa7a4fa859943a68327fec450d2dd85b797a96a3652c4c73a543f2e78d22176b",
           "scope": "Original independent verifier exits0/OOMfalse; source/export complete SHA remain unchanged, parent preparation and both raw/registration identities bound. Format/provenance only, not quality or promotion."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-study-registration.json",
+          "sha256": "01cadc3da588845cac2a4981c3caee7535f082fa1773134ce2843df081f91aa4",
+          "scope": "Complete frozen two-cohort exact/full diagnostic, all reference worker hashes and baseline labels, legal candidate identity, fixed data/thresholds and original GPU6/7 deadlines. Full video runs independently of exact outcome; no retries, training or public writes."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-study-exact-result.json",
+          "sha256": "d41ef2136a18d8e93b783a78c4edc87f32998ab2f6689a07465c7c36fb3d7416",
+          "scope": "Actual frozen H200 exact run completes768 cases across two disjoint sixteen-video cohorts. Candidate means are slightly higher but neither confidence bound passes; all baseline cells reproduce the original records exactly."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-study-exact-independent-review.json",
+          "sha256": "76e5dbd8a55bb03c1f170a85f537be380600c21bf3e513af3b0d1d3dde659834",
+          "scope": "Independent standard-library weighted means and route/video/step bootstrap reproduce both complete exact reports within1e-12. Does not recapture candidate per-budget attentions, establish statistical coverage or provide the still-running full-video result."
         }
       ],
       "release_blocker": false,
