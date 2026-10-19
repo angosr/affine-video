@@ -91,13 +91,6 @@ class AssetClient:
         assert headers is None
         return AssetResponse(self.parts[url.rsplit("/", 1)[-1]])
 
-    def get(self, url: str, *, headers: dict[str, str] | None = None):
-        if url.endswith("/manifest.json"):
-            assert headers == {"Accept": "application/json"}
-            return AssetResponse(self.manifest)
-        assert headers is None
-        return AssetResponse(self.parts[url.rsplit("/", 1)[-1]])
-
 
 def sibling(*, size: int | None):
     return SimpleNamespace(
@@ -196,6 +189,96 @@ def test_generic_chunked_file_is_reassembled(tmp_path, monkeypatch) -> None:
     )
 
     assert path.read_bytes() == complete
+
+
+class _CountingStream(httpx.SyncByteStream):
+    def __init__(self, content: bytes, repeats: int = 1) -> None:
+        self.content = content
+        self.repeats = repeats
+        self.chunks_read = 0
+        self.closed = False
+
+    def __iter__(self):
+        for _ in range(self.repeats):
+            self.chunks_read += 1
+            yield self.content
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_generic_chunked_file_limits_manifest_before_buffering(
+    tmp_path, monkeypatch, declared,
+) -> None:
+    limit = 64 * 1024
+    monkeypatch.setattr(download_module, "_MAX_MANIFEST_BYTES", limit)
+    body = _CountingStream(b"x" * limit, repeats=64)
+    headers = {"Content-Length": str(limit + 1)} if declared else {}
+    with (
+        httpx.Client(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, stream=body, headers=headers),
+        )) as client,
+        pytest.raises(RuntimeError, match="could not be restored"),
+    ):
+        download_chunked_file(
+            "https://public.example/models/digest/manifest.json",
+            cache_dir=tmp_path,
+            expected_sha256="ab" * 32,
+            max_bytes=10,
+            suffix=".safetensors",
+            http_client=client,
+        )
+    assert body.chunks_read <= (0 if declared else 2)
+    assert body.closed
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fault", [
+    "oversized_header", "short_header", "oversized_body", "lying_header",
+    "short_body", "corrupt_body", "http_error",
+])
+def test_generic_chunked_file_limits_parts_and_preserves_existing_cache(tmp_path, fault) -> None:
+    content = b"a" * (64 * 1024)
+    digest = hashlib.sha256(content).hexdigest()
+    manifest = ChunkManifest(
+        digest, len(content), (ChunkPart("part-00000", digest, len(content)),),
+    ).encode()
+    headers = {}
+    if fault in {"oversized_header", "short_header", "lying_header"}:
+        delta = {"oversized_header": 1, "short_header": -1, "lying_header": 0}[fault]
+        headers["Content-Length"] = str(len(content) + delta)
+    body = _CountingStream(
+        b"b" * len(content) if fault == "corrupt_body" else
+        b"a" if fault == "short_body" else content,
+        repeats=1 if fault in {"short_body", "corrupt_body"} else 64,
+    )
+    target = tmp_path / f"{digest}.safetensors"
+    target.write_bytes(b"previous cache")
+
+    def respond(request):
+        if request.url.path.endswith("/manifest.json"):
+            return httpx.Response(200, content=manifest)
+        return httpx.Response(503 if fault == "http_error" else 200, stream=body, headers=headers)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        pytest.raises(RuntimeError, match="could not be restored"),
+    ):
+        download_chunked_file(
+            "https://public.example/models/digest/manifest.json",
+            cache_dir=tmp_path,
+            expected_sha256=digest,
+            max_bytes=len(content),
+            suffix=".safetensors",
+            http_client=client,
+        )
+    assert body.chunks_read <= (0 if fault in {
+        "oversized_header", "short_header", "http_error",
+    } else 2)
+    assert body.closed
+    assert target.read_bytes() == b"previous cache"
+    assert list(tmp_path.iterdir()) == [target]
 
 
 def test_downloads_anonymously_into_content_addressed_cache(tmp_path) -> None:

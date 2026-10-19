@@ -92,11 +92,17 @@ def download_chunked_file(
     client = http_client or httpx.Client(follow_redirects=False, timeout=timeout_seconds)
     temporary: Path | None = None
     try:
-        response = client.get(manifest_url, headers={"Accept": "application/json"})
-        response.raise_for_status()
-        if len(response.content) > _MAX_MANIFEST_BYTES:
-            raise ValueError("chunk manifest exceeds the byte limit")
-        manifest = ChunkManifest.decode(response.content)
+        manifest_bytes = bytearray()
+        with client.stream("GET", manifest_url, headers={"Accept": "application/json"}) as response:
+            response.raise_for_status()
+            declared = response.headers.get("content-length")
+            if declared is not None and int(declared) > _MAX_MANIFEST_BYTES:
+                raise ValueError("chunk manifest exceeds the byte limit")
+            for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                manifest_bytes.extend(chunk)
+                if len(manifest_bytes) > _MAX_MANIFEST_BYTES:
+                    raise ValueError("chunk manifest exceeds the byte limit")
+        manifest = ChunkManifest.decode(bytes(manifest_bytes))
         if manifest.sha256 != expected_sha256 or manifest.size > max_bytes:
             raise ValueError("chunk manifest conflicts with the expected file")
         descriptor, name = tempfile.mkstemp(prefix=".partial-chunk-", dir=cache)
@@ -107,13 +113,22 @@ def download_chunked_file(
                 part_url = urljoin(manifest_url, part.name)
                 if urlparse(part_url).netloc != parsed_url.netloc:
                     raise ValueError("chunk URL escaped the manifest origin")
-                part_response = client.get(part_url)
-                part_response.raise_for_status()
-                content = part_response.content
-                if len(content) != part.size or hashlib.sha256(content).hexdigest() != part.sha256:
+                part_received = 0
+                part_digest = hashlib.sha256()
+                with client.stream("GET", part_url) as part_response:
+                    part_response.raise_for_status()
+                    declared = part_response.headers.get("content-length")
+                    if declared is not None and int(declared) != part.size:
+                        raise ValueError("public chunk content length is incorrect")
+                    for chunk in part_response.iter_bytes(chunk_size=64 * 1024):
+                        part_received += len(chunk)
+                        if part_received > part.size:
+                            raise ValueError("public chunk exceeds its byte limit")
+                        part_digest.update(chunk)
+                        complete.update(chunk)
+                        output.write(chunk)
+                if part_received != part.size or part_digest.hexdigest() != part.sha256:
                     raise ValueError("public chunk failed size or digest verification")
-                complete.update(content)
-                output.write(content)
             output.flush()
             os.fsync(output.fileno())
         if temporary.stat().st_size != manifest.size or complete.hexdigest() != expected_sha256:
