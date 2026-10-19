@@ -287,13 +287,64 @@
     {
       "acceptance_manifest": null,
       "acceptance_rule": "所有 route、geometry、segment、padding 和并列分数的 valid/required/selected mask 与正式 runtime 完全一致；非法布局必须拒绝",
-      "actual_values": null,
+      "actual_values": {
+        "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+        "source_commit": "364c0ca",
+        "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
+        "physical_gpu": 6,
+        "cases": 32,
+        "sampled_routes": 8,
+        "architecture_routes": 2800,
+        "geometries": 4,
+        "independent_sources": 4,
+        "fixed_models": 2,
+        "budgets": [16, 32, 64],
+        "native_and_production_budget_comparisons": 384,
+        "native_mask_mismatches": 0,
+        "production_mask_mismatches": 0,
+        "max_logits_abs_delta": 8.58306884765625e-06,
+        "max_production_logits_abs_delta": 9.5367431640625e-07,
+        "max_output_mean_abs_delta": 9.834766387939453e-06,
+        "key_tiles_range": [319, 634],
+        "elapsed_seconds": 112.64251455804333,
+        "peak_rss_kib": 3125332,
+        "peak_cuda_bytes": 746404352,
+        "initial_diagnostic_owner_loading_failure_preserved": true,
+        "only_correction": "Supply fixed-control owner to the anonymous-only diagnostic loader; unchanged numerical trace, model bytes, cases and tolerances. Formal admission/scoring already supplies ownership and was not changed.",
+        "scope": "First canonical case per sampled route/stratum in one existing CF audit fixture. Native Miowtion, production and NumPy masks agree. Existing current-image H200 tests separately cover reference/global/required segments, padding and ties. Not every architecture route, all legal layouts or general ranking acceptance."
+      },
       "id": "E5",
       "method": "对冻结 tile plan 和预算规则逐项比较独立 scorer 与真实 sparse runtime；覆盖边界、必选块和实际分段预算，不开展架构搜索",
       "pass": false,
-      "raw_evidence": [],
+      "raw_evidence": [
+        {
+          "path": "private/maintenance-v2-r1/tile-mask-initial-failure.json",
+          "sha256": "f7ffab3ea4a3f8388a6df6f0f8b4ea41f85679db217cdaa6922a179294a24f2e",
+          "scope": "Original failed diagnostic, complete initial harness, exit1 and raw log hash. Owned fixed control rejected by anonymous-only trace helper, not a formal scoring failure."
+        },
+        {
+          "path": "private/maintenance-v2-r1/tile-mask-owner-aware-registration.json",
+          "sha256": "b3988b8e54283783f2493df83b856cb354413dbaa26a05a326a8f1de9465077b",
+          "scope": "Fixed corrected diagnostic harness and Docker arguments before execution; owner loading context only, no numerical, model, dataset, threshold or deadline changes."
+        },
+        {
+          "path": "private/maintenance-v2-r1/tile-mask-owner-aware-result.json",
+          "sha256": "e14de419e18fde6f10b10ef6f65127dee2035d89d5510353fa7091907e4deeb4",
+          "scope": "All64 model/case rows and three budgets from the unchanged numerical trace helper on actual H200; native and production masks have zero differences."
+        },
+        {
+          "path": "private/maintenance-v2-r1/tile-mask-owner-aware-verification.json",
+          "sha256": "b1f299df19126a1c2cb2d35a90004a239703de22f479292c2edc6b023c3b9db5",
+          "scope": "Original current-image container exits0/OOMfalse. All raw rows equal result rows; dimensions, numerical tolerances and both mask families independently checked."
+        },
+        {
+          "path": "private/maintenance-v2-r1/code-verification.json",
+          "sha256": "fa7753df26a0e9da0fd797feccf64d3b341d1602c3df5b29beeb7b483d222ead",
+          "scope": "Original current-image14 actual H200 tests include forced ties, reference/global/required masks, sampled/full rows, padding and dtype pooling; test IDs and raw/JUnit hashes retained."
+        }
+      ],
       "release_blocker": false,
-      "status": "not_final_runtime_verified",
+      "status": "current_runtime_sampled_native_mask_parity_passed_full_architecture_coverage_pending",
       "subject": "tile、必选块与预算语义"
     },
     {
@@ -1141,6 +1192,20 @@
           "total_seconds_including_validation": 1045.1573085188866,
           "scope": "Frozen860/3749 run(once=True), reservation, sixteen actual newly produced units and complete10.36GB NPZ byte comparison plus original CUDA Reader. Bootstrap/READY only cloned; empty SQLite has no admissions/stages, so not queue replay or static-asset/whole-host recovery. Older D1/E91 component evidence remains archived off-repository and in index history; current index uses this actual860 run instead."
         },
+        "current_runtime_model_archive_restore": {
+          "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+          "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
+          "complete_file_sha256": "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f",
+          "size_bytes": 550511648,
+          "elapsed_seconds": 1442.6971396338195,
+          "peak_rss_kib": 81144,
+          "original_model_mounted": false,
+          "hf_download_used": false,
+          "complete_file_independently_rehashed": true,
+          "container_exited_zero": true,
+          "oom_killed": false,
+          "scope": "Actual unchanged ReadyBatchSource.restore_model downloads every baseline byte from off-GPU TLS S3 into an empty scratch cache using the evaluator role. No original model/HF, private or public writes. Not model upload, a real winning submission or whole-host restore."
+        },
         "current_runtime_worker_pool_integration": {
           "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
           "source_commit": "364c0ca",
@@ -1280,6 +1345,21 @@
           "path": "private/maintenance-v2-r1/joint-pools-verification.json",
           "sha256": "e86daa62e4625646ccd4a71d412beb64a7fb33ff2b9755c883fa6af0ae9bb2cb",
           "scope": "Both actual pools complete at formal256GiB/16CPU limits and all six GPUs compute simultaneously. One plan per pool only, not sustained production capacity or whole-host acceptance."
+        },
+        {
+          "path": "private/maintenance-v2-r1/model-restore-registration.json",
+          "sha256": "65d582850b84b976400f44d9edb09c235881e075e426bc38b4cc89db1292669b",
+          "scope": "Original embedded restore harness, fixed550511648-byte model identity, empty cache,1800-second limit, no restart or HF access."
+        },
+        {
+          "path": "private/maintenance-v2-r1/model-restore-result.json",
+          "sha256": "ec279acd3fed4185ab1d97b0f19fe0c2e2fa9c06b5c3bf98ff00d2c5f985f699",
+          "scope": "Actual current-image production restore primitive recovers the complete baseline from off-GPU S3 with81144KiB peak RSS; elapsed1442.70 seconds, full file SHA matches."
+        },
+        {
+          "path": "private/maintenance-v2-r1/model-restore-verification.json",
+          "sha256": "587686dd27adbd98af57d262da889af18ecc1e1683229d300bb8abdaee2dfe44",
+          "scope": "Original container exits0/OOMfalse without model mount; independently streamed full-file sha256sum matches. Raw log, registration and terminal-state hashes bound. Not a whole-host or real winner recovery claim."
         }
       ],
       "release_blocker": false,

@@ -23,6 +23,8 @@ same-card and cross-card video repeats have identical scores and output hashes.
 The actual four-GPU producer and restricted two-GPU confirmation pools also pass at their deployed
 resource limits: 48 regenerated-file hashes and 96 full-video scores/output hashes match the
 reference exactly, with all six GPUs observed computing concurrently.
+An empty-cache restore also recovers all 550 MB of the baseline from off-GPU private S3,
+without Hugging Face or an existing model mount; the complete file hash matches.
 Evidence scope and remaining validation are
 tracked in the [acceptance inventory](evidence/system-panel/acceptance/inventory.json);
 isolated checks do not establish real-miner admission or complete host-loss recovery.
