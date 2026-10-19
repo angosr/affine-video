@@ -28,6 +28,13 @@ The current production config is also preserved byte-for-byte off GPU. All 15 ro
 values match control-host sources, and both active commands match the archived launch arguments;
 the receipt retains no credentials or value digests. This is input coverage, not a cold restart.
 
+The current-image CPU-only assembly interruption test also passes: a real SIGKILL leaves an
+11.6 MB incomplete NPZ, unchanged pruning reclaims it while retaining an unrelated canary,
+and the original 16 units rebuild all 384 cases into the same 10,304,413,828-byte file hash.
+Elapsed 81.40 s and peak child RSS 150,692 KiB; no GPU or object-store writes. This is not whole-host,
+unit-generation, scheduler/CAS or full-disclosure acceptance. Eight superseded local image
+archives (139.3 GB) have been removed; all 56 current assets and small historical provenance remain.
+
 The previous `b81bfa8`/`8608cf5d` runtime passed E2, repeatability, CUDA ordering, and a two-stage SQLite/FIFO/off-GPU S3 control fixture. The new image retains byte-identical numerical scoring/runtime/full-video code, but those historical runs keep their original identities. The intermediate E91 regeneration and 16-case synthetic full-mask diagnostic likewise remain component evidence, not relabeled current acceptance.
 
 `launch/runner.py` implements the broader research panel and requires an explicit runtime binding for every data-producing command. Its six identities run on ten production and eight audit exact batches, followed by five production and two audit full-video batches. Both replay orders reuse the same five exact labels and the same confirmation labels. All six identities receive full-video cells, covering every dynamic-incumbent path. Directional gates reject self or degenerate promotion and require the reverse VEDA-versus-shuffled positive to promote on every production batch. Aggregation binds the complete fixed model roster to the exact-summary hash and recomputes full-video bounds from raw cells. Completing this entire research panel is not required before initial release.

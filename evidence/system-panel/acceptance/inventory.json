@@ -1544,6 +1544,31 @@
           "path": "private/maintenance-v2-r1/recovery-input-verification.json",
           "sha256": "7d353cd350b0eade59136935143a761bad9920a10c9b9fe841b98f056742c0ee",
           "scope": "Current production config preserved byte-for-byte off GPU; both actual container commands match archived launch arguments, and all15 role environment values match off-GPU sources through an ephemeral comparison. Receipt contains key names and booleans, never credentials or value digests. No restart or whole-host restore claim."
+        },
+        {
+          "path": "private/maintenance-v2-r1/assembly-recovery-registration.json",
+          "sha256": "8140d4087c799ee13d1903a50126c1ef0543dd2618d0f09cc1bb076107f58d51",
+          "scope": "Frozen current-image CPU-only interruption protocol: exact16 original units and384 cases, SIGKILL only after observing a real incomplete NPZ, unchanged pruning, no network/GPU/new data/automatic retry."
+        },
+        {
+          "path": "private/maintenance-v2-r1/assembly-recovery-result.json",
+          "sha256": "cb7fb49c33baffc3ae1d65f06c0c684cdc0f8573ab672bbd08b8934236a51d9e",
+          "scope": "Actual assembler child exits SIGKILL;11595776 orphan bytes are reclaimed, unrelated canary retained, and complete10304413828-byte NPZ reproduces its original SHA.81.40 seconds, peak child150692KiB. Component only, not scheduler/CAS, unit generation, disclosure or whole-host recovery."
+        },
+        {
+          "path": "private/maintenance-v2-r1/assembly-recovery-verification.json",
+          "sha256": "b2dd87c9d987e98bd4e66c0488f4c7fabe1db027e065b9eae6065f723231881f",
+          "scope": "Root independently checks original registration/raw events/terminal exit0/OOMfalse and streams a separate SHA over the complete rebuilt NPZ. E18 remains incomplete."
+        },
+        {
+          "path": "private/maintenance-v2-r1/assembly-recovery-retirement.json",
+          "sha256": "eb63f0850e397a685654c3e076b5bde13e87690239d7c2cc32fe4ded5014079d",
+          "scope": "Completed container and10.3GB duplicate scratch are removed only after off-GPU raw/result preservation and independent full-file SHA. Original same-byte cache and16 units remain available; no production files changed."
+        },
+        {
+          "path": "private/maintenance-v2-r1/retired-image-cleanup-result.json",
+          "sha256": "95d462c3310ea4eac47d00a1e17889044691a596e1fb8c127a40023af5d83390",
+          "scope": "Eight inactive superseded local image archives removed,139315253248 bytes. All56 current asset paths/size/inodes verified before and after; current OCI, configs, authority store and historical small provenance retained. Historical full image archives, including the old basis image, are intentionally no longer retained off GPU."
         }
       ],
       "release_blocker": false,
