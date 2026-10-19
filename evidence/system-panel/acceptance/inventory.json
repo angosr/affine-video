@@ -273,7 +273,7 @@
           "cuda_devices": 0,
           "duplicate_of_genesis_tensors": false,
           "exact_proxy_evaluated": true,
-          "full_video_quality_complete": false,
+          "full_video_quality_complete": true,
           "training": false,
           "paired_audit_study": {
             "registration_sha256": "01cadc3da588845cac2a4981c3caee7535f082fa1773134ce2843df081f91aa4",
@@ -293,11 +293,35 @@
               "clears_frozen_exact_gate": false
             },
             "independent_exact_statistics_reproduced": true,
-            "full_video_complete": false,
+            "full_video_complete": true,
+            "full_video_candidate_cells": 48,
+            "baseline_full_video_hash_replays": 8,
+            "full_video": {
+              "challenger_score": 0.7302189477098174,
+              "incumbent_score": 0.7556230476023633,
+              "gain_lower_bound": -0.09536131035399588,
+              "clears_frozen_full_video_gate": false,
+              "elapsed_seconds": 3166.31927748397,
+              "peak_rss_kib": 40122364,
+              "peak_cuda_bytes": 57668403200
+            },
+            "independent_full_statistics_reproduced": true,
+            "zero_cell_replay": {
+              "original_gpu": 7,
+              "fresh_gpu": 6,
+              "all_three_original_scores_and_hashes_reproduced": true,
+              "baseline_before_after_fidelity_identical": true,
+              "black_frame_fraction": 0.0,
+              "latents_and_trajectory_finite": true,
+              "flicker_ratio": 2.0112140956312503,
+              "frozen_flicker_threshold": 2.0,
+              "pre_gate_weighted_quality": 0.741026116243652,
+              "scope": "Actual baseline -> candidate -> baseline fresh-process replay of the post-selected zero; only the frozen motion-ratio gate rejects it. This establishes determinism and a hard-gate sensitivity, not perceptual flicker severity, a wrong threshold or permission to replace the original result."
+            },
             "full_video_runs_regardless_of_exact_result": true,
-            "scope": "Both complete existing CF audit exact cohorts, with known original baseline labels. Small positive mean gains do not clear either frozen confidence gate. Full sixteen-video candidate inference is still running independently; no video-quality, promotion, general ranking or live reward claim."
+            "scope": "Both complete existing CF audit exact cohorts and all16 future full-video cases, with known original baseline labels. Small positive exact mean gains coexist with a lower complete-video mean; neither frozen gate passes. All48 candidate cells and8 baseline output-hash replays retained; independent full mean/AUC/bootstrap agrees. One budget32 video scores zero and remains in the result; its metric decomposition is a separate diagnostic, never grounds to discard or replace this observation. No general ranking, visual preference, statistical coverage or live reward claim."
           },
-          "scope": "Pinned official public FP8 data verified in full and converted with the unchanged installed reader into the legal FP16 projection schema. Independent CPU-only formula reproduces all100 tensors bitwise. Original source plans/budgets are not imported into the tournament. Proxy observations are recorded separately; full-video comparison remains incomplete. No remote code, training, actual Miner admission or genesis replacement."
+          "scope": "Pinned official public FP8 data verified in full and converted with the unchanged installed reader into the legal FP16 projection schema. Independent CPU-only formula reproduces all100 tensors bitwise. Complete exact/full comparisons reject promotion. Original source plans/budgets are not imported into the tournament. No remote code, training, actual Miner admission, genesis replacement or broad headroom proof."
         }
       },
       "id": "E4",
@@ -373,10 +397,50 @@
           "path": "private/maintenance-v2-r1/external-control-study-exact-independent-review.json",
           "sha256": "76e5dbd8a55bb03c1f170a85f537be380600c21bf3e513af3b0d1d3dde659834",
           "scope": "Independent standard-library weighted means and route/video/step bootstrap reproduce both complete exact reports within1e-12. Does not recapture candidate per-budget attentions, establish statistical coverage or provide the still-running full-video result."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-study-full-result.json",
+          "sha256": "8f3f5691d25a50a07ef3f7564ac7ec0769fbe1540edef23a9d2773c48721481f",
+          "scope": "Complete frozen H200 run, all16 registered future audit videos and48 candidate full-video cells, including a zero. Baseline48 original labels plus8 actual repeated output hashes retained. No winner, training, formal admission or reward change."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-study-full-verification.json",
+          "sha256": "4352dcd003283dbb87f87f0186b971db33b3d77cd3a5f502ea81bdfea2163cb7",
+          "scope": "Original current-image container exits0/OOMfalse; all56 actual completed cell events match the complete result and registered baseline labels/hashes. Ordinary teacher text remains in raw logs; initial strict-JSON collector error is preserved without rerunning inference."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-study-full-independent-review.json",
+          "sha256": "c6afd2b12f752b88317271d09b0bd8cbd85539dbdf9db07638fd04e36c3ceaf2",
+          "scope": "Independent standard-library per-video log-cost AUC and clustered bootstrap reproduce all full scores/bounds within1e-12, with reverse/self checks and all16 video gains. Slightly higher exact means reverse to a lower full-video mean; both promotion gates fail. Not coverage or population-retention acceptance."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-study-retirement.json",
+          "sha256": "493d079d845f96d7ba48b6b8f4c8e512573012f4afd7374423b31f7156190fbc",
+          "scope": "Original completed H200 handle/image/resource/GPU7 identity checked and container retired after full off-GPU collection. Redundant .py source is removed only after matching the complete harness embedded in the frozen registration. Candidate and inputs remain for the separately registered zero-cell diagnostic."
+        },
+        {
+          "path": "private/maintenance-v2-r1/zero-cell-registration.json",
+          "sha256": "ca2d9b08a073f648ba9a12ccd7a8aba84c8b5546eb884f2191a10c59a1bd13de",
+          "scope": "Bounded900-second post-selected diagnostic, unchanged generation/decoder/metric and fixed baseline/candidate/baseline order; records fidelity components and eight-frame contact sheets, with no inference retries or changes to original scores."
+        },
+        {
+          "path": "private/maintenance-v2-r1/zero-cell-result.json",
+          "sha256": "a3779f7e2050b9d6046a3c502dacd3d28705266c468733e11fbb94af1f8daeb3",
+          "scope": "Fresh H200 GPU6 reproduces all three original GPU7 scores and raw output hashes. Candidate is finite with no black frames; motion ratio2.011214 exceeds frozen2.0 and zeros an otherwise0.741026 weighted fidelity. Before/after baseline fidelity is identical."
+        },
+        {
+          "path": "private/maintenance-v2-r1/zero-cell-independent-review.json",
+          "sha256": "aa8ec38137df35cc9d82d74d2080952919e87b409f0944610cb8da1b8d94d7c0",
+          "scope": "Independent scalar ratio/weighted-quality arithmetic, original-score/hash binding and four complete PNG checks. Hard-gate sensitivity remains a calibration concern; sampled contact sheets cannot prove temporal flicker or human preferences, and full decoded-frame hashes were not recorded. No production change."
+        },
+        {
+          "path": "private/maintenance-v2-r1/zero-cell-retirement.json",
+          "sha256": "b985246e9ea30d5a8e0743c288ed7835a16016cefe383561f8aeba665b908452",
+          "scope": "Completed diagnostic container and duplicate GPU JSON/PNG scratch retired only after complete off-GPU raw/result/image collection and hash checks. Original cache, models, source, track and public pointers unchanged."
         }
       ],
       "release_blocker": false,
-      "status": "fixed_controls_completed_external_legal_export_verified_quality_and_headroom_pending",
+      "status": "fixed_external_exact_and_full_comparison_complete_broad_headroom_pending",
       "subject": "可竞争空间"
     },
     {
@@ -897,6 +961,11 @@
           "path": "private/same-cohort-fidelity-860-20261019/result.json",
           "sha256": "abbf52a1fb87d8d9f7cb7815ae5ee564c78b5a15c476195b3438d141dfdebd5e",
           "scope": "Actual bounded CPU recomputation, all original worker/binding hashes and aggregate scores verified. Two executions reproduce all correlations, intervals and counts; final receipt retains per-video values. Weak cross-video paired-gain correlation is not relabeled as model-ranking failure or acceptance."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-study-full-independent-review.json",
+          "sha256": "c6afd2b12f752b88317271d09b0bd8cbd85539dbdf9db07638fd04e36c3ceaf2",
+          "scope": "Current R1 external fixed selector: both exact means are slightly higher while the complete future-video mean is lower. All16 video gains and original zero retained; both frozen promotion gates reject. A concrete mean-order reversal, not a population-correlation estimate."
         }
       ],
       "release_blocker": false,
@@ -1173,6 +1242,11 @@
           "path": "private/fixed-control-video-860-20261019/gpu7.raw.log",
           "sha256": "ebe2b04329c593396f9c324a4a65611e632a202a2e19e192a4b070965af3071b",
           "scope": "Original GPU7 controller and complete real inference stdout, including192 exact cases,48 new full cells,8 baseline32 parity checks and terminal exit0. Original live3fdf/3749/860 runtime, not the later maintenance candidate."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-study-full-independent-review.json",
+          "sha256": "c6afd2b12f752b88317271d09b0bd8cbd85539dbdf9db07638fd04e36c3ceaf2",
+          "scope": "Current R1 official external control completes full evaluation despite exact rejection and also fails the full gate. This adds no above-baseline full winner, so observed population retention remains undefined rather than100%."
         }
       ],
       "release_blocker": false,
@@ -1183,108 +1257,9 @@
       "acceptance_manifest": null,
       "acceptance_rule": "按固定GPU分工打通生产、评测与发布，记录单批耗时、显存和磁盘占用；unit/assemble/upload中断后恢复同一批次和冠军，重试耗尽有告警且到期自动恢复；峰值容量与30%余量作为上线后持续压测目标",
       "actual_values": {
-        "current_track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
-        "current_runtime_source_commit": "b81bfa8",
-        "current_assembly_interruption": {
-          "real_assembler_sigkill": true,
-          "interrupted_temporary_file_bytes": 11827811,
-          "new_process_after_ready_cas_response_loss": true,
-          "complete_regenerated_npz_byte_equal": true,
-          "ready_body_and_etag_unchanged": true,
-          "runtime_source_commit": "b81bfa8",
-          "temporary_cleanup_passed": false,
-          "scoring_opportunity_preserved": true,
-          "scope": "Actual SIGKILL and off-GPU S3 READY commit with injected response loss. Recovery succeeded but a retained-plan batch temp survived normal pruning. This frozen-runtime failure remains recorded; separate candidate repair evidence is not a deployed fix. No CUDA dense revalidation, real scoring or whole-host recovery claim."
-        },
-        "candidate_cleanup_repair": {
-          "source_commit": "8863972",
-          "cpu_tests_passed": 732,
-          "cpu_tests_skipped_without_torch": 12,
-          "three_ready_plans_oldest_pending_progress_regression_passed": true,
-          "real_interrupted_temp_copy_bytes_reclaimed": 11827811,
-          "original_failed_file_and_complete_npz_sha_unchanged": true,
-          "cpu_torch_supplement": {
-            "selected_tests": 14,
-            "passed": 9,
-            "originally_skipped_cpu_cases_now_passed": 7,
-            "skipped_without_cuda": 5,
-            "gpu_devices_used": 0,
-            "scope": "Existing candidate tests on GPU host with exact offline pytest dependencies and original Torch. Two cases were already covered by the clean CPU suite; this is not a single739-pass run or CUDA/new formal runtime acceptance. Initial test-runner import failure preserved, only missing packaged py.py shim added."
-          },
-          "deployed": false,
-          "scope": "Minimal candidate repair, independent clean CPU suite/build hashes and isolated actual orphan-copy cleanup reviewed. Three-plan scheduling is a controlled regression, not actual three-batch S3 generation or new frozen-image acceptance."
-        },
-        "last_verified_fixed_asset_coverage": {
-          "formal_artifacts": 56,
-          "formal_total_bytes": 97294548471,
-          "artifacts_sha_verified_in_this_audit": 48,
-          "total_bytes_with_sha_evidence": 56033950679,
-          "artifacts_not_yet_fully_preserved": 8,
-          "complete_size_of_unverified_artifacts_bytes": 41260597792,
-          "historical_extra_assets_not_used_by_formal_runtime": 38,
-          "historical_extra_assets_bytes": 67938105720,
-          "scope": "The single manifest-driven preserver freshly stream-SHA-verified all48 reused local artifacts, including runtime packages and v7 inputs; no reused file retransmission. Other eight artifacts remain unverified. Public pinned HF fallback checked for47 base files and one LoRA, not guaranteed permanent. Excludes genesis selector, credentials and private ledger recovery; not whole-host acceptance."
-        },
-        "current_manifest_preserver": {
-          "operations_commit": "8e21c4b",
-          "service": "veda-preserve-runtime-assets.service",
-          "single_destination_lock_verified": true,
-          "old_revision_specific_writer_retired": true,
-          "selected_artifacts": 56,
-          "initial_transfer_artifacts": 8,
-          "reuse_artifacts": 48,
-          "historical_extra_artifacts_no_longer_transferred": 38,
-          "scope": "Only the explicit current manifest and existing local mirrors/partials; external runtime/v7/predictor files remain read-only. One writer, bounded transfers, no GPU source or formal container changes. Transfer completion and full56 recovery remain pending."
-        },
-        "current_public_chunk_recovery": {
-          "runtime_source_commit": "b81bfa8",
-          "synthetic_bytes": 41944064,
-          "parts": 2,
-          "first_part_successful_logical_puts": 1,
-          "first_put_acknowledged_then_response_lost": true,
-          "new_repository_resumes_without_first_part_reupload": true,
-          "missing_local_source_reverification_requires_no_restore_or_put": true,
-          "anonymous_manifest_and_two_part_full_sha_verified": true,
-          "owned_s3_objects_deleted_and_independently_absent": 3,
-          "formal_container_start_unchanged": true,
-          "formal_pointer_writes": 0,
-          "elapsed_seconds": 55.7447509681806,
-          "peak_gpu_host_cpu_rss_kib": 182232,
-          "scope": "Actual formal S3Repository and public Supabase/HTTP, synthetic data only. One transfer process with three new repository instances plus a separate read-only cleanup observer; not process restart, real match, hidden disclosure or whole10GiB throughput acceptance. Original pre-exec SSH observer quoting error preserved and corrected without changing preregistration/harness/deadline."
-        },
-        "current_production_plan_lifecycle": {
-          "videos": 16,
-          "exact_cases": 384,
-          "generation_workers": 2,
-          "physical_gpus": [
-            6,
-            7
-          ],
-          "actual_service_constructors": 3,
-          "actual_same_etag_cas_winners": 1,
-          "actual_same_etag_cas_rejections": 1,
-          "candidate_ready_bytes_identical": true,
-          "complete_candidate_npz_bytes_identical": true,
-          "exact_size_bytes": 10364189042,
-          "original_reader_cuda_validation_passed": true,
-          "generation_and_assembly_seconds": 1165.6932299672626,
-          "root_actual_s3_ready_readback_passed": true,
-          "nonterminal_disclosure_restored_payload": false,
-          "scope": "Real production-partition plan, two-worker generation and two-process full assembly/READY race. B reused A's sixteen actual units. Single controlled admission only; not two-challenge disclosure, real HF admission, interruption, joint capacity or whole-host recovery."
-        },
-        "current_actual_s3_admission_retry": {
-          "temporary_download_failures": 5,
-          "fresh_sqlite_databases": 6,
-          "configured_fast_retry_ceiling": 5,
-          "actual_remote_checkpoint_restored_after_each_database_loss": true,
-          "same_lease_replay_does_not_increment_attempts": true,
-          "same_original_submission_claimable_after_cooldown": true,
-          "later_fifo_submission_cannot_bypass": true,
-          "permanent_miner_failure": false,
-          "actual_https_push_delivery": false,
-          "scope": "Actual admission/store/retry classes and off-GPU TLS S3; only downloader outage injected, explicit simulated retry timestamps. Failed observers and a shell transport error are retained; original first attempt was preserved, not reset. Not successful HF/model admission, scheduler loop or whole-host recovery."
-        },
-        "current_fixed_input_envelope": {
+        "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+        "runtime_source_commit": "364c0ca",
+        "fixed_input_envelope": {
           "samples": 1120,
           "source_families": 1120,
           "binding_and_all_fixed_input_file_shas_verified": true,
@@ -1310,25 +1285,7 @@
           },
           "scope": "Fixed-byte source-cache integrity and declared input bounds only; not generated-batch throughput, joint GPU capacity or complete host recovery"
         },
-        "current_ready_batch_data_loss_recovery": {
-          "actual_run_once_and_worker_pool": true,
-          "newly_regenerated_units": 16,
-          "byte_equal_unit_files": 48,
-          "complete_npz_byte_equal": true,
-          "complete_npz_bytes": 10364189042,
-          "authoritative_plan_writes_during_regeneration": 0,
-          "real_remote_attempt": 1,
-          "actual_private_s3_objects_after_run": 4,
-          "ready_body_and_etag_unchanged": true,
-          "initial_sqlite_work_units_and_content_empty": true,
-          "sqlite_challenge_or_stage_replay_claimed": false,
-          "static_assets_survived": true,
-          "whole_host_recovery_claimed": false,
-          "actual_run_seconds": 845.6014928277582,
-          "total_seconds_including_validation": 1045.1573085188866,
-          "scope": "Frozen860/3749 run(once=True), reservation, sixteen actual newly produced units and complete10.36GB NPZ byte comparison plus original CUDA Reader. Bootstrap/READY only cloned; empty SQLite has no admissions/stages, so not queue replay or static-asset/whole-host recovery. Older D1/E91 component evidence remains archived off-repository and in index history; current index uses this actual860 run instead."
-        },
-        "current_static_manifest_off_gpu_preservation": {
+        "static_manifest_off_gpu_preservation": {
           "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
           "artifact_manifest_sha256": "e612352e59f63389efdd3d9ee6e6b586bb9a6371de26138354c784d237e30b67",
           "current_artifacts": 56,
@@ -1336,13 +1293,16 @@
           "shared_basis_artifacts": 53,
           "separately_preserved_runtime_artifacts": 3,
           "original_completed_basis_sha_events": 56,
-          "path_metadata_rows_rechecked": 59,
           "public_current_manifest_matches": true,
           "bulk_payload_independently_rehashed_again": false,
           "transient_unit_garbage_collected": true,
           "independent_os_exit_code_claimed": false,
           "whole_host_recovery_claimed": false,
-          "scope": "Original sole writer completed all56 full-byte SHA verifications. Current53 shared assets plus separately verified source/lock/OCI triple cover the entire current manifest off GPU. Root rechecks original facts, all59 path metadata and public manifest, not97GB payload again. Transient-unit default status after GC is not an OS exit-code proof."
+          "scope": "Original writer full-byte SHA facts plus exact current53 shared/3 runtime mapping cover all56 assets off GPU. Original59-path metadata snapshot predates intentional retirement of eight historical image archives, including the old basis image; all56 current paths/size/inodes rechecked unchanged after cleanup. No repeat97GB read or whole-host restore. Transient-unit GC defaults are not an OS exit-code proof.",
+          "path_metadata_rows_at_original_verification": 59,
+          "current_asset_paths_retained_after_cleanup": 56,
+          "retired_image_archives_removed": 8,
+          "retired_image_archive_bytes_removed": 139315253248
         },
         "first_live_empty_generation_boundary": {
           "boundary_block": 9315500,
@@ -1351,12 +1311,19 @@
           "boundary_hash": "0x541c391b484f98dd0c498c5a209014a4f4aec95181ed10bb9c6eb72fe8e231ef",
           "submissions_and_challenges": 0,
           "authoritative_private_plans": 0,
-          "formal_gpus_idle_at_after_snapshot": [0, 1, 2, 3, 4, 5],
+          "formal_gpus_idle_at_after_snapshot": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
           "public_weights_refreshed_beyond_boundary": true,
           "service_restarts": 0,
           "scope": "Actual finalized Finney first generation boundary with an empty queue. Read-only SQLite/S3 and public-pointer checks show no empty production plan or needless GPU load; not a queued-model, full-cycle-capacity or continuous GPU telemetry proof."
         },
-        "current_runtime_model_archive_restore": {
+        "runtime_model_archive_restore": {
           "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
           "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
           "complete_file_sha256": "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f",
@@ -1370,12 +1337,20 @@
           "oom_killed": false,
           "scope": "Actual unchanged ReadyBatchSource.restore_model downloads every baseline byte from off-GPU TLS S3 into an empty scratch cache using the evaluator role. No original model/HF, private or public writes. Not model upload, a real winning submission or whole-host restore."
         },
-        "current_runtime_worker_pool_integration": {
+        "runtime_worker_pool_integration": {
           "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
           "source_commit": "364c0ca",
           "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
-          "producer_gpus": [2, 3, 4, 5],
-          "confirmation_gpus": [0, 1],
+          "producer_gpus": [
+            2,
+            3,
+            4,
+            5
+          ],
+          "confirmation_gpus": [
+            0,
+            1
+          ],
           "memory_bytes_per_pool": 274877906944,
           "cpus_per_pool": 16,
           "both_pools_exited_zero": true,
@@ -1389,6 +1364,27 @@
           "confirmation_output_hash_mismatches": 0,
           "whole_host_recovery_claimed": false,
           "scope": "Actual unchanged WorkerPool and ConfirmationWorkerPool at deployed resource limits, overlapping on H200 GPUs0-5. Same-plan generator replay from empty work and restricted evaluator assets/selected-input mounts. Not independent new batches, real Miner/HF admission, sustained queue throughput or whole-host restore."
+        },
+        "recovery_inputs": {
+          "current_production_config_sha256": "5c1fb236a0453333eecd244bbc183a71c8f679509391f68e447d9d1f9a02c4dc",
+          "role_environment_values_with_matching_off_gpu_sources": 15,
+          "both_active_commands_match_recorded_launch_arguments": true,
+          "all_checked_values_match": true,
+          "formal_services_restarted": false,
+          "scope": "Actual active container input coverage and preserved config, not a cold startup or exercised restored secrets. No credential values/digests retained."
+        },
+        "assembly_interruption_recovery": {
+          "cases": 384,
+          "original_units": 16,
+          "child_sigkill_returncode": -9,
+          "abandoned_temporary_bytes_reclaimed": 11595776,
+          "unrelated_canary_retained": true,
+          "complete_npz_bytes": 10304413828,
+          "complete_original_npz_hash_matches": true,
+          "elapsed_seconds": 81.40162915410474,
+          "peak_child_rss_kib": 150692,
+          "completed_scratch_and_container_retired": true,
+          "scope": "Current frozen production assembler is SIGKILLed mid-write; actual unchanged pruning removes its orphan without touching a canary, and the same16 original real units reconstruct the complete384-case NPZ with byte-identical SHA. CPU-only isolated scratch on GPU host, original evidence readonly, no storage credentials/network/new data or scoring. This is not producer scheduling/CAS, full host restoration, interrupted unit generation or entire batch disclosure acceptance."
         }
       },
       "id": "E18",
