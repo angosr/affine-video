@@ -270,7 +270,7 @@
         }
       ],
       "release_blocker": false,
-      "status": "privileged_headroom_and_two_batch_legal_control_verified_full_video_pending",
+      "status": "fixed_legal_controls_completed_no_above_baseline_winner_headroom_pending",
       "subject": "可竞争空间"
     },
     {
@@ -556,6 +556,16 @@
       "acceptance_rule": "局部对视频主指标的 Spearman bootstrap 95% 下界 ≥0.8，且前列无集中结构性伪影；否则修改缓存/分数，或仅在 E18 证明扩大完整视频评测可负担时发布",
       "actual_values": {
         "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+        "completed_fixed_model_comparison": {
+          "models": ["baseline_self", "shuffled_heads", "mean_pool", "perturbed_baseline"],
+          "independent_videos": 16,
+          "exact_cases_per_model": 384,
+          "full_video_budget_cells_per_model": 48,
+          "model_mean_rank_spearman": 0.8,
+          "exact_mean_order": ["perturbed_baseline", "baseline_self", "mean_pool", "shuffled_heads"],
+          "full_video_mean_order": ["baseline_self", "perturbed_baseline", "mean_pool", "shuffled_heads"],
+          "scope": "Every preregistered video and exact-rejected control included. The near-copy swaps mean order but passes neither confidence gate. Four fixed identities and one full-video cohort do not prove a population rank-correlation bound or human quality; full data and provenance are indexed under E17."
+        },
         "same_cohort_diagnostic": {
           "independent_videos": 16,
           "fixed_models": 2,
@@ -778,6 +788,19 @@
           "single_full_gpu_suite_claimed": false,
           "scope": "Real H200 tie-order, three-dtype fused/cached pooling and legal allocation replay. Exact source/test identity checked against live numerical files; offline pytest and explicit candidate source overlay, not a frozen new production image, ranking or match acceptance."
         },
+        "latest_maintenance_candidate": {
+          "source_commit": "b5f9712",
+          "source_sha256": "4dbf65f15395027e68ec4f3806e366d1ddc1fde0c7c7db84eb7c0f636f81db03",
+          "image_id": "sha256:c4884377fb18d6b9c456bff5ff4292cac05bee3521e87f37bfb13c173f9cb915",
+          "deployed": false,
+          "cpu_passed": 774,
+          "cpu_skipped": 12,
+          "h200_passed": 14,
+          "h200_skipped": 0,
+          "distinct_case_ids_covered": 786,
+          "remaining_uncovered_case_ids": 0,
+          "scope": "Actual installed candidate application, pristine source/lock/environment verified before the exact offline test-runner overlay. Separate CPU/H200 XML inventories cover all786 cases, including every CPU skip and CUDA tie order. Not one complete GPU-suite run, full-video quality acceptance or deployed-runtime evidence."
+        },
         "historical_d1b_fp16_probe": {
           "file_sha256": "7f476b03c39069de4ba24f650a5d74c1d76feab80c3803bb806dc7435f2eb7c1",
           "weight_value": 65504.0,
@@ -830,6 +853,16 @@
           "path": "private/torch-cuda-verification-8863972/result.json",
           "sha256": "1ca5620acc097d401d864167de061297bab82426d668c55945617b7242e52b8b",
           "scope": "Five original CUDA tests actually pass on H200 GPU6, no skips or overlap with that card's cost measurement. Source/Git and three verified JUnit collections cover all770 8e21 case IDs, not a single770-pass GPU run. Numerical modules and regressions match live b81; source/testing overlay, not a new formal runtime."
+        },
+        {
+          "path": "private/code-verification-b5f9712/result.json",
+          "sha256": "3aa93cb474db2ee5d1be5d3828d5b28a058e8d57ed159b929fe9c8d56e481269",
+          "scope": "Unified maintenance candidate actually built and frozen; installed scoring/runtime numeric modules match the live parent. CPU774 plus H20014 successful cases independently cover all786 registered IDs. Includes real CUDA tie-order, zero GPU skips, terminal exit0/OOMfalse and runner-overlay limitations; candidate not deployed."
+        },
+        {
+          "path": "private/candidate-b5f9712/cuda-test-execution.raw.log",
+          "sha256": "d97a0ba9effcdd866f85da4bafa381bfa1c6082b3995bb21dec58e0788c4afa5",
+          "scope": "Actual candidate H200 GPU7 stdout and precise execution timestamps, including pristine-runtime verification, installed application path and14 successful tests. No model training, hidden-data generation or public mutation."
         }
       ],
       "release_blocker": true,
@@ -854,10 +887,15 @@
           "control_wait_services_started": true,
           "registered_wait_barrier_completed": true,
           "new_cuda_measurements_started": true,
-          "full_video_comparison_complete": false,
+          "full_video_comparison_complete": true,
+          "baseline_output_sha_parity_checks_passed": 16,
+          "baseline_exact_case_parity_checks_passed": 384,
+          "controls_clearing_full_video_gain_gate": 0,
+          "full_video_winners_rejected_by_first_exact_gate": [],
+          "retention_rate": null,
           "timeout_seconds_per_gpu_attempt": 7200,
           "automatic_retry": false,
-          "scope": "CPU preflight validated all16 original future-cohort shard/latent pairs and three selector identities. Both registered cost handles completed before the control-host wait services automatically launched the frozen full-video jobs on GPU6/7. Real inference and baseline32 output-SHA replays are running, with logs directly off GPU; not complete retention acceptance. Four fixed identities cannot establish99% population retention. No training, generation, scoring/track change or public match."
+          "scope": "All16 preregistered future videos completed on both original no-retry H200 handles:96 new control full-video cells plus16 original baseline32 output-SHA replays, with384 future exact cases per control. Every baseline output hash and case score matches. Mean-pool and fixed perturbation fail both their original first exact gate and the future full gate. There are zero above-baseline full winners, so retention has a zero denominator and is undefined, not100%. Four identities cannot establish99% population retention. No training, new source, scoring/track change or public match."
         }
       },
       "id": "E17",
@@ -877,11 +915,36 @@
         {
           "path": "private/fixed-control-video-860-20261019/execution.json",
           "sha256": "669232980fca88b95b1a9cef7e9c29c8a182552488c2089dcdd5e1430a77ad4e",
-          "scope": "Actual automatically launched CUDA container IDs, original formal image, distinct GPU6/7 requests, read-only source/data mounts and7200s per-job bounds. Running execution evidence only, not complete model rankings or E12/E17 acceptance."
+          "scope": "Initial running snapshot of the actual automatically launched CUDA IDs, original formal image, distinct GPU6/7 requests, read-only mounts and7200s limits. Original bytes preserved; final states are in terminal-observation.json, not retroactively inserted here."
+        },
+        {
+          "path": "private/fixed-control-video-860-20261019/terminal-observation.json",
+          "sha256": "33047c6d07317cd7a688b005e29314df862472c67e687d8a5aa2b326a4b104bc",
+          "scope": "Both registered handles actually exited0/OOMfalse within their original bounds. Docker COMPLETED payload hashes match the off-GPU controller logs; all96 new full cells,16 baseline replays and384 paired exact cases are present."
+        },
+        {
+          "path": "private/fixed-control-video-860-20261019/analysis-registration.json",
+          "sha256": "05bef30b24fd5196470d754c179d4aa7f41fb5d02a0387a74e9b0d77b54dff4c",
+          "scope": "Complete implementation of the original frozen analysis rule, fixed before GPU6 finished, with exact old source/input/report hashes. Not a new pre-data protocol claim; no changed roster, seed, threshold, fitted weight or repeated experiment."
+        },
+        {
+          "path": "private/fixed-control-video-860-20261019/result.json",
+          "sha256": "a85ffa783ef05ff2eaa15e1d98ab455be9b6e89df1ece3f709b589d94005189d",
+          "scope": "All-video exact/full score recomputation for all four fixed models, preserving model file/tensor identities, original full baseline/shuffled cells, new controls, every budget and stratum. Near-copy mean-order reversal is retained; neither confidence gate promotes it. No above-baseline full winner exists, so this does not estimate retention, prove proxy safety or establish broad model-quality acceptance."
+        },
+        {
+          "path": "private/fixed-control-video-860-20261019/gpu6.raw.log",
+          "sha256": "8ce117ca2090eaccccbb80942b7d0b54b25ab8aeff3bfdef161ce008017a9b64",
+          "scope": "Original GPU6 controller and complete real inference stdout, including192 exact cases,48 new full cells,8 baseline32 parity checks and terminal exit0. Original live3fdf/3749/860 runtime, not the later maintenance candidate."
+        },
+        {
+          "path": "private/fixed-control-video-860-20261019/gpu7.raw.log",
+          "sha256": "ebe2b04329c593396f9c324a4a65611e632a202a2e19e192a4b070965af3071b",
+          "scope": "Original GPU7 controller and complete real inference stdout, including192 exact cases,48 new full cells,8 baseline32 parity checks and terminal exit0. Original live3fdf/3749/860 runtime, not the later maintenance candidate."
         }
       ],
       "release_blocker": false,
-      "status": "fixed_control_full_video_comparison_running",
+      "status": "fixed_controls_completed_no_full_winner_population_retention_unproven",
       "subject": "精确晋级误杀"
     },
     {
