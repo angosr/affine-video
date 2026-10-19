@@ -656,6 +656,8 @@ class ProducerService:
             _require_before_deadline(deadline)
             if winner.state != "READY":
                 raise RuntimeError("plan changed without reaching READY") from None
+            if winner.encode() != ready.encode():
+                raise RuntimeError("concurrent READY differs from the local batch") from None
             return winner
         _require_before_deadline(deadline)
         return ready

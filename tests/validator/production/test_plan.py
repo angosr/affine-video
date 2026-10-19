@@ -636,12 +636,8 @@ class AttemptObjects:
         return self.get(name)
 
 
-@pytest.mark.parametrize("interruption_reason", ["REGENERATION_MISMATCH", "REGENERATION_EXHAUSTED"])
-def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_bytes(
-    tmp_path, monkeypatch, interruption_reason,
-) -> None:
-    """Storage/orchestration regression, not GPU determinism or score evidence."""
-
+@pytest.fixture
+def local_producer(tmp_path, monkeypatch):
     plan = build_plan(
         track_spec_digest="ab" * 32, generation_block=120,
         block_hash="0x" + "cd" * 32, track_start_block=100,
@@ -706,8 +702,68 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
                 ))
             return tuple(results)
 
+    return service, plan, objects, Workers(), payload
+
+
+@pytest.mark.parametrize("winner_change", ["identical", "exact", "inputs", "dense", "plan"])
+def test_producer_cas_loser_requires_identical_ready(local_producer, winner_change):
+    service, plan, objects, workers, _payload = local_producer
+    objects.create_plan("stages/challenge/SCORING.json", b"immutable scored result")
+    winner_body = []
+
+    def lose_replace(name, payload, *, etag):
+        assert objects.get(name).etag == etag
+        candidate = BatchPlan.decode(payload)
+        if winner_change == "exact":
+            candidate = replace(candidate, exact=replace(candidate.exact, sha256="11" * 32))
+        elif winner_change == "inputs":
+            candidate = replace(candidate, sample_cache=replace(
+                candidate.sample_cache,
+                text=replace(candidate.sample_cache.text, sha256="22" * 32),
+            ))
+        elif winner_change == "dense":
+            reference, *remaining = candidate.dense_references
+            candidate = replace(candidate, dense_references=(replace(
+                reference, video=replace(reference.video, sha256="33" * 32),
+            ), *remaining))
+        elif winner_change == "plan":
+            changed = {**candidate.planned_document(), "exact_challenge_ids": ["other"]}
+            candidate = replace(
+                candidate, exact_challenge_ids=("other",),
+                plan_digest=hashlib.sha256(canonical_json(changed)).hexdigest(),
+            )
+        winner_body.append(candidate.encode())
+        objects.values[name] = candidate.encode()
+        raise PreconditionFailed("another producer won the same PLANNED ETag")
+
+    objects.replace_plan = lose_replace
+    if winner_change == "identical":
+        ready = service._execute(
+            "plans/120.json", objects.get("plans/120.json"), plan, workers,
+            deadline=time.monotonic() + 30,
+        )
+        assert ready.encode() == winner_body[0]
+        assert not service._needs_regeneration(ready)
+    else:
+        with pytest.raises(RuntimeError, match="concurrent READY.*local batch"):
+            service._execute(
+                "plans/120.json", objects.get("plans/120.json"), plan, workers,
+                deadline=time.monotonic() + 30,
+            )
+    assert objects.get("plans/120.json").body == winner_body[0]
+    assert objects.get("stages/challenge/SCORING.json").body == b"immutable scored result"
+    assert set(objects.values) == {"plans/120.json", "stages/challenge/SCORING.json"}
+
+
+@pytest.mark.parametrize("interruption_reason", ["REGENERATION_MISMATCH", "REGENERATION_EXHAUSTED"])
+def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_bytes(
+    tmp_path, monkeypatch, local_producer, interruption_reason,
+) -> None:
+    """Storage/orchestration regression, not GPU determinism or score evidence."""
+
+    service, plan, objects, workers, payload = local_producer
     ready = service._execute(
-        "plans/120.json", objects.get("plans/120.json"), plan, Workers(),
+        "plans/120.json", objects.get("plans/120.json"), plan, workers,
         deadline=time.monotonic() + 30,
     )
     assert ready.state == "READY"
@@ -717,7 +773,7 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
     shutil.rmtree(service.content.root)
     assert service._needs_regeneration(ready)
     recovered = service._execute(
-        "plans/120.json", immutable_ready, ready, Workers(), deadline=time.monotonic() + 30,
+        "plans/120.json", immutable_ready, ready, workers, deadline=time.monotonic() + 30,
     )
     assert recovered.encode() == immutable_ready.body
     assert objects.get("plans/120.json") == immutable_ready
@@ -728,7 +784,7 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
     payload[0] = b"non-reproducible replacement"
     with pytest.raises(RuntimeError, match="SYSTEM_BLOCKED"):
         service._execute(
-            "plans/120.json", immutable_ready, ready, Workers(), deadline=time.monotonic() + 30,
+            "plans/120.json", immutable_ready, ready, workers, deadline=time.monotonic() + 30,
         )
     assert objects.get("plans/120.json") == immutable_ready
     assert objects.get("stages/challenge/SCORING.json").body == b"immutable scored result"
@@ -744,7 +800,7 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
         source._plan_for("challenge", confirmation=False)
     payload[0] = b"deterministic exact fixture"
     recovered = service._execute(
-        "plans/120.json", immutable_ready, ready, Workers(), deadline=time.monotonic() + 30,
+        "plans/120.json", immutable_ready, ready, workers, deadline=time.monotonic() + 30,
     )
     assert recovered.encode() == immutable_ready.body
     assert source._plan_for("challenge", confirmation=False) == ready
