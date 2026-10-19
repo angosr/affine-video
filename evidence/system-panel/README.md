@@ -48,6 +48,17 @@ sensitivity, not a numerical failure or proof of severe perceptual flicker. Eigh
 sheets do not validate temporal quality; further calibration remains open, with no parameter or
 original-result changes.
 
+External-control summaries are now published as immutable system benchmarks 5 (two-cohort exact)
+and 6 (full video) through the existing namespace. Anonymous bytes match the canonical records;
+the normal five-minute refresh adds them to the existing status/CLI without a service restart.
+They do not change the real match sequence, UID0 weights, track digest or public pointer paths.
+
+A small CPU boundary diagnostic also runs the actual metric's five AST-extracted gate statements
+on nine predetermined uint8 frame cases. A monotone drift of at most one gray level from a static
+reference rejects, while a constant one-level offset accepts. This isolates denominator-floor
+sensitivity and is distinct from the real R2VA case (dense motion 1.0174, not epsilon-limited).
+No feature/model/VAE or human-quality validation is implied; no replacement rule is adopted.
+
 The previous `b81bfa8`/`8608cf5d` runtime passed E2, repeatability, CUDA ordering, and a two-stage SQLite/FIFO/off-GPU S3 control fixture. The new image retains byte-identical numerical scoring/runtime/full-video code, but those historical runs keep their original identities. The intermediate E91 regeneration and 16-case synthetic full-mask diagnostic likewise remain component evidence, not relabeled current acceptance.
 
 `launch/runner.py` implements the broader research panel and requires an explicit runtime binding for every data-producing command. Its six identities run on ten production and eight audit exact batches, followed by five production and two audit full-video batches. Both replay orders reuse the same five exact labels and the same confirmation labels. All six identities receive full-video cells, covering every dynamic-incumbent path. Directional gates reject self or degenerate promotion and require the reverse VEDA-versus-shuffled positive to promote on every production batch. Aggregation binds the complete fixed model roster to the exact-summary hash and recomputes full-video bounds from raw cells. Completing this entire research panel is not required before initial release.

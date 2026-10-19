@@ -319,6 +319,8 @@
               "scope": "Actual baseline -> candidate -> baseline fresh-process replay of the post-selected zero; only the frozen motion-ratio gate rejects it. This establishes determinism and a hard-gate sensitivity, not perceptual flicker severity, a wrong threshold or permission to replace the original result."
             },
             "full_video_runs_regardless_of_exact_result": true,
+            "public_system_benchmark_sequences": [5, 6],
+            "public_formal_match_sequence_and_uid0_weights_unchanged": true,
             "scope": "Both complete existing CF audit exact cohorts and all16 future full-video cases, with known original baseline labels. Small positive exact mean gains coexist with a lower complete-video mean; neither frozen gate passes. All48 candidate cells and8 baseline output-hash replays retained; independent full mean/AUC/bootstrap agrees. One budget32 video scores zero and remains in the result; its metric decomposition is a separate diagnostic, never grounds to discard or replace this observation. No general ranking, visual preference, statistical coverage or live reward claim."
           },
           "scope": "Pinned official public FP8 data verified in full and converted with the unchanged installed reader into the legal FP16 projection schema. Independent CPU-only formula reproduces all100 tensors bitwise. Complete exact/full comparisons reject promotion. Original source plans/budgets are not imported into the tournament. No remote code, training, actual Miner admission, genesis replacement or broad headroom proof."
@@ -437,6 +439,16 @@
           "path": "private/maintenance-v2-r1/zero-cell-retirement.json",
           "sha256": "b985246e9ea30d5a8e0743c288ed7835a16016cefe383561f8aeba665b908452",
           "scope": "Completed diagnostic container and duplicate GPU JSON/PNG scratch retired only after complete off-GPU raw/result/image collection and hash checks. Original cache, models, source, track and public pointers unchanged."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-benchmark-publication.json",
+          "sha256": "9e9625bb288fa8f435d11c72811b71dfc2ede163ca3231b1af6cfc567b08d871",
+          "scope": "Original measured identities and independently recomputed exact reverse bounds feed existing frozen benchmark constructor for immutable sequences5/6. No new public protocol or direct mutable-pointer writes."
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-benchmark-publication-verification.json",
+          "sha256": "4c33c8575db95bbccd0c5a8e2d7402e907f6582ee6c15f396c1ff888e38e69a7",
+          "scope": "Anonymous HTTP bytes match both canonical new records; normal evaluator refresh exposes all six benchmarks. Formal match sequence0 and UID0 weight1 remain unchanged, as do digest and paths. Initial combined observer assertion is recorded; no inference rerun, publisher restart or immutable overwrite."
         }
       ],
       "release_blocker": false,
@@ -933,6 +945,17 @@
           ],
           "scope": "Every preregistered video and exact-rejected control included. The near-copy swaps mean order but passes neither confidence gate. Four fixed identities and one full-video cohort do not prove a population rank-correlation bound or human quality; full data and provenance are indexed under E17."
         },
+        "motion_gate_boundary_diagnostic": {
+          "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+          "synthetic_frame_cases": 9,
+          "actual_metric_gate_extracted_from_ast": true,
+          "static_reference_monotone_candidate_max_pixel_error": 1,
+          "monotone_one_level_drift_flicker_ratio": 4132.23123177886,
+          "monotone_one_level_drift_rejected": true,
+          "constant_one_level_offset_accepted": true,
+          "new_threshold_or_metric_adopted": false,
+          "scope": "Bounded CPU diagnostic of actual frozen gate assignments on valid synthetic uint8 frames, not feature/model/VAE inference or legal-selector outputs. Static-reference denominator sensitivity is separate from the real R2VA zero, whose dense motion1.0174 is far above the epsilon floor. Human quality and replacement-rule calibration remain unverified."
+        },
         "same_cohort_diagnostic": {
           "independent_videos": 16,
           "fixed_models": 2,
@@ -966,6 +989,26 @@
           "path": "private/maintenance-v2-r1/external-control-study-full-independent-review.json",
           "sha256": "c6afd2b12f752b88317271d09b0bd8cbd85539dbdf9db07638fd04e36c3ceaf2",
           "scope": "Current R1 external fixed selector: both exact means are slightly higher while the complete future-video mean is lower. All16 video gains and original zero retained; both frozen promotion gates reject. A concrete mean-order reversal, not a population-correlation estimate."
+        },
+        {
+          "path": "private/maintenance-v2-r1/motion-gate-boundary-registration.json",
+          "sha256": "f9c9b9a5281358ded199aecaf17a13dfa08f231adb2c808e8e5bf8c8822ba2f8",
+          "scope": "Frozen source-method identity and nine predetermined synthetic frame cases. AST extraction runs the original five black/motion/eligibility assignments, no duplicate replacement formula, embeddings, model or GPU requests."
+        },
+        {
+          "path": "private/maintenance-v2-r1/motion-gate-boundary-result.json",
+          "sha256": "cf190621c57cb9911b3669558302ac049986e486b87d0506b7b516835c025daf",
+          "scope": "Actual current-image CPU run,0.025s numeric work and130472KiB peak RSS. A maximum one-level monotone drift from static128 is rejected while constant129 is accepted; strong alternation and black frames also reject. Not full video or perceptual-quality acceptance."
+        },
+        {
+          "path": "private/maintenance-v2-r1/motion-gate-boundary-independent-review.json",
+          "sha256": "a371d5e96ebc94b15a314918e2fed3aa96f1659bf2de074c8350a44a9555eaec",
+          "scope": "Original method/AST source and all nine cases independently checked from analytic per-transition brightness variation with float32 tolerance. No legal-model realizability, human labels or validated threshold replacement claim."
+        },
+        {
+          "path": "private/maintenance-v2-r1/motion-gate-boundary-retirement.json",
+          "sha256": "57670e2342cd87c29e9d9a30f0c29fc0ad78d7e6812d1d2f208ff41be17fec45",
+          "scope": "Completed512MiB-capped CPU container and duplicate GPU scratch are retired after raw/result/source-binding preservation. No formal source, track, model or service changes."
         }
       ],
       "release_blocker": false,

@@ -100,6 +100,10 @@ A frozen-runtime synthetic rare-failure check confirms this statistical limitati
 batches can miss uncommon severe regressions even when both bootstrap gates pass. This is not a
 demonstrated selector exploit; actual-model coverage and power remain under post-launch validation.
 
+The deterministic full-video motion gate also needs perceptual calibration: current diagnostics
+show a hard-cutoff case and synthetic near-static sensitivity. Neither establishes a general
+false-rejection rate or changes the frozen score; details remain in the acceptance inventory.
+
 ## Public object-storage state
 
 The public contract uses one fixed prefix:
