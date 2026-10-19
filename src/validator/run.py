@@ -41,7 +41,7 @@ from validator.publication import (
     validate_public_weights_url,
 )
 from validator.queue import TERMINAL_STATES, ChallengeState
-from validator.release import require_release_approval
+from validator.release import PRODUCTION_NETUID, require_release_approval
 from validator.scoring import (
     EvaluatedStage,
     PairedTrackEvaluator,
@@ -54,7 +54,6 @@ from validator.scoring import (
     verify_initial_champion,
 )
 from validator.store import MAX_PUBLICATION_FAILURES, ChallengeStore, LeasedChallenge
-from validator.system_matches import PRODUCTION_NETUID
 from validator.tournament import MatchRecord
 from validator.weights import (
     WeightReceipt,

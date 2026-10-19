@@ -1,11 +1,11 @@
-"""Immutable summaries of the final launch-time H200 stability run."""
+"""Immutable, phase-specific summaries attached only to their measured runtime."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 from functools import lru_cache
-from math import fsum
+from math import fsum, isfinite
 from typing import Any
 
 from scoring.spec import TrackSpec, track_spec_dict
@@ -14,40 +14,61 @@ from validator.production.environment import (
     evaluation_environment_digest,
     evaluation_source_digest,
 )
-from validator.system_match_data import (
-    BASELINE_SCORES,
-    CONTROLS,
-    EVIDENCE_SHA256,
-    MINIMUM_GAIN,
-    PRODUCTION_EVIDENCE_CONTRACT_DIGEST,
-    PRODUCTION_EVIDENCE_RUNTIME_DIGEST,
-    PRODUCTION_NETUID,
-    PRODUCTION_TRACK_ID,
-    REFERENCE,
-    RUNTIME_TRACE_EVIDENCE_SHA256,
-)
+from validator.release import PRODUCTION_NETUID, PRODUCTION_TRACK_ID
+from validator.system_match_data import BENCHMARKS
 
 
 def system_match_artifacts(
     track: TrackSpec,
     runtime_manifest: bytes | None,
 ) -> tuple[tuple[str, bytes], ...]:
-    """Return evidence only for its frozen, non-circular scoring contract."""
+    """Never relabel old measurements or renumber records on a packaging rebuild."""
 
     if (
         runtime_manifest is None
         or track.track_id != PRODUCTION_TRACK_ID
         or track.netuid != PRODUCTION_NETUID
-        or _evidence_contract_digest(track) != PRODUCTION_EVIDENCE_CONTRACT_DIGEST
-        or _evidence_runtime_digest(runtime_manifest) != PRODUCTION_EVIDENCE_RUNTIME_DIGEST
     ):
         return ()
+    sequences = [record["sequence"] for record in BENCHMARKS]
+    if any(
+        type(sequence) is not int or sequence < 1 for sequence in sequences
+    ) or sequences != sorted(set(sequences)):
+        raise ValueError("system benchmark sequences must be unique and increasing")
+    contract = _evidence_contract_digest(track)
+    candidates = [record for record in BENCHMARKS if record["track_contract_sha256"] == contract]
+    if not candidates:
+        return ()
+    # Reject historical source bytes before any expensive environment scan.
+    source = evaluation_source_digest()
+    candidates = [record for record in candidates if record["source_sha256"] == source]
+    if not candidates:
+        return ()
+    environment = evaluation_environment_digest()
+    candidates = [record for record in candidates if record["environment_sha256"] == environment]
+    if not candidates:
+        return ()
+    for record in candidates:
+        minimum_gain = (
+            track.full_video.minimum_gain
+            if record["phase"] == "full_video"
+            else track.scoring.minimum_frontier_gain
+        )
+        if (
+            record["confidence"] != track.match_confidence
+            or record["minimum_gain"] != minimum_gain
+            or tuple(record["budgets"])
+            != tuple(budget.target_blocks for budget in track.scoring.budgets)
+        ):
+            raise ValueError("system benchmark context differs from its track contract")
+    runtime = _evidence_runtime_digest(runtime_manifest)
     return tuple(
         (
-            f"system_matches/{track.track_id}/{sequence:012d}.json",
-            _json_bytes(_match_document(sequence, control, track.digest)),
+            f"system_matches/{track.track_id}/{record['sequence']:012d}.json",
+            _json_bytes(_match_document(record)),
         )
-        for sequence, control in enumerate(CONTROLS, start=1)
+        for record in candidates
+        if record["runtime_contract_sha256"] == runtime
     )
 
 
@@ -59,11 +80,12 @@ def system_match_summaries(
     summaries = []
     for name, payload in artifacts:
         document = json.loads(payload)
+        phase = document["evaluation"]["phase"]
         summaries.append(
             {
                 "sequence": document["sequence"],
                 "reference": document["reference"]["label"],
-                "challenger": document["challenger"]["label"],
+                "challenger": f"{document['challenger']['label']} ({phase})",
                 "reference_score": document["scores"]["reference"],
                 "challenger_score": document["scores"]["challenger"],
                 "outcome": document["outcome"],
@@ -73,73 +95,154 @@ def system_match_summaries(
     return summaries
 
 
-def _match_document(
-    sequence: int,
-    control: dict[str, Any],
-    track_spec_digest: str,
-) -> dict[str, Any]:
-    challenger_scores = control["scores"]
-    batches = [
-        {
-            "batch": index,
-            "reference_score": reference,
-            "challenger_score": challenger,
-            "challenger_gain_lower_bound": gain,
-        }
-        for index, (reference, challenger, gain) in enumerate(
-            zip(
-                BASELINE_SCORES,
-                challenger_scores,
-                control["gain_lower_bounds"],
-                strict=True,
+def _match_document(record: dict[str, Any]) -> dict[str, Any]:
+    phase = record["phase"]
+    batches = record["batches"]
+    if phase not in {"exact", "full_video"} or not batches:
+        raise ValueError("system benchmark requires a measured phase and non-empty cohorts")
+    digest_fields = (
+        "track_spec_digest",
+        "track_contract_sha256",
+        "runtime_contract_sha256",
+        "source_sha256",
+        "environment_sha256",
+        "image_sha256",
+    )
+    for field in digest_fields:
+        _require_digest(record[field])
+    for role in ("reference", "challenger"):
+        model = record[role]
+        _require_digest(model["sha256"])
+        _require_digest(model["model_digest"])
+        if not all(isinstance(model[key], str) and model[key] for key in ("model_id", "label")):
+            raise ValueError("system benchmark model identity is incomplete")
+    minimum_gain = record["minimum_gain"]
+    if (
+        not isfinite(minimum_gain)
+        or minimum_gain <= 0
+        or not 0.5 < record["confidence"] < 1
+        or record["cluster_unit"] != "source_video"
+        or not record["budgets"]
+    ):
+        raise ValueError("system benchmark statistical context is invalid")
+    cohorts = set()
+    batch_fields = (
+        "cohort",
+        "partition",
+        "generation_block",
+        "plan_digest",
+        "cache_sha256",
+        "ready_sha256",
+        "evidence_sha256",
+        "cases",
+        "independent_videos",
+        "independent_videos_per_stratum",
+        "reference_score",
+        "challenger_score",
+        "reference_gain_lower_bound",
+        "challenger_gain_lower_bound",
+    )
+    for batch in batches:
+        for field in ("plan_digest", "cache_sha256", "ready_sha256", "evidence_sha256"):
+            _require_digest(batch[field])
+        if batch["cohort"] in cohorts or batch["partition"] not in {"production", "audit"}:
+            raise ValueError("system benchmark cohorts must be distinct and partitioned")
+        cohorts.add(batch["cohort"])
+        for field in (
+            "generation_block",
+            "cases",
+            "independent_videos",
+            "independent_videos_per_stratum",
+        ):
+            if type(batch[field]) is not int or batch[field] <= 0:
+                raise ValueError("system benchmark cohort dimensions must be positive integers")
+        for field in (
+            "reference_score",
+            "challenger_score",
+            "reference_gain_lower_bound",
+            "challenger_gain_lower_bound",
+        ):
+            if not isfinite(batch[field]):
+                raise ValueError("system benchmark scores and bounds must be finite")
+        if record["reference"] == record["challenger"] and (
+            batch["reference_score"] != batch["challenger_score"]
+            or batch["reference_gain_lower_bound"] != 0
+            or batch["challenger_gain_lower_bound"] != 0
+        ):
+            raise ValueError(
+                "system benchmark self comparison must have identical scores and zero bounds"
             )
+    if (
+        len({batch["cases"] for batch in batches}) != 1
+        or len({batch["independent_videos_per_stratum"] for batch in batches}) != 1
+    ):
+        raise ValueError("different cohort dimensions require separate benchmark records")
+    outcome = "REFERENCE_RETAINED"
+    if all(batch["reference_gain_lower_bound"] > minimum_gain for batch in batches):
+        outcome = "REFERENCE_WON"
+    elif all(batch["challenger_gain_lower_bound"] > minimum_gain for batch in batches):
+        outcome = "CHALLENGER_WON"
+    evaluation = {
+        key: record[key]
+        for key in (
+            "phase",
+            "hardware",
+            "scope",
+            "track_contract_sha256",
+            "runtime_contract_sha256",
+            "source_sha256",
+            "environment_sha256",
+            "image_sha256",
+            "confidence",
+            "minimum_gain",
+            "budgets",
+            "cluster_unit",
         )
-    ]
-    reference_gains = control.get("reference_gain_lower_bounds")
-    if reference_gains is not None:
-        for batch, gain in zip(batches, reference_gains, strict=True):
-            batch["reference_gain_lower_bound"] = gain
+    }
+    evaluation.update(
+        batch_count=len(batches),
+        cases_per_batch=batches[0]["cases"],
+        independent_videos_per_stratum=batches[0]["independent_videos_per_stratum"],
+        batches=[
+            {"batch": index, **{key: batch[key] for key in batch_fields}}
+            for index, batch in enumerate(batches)
+        ],
+    )
+    if len(batches) == 1:
+        evaluation["evidence_sha256"] = batches[0]["evidence_sha256"]
     return {
         "record_type": "SYSTEM_BENCHMARK",
-        "sequence": sequence,
+        "sequence": record["sequence"],
         "track_id": PRODUCTION_TRACK_ID,
-        "track_spec_digest": track_spec_digest,
+        # The report's original full digest, NOT the latest release wrapper digest.
+        "track_spec_digest": record["track_spec_digest"],
         "netuid": PRODUCTION_NETUID,
         "affects_tournament": False,
         "reward_eligible": False,
-        "reference": REFERENCE,
-        "challenger": {key: control[key] for key in ("model_id", "label", "sha256")},
-        "evaluation": {
-            "hardware": "NVIDIA H200",
-            "torch": "2.12.0+cu130",
-            "cuda": "13.0",
-            "track_contract_sha256": PRODUCTION_EVIDENCE_CONTRACT_DIGEST,
-            "runtime_contract_sha256": PRODUCTION_EVIDENCE_RUNTIME_DIGEST,
-            "batch_count": 10,
-            "cases_per_batch": 384,
-            "independent_videos_per_stratum": 4,
-            "confidence": 0.9975,
-            "minimum_gain": MINIMUM_GAIN,
-            "cluster_unit": "source_video",
-            "evidence_sha256": EVIDENCE_SHA256,
-            "runtime_trace": {
-                "evidence_sha256": RUNTIME_TRACE_EVIDENCE_SHA256,
-                "cases": 16,
-                "sampled_routes": 8,
-                "descriptor_max_abs": 2.384185791015625e-07,
-                "logits_max_abs": 6.198883056640625e-06,
-                "mask_mismatches": 0,
-                "output_max_abs": 0.0625,
-                "output_mean_abs": 3.039836883544922e-06,
-            },
-            "batches": batches,
+        "reference": {
+            key: record["reference"][key] for key in ("model_id", "label", "sha256", "model_digest")
         },
+        "challenger": {
+            key: record["challenger"][key]
+            for key in ("model_id", "label", "sha256", "model_digest")
+        },
+        "evaluation": evaluation,
         "scores": {
-            "reference": fsum(BASELINE_SCORES) / len(BASELINE_SCORES),
-            "challenger": fsum(challenger_scores) / len(challenger_scores),
+            role: fsum(batch[f"{role}_score"] for batch in batches) / len(batches)
+            for role in ("reference", "challenger")
         },
-        "outcome": control["outcome"],
+        "outcome": outcome,
     }
+
+
+def _require_digest(value: Any) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or set(value) - set("0123456789abcdef")
+        or value == "0" * 64
+    ):
+        raise ValueError("system benchmark requires non-placeholder SHA-256 identities")
 
 
 def _json_bytes(value: Any) -> bytes:

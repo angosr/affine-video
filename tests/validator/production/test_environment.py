@@ -1,5 +1,6 @@
 import json
 import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -72,9 +73,12 @@ def test_evaluation_source_digest_excludes_frozen_result_data(
 
     environment.evaluation_source_digest.cache_clear()
     first = environment.evaluation_source_digest()
+    bundle = environment.build_source_bundle(tmp_path / "frozen.zip")
     system_match_data.write_text("RESULTS = 2\n", encoding="utf-8")
     environment.evaluation_source_digest.cache_clear()
     assert environment.evaluation_source_digest() == first
+    with pytest.raises(ValueError, match="active runtime source differs"):
+        environment._verify_source_bundle(bundle, environment._active_source_files())
     environment.evaluation_source_digest.cache_clear()
 
 
@@ -110,6 +114,32 @@ def test_evaluation_source_digest_binds_system_match_gate_and_runtime_digest(
     )
     environment.evaluation_source_digest.cache_clear()
     assert environment.evaluation_source_digest() != first
+    environment.evaluation_source_digest.cache_clear()
+
+
+def test_production_identity_constants_are_source_bound_not_result_data(tmp_path, monkeypatch):
+    import ast
+
+    from validator import release, system_match_data
+
+    assert release.PRODUCTION_TRACK_ID == "veda-sn120-v2"
+    assert release.PRODUCTION_NETUID == 120
+    tree = ast.parse(Path(system_match_data.__file__).read_text())
+    assert not any(
+        isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef)) for node in tree.body
+    )
+    assert not hasattr(system_match_data, "PRODUCTION_TRACK_ID")
+    assert not hasattr(system_match_data, "PRODUCTION_NETUID")
+    identity = tmp_path / "release.py"
+    identity.write_text('PRODUCTION_TRACK_ID = "veda-sn120-v2"\nPRODUCTION_NETUID = 120\n')
+    monkeypatch.setattr(
+        environment, "_active_source_files", lambda: {"validator/release.py": identity}
+    )
+    environment.evaluation_source_digest.cache_clear()
+    before = environment.evaluation_source_digest()
+    identity.write_text('PRODUCTION_TRACK_ID = "changed"\nPRODUCTION_NETUID = 121\n')
+    environment.evaluation_source_digest.cache_clear()
+    assert environment.evaluation_source_digest() != before
     environment.evaluation_source_digest.cache_clear()
 
 

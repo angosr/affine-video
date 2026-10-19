@@ -149,6 +149,15 @@ tracks/main/
   packaging does not invalidate it. Panel-only selectors, runner bytes and raw results live under
   the manifest's `evidence/system-panel/` namespace. They remain content-addressed and recoverable
   but are excluded from the non-circular runtime digest because production scoring never reads them.
+  Each row records its measured phase, cohort, actual batch dimensions, both model file hashes and
+  tensor digests, and original report/runtime identities. Exact and full-video scores are separate;
+  self checks are not promotions. Sequences are explicit and append-only. Repackaging must preserve
+  existing row bytes, including the report's original full track digest, rather than relabeling them
+  with the newest wrapper digest. The data-only table currently preserves historical b81/860 self
+  and shuffled-heads reports; it does not authorize a changed scoring runtime. Candidate rows need
+  actual measurements under that candidate's frozen source, environment and asset contract before
+  binding. Updating result data still requires a rebuilt, verified source bundle, dependency lock
+  and image; it cannot be hot-mounted into an older release.
 - `events/<track_id>/track-aborted.json` is the immutable stop fact created when system work remains
   unfinished after the close grace block. It survives loss of local state and prevents that track
   from resuming evaluation or weight refresh.

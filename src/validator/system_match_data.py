@@ -1,136 +1,126 @@
-"""Data-only results from the frozen launch-time H200 benchmark panel."""
+"""Frozen GPU report summaries, not protocol identity or candidate authorization.
 
-PRODUCTION_TRACK_ID = "veda-sn120-v2"
-PRODUCTION_NETUID = 120
-PRODUCTION_EVIDENCE_CONTRACT_DIGEST = (
-    "eb091449d2ab176ad6f9136461d9b88c1d69061b1db3175b11192e289c58aa59"
-)
-PRODUCTION_EVIDENCE_RUNTIME_DIGEST = (
-    "0000000000000000000000000000000000000000000000000000000000000000"
-)
-EVIDENCE_SHA256 = "87ba4871c29df4f5113b4051c4f2d1e6905be834ef9a54dfcb780a675fc357db"
-RUNTIME_TRACE_EVIDENCE_SHA256 = (
-    "c6e873d8d9acbcb02814eae888fb30fa73e620d73fca03f99a7f8f30f10b3fa5"
-)
-MINIMUM_GAIN = 0.005
-BASELINE_SCORES = (
-    0.965935974938656,
-    0.942681827805732,
-    0.962320576535515,
-    0.974050067809449,
-    0.947151104436117,
-    0.940292660403239,
-    0.897184126503376,
-    0.923065939590511,
-    0.927028997571669,
-    0.971341256693279,
-)
-REFERENCE = {
+Historical records retain the measured b81/860 identities. A later scoring runtime
+must produce its own evidence before it can attach records. Published sequences
+and recorded identities are immutable: append rather than renumber. No private
+source identities, inputs, paths, or credentials belong in this table.
+"""
+
+_HISTORICAL_RUNTIME = {
+    "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
+    "track_contract_sha256": "2c1634e3eee6d970d432c31d71c4c5ac4a983d8fc95872cb251c297e8606f95f",
+    "runtime_contract_sha256": "92dfa83a26292df75e8bfd329e972eb1a92002884596032887fe4aac54a09021",
+    "source_sha256": "3fdf7148a4da81119ee51b6557e2a08066c4ffdc69bdb759fd567e524ab0c025",
+    "environment_sha256": "cde5278e70b6e5f61df2b9c2bd8810de5584579a4fc3f59e062cc7d3c417a124",
+    "image_sha256": "3749e5b063b50d66c4d676dd2c79c10c460e5d7f1de9e7713f7444428bcc2c2c",
+    "hardware": "NVIDIA H200",
+    "scope": "isolated_accelerated_chain_fixture",
+    "confidence": 0.9975,
+    "minimum_gain": 0.005,
+    "budgets": (16, 32, 64),
+    "cluster_unit": "source_video",
+}
+
+_BASELINE = {
     "model_id": "veda_baseline",
     "label": "VEDA baseline",
     "sha256": "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f",
+    "model_digest": "3fef3eca0eebee238b1ed9c692b217dd25cb1082ef94779ec2ef7c93ae0560c9",
 }
-CONTROLS = (
+_SHUFFLED = {
+    "model_id": "shuffled_heads_control",
+    "label": "Shuffled-heads control",
+    "sha256": "d9e549ef355ae494947a47b4891c92716b85e75a82fb868d8277db1e090017ec",
+    "model_digest": "7c7798ca66eed2a9a8a48bbc5091d361c2ba9b56a908aa790a33c1434b92a42b",
+}
+_EXACT_COHORT = {
+    "cohort": "audit-9311300",
+    "partition": "audit",
+    "generation_block": 9311300,
+    "plan_digest": "8a64319c80c15d946d1aceee835350def0500a0d9c1a392516aaf8c08c1fc973",
+    "cache_sha256": "25394b9282a9b79fd9f7b589281d49d17abafb753e69548db5af2124d7a8acb3",
+    "ready_sha256": "daa9e35fdababa0ea5f74d23bc19c6beac60e3316da759978b8f48b1f9cdbce6",
+    "evidence_sha256": "4a2f9c84bef9067522a83d80b8674d2eba7438439aa8495cc0c550852fa66809",
+    "cases": 384,
+    "independent_videos": 16,
+    "independent_videos_per_stratum": 4,
+}
+_CONFIRMATION_COHORT = {
+    "cohort": "audit-9312500",
+    "partition": "audit",
+    "generation_block": 9312500,
+    "plan_digest": "3a508e53304f248015cca3f68821b47dcdf05c892ded6fe40b56c6bc48538b87",
+    "cache_sha256": "38394c068b9f540c7617d672ffb67bd33ee9ac44fe63d9c39518b3c6500a3fbb",
+    "ready_sha256": "b077d148244c5b91656684d71add786ac8f26660d69963d646fddefecbafea13",
+    "evidence_sha256": "59b6aba46debcb3001848ca667443106b25fc075bc7071acf0487ceb5d37057e",
+    "cases": 48,
+    "independent_videos": 16,
+    "independent_videos_per_stratum": 4,
+}
+
+BENCHMARKS = (
     {
-        "model_id": "mean_pool_control",
-        "label": "MeanPool control",
-        "sha256": "53bd350490e16702f70f69d33e10e241a134573f27f706caf82647092342b025",
-        "scores": (
-            0.962799095078332,
-            0.934511712220001,
-            0.956489263685866,
-            0.961562762012376,
-            0.943030204044916,
-            0.937266331544423,
-            0.892189299288133,
-            0.919444076867836,
-            0.923476631198779,
-            0.965579680875613,
+        **_HISTORICAL_RUNTIME,
+        "sequence": 1,
+        "phase": "exact",
+        "reference": _BASELINE,
+        "challenger": _BASELINE,
+        "batches": (
+            {
+                **_EXACT_COHORT,
+                "reference_score": 0.9491625628902893,
+                "challenger_score": 0.9491625628902893,
+                "challenger_gain_lower_bound": 0.0,
+                "reference_gain_lower_bound": 0.0,
+            },
         ),
-        "gain_lower_bounds": (
-            -0.006498988939666,
-            -0.031164102845540,
-            -0.014396288190415,
-            -0.032205051765224,
-            -0.009379684047755,
-            -0.009432251177008,
-            -0.067030688874896,
-            -0.011586045684992,
-            -0.010026242209518,
-            -0.009397013291712,
-        ),
-        "outcome": "REFERENCE_RETAINED",
     },
     {
-        "model_id": "shuffled_heads_control",
-        "label": "Shuffled-heads control",
-        "sha256": "83235ac1c8c0500c108f8f23c5a45eb13ab4a69f294f506269641615a7394360",
-        "scores": (
-            0.852781882861242,
-            0.812557190537774,
-            0.834177581969323,
-            0.863479207110985,
-            0.838107927972904,
-            0.837237025404604,
-            0.750811432166654,
-            0.821082490911290,
-            0.788100556446850,
-            0.819857745358149,
+        **_HISTORICAL_RUNTIME,
+        "sequence": 2,
+        "phase": "exact",
+        "reference": _BASELINE,
+        "challenger": _SHUFFLED,
+        "batches": (
+            {
+                **_EXACT_COHORT,
+                "reference_score": 0.9491625628902893,
+                "challenger_score": 0.7885866430037899,
+                "challenger_gain_lower_bound": -0.2561681043494346,
+                "reference_gain_lower_bound": 0.09963065729838526,
+            },
         ),
-        "gain_lower_bounds": (
-            -0.135478781935666,
-            -0.160052462233410,
-            -0.173646161759022,
-            -0.193122903638280,
-            -0.165247508554978,
-            -0.166235029383888,
-            -0.226321600365791,
-            -0.173563771818016,
-            -0.181302089781703,
-            -0.215340142268243,
-        ),
-        "reference_gain_lower_bounds": (
-            0.092622429320872,
-            0.103585650444588,
-            0.087541190870046,
-            0.043737593915000,
-            0.060357618632067,
-            0.042795471317278,
-            0.040568520436958,
-            0.047172395266923,
-            0.102444352400404,
-            0.090486359687219,
-        ),
-        "outcome": "REFERENCE_WON",
     },
     {
-        "model_id": "perturbed_veda_control",
-        "label": "Perturbed VEDA control",
-        "sha256": "74b8c5ad043450250acee23572f35c2be8eabf2141f01cb4e06abf259d694eaf",
-        "scores": (
-            0.965955427449611,
-            0.942422722618746,
-            0.962379876857487,
-            0.973877472191853,
-            0.947140700239371,
-            0.940142028668577,
-            0.897135290183366,
-            0.923316191936039,
-            0.927029572062086,
-            0.971308320091918,
+        **_HISTORICAL_RUNTIME,
+        "sequence": 3,
+        "phase": "full_video",
+        "reference": _BASELINE,
+        "challenger": _BASELINE,
+        "batches": (
+            {
+                **_CONFIRMATION_COHORT,
+                "reference_score": 0.7619235479211722,
+                "challenger_score": 0.7619235479211722,
+                "challenger_gain_lower_bound": 0.0,
+                "reference_gain_lower_bound": 0.0,
+            },
         ),
-        "gain_lower_bounds": (
-            -0.000617914064848,
-            -0.000959966919615,
-            -0.000353700764687,
-            -0.000736079039864,
-            -0.000490573831764,
-            -0.000878954560204,
-            -0.000753818736879,
-            -0.000283273693010,
-            -0.000703698577301,
-            -0.000474816048444,
+    },
+    {
+        **_HISTORICAL_RUNTIME,
+        "sequence": 4,
+        "phase": "full_video",
+        "reference": _BASELINE,
+        "challenger": _SHUFFLED,
+        "batches": (
+            {
+                **_CONFIRMATION_COHORT,
+                "reference_score": 0.7619235479211722,
+                "challenger_score": 0.6570879920438147,
+                "challenger_gain_lower_bound": -0.19131944739869802,
+                "reference_gain_lower_bound": 0.04190771739740623,
+            },
         ),
-        "outcome": "REFERENCE_RETAINED",
     },
 )

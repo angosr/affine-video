@@ -34,10 +34,9 @@ from validator.production.plan import (
     validate_source_selection_sequence,
 )
 from validator.queue import TERMINAL_STATES, ChallengeState
-from validator.release import ReleaseApproval, require_release_approval
+from validator.release import PRODUCTION_TRACK_ID, ReleaseApproval, require_release_approval
 from validator.s3 import client_config
 from validator.store import ChallengeStore
-from validator.system_match_data import PRODUCTION_TRACK_ID
 from validator.system_matches import system_match_artifacts, system_match_summaries
 from validator.tournament import (
     Champion,

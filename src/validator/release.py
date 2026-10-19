@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from scoring.spec import TrackSpec
 from validator.production.commitment import ArtifactManifest
 
+PRODUCTION_TRACK_ID = "veda-sn120-v2"
+PRODUCTION_NETUID = 120
+
 
 @dataclass(frozen=True, slots=True)
 class ReleaseApproval:
