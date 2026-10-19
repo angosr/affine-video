@@ -1,21 +1,19 @@
 {
   "scope": "release_requirements_and_evidence_not_authorization",
-  "public_evidence_url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r1/evidence/README.md",
-  "public_evidence_readme_sha256": "6619b23bd020cc6a7a3c4011c09445ff1ca1236e47316b59105ef1bbf2ae5a78",
-  "source_change_verification": {
-    "path": "private/maintenance-v2-r1/release-gate-source-verification.json",
-    "sha256": "c683e721eccba38ae9ea6b3523d411a6f80af4fd8108b3c5e40ad07c6329c8d8",
-    "scope": "Core release gate:802 CPU tests,12 GPU-dependent skips, targeted semantic rejections, lint/build. Not a new GPU-runtime rollout."
-  },
-  "public_evidence_verification": {
-    "path": "private/maintenance-v2-r1/public-e2-e16-evidence-root-verification.json",
-    "sha256": "cfa8f4e1a4c1567d30a7502b4dbbb39de741704b9a4e201e8c4deb8eced75348",
-    "scope": "Independent anonymous full byte/SHA check of all13 public original evidence objects."
+  "track_id": "veda-sn120-v2-r2",
+  "track_spec_digest": "d1d4ced33ba2ec7478a96b8bdfc99daa0f3feaad6443ae3ff556e0f619f8d78b",
+  "public_evidence_url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/README.md",
+  "public_evidence_readme_sha256": "eb055a1e498ff16a4dada8ec0fc7972f48d0e05c558218bf050f372143cdd87f",
+  "runtime_authorization": {
+    "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/accepted.json",
+    "sha256": "c49516e2f36b241083f65d33668620461c5cdc0c1af250d9938b8f7ee5371b51",
+    "scope": "Canonical receipt bound by the live runtime manifest and enforced by its installed release gate."
   },
   "operational_readiness": {
-    "path": "private/maintenance-v2-r1/operational-readiness-check.json",
-    "sha256": "94e3e4e79baa4a8aeeffb02f95903b289dab0e16ac1cf69cec71d98526ad2949",
-    "scope": "GO for initial operation of the unchanged frozen runtime, not all research completed or restored source gate already deployed."
+    "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/readiness.json",
+    "sha256": "f06f70dc1281144d285b3cf1328313a47a13426ee1f6fe75220b8685beb83f32",
+    "verdict": "GO",
+    "scope": "Initial operation only, not completed research or external validator adoption."
   },
   "constraints": [
     "Release checks cover numerical fidelity, actual two-stage GPU execution, determinism and error handling; infrastructure/schema/isolation checks remain enforced at startup.",
@@ -26,222 +24,152 @@
   ],
   "experiments": [
     {
-      "acceptance_manifest": {
-        "path": "private/maintenance-v2-r1/e2-cache-fidelity.json",
-        "sha256": "5c61eed9c3a14e47137239fa6b9e0025c78923592cc95c99ea42a3222c830c89"
-      },
-      "acceptance_rule": "排名 Spearman ≥0.999，缓存引入的输出 RSE ≤1e-3，Top k 一致率达到清单门槛",
+      "id": "E2",
+      "release_blocker": true,
+      "status": "passed",
+      "pass": true,
+      "method": "Actual H200 recapture of four quarantined historical videos, eight routes, three steps, three controls and three budgets in the frozen candidate image. Independent online/cache comparison.",
       "actual_values": {
-        "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
-        "runtime_source_commit": "364c0ca",
-        "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
-        "source_sha256": "f86ddf56a3eeb4e0a37781a089f37961fb3542da5ac967d50f85ba6de1086eed",
-        "budgets": [
-          16,
-          32,
-          64
-        ],
         "cases": 96,
-        "controls": 3,
-        "elapsed_seconds": 381.07998078130186,
-        "geometries": 4,
-        "global_spearman": 0.999999981394532,
-        "independent_source_videos": 4,
         "mask_mismatches": 0,
         "max_abs_quality_delta": 0.000005314612807727492,
         "max_dense_reference_rse": 4.397595680954343e-8,
         "max_sparse_output_rse": 7.414164965213606e-18,
-        "minimum_per_case_budget_spearman": 1,
-        "peak_cuda_bytes": 50630709760,
-        "routes": 8,
-        "numerical_rows": 288,
-        "limitations": [
-          "Four historical disclosed source videos, not96 independent videos",
-          "Three fixed controls, not population-ranking acceptance",
-          "Input provenance retains its original track identity; tested runtime is the current frozen image"
+        "rows": 288,
+        "rows_identical_to_previous_runtime": true,
+        "videos": 4
+      },
+      "acceptance_manifest": {
+        "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/E2.json",
+        "sha256": "9a30ba789ea5d50a7fcad27f1501a3ce00ceec6028374a6bb73a25b37b8b8669"
+      },
+      "raw_evidence": [
+        {
+          "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/numerical.raw.log",
+          "sha256": "cd15304b1900e18303fa81bf8ff96ce829124c7d5a18d5049dce3ec57fca1a7d"
+        },
+        {
+          "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/core-proof-registration.json",
+          "sha256": "8eec0c2a3560eca0be27f596ed809d282c7ed513d75393d95bc445430f912ab6"
+        }
+      ],
+      "limitations": [
+        "Cache fidelity, not proof of population ranking or fresh production sampling."
+      ]
+    },
+    {
+      "id": "E3",
+      "release_blocker": true,
+      "status": "passed",
+      "pass": true,
+      "method": "Maintenance compatibility acceptance: original sixteen-video per-stage real-GPU E3 and real off-GPU S3/FIFO restoration retain their original source/track identities. All relevant code and third-party execution bytes are unchanged; nine fresh candidate full-video cells reproduce exact original output hashes and scores. Only the release gate changes.",
+      "actual_values": {
+        "fresh_candidate_full_video_cells": 9,
+        "fresh_max_score_delta": 0,
+        "fresh_output_sha256_mismatches": 0,
+        "previous_e3_exact_cases": 384,
+        "previous_e3_full_video_cells": 96,
+        "previous_e3_independent_videos_per_stage": 16,
+        "previous_e3_scenarios": [
+          {
+            "scenario": "baseline_self",
+            "stage_restored_without_evaluation": true,
+            "weight_uids": [
+              0
+            ],
+            "winner_source": "VEDA_BASELINE",
+            "winner_uid": 0
+          },
+          {
+            "scenario": "shuffled_heads",
+            "stage_restored_without_evaluation": true,
+            "weight_uids": [
+              0
+            ],
+            "winner_source": "VEDA_BASELINE",
+            "winner_uid": 0
+          },
+          {
+            "scenario": "positive-fifo",
+            "stage_restored_without_evaluation": true,
+            "weight_uids": [
+              1
+            ],
+            "winner_source": "MINER",
+            "winner_uid": null
+          }
         ]
       },
-      "id": "E2",
-      "method": "对 float32 在线结果、候选缓存 dtype 和缓存重放做逐项及排名比较",
-      "pass": true,
+      "acceptance_manifest": {
+        "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/E3.json",
+        "sha256": "ef350aec7e6c7cfa597abd2030cdbb1cb32a8902ce90cc16f86854b2ef6886dc"
+      },
       "raw_evidence": [
         {
-          "path": "private/maintenance-v2-r1/runtime-checks-registration.json",
-          "sha256": "25317f8bbd99a669a3a11b0300d38eda7033b5ed42939c5282a1fabdc1e1d52d",
-          "scope": "Frozen instrumentation and actual current-image invocation"
+          "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/previous-E3-original.json",
+          "sha256": "ebb0bb3b02e6ed93b4b784018841b643e7db52a1261fa23cb6d82179c656971b"
         },
         {
-          "path": "private/maintenance-v2-r1/runtime-checks-gpu6.raw.log",
-          "sha256": "93dca4eae05f65c1dbb23e11395ac01bf1df8fe8fb3455fce8a3245f144694f2",
-          "scope": "Actual H200:288 numeric rows, zero mask mismatches"
+          "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/full_repeat.raw.log",
+          "sha256": "929b79ad91732453a462b7bd47eeef6b5e50a015e4e302843c14530b50c5c06e"
+        },
+        {
+          "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/source-compatibility.json",
+          "sha256": "a6f9dac5f4d0de5a2e49e3f58d82b1810ff1f114db5ee62b9e44159709f95024"
         }
       ],
-      "release_blocker": true,
-      "status": "current_runtime_registered_cache_fidelity_passed",
-      "subject": "缓存数值忠实度"
+      "limitations": [
+        "Original E3 uses an accelerated isolated chain fixture, not real miner commitments or weight transactions.",
+        "The complete sixteen-video E3 is prior unchanged-component evidence; it was not rerun in the candidate.",
+        "No claim of whole-host recovery or ten consecutive fresh batches."
+      ]
     },
     {
-      "acceptance_manifest": {
-        "path": "private/maintenance-v2-r1/sqlite-final/run/result.json",
-        "sha256": "ebb0bb3b02e6ed93b4b784018841b643e7db52a1261fa23cb6d82179c656971b"
-      },
-      "acceptance_rule": "真实GPU执行固定self和退化对照，完成一次两阶段FIFO闭环；self不能晋级，较好基线能战胜可控退化，两阶段均过线才替换冠军，confirmation使用exact决策之后的新批次；报告局部与完整视频分数差异，不宣称已证明总体排序一致",
-      "actual_values": {
-        "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
-        "runtime_source_commit": "364c0ca",
-        "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
-        "source_sha256": "f86ddf56a3eeb4e0a37781a089f37961fb3542da5ac967d50f85ba6de1086eed",
-        "independent_videos_per_phase": 16,
-        "exact_cases_per_phase": 384,
-        "full_video_cells": 96,
-        "exact_gain_lower_bound": 0.09890598780424399,
-        "full_video_baseline_score": 0.7556230476023633,
-        "full_video_shuffled_score": 0.622002479661849,
-        "full_video_gain_lower_bound": 0.04680054524618486,
-        "minimum_gain": 0.005,
-        "self_gain_lower_bound": 0,
-        "phase_source_families_disjoint": true,
-        "both_stage_gates_required_for_promotion": true,
-        "following_fifo_negative_preserves_new_champion": true,
-        "archived_stages_restored_without_rescoring": true,
-        "private_s3_stage_objects_independently_verified": 5,
-        "saved_sqlite_databases_verified": 10,
-        "memory_s3_used": false,
-        "clock": "isolated accelerated chain fixture",
-        "real_chain_admission_or_weight_transaction_claimed": false,
-        "scope": "Actual current-image GPU reports and durable lifecycle. Positive fixture starts with a degraded incumbent; not formal genesis defeat, HF admission, whole-host recovery or general rankings. Actual deployed-resource worker-pool parity is separately recorded under E18."
-      },
-      "id": "E3",
-      "method": "用固定只读self和退化模型运行真实exact及完整视频，核验FIFO、未来confirmation、冠军替换及持久化事实；更广的跨批次、近阈值和排序研究上线后继续，不训练模型",
-      "pass": true,
-      "raw_evidence": [
-        {
-          "path": "private/maintenance-v2-r1/acceptance-registration.json",
-          "sha256": "3ccdfaf30f90a1b222ca762affb6dab1bad324f5696e692a2860578070defb77",
-          "scope": "Frozen identities and sixteen videos per phase; fixture clock explicit"
-        },
-        {
-          "path": "private/maintenance-v2-r1/acceptance/exact-result.json",
-          "sha256": "16d9890bde474d3dac4c69010e85016a98214b8464490def0af20bc0cc41ec35",
-          "scope": "Actual384-case first-stage GPU report"
-        },
-        {
-          "path": "private/maintenance-v2-r1/acceptance/confirmation-result.json",
-          "sha256": "cef234fad9470f8ee0a1319317c9ebdcc2832af076897e31301930e65b49d5f0",
-          "scope": "Actual96 full-video cells, independent future sixteen-video batch"
-        },
-        {
-          "path": "private/maintenance-v2-r1/confirmation-gpu6.raw.log",
-          "sha256": "a4aa6cb8c38120e879bd6291347276311070f79f6a611b40a2395415a3758ac2",
-          "scope": "Original H200 complete-video execution on GPU6"
-        },
-        {
-          "path": "private/maintenance-v2-r1/confirmation-gpu7.raw.log",
-          "sha256": "e12cc1117a5c0045c8a54a21283cdb61ef943c40fc2bb876e2a86aabb500d000",
-          "scope": "Original H200 complete-video execution on GPU7"
-        },
-        {
-          "path": "private/maintenance-v2-r1/aggregate-independent-review.json",
-          "sha256": "b26b2b301413e75e5ea523cde1bf944f203e693ead24abfcc2edbdc2ade803f9",
-          "scope": "Independent standard-library means, AUC and bootstrap recomputation"
-        },
-        {
-          "path": "private/maintenance-v2-r1/confirmation-sqlite.raw.log",
-          "sha256": "eb6b71edeb0cb7878028d1471aa6ee4fac73fbd3fe70b914298d85b458a4f4c0",
-          "scope": "Actual isolated SQLite/S3 execution exited zero"
-        },
-        {
-          "path": "private/maintenance-v2-r1/sqlite-final/independent-s3-check.json",
-          "sha256": "dcac1f7dec6869c5ce63c2c905f95fe15cb107e57f95aec92871f1b8e846302b",
-          "scope": "Independent TLS GET of five full stages against ten SQLite snapshots and public projections"
-        }
-      ],
-      "release_blocker": true,
-      "status": "current_runtime_two_stage_gpu_controls_and_real_sqlite_s3_recovery_passed",
-      "subject": "teacher-state 到完整稀疏 rollout 的分布偏移"
-    },
-    {
-      "acceptance_manifest": {
-        "path": "private/maintenance-v2-r1/e16-determinism-and-errors.json",
-        "sha256": "8f0a787d740bdc6886c04b54714de4711e6e495db79d59d67da4e1b99995b4fa"
-      },
-      "acceptance_rule": "mask 完全一致；分数差 ≤1e-6；所有非法输入按固定错误码拒绝",
-      "actual_values": {
-        "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
-        "runtime_source_commit": "364c0ca",
-        "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
-        "source_sha256": "f86ddf56a3eeb4e0a37781a089f37961fb3542da5ac967d50f85ba6de1086eed",
-        "physical_gpus": [
-          6,
-          7
-        ],
-        "same_card_repeat_pairs": 6,
-        "cross_card_cells": 9,
-        "max_score_delta": 0,
-        "output_sha256_mismatches": 0,
-        "independent_source_videos": 1,
-        "independent_selectors": 2,
-        "baseline_repeat_is_alias": true,
-        "h200_pytest_passed": 14,
-        "limitations": [
-          "One historical source and two independent fixed selectors; no population or ten-batch stability claim",
-          "Actual current H200 regressions cover CUDA ties, dtype/projection parity, allocation replay and non-finite participant errors; not a real hung CUDA-kernel recovery run",
-          "Separate CPU/H200 runs jointly cover all797 case IDs, not one complete GPU-suite run",
-          "No wallet or chain transaction; restricted production-pool integration remains a separate running diagnostic"
-        ],
-        "distinct_current_test_case_ids_covered": 797,
-        "single_full_gpu_suite_claimed": false
-      },
       "id": "E16",
-      "method": "同机复跑、同型号跨卡、并列 logits、极值、padding、NaN/Inf、超时和损坏文件",
+      "release_blocker": true,
+      "status": "passed",
       "pass": true,
+      "method": "Fresh H200 tie-order, shared-mask, pooling and non-finite error tests against installed frozen application; offline pytest overlay only after pristine source verification. Fresh three-budget self/repeat/degraded full-video comparison.",
+      "actual_values": {
+        "cuda_tests_passed": 12,
+        "cuda_tests_skipped": 0,
+        "full_video_cells": 9,
+        "max_repeat_score_delta": 0,
+        "output_sha256_mismatches": 0,
+        "same_card_repeat_pairs": 3
+      },
+      "acceptance_manifest": {
+        "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/E16.json",
+        "sha256": "3f2b36e24b34d9088a2a41dd9aa2104697684bc8ea3ecbef9e0169a015418460"
+      },
       "raw_evidence": [
         {
-          "path": "private/maintenance-v2-r1/code-verification.json",
-          "sha256": "fa7753df26a0e9da0fd797feccf64d3b341d1602c3df5b29beeb7b483d222ead",
-          "scope": "Exact source/test identities and CPU/H200 XML union covering all797 case IDs"
+          "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/cuda-tests.xml",
+          "sha256": "9a042957489d85313574c1cfada347748542d62aa0c1d58c00335ef8c0459cdf"
         },
         {
-          "path": "private/maintenance-v2-r1/cuda-test-execution.raw.log",
-          "sha256": "9a912e1f12671e83961ca95fad33572a1a69487ef395d9ef898a831c5e03fa06",
-          "scope": "Current frozen H200 runner:14 tests, including native CUDA tie order"
+          "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/cuda-overlay.raw.log",
+          "sha256": "a5eb2b631956646e1e894f979984bbd5e43d1994b9d25713cb12356f7fec2d65"
         },
         {
-          "path": "private/maintenance-v2-r1/full-repeat-gpu6.raw.log",
-          "sha256": "3d913531d3eed9cac5146d35a190590f6112d3b6025e9af9da5adfc14fca0972",
-          "scope": "Nine full-video cells including three baseline repeats on one historical portrait"
-        },
-        {
-          "path": "private/maintenance-v2-r1/full-repeat-gpu7.raw.log",
-          "sha256": "8ad190cba64f7bb1c9ed8f74208d24b89681607d3e16a9fb5f6c11e3236f6af8",
-          "scope": "Same protocol on other H200, all nine corresponding score/output hashes identical"
+          "url": "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/full_repeat.raw.log",
+          "sha256": "929b79ad91732453a462b7bd47eeef6b5e50a015e4e302843c14530b50c5c06e"
         }
       ],
-      "release_blocker": true,
-      "status": "current_runtime_cuda_regressions_and_complete_video_repeatability_passed",
-      "subject": "确定性与异常输入"
+      "limitations": [
+        "The first invocation lacked pytest and exited before running tests. The explicit offline runner overlay invocation passed; no image/source/environment mutation or automatic retries."
+      ]
     }
   ],
   "known_limitations": {
     "cost_prediction": {
-      "scope": "Fixed score-axis costs do not promise exact wall time for every GPU layout; exploratory calibration targets were not met and the proposed fit was not adopted.",
-      "confirmation_groups_meeting_original_target": 29,
-      "total_confirmation_groups": 64,
-      "original_report": {
-        "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/analysis/confirmation-report.json",
-        "sha256": "e256de91a3a69b605618a9adc36fadcaa38f183cc1bd911a7152cfa76d3c3f88",
-        "scope": "Original registered analyzer, all8400 independent confirmation rows and frozen calibration costs/scales. E10 passes29/64 contexts and E11 passes32/64, so neither is accepted; no refit or production update."
-      }
+      "status": "development_target_not_met",
+      "failed_fit_adopted": false,
+      "scope": "Fixed frozen cost-axis weights do not guarantee exact end-to-end GPU latency. Original failed research measurements remain in the preserved development history."
     },
     "selector_overhead": {
-      "scope": "Exploratory ten-percent overhead target was not met in every context; it is not a runtime failure or an extra release gate.",
-      "confirmation_groups_meeting_original_target": 32,
-      "total_confirmation_groups": 64,
-      "original_report": {
-        "path": "evidence/system-panel/acceptance-8608cf5d/cost-calibration-20261019/analysis/confirmation-report.json",
-        "sha256": "e256de91a3a69b605618a9adc36fadcaa38f183cc1bd911a7152cfa76d3c3f88",
-        "scope": "All8400 original independent confirmation rows;32/64 E11 contexts pass the unchanged10% dense-denominator overhead requirement. No refit or production adoption."
-      }
+      "status": "development_target_not_met",
+      "scope": "The exploratory overhead target was not met in every context. This is not an additional production startup gate."
     }
   },
   "development_history": {

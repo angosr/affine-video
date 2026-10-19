@@ -14,20 +14,19 @@ lightweight process: fetch `weights.json`, validate it against finalized chain s
 own `SetWeights` transaction. No service or direct Miner-to-Validator protocol exists.
 
 The live SN120/mech-1 [track specification](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/track.json)
-uses digest `cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3`
-and frozen evaluator source `364c0ca` (`veda-sn120-v2-r1`). Public paths are unchanged.
-CPU and H200 checks cover all 797 tests, including the CUDA tie-order test. The frozen image
-also passes cache/runtime precision checks, independent sixteen-video exact and full-video
-control batches, and a two-stage SQLite/FIFO/off-GPU S3 recovery fixture. Current-image
-same-card and cross-card video repeats have identical scores and output hashes.
-The actual four-GPU producer and restricted two-GPU confirmation pools also pass at their deployed
-resource limits: 48 regenerated-file hashes and 96 full-video scores/output hashes match the
-reference exactly, with all six GPUs observed computing concurrently.
-An empty-cache restore also recovers all 550 MB of the baseline from off-GPU private S3,
-without Hugging Face or an existing model mount; the complete file hash matches.
-Evidence scope and remaining validation are
-tracked in the [acceptance inventory](evidence/system-panel/acceptance/inventory.json);
-isolated checks do not establish real-miner admission or complete host-loss recovery.
+uses digest `d1d4ced33ba2ec7478a96b8bdfc99daa0f3feaad6443ae3ff556e0f619f8d78b`
+and frozen evaluator source `c8685ad` (`veda-sn120-v2-r2`), starting at block 9316700.
+Public paths are unchanged. The restored release gate is deployed and verifies its
+runtime-bound E2/E3/E16 acceptance before publication. Fresh H200 checks reproduce 288 numerical
+rows with zero mask mismatches, all 9 full-video scores/output hashes, and pass 12 backend tests
+including CUDA tie ordering. Only the release gate differs from the previous frozen source;
+the sixteen-video two-stage GPU/FIFO/off-GPU S3 component evidence retains its original runtime
+identity and is not described as a new full rerun. CPU tests pass 802 cases with 12 GPU-dependent
+skips; broader research is not an additional launch checklist.
+[Public reports and raw GPU logs](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/README.md)
+record these scopes. Isolated checks do not establish real-miner rewards or complete host-loss
+recovery. The [acceptance inventory](evidence/system-panel/acceptance/inventory.json) is an index,
+not runtime authorization.
 
 ## Competition flow
 
@@ -219,8 +218,8 @@ rejects publication before any storage write. Existing startup checks also enfor
 runtime integrity, data isolation and track consistency. The broader experiment inventory is
 not a startup checklist: E10/E11 remain failed research checks, not fabricated passes or a
 reason to disable authorized initial operation.
-This restored gate is a source change for the next coordinated runtime. The already-running
-frozen `364c0ca` image predates it; it has not been replaced under the existing track digest.
+The deployed `c8685ad` image includes this gate. Its new immutable runtime identity is published
+under the current track digest; the previous image was not hot-patched under its old digest.
 
 Initial operation can generate batches on demand with `veda validator produce --config ... --once`.
 Continuous generation and broader quality studies can be enabled after the evaluator is operating;
