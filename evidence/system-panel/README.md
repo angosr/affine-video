@@ -59,6 +59,12 @@ reference rejects, while a constant one-level offset accepts. This isolates deno
 sensitivity and is distinct from the real R2VA case (dense motion 1.0174, not epsilon-limited).
 No feature/model/VAE or human-quality validation is implied; no replacement rule is adopted.
 
+Recovery transport also has a measured limit: a 32 MiB direct control-to-GPU SSH stream takes
+82.96 s (0.404 MB/s), with matching source/receiver prefix hashes and no receiver file. The same
+rate would require about 67 hours for all 97.3 GB, so the proposed three-hour copy is not started.
+This is one directional pilot, not sustained throughput or evidence of lost backup data; rapid
+whole-host restoration remains unverified while existing off-GPU sources are assessed.
+
 The previous `b81bfa8`/`8608cf5d` runtime passed E2, repeatability, CUDA ordering, and a two-stage SQLite/FIFO/off-GPU S3 control fixture. The new image retains byte-identical numerical scoring/runtime/full-video code, but those historical runs keep their original identities. The intermediate E91 regeneration and 16-case synthetic full-mask diagnostic likewise remain component evidence, not relabeled current acceptance.
 
 `launch/runner.py` implements the broader research panel and requires an explicit runtime binding for every data-producing command. Its six identities run on ten production and eight audit exact batches, followed by five production and two audit full-video batches. Both replay orders reuse the same five exact labels and the same confirmation labels. All six identities receive full-video cells, covering every dynamic-incumbent path. Directional gates reject self or degenerate promotion and require the reverse VEDA-versus-shuffled positive to promote on every production batch. Aggregation binds the complete fixed model roster to the exact-summary hash and recomputes full-video bounds from raw cells. Completing this entire research panel is not required before initial release.

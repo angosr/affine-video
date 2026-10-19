@@ -1302,6 +1302,17 @@
       "actual_values": {
         "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
         "runtime_source_commit": "364c0ca",
+        "single_flow_restore_transport": {
+          "direction": "control_to_gpu",
+          "measured_bytes": 33554432,
+          "payload_elapsed_seconds": 82.9598591439717,
+          "bytes_per_second": 404465.8747764791,
+          "receiver_prefix_sha256_matches": true,
+          "receiver_files_written": false,
+          "constant_rate_full_static_copy_projection_hours": 66.82111315170992,
+          "three_hour_full_copy_experiment_authorized": false,
+          "scope": "One bounded directional SSH pilot, not sustained throughput, private S3 or irrecoverability proof. All56 current donor mappings verified; the97GB/3h proposal is not launched because measured throughput does not justify its budget. Formal services and backup bytes are unchanged."
+        },
         "fixed_input_envelope": {
           "samples": 1120,
           "source_families": 1120,
@@ -1608,6 +1619,21 @@
           "path": "private/maintenance-v2-r1/retired-image-cleanup-result.json",
           "sha256": "95d462c3310ea4eac47d00a1e17889044691a596e1fb8c127a40023af5d83390",
           "scope": "Eight inactive superseded local image archives removed,139315253248 bytes. All56 current asset paths/size/inodes verified before and after; current OCI, configs, authority store and historical small provenance retained. Historical full image archives, including the old basis image, are intentionally no longer retained off GPU."
+        },
+        {
+          "path": "private/maintenance-v2-r1/host-recovery-direct-push-registration.json",
+          "sha256": "716130d4214b28a04a83bff5b9ab7b75289ce2010f3f6c747c39d452492abcd0",
+          "scope": "Single bounded32MiB control-to-GPU stream from current preserved OCI, readiness handshake, streaming source hash and standard receiver-stdin SHA. No receiver file, source mutation or97GB transfer."
+        },
+        {
+          "path": "private/maintenance-v2-r1/host-recovery-direct-push-result.json",
+          "sha256": "3355f1174d289c87f24b89a295d13e01884aaecc5219ac49c4423f7c237ff89e",
+          "scope": "Actual32MiB stream completes with matching prefix hashes and unchanged source metadata:82.96s/404465.9Bps. Not full OCI/hash recovery or a measurement of other storage routes."
+        },
+        {
+          "path": "private/maintenance-v2-r1/host-recovery-proposal-review.json",
+          "sha256": "a6443511851aa01cb5a0a463c33ad999e1d45207c417a9b5ebb3e5249a72b5a9",
+          "scope": "Root reads complete proposed controller and validates all56 source/manifest mappings. Current pilot does not justify97GB within3h, so the proposed copy is not authorized or started. Initial pre-network argv error and corrected one-attempt invocation are recorded; no automatic retries or changed deadlines."
         }
       ],
       "release_blocker": false,
