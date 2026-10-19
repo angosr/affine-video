@@ -24,6 +24,9 @@ the current source/lock/OCI triple. Root verifies the original full-byte SHA fac
 mapping without rereading the entire payload. Whole-host restoration remains unverified. At the
 first live generation boundary, an empty queue creates no private plan or formal GPU load while
 the original public weights continue refreshing; the read-only before/after check is indexed.
+The current production config is also preserved byte-for-byte off GPU. All 15 role environment
+values match control-host sources, and both active commands match the archived launch arguments;
+the receipt retains no credentials or value digests. This is input coverage, not a cold restart.
 
 The previous `b81bfa8`/`8608cf5d` runtime passed E2, repeatability, CUDA ordering, and a two-stage SQLite/FIFO/off-GPU S3 control fixture. The new image retains byte-identical numerical scoring/runtime/full-video code, but those historical runs keep their original identities. The intermediate E91 regeneration and 16-case synthetic full-mask diagnostic likewise remain component evidence, not relabeled current acceptance.
 

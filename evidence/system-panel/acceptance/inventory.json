@@ -1539,6 +1539,11 @@
           "path": "private/maintenance-v2-r1/first-generation-empty-boundary-verification.json",
           "sha256": "8fe6ec4b7f5f9f6dcf4f3af77248945a0649665ab68320dc98877404db7f1809",
           "scope": "Actual before/after first Finney generation boundary: zero formal submissions/challenges/private plans, GPUs0-5 idle at after snapshot, original weights refresh beyond the boundary, both services active without restarts. Read only, not queued-model acceptance."
+        },
+        {
+          "path": "private/maintenance-v2-r1/recovery-input-verification.json",
+          "sha256": "7d353cd350b0eade59136935143a761bad9920a10c9b9fe841b98f056742c0ee",
+          "scope": "Current production config preserved byte-for-byte off GPU; both actual container commands match archived launch arguments, and all15 role environment values match off-GPU sources through an ephemeral comparison. Receipt contains key names and booleans, never credentials or value digests. No restart or whole-host restore claim."
         }
       ],
       "release_blocker": false,
