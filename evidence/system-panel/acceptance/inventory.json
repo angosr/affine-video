@@ -1328,6 +1328,34 @@
           "total_seconds_including_validation": 1045.1573085188866,
           "scope": "Frozen860/3749 run(once=True), reservation, sixteen actual newly produced units and complete10.36GB NPZ byte comparison plus original CUDA Reader. Bootstrap/READY only cloned; empty SQLite has no admissions/stages, so not queue replay or static-asset/whole-host recovery. Older D1/E91 component evidence remains archived off-repository and in index history; current index uses this actual860 run instead."
         },
+        "current_static_manifest_off_gpu_preservation": {
+          "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+          "artifact_manifest_sha256": "e612352e59f63389efdd3d9ee6e6b586bb9a6371de26138354c784d237e30b67",
+          "current_artifacts": 56,
+          "current_artifact_bytes": 97296695944,
+          "shared_basis_artifacts": 53,
+          "separately_preserved_runtime_artifacts": 3,
+          "original_completed_basis_sha_events": 56,
+          "path_metadata_rows_rechecked": 59,
+          "public_current_manifest_matches": true,
+          "bulk_payload_independently_rehashed_again": false,
+          "transient_unit_garbage_collected": true,
+          "independent_os_exit_code_claimed": false,
+          "whole_host_recovery_claimed": false,
+          "scope": "Original sole writer completed all56 full-byte SHA verifications. Current53 shared assets plus separately verified source/lock/OCI triple cover the entire current manifest off GPU. Root rechecks original facts, all59 path metadata and public manifest, not97GB payload again. Transient-unit default status after GC is not an OS exit-code proof."
+        },
+        "first_live_empty_generation_boundary": {
+          "boundary_block": 9315500,
+          "cursor_before": 9315499,
+          "cursor_after": 9315509,
+          "boundary_hash": "0x541c391b484f98dd0c498c5a209014a4f4aec95181ed10bb9c6eb72fe8e231ef",
+          "submissions_and_challenges": 0,
+          "authoritative_private_plans": 0,
+          "formal_gpus_idle_at_after_snapshot": [0, 1, 2, 3, 4, 5],
+          "public_weights_refreshed_beyond_boundary": true,
+          "service_restarts": 0,
+          "scope": "Actual finalized Finney first generation boundary with an empty queue. Read-only SQLite/S3 and public-pointer checks show no empty production plan or needless GPU load; not a queued-model, full-cycle-capacity or continuous GPU telemetry proof."
+        },
         "current_runtime_model_archive_restore": {
           "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
           "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
@@ -1496,10 +1524,25 @@
           "path": "private/maintenance-v2-r1/model-restore-verification.json",
           "sha256": "587686dd27adbd98af57d262da889af18ecc1e1683229d300bb8abdaee2dfe44",
           "scope": "Original container exits0/OOMfalse without model mount; independently streamed full-file sha256sum matches. Raw log, registration and terminal-state hashes bound. Not a whole-host or real winner recovery claim."
+        },
+        {
+          "path": "private/maintenance-v2-r1/runtime-assets-final-verification.json",
+          "sha256": "8632a528be981eedf2b1e05072e5a0b811bc4dd36602d190921dd400364f3cfb",
+          "scope": "Original56-entry writer SHA facts plus exact53 shared/3 new current-manifest mapping and twice-stable59 path metadata. Explicitly records transient-unit GC and absence of an independent OS exit code; not a whole-host restore."
+        },
+        {
+          "path": "private/maintenance-v2-r1/runtime-assets-root-review.json",
+          "sha256": "3d487dd4e84237f0f8a89f7e158ee7448a9854261baeee0aff907afee287b01d",
+          "scope": "Root independently checks all original56 unique SHA events, complete current mapping,59 live path metadata, all small evidence hashes and public current manifest. No repeat97GB/image read or whole-host claim."
+        },
+        {
+          "path": "private/maintenance-v2-r1/first-generation-empty-boundary-verification.json",
+          "sha256": "8fe6ec4b7f5f9f6dcf4f3af77248945a0649665ab68320dc98877404db7f1809",
+          "scope": "Actual before/after first Finney generation boundary: zero formal submissions/challenges/private plans, GPUs0-5 idle at after snapshot, original weights refresh beyond the boundary, both services active without restarts. Read only, not queued-model acceptance."
         }
       ],
       "release_blocker": false,
-      "status": "current_worker_pool_integration_passed_whole_host_and_sustained_capacity_pending",
+      "status": "static_assets_and_role_pools_verified_whole_host_and_sustained_capacity_pending",
       "subject": "评测容量"
     }
   ],

@@ -19,6 +19,12 @@ the existing baseline score and output hash exactly; all extreme-model scores ar
 temporary weight file is deleted. This covers one historical video, not broad adversarial or
 all-geometry acceptance. No model training, parameter search or production change is involved.
 
+All 56 current-manifest assets (97.3 GB) now have off-GPU preserved paths: 53 shared assets and
+the current source/lock/OCI triple. Root verifies the original full-byte SHA facts and exact current
+mapping without rereading the entire payload. Whole-host restoration remains unverified. At the
+first live generation boundary, an empty queue creates no private plan or formal GPU load while
+the original public weights continue refreshing; the read-only before/after check is indexed.
+
 The previous `b81bfa8`/`8608cf5d` runtime passed E2, repeatability, CUDA ordering, and a two-stage SQLite/FIFO/off-GPU S3 control fixture. The new image retains byte-identical numerical scoring/runtime/full-video code, but those historical runs keep their original identities. The intermediate E91 regeneration and 16-case synthetic full-mask diagnostic likewise remain component evidence, not relabeled current acceptance.
 
 `launch/runner.py` implements the broader research panel and requires an explicit runtime binding for every data-producing command. Its six identities run on ten production and eight audit exact batches, followed by five production and two audit full-video batches. Both replay orders reuse the same five exact labels and the same confirmation labels. All six identities receive full-video cells, covering every dynamic-incumbent path. Directional gates reject self or degenerate promotion and require the reverse VEDA-versus-shuffled positive to promote on every production batch. Aggregation binds the complete fixed model roster to the exact-summary hash and recomputes full-video bounds from raw cells. Completing this entire research panel is not required before initial release.
