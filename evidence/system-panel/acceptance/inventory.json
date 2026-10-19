@@ -248,6 +248,22 @@
             }
           ],
           "scope": "Actual isolated FilePairedEvaluator with a fixed existing schema-valid model; exact-only on two disjoint cached batches, not full-video, live submission or broad ranking acceptance"
+        },
+        "external_fixed_control_discovery": {
+          "repo_id": "Veda-Sparse/Minimax-H3-R2VA-Veda-Preview",
+          "revision": "1598b407905b7c0af85aa0c13acdfa6f01ff2982",
+          "filename": "minimax_h3_r2va_veda_preview_fp8.safetensors",
+          "expected_file_sha256": "23edace948693772be33d5cc945d302d2b037a29bd44bd57071bfbdd8b02517d",
+          "expected_file_bytes": 275415752,
+          "bounded_header_bytes_read": 142144,
+          "projection_shapes_checked": 100,
+          "per_head_scale_shapes_checked": 100,
+          "architecture": {"num_layers": 50, "num_heads": 56, "head_dim": 128},
+          "whole_file_validated": false,
+          "legal_fp16_export_validated": false,
+          "quality_evaluated": false,
+          "training": false,
+          "scope": "Official public fixed candidate located through its API and bounded data-only header read. Shapes match the plain predictor. No external code imported, full-byte or legal-export verification yet; no claim of better quality or a changed genesis model."
         }
       },
       "id": "E4",
@@ -278,10 +294,15 @@
           "path": "evidence/system-panel/acceptance-8608cf5d/mean-pool-exact-gpu6.raw.log",
           "sha256": "5ef66a79ad05f683a6e6cbc33683e89cc675417006f6e1950438a6c1a8d1c8e9",
           "scope": "Actual current-image H200 isolated paired evaluation, two disjoint batches/768 cases, both original baseline scores reproduced, no promotion or public writes, exit zero"
+        },
+        {
+          "path": "private/maintenance-v2-r1/external-control-discovery.json",
+          "sha256": "9c62d21ef4e7475bd5e2b8db2321117281b2afa1ff1f3c7bddebbf58de43e5e4",
+          "scope": "Pinned official R2VA candidate, canonical URLs, API and bounded header hashes, all200 tensor descriptors and metadata retained. Not a full download, legal selector validation, runtime or quality result."
         }
       ],
       "release_blocker": false,
-      "status": "fixed_legal_controls_completed_no_above_baseline_winner_headroom_pending",
+      "status": "fixed_controls_completed_external_candidate_header_verified_headroom_pending",
       "subject": "可竞争空间"
     },
     {
@@ -390,7 +411,33 @@
           "fp32_headroom_factor": 979119857845.1245,
           "full_video_backbone_trajectories_bounded": false
         },
-        "scope": "Actual installed formal/candidate spawned scorers plus a conservative arithmetic bound for fixed finite-FP16 cached inputs. Not every legal file, malformed parser input, full-video trajectory, live admission or queue recovery; no training or new sources."
+        "historical_exact_component_scope": "Actual installed formal/candidate spawned scorers plus a conservative arithmetic bound for fixed finite-FP16 cached inputs. Not every legal file, malformed parser input, full-video trajectory, live admission or queue recovery; no training or new sources.",
+        "current_runtime_full_video_boundary": {
+          "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+          "source_commit": "364c0ca",
+          "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
+          "physical_gpu": 6,
+          "model_weight_value": 65504.0,
+          "model_digest": "f990fb6ddc5466e7f1621880330e57543c68f982bd868060352bc3f06d3d9bb9",
+          "file_sha256": "94f6ccb4704495199214e3d46d5d158335d34a8a407f97c9a0d2e02b35398d4f",
+          "file_bytes": 550511720,
+          "tensor_count": 100,
+          "independent_videos": 1,
+          "geometry": "9:16@37",
+          "video_cells": 9,
+          "baseline_cells_compared_to_existing_evidence": 6,
+          "baseline_max_score_delta": 0.0,
+          "baseline_output_hash_mismatches": 0,
+          "boundary_scores": {"16": 0.0, "32": 0.7105635124453294, "64": 0.7476847771777314},
+          "elapsed_seconds": 502.56071130000055,
+          "peak_rss_kib": 40117936,
+          "peak_cuda_bytes": 52801840640,
+          "container_exited_zero": true,
+          "oom_killed": false,
+          "temporary_model_deleted": true,
+          "training": false,
+          "scope": "Actual complete runtime and production fidelity handler for one historical video and three baseline/extreme/baseline sequences. Every extreme score is finite; all following baseline hashes and scores unchanged. Not all legal models, geometries, a complete paired batch, real Miner admission or broad adversarial acceptance."
+        }
       },
       "id": "E6",
       "method": "用冻结 selector 的真实输入 trace、schema 负控和极值测试核验 TripPool/投影/Top k 的运行边界及开销，不训练或扩大模型结构",
@@ -425,10 +472,25 @@
           "path": "private/model-boundary-replay-20261019/fp16-logit-bound.json",
           "sha256": "d0e81a438abdc41e9373096ae7648a4d88089ddf699d212b1885a3d311eb00b8",
           "scope": "Decimal derivation using conservative FP32 rounding bounds and exact numeric-source byte comparisons against both frozen bundles. Excludes logit overflow only under the stated finite-FP16 cached-input/weight assumptions; not full-video or resource-safety acceptance."
+        },
+        {
+          "path": "private/maintenance-v2-r1/full-boundary-registration.json",
+          "sha256": "7e7e2deda3695bbf75126a9d163bdc515b168d657f5cc71a11cb8e7124b4367c",
+          "scope": "Original embedded no-training harness and frozen baseline references, one fixed video, three budgets, all-FP16-maximum model digest and1800-second deadline, no retries or public writes."
+        },
+        {
+          "path": "private/maintenance-v2-r1/full-boundary-result.json",
+          "sha256": "7752e1ac3f4f24fabdfd9a7f9eeb33a9dd2ba6b8f8919fd20828662b94f88155",
+          "scope": "Actual current-image H200 nine complete video cells. Legal maximum-weight model runs at all budgets; baseline scores and output hashes before/after remain identical, temporary model removed."
+        },
+        {
+          "path": "private/maintenance-v2-r1/full-boundary-verification.json",
+          "sha256": "84b4fb25bc84632e3cfa6c165bf38b46cbb990073cfc6d177df2840db0d54d29",
+          "scope": "Original container exits0/OOMfalse; all raw rows match, six baseline cells independently compared with original evidence, finite scores and actual file cleanup checked. Complete stdout/stderr/raw and registration hashes bound."
         }
       ],
       "release_blocker": false,
-      "status": "legal_fp16_boundary_and_candidate_exact_replay_verified_full_runtime_pending",
+      "status": "legal_fp16_exact_and_current_full_video_boundary_smoke_passed_broad_validation_pending",
       "subject": "固定选块器结构与输入边界"
     },
     {

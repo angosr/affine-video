@@ -13,6 +13,12 @@ loader failure is preserved; supplying the fixed control's owner changes no nume
 model, case or tolerance. All 64 result rows match the complete raw log. This is sampled component
 coverage, not all 2800 architecture routes or whole-host recovery.
 
+A current-image legal-FP16-maximum boundary smoke also completes nine full-video cells in 502.56 s
+without timeout or OOM. At each budget, baseline -> fixed extreme weights -> baseline reproduces
+the existing baseline score and output hash exactly; all extreme-model scores are finite. The
+temporary weight file is deleted. This covers one historical video, not broad adversarial or
+all-geometry acceptance. No model training, parameter search or production change is involved.
+
 The previous `b81bfa8`/`8608cf5d` runtime passed E2, repeatability, CUDA ordering, and a two-stage SQLite/FIFO/off-GPU S3 control fixture. The new image retains byte-identical numerical scoring/runtime/full-video code, but those historical runs keep their original identities. The intermediate E91 regeneration and 16-case synthetic full-mask diagnostic likewise remain component evidence, not relabeled current acceptance.
 
 `launch/runner.py` implements the broader research panel and requires an explicit runtime binding for every data-producing command. Its six identities run on ten production and eight audit exact batches, followed by five production and two audit full-video batches. Both replay orders reuse the same five exact labels and the same confirmation labels. All six identities receive full-video cells, covering every dynamic-incumbent path. Directional gates reject self or degenerate promotion and require the reverse VEDA-versus-shuffled positive to promote on every production batch. Aggregation binds the complete fixed model roster to the exact-summary hash and recomputes full-video bounds from raw cells. Completing this entire research panel is not required before initial release.
