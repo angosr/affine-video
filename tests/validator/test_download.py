@@ -485,7 +485,36 @@ def test_metadata_size_rejects_before_download(tmp_path) -> None:
         )
 
     assert caught.value.code == "MODEL_TOO_LARGE"
+    assert caught.value.temporary is False
     assert client.called is False
+
+
+@pytest.mark.parametrize("declared_size", (None, 6))
+@pytest.mark.parametrize("failure", ("header", "body"))
+def test_oversized_response_is_bounded_and_retryable_after_pinned_metadata(
+    tmp_path, declared_size, failure,
+) -> None:
+    class OversizedResponse(FakeResponse):
+        headers = {"content-length": "11"} if failure == "header" else {}
+
+        def iter_bytes(self, *, chunk_size):
+            if failure == "header":
+                pytest.fail("oversized response header must reject before reading the body")
+            yield b"x" * 11
+            pytest.fail("body must stop immediately at the byte limit")
+
+    class OversizedClient(FakeClient):
+        def stream(self, *_args):
+            return OversizedResponse()
+
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model(
+            "owner/model", "12" * 20, cache_dir=tmp_path, max_bytes=10,
+            api=FakeApi([sibling(size=declared_size)]), http_client=OversizedClient(),
+        )
+    assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
+    assert caught.value.temporary is True
+    assert not list(tmp_path.iterdir())
 
 
 def test_missing_fixed_filename_is_participant_failure(tmp_path) -> None:

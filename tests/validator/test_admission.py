@@ -1277,8 +1277,9 @@ def test_permanent_download_failure_records_no_authoritative_score(tmp_path) -> 
 
 
 @pytest.mark.parametrize("metadata_type", ("lfs", "git"))
+@pytest.mark.parametrize("failure", ("digest", "header", "body"))
 def test_pinned_content_mismatch_retries_and_preserves_same_admission(
-    tmp_path, metadata_type,
+    tmp_path, metadata_type, failure,
 ) -> None:
     model = tmp_path / "expected.safetensors"
     write_model(model, "hk1")
@@ -1293,9 +1294,15 @@ def test_pinned_content_mismatch_retries_and_preserves_same_admission(
     api = SimpleNamespace(
         model_info=lambda *_args, **_kwargs: SimpleNamespace(siblings=[item], sha="12" * 20),
     )
-    actual = [corrupt]
+    actual = [corrupt if failure == "digest" else payload]
+    headers = [{}]
+    maximum = settings(tmp_path).max_model_bytes
+    if failure == "header":
+        headers[0] = {"content-length": str(maximum + 1)}
+    elif failure == "body":
+        actual[0] = b"x" * (maximum + 1)
     transport = httpx.MockTransport(
-        lambda _request: httpx.Response(200, content=actual[0]),
+        lambda _request: httpx.Response(200, content=actual[0], headers=headers[0]),
     )
     with httpx.Client(transport=transport) as client:
         def downloader(repo_id, revision, **kwargs):
@@ -1315,6 +1322,7 @@ def test_pinned_content_mismatch_retries_and_preserves_same_admission(
             assert challenge.final_score is None and challenge.score_block is None
             assert not list((tmp_path / "cache").iterdir())
             actual[0] = payload
+            headers[0] = {}
             restored = process_next_admission(
                 store, worker_id="admission", settings=settings(tmp_path),
                 current_finalized_block=10_000, now_ms=30_100, downloader=downloader,

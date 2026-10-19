@@ -425,13 +425,21 @@ def download_public_model(
                 )
             content_length = response.headers.get("content-length")
             if content_length is not None and int(content_length) > max_bytes:
-                raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
+                raise ModelDownloadError(
+                    "DOWNLOAD_TEMPORARY_FAILURE",
+                    "model response exceeds the byte limit after pinned metadata verification",
+                    temporary=True,
+                )
             etag = response.headers.get("etag")
             host = urlparse(str(response.url)).hostname
             for chunk in response.iter_bytes(chunk_size=1024 * 1024):
                 received += len(chunk)
                 if received > max_bytes:
-                    raise ModelDownloadError("MODEL_TOO_LARGE", "model exceeds the byte limit")
+                    raise ModelDownloadError(
+                        "DOWNLOAD_TEMPORARY_FAILURE",
+                        "model response exceeds the byte limit after pinned metadata verification",
+                        temporary=True,
+                    )
                 digest.update(chunk)
                 output.write(chunk)
         if declared_size is not None and received != declared_size:
