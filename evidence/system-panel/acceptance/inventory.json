@@ -137,7 +137,7 @@
         "memory_s3_used": false,
         "clock": "isolated accelerated chain fixture",
         "real_chain_admission_or_weight_transaction_claimed": false,
-        "scope": "Actual current-image GPU reports and durable lifecycle. Positive fixture starts with a degraded incumbent; not formal genesis defeat, HF admission, whole-host recovery, general rankings or the separately running restricted production-pool diagnostic."
+        "scope": "Actual current-image GPU reports and durable lifecycle. Positive fixture starts with a degraded incumbent; not formal genesis defeat, HF admission, whole-host recovery or general rankings. Actual deployed-resource worker-pool parity is separately recorded under E18."
       },
       "id": "E3",
       "method": "用固定只读self和退化模型运行真实exact及完整视频，核验FIFO、未来confirmation、冠军替换及持久化事实；更广的跨批次、近阈值和排序研究上线后继续，不训练模型",
@@ -1140,6 +1140,26 @@
           "actual_run_seconds": 845.6014928277582,
           "total_seconds_including_validation": 1045.1573085188866,
           "scope": "Frozen860/3749 run(once=True), reservation, sixteen actual newly produced units and complete10.36GB NPZ byte comparison plus original CUDA Reader. Bootstrap/READY only cloned; empty SQLite has no admissions/stages, so not queue replay or static-asset/whole-host recovery. Older D1/E91 component evidence remains archived off-repository and in index history; current index uses this actual860 run instead."
+        },
+        "current_runtime_worker_pool_integration": {
+          "track_spec_digest": "cf747b59ae96a39782ee3660f0c8e3029003e784087fc37102bf9a36695e3eb3",
+          "source_commit": "364c0ca",
+          "image_id": "sha256:6086b0bf747106c01f21341e7853cfee0996a4a8524af809f8af259d867a8f0b",
+          "producer_gpus": [2, 3, 4, 5],
+          "confirmation_gpus": [0, 1],
+          "memory_bytes_per_pool": 274877906944,
+          "cpus_per_pool": 16,
+          "both_pools_exited_zero": true,
+          "both_pools_oom_killed": false,
+          "all_six_gpus_simultaneously_active": true,
+          "producer_regenerated_videos": 16,
+          "producer_complete_file_hash_comparisons": 48,
+          "producer_file_hash_mismatches": 0,
+          "restricted_confirmation_video_cells": 96,
+          "confirmation_max_score_delta": 0.0,
+          "confirmation_output_hash_mismatches": 0,
+          "whole_host_recovery_claimed": false,
+          "scope": "Actual unchanged WorkerPool and ConfirmationWorkerPool at deployed resource limits, overlapping on H200 GPUs0-5. Same-plan generator replay from empty work and restricted evaluator assets/selected-input mounts. Not independent new batches, real Miner/HF admission, sustained queue throughput or whole-host restore."
         }
       },
       "id": "E18",
@@ -1235,10 +1255,35 @@
           "path": "private/candidate-b5f9712/archive-preservation.raw.log",
           "sha256": "cc67782779b167e44c3736a423f45aa0772ee8423a200ce3dd4690eda1924f4f",
           "scope": "Completed off-GPU copy of the actual historical C488 measured image: all17,418,646,528 bytes SHA-verified against GPU and tar config verified against OCI ID; donor unchanged. Rsync reused17,414,356,992 bytes and transferred4,289,536 literal bytes in344.08s. Unit exited0, no retry or formal mutation; not current-source acceptance, complete56-asset preservation or whole-host restore."
+        },
+        {
+          "path": "private/maintenance-v2-r1/producer-pool-result.json",
+          "sha256": "bde22d679a7af03ea21c13da53404c32f8402233cd8073d714fa9631cfe0a1a6",
+          "scope": "Actual current-image four-worker regeneration of all16 same-plan videos from empty work; all48 complete shard/video/latent hashes match. No unit cache reuse."
+        },
+        {
+          "path": "private/maintenance-v2-r1/producer-pool-verification.json",
+          "sha256": "891c84b3f7c010e2b713abedb7fe02904b3f2150d446eeb0c6ef8e6cf6f39987",
+          "scope": "Original production-class container exited0/OOMfalse; registration, complete raw log and joint observation hashes preserved. Static assets survived, not whole-host restore."
+        },
+        {
+          "path": "private/maintenance-v2-r1/restricted-pool-result.json",
+          "sha256": "e71c38e60fe5d30a887caff2ddd2291cdf84a2c3e17ae91cf09cc38ca5154f26",
+          "scope": "Actual restricted ConfirmationWorkerPool on GPUs0/1,16 future videos and96 cells, same model/budget roster and frozen thresholds; no full private-source mount or storage credentials."
+        },
+        {
+          "path": "private/maintenance-v2-r1/restricted-pool-verification.json",
+          "sha256": "32d6ab9f8ff60e6a39ec4b1420c47ce10b4ce6385ef343a55cfa428b4a2ce5fd",
+          "scope": "Container exited0/OOMfalse; all96 scores and output hashes independently compared with the original GPU6/7 reports, zero discrepancies."
+        },
+        {
+          "path": "private/maintenance-v2-r1/joint-pools-verification.json",
+          "sha256": "e86daa62e4625646ccd4a71d412beb64a7fb33ff2b9755c883fa6af0ae9bb2cb",
+          "scope": "Both actual pools complete at formal256GiB/16CPU limits and all six GPUs compute simultaneously. One plan per pool only, not sustained production capacity or whole-host acceptance."
         }
       ],
       "release_blocker": false,
-      "status": "current_batch_data_loss_recovery_verified_whole_host_and_capacity_pending",
+      "status": "current_worker_pool_integration_passed_whole_host_and_sustained_capacity_pending",
       "subject": "评测容量"
     }
   ],

@@ -20,7 +20,9 @@ CPU and H200 checks cover all 797 tests, including the CUDA tie-order test. The 
 also passes cache/runtime precision checks, independent sixteen-video exact and full-video
 control batches, and a two-stage SQLite/FIFO/off-GPU S3 recovery fixture. Current-image
 same-card and cross-card video repeats have identical scores and output hashes.
-The restricted production confirmation-pool diagnostic continues separately after deployment.
+The actual four-GPU producer and restricted two-GPU confirmation pools also pass at their deployed
+resource limits: 48 regenerated-file hashes and 96 full-video scores/output hashes match the
+reference exactly, with all six GPUs observed computing concurrently.
 Evidence scope and remaining validation are
 tracked in the [acceptance inventory](evidence/system-panel/acceptance/inventory.json);
 isolated checks do not establish real-miner admission or complete host-loss recovery.
