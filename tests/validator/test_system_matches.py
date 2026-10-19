@@ -532,3 +532,78 @@ def test_self_checks_cannot_be_relabelled_as_wins(field):
     record["batches"][0][field] = 0.1
     with pytest.raises(ValueError, match="self comparison"):
         system_matches_module._match_document(record)
+
+
+def test_historical_four_records_keep_their_exact_serialized_body_bytes():
+    # Captured before cross-version identity decoupling; not a new GPU measurement.
+    expected = (
+        "6956fb402e1500930e33fa11eeda149b16ce126317bf0bdebdd4e18b97c90041",
+        "eb512217955a93cdd1906af29a79235b6651afbf1fd2c8cacb0bab3fc65bbfad",
+        "0fedc0dcdfdfaafe823ec07755e36a22f3a10901a6a315ba2b6c0de090ff39f4",
+        "4ad5ef3acd7ffa5432c714ed043d701fa576f15cde8eefb58a94e94bde65e94e",
+    )
+    assert (
+        tuple(
+            hashlib.sha256(
+                system_matches_module._json_bytes(system_matches_module._match_document(record))
+            ).hexdigest()
+            for record in system_matches_module.BENCHMARKS
+        )
+        == expected
+    )
+
+
+def test_different_tracks_can_each_have_sequence_one_without_relabelling(monkeypatch):
+    track = load_track_spec(Path(__file__).parents[2] / "track.json")
+    manifest = _runtime_manifest()
+    _bind_evidence(monkeypatch, track, manifest)
+    original = system_match_artifacts(track, manifest)
+    # Synthetic CPU gate fixture only, never a pending release's measured record.
+    other_track = replace(track, track_id="benchmark-test-track", netuid=121, digest="ef" * 32)
+    records = deepcopy(system_matches_module.BENCHMARKS)
+    other_record = {
+        **deepcopy(records[0]),
+        "track_id": other_track.track_id,
+        "netuid": other_track.netuid,
+        "track_spec_digest": other_track.digest,
+        "track_contract_sha256": system_matches_module._evidence_contract_digest(other_track),
+        "sequence": 1,
+    }
+    monkeypatch.setattr(system_matches_module, "BENCHMARKS", (*records, other_record))
+
+    assert system_match_artifacts(track, manifest) == original
+    other_artifacts = system_match_artifacts(other_track, manifest)
+    assert len(other_artifacts) == 1
+    assert other_artifacts[0][0] == "system_matches/benchmark-test-track/000000000001.json"
+    document = json.loads(other_artifacts[0][1])
+    assert document["track_id"] == other_track.track_id
+    assert document["netuid"] == other_track.netuid
+    assert document["track_spec_digest"] == other_track.digest
+    assert document["affects_tournament"] is document["reward_eligible"] is False
+
+    other_record["track_contract_sha256"] = records[0]["track_contract_sha256"]
+    assert system_match_artifacts(other_track, manifest) == ()
+    assert system_match_artifacts(track, manifest) == original
+
+
+@pytest.mark.parametrize("identity", ["track_id", "netuid"])
+def test_matching_contract_cannot_override_the_recorded_identity(monkeypatch, identity):
+    track = load_track_spec(Path(__file__).parents[2] / "track.json")
+    manifest = _runtime_manifest()
+    _bind_evidence(monkeypatch, track, manifest)
+    records = deepcopy(system_matches_module.BENCHMARKS)
+    for record in records:
+        record[identity] = "another-track" if identity == "track_id" else track.netuid + 1
+    monkeypatch.setattr(system_matches_module, "BENCHMARKS", records)
+    assert system_match_artifacts(track, manifest) == ()
+
+
+def test_sequences_cannot_be_reused_in_one_track_path_even_on_another_netuid(monkeypatch):
+    track = load_track_spec(Path(__file__).parents[2] / "track.json")
+    manifest = _runtime_manifest()
+    _bind_evidence(monkeypatch, track, manifest)
+    records = deepcopy(system_matches_module.BENCHMARKS)
+    collision = {**records[0], "netuid": track.netuid + 1}
+    monkeypatch.setattr(system_matches_module, "BENCHMARKS", (*records, collision))
+    with pytest.raises(ValueError, match="sequences"):
+        system_match_artifacts(track, manifest)

@@ -14,7 +14,6 @@ from validator.production.environment import (
     evaluation_environment_digest,
     evaluation_source_digest,
 )
-from validator.release import PRODUCTION_NETUID, PRODUCTION_TRACK_ID
 from validator.system_match_data import BENCHMARKS
 
 
@@ -24,19 +23,20 @@ def system_match_artifacts(
 ) -> tuple[tuple[str, bytes], ...]:
     """Never relabel old measurements or renumber records on a packaging rebuild."""
 
-    if (
-        runtime_manifest is None
-        or track.track_id != PRODUCTION_TRACK_ID
-        or track.netuid != PRODUCTION_NETUID
-    ):
+    if runtime_manifest is None:
         return ()
-    sequences = [record["sequence"] for record in BENCHMARKS]
+    namespace = [record for record in BENCHMARKS if record["track_id"] == track.track_id]
+    sequences = [record["sequence"] for record in namespace]
     if any(
         type(sequence) is not int or sequence < 1 for sequence in sequences
     ) or sequences != sorted(set(sequences)):
         raise ValueError("system benchmark sequences must be unique and increasing")
     contract = _evidence_contract_digest(track)
-    candidates = [record for record in BENCHMARKS if record["track_contract_sha256"] == contract]
+    candidates = [
+        record
+        for record in namespace
+        if record["netuid"] == track.netuid and record["track_contract_sha256"] == contract
+    ]
     if not candidates:
         return ()
     # Reject historical source bytes before any expensive environment scan.
@@ -64,7 +64,7 @@ def system_match_artifacts(
     runtime = _evidence_runtime_digest(runtime_manifest)
     return tuple(
         (
-            f"system_matches/{track.track_id}/{record['sequence']:012d}.json",
+            f"system_matches/{record['track_id']}/{record['sequence']:012d}.json",
             _json_bytes(_match_document(record)),
         )
         for record in candidates
@@ -96,6 +96,13 @@ def system_match_summaries(
 
 
 def _match_document(record: dict[str, Any]) -> dict[str, Any]:
+    if (
+        not isinstance(record["track_id"], str)
+        or not record["track_id"]
+        or type(record["netuid"]) is not int
+        or record["netuid"] < 0
+    ):
+        raise ValueError("system benchmark track identity is invalid")
     phase = record["phase"]
     batches = record["batches"]
     if phase not in {"exact", "full_video"} or not batches:
@@ -213,10 +220,10 @@ def _match_document(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "record_type": "SYSTEM_BENCHMARK",
         "sequence": record["sequence"],
-        "track_id": PRODUCTION_TRACK_ID,
+        "track_id": record["track_id"],
         # The report's original full digest, NOT the latest release wrapper digest.
         "track_spec_digest": record["track_spec_digest"],
-        "netuid": PRODUCTION_NETUID,
+        "netuid": record["netuid"],
         "affects_tournament": False,
         "reward_eligible": False,
         "reference": {

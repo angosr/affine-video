@@ -7,6 +7,8 @@ source identities, inputs, paths, or credentials belong in this table.
 """
 
 _HISTORICAL_RUNTIME = {
+    "track_id": "veda-sn120-v2",
+    "netuid": 120,
     "track_spec_digest": "8608cf5dcb4e2ab68933950a333dbf95184732b93c8a1ba9332f3a0b90af7c34",
     "track_contract_sha256": "2c1634e3eee6d970d432c31d71c4c5ac4a983d8fc95872cb251c297e8606f95f",
     "runtime_contract_sha256": "92dfa83a26292df75e8bfd329e972eb1a92002884596032887fe4aac54a09021",
