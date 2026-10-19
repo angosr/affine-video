@@ -93,8 +93,11 @@ def download_chunked_file(
     temporary: Path | None = None
     try:
         manifest_bytes = bytearray()
-        with client.stream("GET", manifest_url, headers={"Accept": "application/json"}) as response:
+        with client.stream("GET", manifest_url, headers={
+            "Accept": "application/json", "Accept-Encoding": "identity",
+        }) as response:
             response.raise_for_status()
+            _require_identity_encoding(response)
             declared = response.headers.get("content-length")
             if declared is not None and int(declared) > _MAX_MANIFEST_BYTES:
                 raise ValueError("chunk manifest exceeds the byte limit")
@@ -115,8 +118,11 @@ def download_chunked_file(
                     raise ValueError("chunk URL escaped the manifest origin")
                 part_received = 0
                 part_digest = hashlib.sha256()
-                with client.stream("GET", part_url) as part_response:
+                with client.stream("GET", part_url, headers={
+                    "Accept-Encoding": "identity",
+                }) as part_response:
                     part_response.raise_for_status()
+                    _require_identity_encoding(part_response)
                     declared = part_response.headers.get("content-length")
                     if declared is not None and int(declared) != part.size:
                         raise ValueError("public chunk content length is incorrect")
@@ -139,10 +145,7 @@ def download_chunked_file(
     except (httpx.HTTPError, OSError, ValueError) as exc:
         raise RuntimeError("public chunked file could not be restored") from exc
     finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        if owned_client:
-            client.close()
+        _finish_public_download(temporary, client if owned_client else None)
 
 
 def download_chunked_asset(
@@ -188,8 +191,11 @@ def download_chunked_asset(
     temporary: Path | None = None
     try:
         manifest_bytes = bytearray()
-        with client.stream("GET", manifest_url, headers={"Accept": "application/json"}) as response:
+        with client.stream("GET", manifest_url, headers={
+            "Accept": "application/json", "Accept-Encoding": "identity",
+        }) as response:
             response.raise_for_status()
+            _require_identity_encoding(response)
             declared = response.headers.get("content-length")
             if declared is not None and int(declared) > _MAX_MANIFEST_BYTES:
                 raise ValueError("asset manifest exceeds the byte limit")
@@ -216,8 +222,11 @@ def download_chunked_asset(
                 part_url = urljoin(manifest_url, part["name"])
                 if urlparse(part_url).netloc != parsed_url.netloc:
                     raise ValueError("asset part escaped the manifest origin")
-                with client.stream("GET", part_url) as part_response:
+                with client.stream("GET", part_url, headers={
+                    "Accept-Encoding": "identity",
+                }) as part_response:
                     part_response.raise_for_status()
+                    _require_identity_encoding(part_response)
                     declared = part_response.headers.get("content-length")
                     if declared is not None and int(declared) != part["size"]:
                         raise ValueError("asset part content length is incorrect")
@@ -241,10 +250,29 @@ def download_chunked_asset(
     except (httpx.HTTPError, json.JSONDecodeError, OSError, ValueError) as exc:
         raise RuntimeError("public baseline asset could not be restored") from exc
     finally:
-        if temporary is not None:
+        _finish_public_download(temporary, client if owned_client else None)
+
+
+def _require_identity_encoding(response: httpx.Response) -> None:
+    if response.headers.get("content-encoding", "identity").strip().lower() not in {"", "identity"}:
+        raise ValueError("public download requires identity content encoding")
+
+
+def _finish_public_download(temporary: Path | None, client: httpx.Client | None) -> None:
+    # Run both cleanups and preserve the primary error used by champion fallback.
+    cleanup_error: Exception | None = None
+    if temporary is not None:
+        try:
             temporary.unlink(missing_ok=True)
-        if owned_client:
+        except OSError as exc:
+            cleanup_error = exc
+    if client is not None:
+        try:
             client.close()
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            cleanup_error = cleanup_error or exc
+    if cleanup_error is not None and sys.exception() is None:
+        raise RuntimeError("public download cleanup failed") from cleanup_error
 
 
 def _validate_asset_manifest(

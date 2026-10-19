@@ -1,4 +1,5 @@
 import errno
+import gzip
 import hashlib
 import json
 import os
@@ -86,9 +87,9 @@ class AssetClient:
     def stream(self, method: str, url: str, *, headers: dict[str, str] | None = None):
         assert method == "GET"
         if url.endswith("/manifest.json"):
-            assert headers == {"Accept": "application/json"}
+            assert headers == {"Accept": "application/json", "Accept-Encoding": "identity"}
             return AssetResponse(self.manifest)
-        assert headers is None
+        assert headers == {"Accept-Encoding": "identity"}
         return AssetResponse(self.parts[url.rsplit("/", 1)[-1]])
 
 
@@ -205,6 +206,109 @@ class _CountingStream(httpx.SyncByteStream):
 
     def close(self) -> None:
         self.closed = True
+
+
+@pytest.fixture(params=["generic", "asset"])
+def public_chunked_download(request):
+    content = b"abcdef"
+    digest = hashlib.sha256(content).hexdigest()
+    part_name = "part-00000" if request.param == "generic" else "part-000"
+    if request.param == "generic":
+        manifest = ChunkManifest(digest, len(content), (
+            ChunkPart(part_name, digest, len(content)),
+        )).encode()
+    else:
+        manifest = json.dumps({
+            "format": "chunked-safetensors", "filename": "selector.safetensors",
+            "size": len(content), "sha256": digest, "model_digest": "ab" * 32,
+            "source": {}, "parts": [{"name": part_name, "size": len(content), "sha256": digest}],
+        }).encode()
+
+    def load(cache_dir, http_client=None):
+        common = {
+            "cache_dir": cache_dir, "expected_sha256": digest,
+            "max_bytes": 10, "http_client": http_client,
+        }
+        url = "https://public.example/assets/manifest.json"
+        if request.param == "generic":
+            return download_chunked_file(url, suffix=".safetensors", **common)
+        return download_chunked_asset(url, expected_model_digest="ab" * 32, **common)
+
+    return SimpleNamespace(manifest=manifest, part_name=part_name, digest=digest, load=load)
+
+
+@pytest.mark.parametrize("location", ["manifest", "part"])
+def test_public_chunked_download_rejects_encoding_before_decompression(
+    tmp_path, monkeypatch, public_chunked_download, location,
+) -> None:
+    case = public_chunked_download
+    body = _CountingStream(gzip.compress(b"x" * 8192))
+    requests = []
+
+    def decode_was_called(*_args):
+        pytest.fail("compressed response reached the automatic decoder")
+
+    monkeypatch.setattr("httpx._decoders.GZipDecoder.decode", decode_was_called)
+
+    def respond(request):
+        requests.append(request)
+        if location == "part" and request.url.path.endswith("/manifest.json"):
+            return httpx.Response(200, content=case.manifest)
+        return httpx.Response(200, stream=body, headers={"Content-Encoding": "gzip"})
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        pytest.raises(RuntimeError) as caught,
+    ):
+        case.load(tmp_path, client)
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert body.chunks_read == 0 and body.closed
+    assert all(r.headers["accept-encoding"] == "identity" for r in requests)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fault", ["http_close", "part_unlink_and_close", "success_close"])
+def test_public_chunked_download_cleanup_preserves_fallback_errors(
+    tmp_path, monkeypatch, public_chunked_download, fault,
+) -> None:
+    case = public_chunked_download
+    calls = []
+    close_failure = httpx.CloseError("secondary client cleanup failure")
+
+    def respond(request):
+        if request.url.path.endswith("/manifest.json"):
+            return httpx.Response(200, content=case.manifest)
+        return httpx.Response(200 if fault == "success_close" else 503, content=b"abcdef")
+
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+    real_close, real_unlink = client.close, Path.unlink
+
+    def fail_close():
+        calls.append("close")
+        real_close()
+        raise close_failure
+
+    def fail_unlink(path, *args, **kwargs):
+        if path.name.startswith(".partial-"):
+            calls.append("unlink")
+            raise OSError(errno.EIO, "secondary unlink failure")
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(download_module.httpx, "Client", lambda **_kwargs: client)
+        patch.setattr(client, "close", fail_close)
+        if fault == "part_unlink_and_close":
+            patch.setattr(Path, "unlink", fail_unlink)
+        with pytest.raises(RuntimeError) as caught:
+            case.load(tmp_path)
+    if fault == "success_close":
+        assert caught.value.__cause__ is close_failure
+        assert case.load(tmp_path, client).read_bytes() == b"abcdef"
+    else:
+        assert isinstance(caught.value.__cause__, httpx.HTTPStatusError)
+    assert calls == (["unlink", "close"] if fault == "part_unlink_and_close" else ["close"])
+    for partial in tmp_path.glob(".partial-*"):
+        partial.unlink()
 
 
 @pytest.mark.parametrize("declared", [True, False])
