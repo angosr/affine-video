@@ -15,7 +15,7 @@ PRODUCTION_TRACK_ID = "veda-sn120-v2"
 PRODUCTION_NETUID = 120
 ACCEPTANCE_LOGICAL_NAME = "evidence/system-panel/acceptance/accepted.json"
 # Numerical fidelity, real two-stage GPU execution, and deterministic/error-safe
-# behavior are release requirements. Broader research stays in the inventory.
+# behavior are release requirements. Broader research is not a release gate.
 REQUIRED_EXPERIMENTS = frozenset({"E2", "E3", "E16"})
 _MAX_ACCEPTANCE_BYTES = 2 * 1024 * 1024
 

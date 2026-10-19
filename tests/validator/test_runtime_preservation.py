@@ -336,6 +336,10 @@ def test_stop_terminates_only_its_private_transfer_process_group(tmp_path, monke
     assert killed == [(31415, signal.SIGTERM)]
 
 
+@pytest.mark.skipif(
+    not Path("/usr/bin/rsync").is_file(),
+    reason="the control-host mirror integration test requires /usr/bin/rsync",
+)
 def test_real_rsync_resumes_the_existing_partial_in_the_same_mirror(tmp_path, monkeypatch, capfd):
     payload = b"frozen-weights-0123456789" * 131072
     source = tmp_path / "source"

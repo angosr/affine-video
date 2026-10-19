@@ -23,7 +23,7 @@ from validator.chunks import (
     verify_chunked_content,
 )
 from validator.production.commitment import Artifact
-from validator.s3 import client_config
+from validator.s3 import client_config, is_missing, is_precondition_failed
 
 ADMISSIONS_NAMESPACE = "admissions"
 ARTIFACTS_NAMESPACE = "artifacts"
@@ -381,7 +381,7 @@ class PrivateObjectStore:
         try:
             self._put(name, payload, if_none_match="*")
         except Exception as exc:
-            if not _is_precondition_failed(exc):
+            if not is_precondition_failed(exc):
                 raise
             existing = self.get(name)
             if existing.body != payload:
@@ -396,7 +396,7 @@ class PrivateObjectStore:
         try:
             self._put(name, payload, if_match=etag)
         except Exception as exc:
-            if _is_precondition_failed(exc):
+            if is_precondition_failed(exc):
                 raise PreconditionFailed("plan changed since it was read") from exc
             raise
         stored = self.get(name)
@@ -415,7 +415,7 @@ class PrivateObjectStore:
             try:
                 self._put(name, b'{"state":"overwrite"}', if_none_match="*")
             except Exception as exc:
-                if not _is_precondition_failed(exc):
+                if not is_precondition_failed(exc):
                     raise
             else:
                 raise StorageError("object store ignores If-None-Match")
@@ -424,7 +424,7 @@ class PrivateObjectStore:
             try:
                 self._put(name, b'{"state":"stale"}', if_match="invalid-etag")
             except Exception as exc:
-                if not _is_precondition_failed(exc):
+                if not is_precondition_failed(exc):
                     raise
             else:
                 raise StorageError("object store ignores If-Match")
@@ -451,7 +451,7 @@ class PrivateObjectStore:
         try:
             return self.get(name)
         except Exception as exc:
-            if _is_missing(exc) or isinstance(exc, KeyError):
+            if is_missing(exc) or isinstance(exc, KeyError):
                 return None
             raise
 
@@ -503,7 +503,7 @@ class PrivateObjectStore:
             try:
                 existing = self._client.head_object(Bucket=self._bucket, Key=key)
             except Exception as exc:
-                if not _is_missing(exc):
+                if not is_missing(exc):
                     raise
             else:
                 if (
@@ -523,7 +523,7 @@ class PrivateObjectStore:
                     IfNoneMatch="*",
                 )
             except Exception as exc:
-                if not _is_precondition_failed(exc):
+                if not is_precondition_failed(exc):
                     raise
             stored = self._client.head_object(Bucket=self._bucket, Key=key)
             if (
@@ -739,24 +739,6 @@ def _etag(value: Any) -> str:
     if not isinstance(value, str) or not value:
         raise StorageError("object store response omitted its ETag")
     return value.strip('"')
-
-
-def _is_missing(exc: Exception) -> bool:
-    response = getattr(exc, "response", None)
-    if not isinstance(response, dict):
-        return False
-    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-    code = response.get("Error", {}).get("Code")
-    return status == 404 or str(code) in {"404", "NoSuchKey", "NotFound"}
-
-
-def _is_precondition_failed(exc: Exception) -> bool:
-    response = getattr(exc, "response", None)
-    if not isinstance(response, dict):
-        return False
-    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-    code = response.get("Error", {}).get("Code")
-    return status == 412 or str(code) in {"412", "PreconditionFailed"}
 
 
 def _is_access_denied(exc: Exception) -> bool:

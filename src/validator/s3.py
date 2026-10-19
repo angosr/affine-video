@@ -1,9 +1,27 @@
-"""Shared S3 transport settings for public and private object storage."""
+"""Shared S3 transport settings and errors for public and private storage."""
 
 from __future__ import annotations
 
 import os
 from typing import Any
+
+
+def is_missing(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    code = response.get("Error", {}).get("Code")
+    return status == 404 or str(code) in {"404", "NoSuchKey", "NotFound"}
+
+
+def is_precondition_failed(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    code = response.get("Error", {}).get("Code")
+    return status == 412 or str(code) in {"412", "PreconditionFailed"}
 
 
 def client_config() -> Any:

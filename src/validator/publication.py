@@ -36,7 +36,7 @@ from validator.production.plan import (
 )
 from validator.queue import TERMINAL_STATES, ChallengeState
 from validator.release import PRODUCTION_TRACK_ID, ReleaseApproval, require_release_approval
-from validator.s3 import client_config
+from validator.s3 import client_config, is_missing, is_precondition_failed
 from validator.store import ChallengeStore
 from validator.system_matches import (
     MAX_SYSTEM_MATCHES,
@@ -1407,7 +1407,7 @@ class S3Repository:
             try:
                 self._put(name, payload, False, if_match=etag)
             except Exception as exc:
-                if _is_precondition_failed(exc):
+                if is_precondition_failed(exc):
                     raise PublicArtifactError(
                         f"concurrent public pointer update was fenced: {name}"
                     ) from exc
@@ -1416,7 +1416,7 @@ class S3Repository:
             try:
                 self._put(name, payload, False, if_none_match="*")
             except Exception as exc:
-                if _is_precondition_failed(exc):
+                if is_precondition_failed(exc):
                     raise PublicArtifactError(
                         f"concurrent public pointer creation was fenced: {name}"
                     ) from exc
@@ -1522,7 +1522,7 @@ class S3Repository:
                 Key=f"{self._prefix}/{name}",
             )
         except Exception as exc:
-            if _is_missing(exc):
+            if is_missing(exc):
                 return None
             raise
         body = response.get("Body")
@@ -1758,21 +1758,3 @@ def _integer(value: Any, name: str, *, maximum: int | None = None) -> int:
     if type(value) is not int or value < 0 or (maximum is not None and value > maximum):
         raise PublicArtifactError(f"{name} is invalid")
     return value
-
-
-def _is_missing(exc: Exception) -> bool:
-    response = getattr(exc, "response", None)
-    if not isinstance(response, dict):
-        return False
-    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-    code = response.get("Error", {}).get("Code")
-    return status == 404 or str(code) in {"404", "NoSuchKey", "NotFound"}
-
-
-def _is_precondition_failed(exc: Exception) -> bool:
-    response = getattr(exc, "response", None)
-    if not isinstance(response, dict):
-        return False
-    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-    code = response.get("Error", {}).get("Code")
-    return status == 412 or str(code) in {"412", "PreconditionFailed"}

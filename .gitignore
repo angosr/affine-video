@@ -15,10 +15,13 @@ models/
 wallets/
 deploy/
 docs/
-experiments/*.md
+experiments/
 evidence/system-panel/*
 !evidence/system-panel/README.md
 !evidence/system-panel/acceptance/
-!evidence/system-panel/launch/
+evidence/system-panel/acceptance/*
+!evidence/system-panel/acceptance/inventory.json
 !evidence/system-panel/operations/
+evidence/system-panel/operations/*
+!evidence/system-panel/operations/preserve_runtime_assets.py
 
