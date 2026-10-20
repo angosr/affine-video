@@ -126,7 +126,6 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
         netuid=7,
         mechid=0,
         track_start_block=1,
-        publication_grace_blocks=1,
         source_pool_merkle_root="cd" * 32,
         source_commitments=(SourceCommitmentSpec("cd" * 32, "production", "all"),),
         artifact_manifest_sha256="ef" * 32,

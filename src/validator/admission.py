@@ -52,7 +52,6 @@ class AdmissionSettings:
     cache_dir: Path
     max_model_bytes: int
     tensor_schema: Mapping[str, TensorSpec]
-    publication_grace_blocks: int
     lease_ms: int = 5 * 60 * 1000
     retry_base_ms: int = 30 * 1000
     retry_max_ms: int = 30 * 60 * 1000
@@ -78,8 +77,6 @@ class AdmissionSettings:
             raise ValueError("admission limits must be positive")
         if self.retry_base_ms > self.retry_max_ms:
             raise ValueError("retry base cannot exceed retry maximum")
-        if self.publication_grace_blocks <= 0:
-            raise ValueError("publication grace blocks must be positive")
         if (self.restore_retry is None) != (self.record_retry is None):
             raise ValueError("durable admission retry callbacks must be configured together")
         if self.archive_rejection is not None and self.restore is None:
@@ -113,7 +110,7 @@ def process_next_admission(
     task = store.claim_next_admission(
         worker_id,
         lease_ms=settings.lease_ms,
-        ready_through_block=current_finalized_block - settings.publication_grace_blocks,
+        ready_through_block=current_finalized_block,
         now_ms=now,
     )
     if task is None:

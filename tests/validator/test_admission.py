@@ -75,7 +75,6 @@ def settings(tmp_path) -> AdmissionSettings:
         cache_dir=tmp_path / "cache",
         max_model_bytes=10_000,
         tensor_schema=SCHEMA,
-        publication_grace_blocks=1,
         lease_ms=1_000,
         retry_base_ms=30_000,
         retry_max_ms=120_000,
@@ -290,27 +289,26 @@ def test_restored_admission_rejection_waits_for_finalized_head(tmp_path) -> None
         assert store.get_challenge(identifier).score_block == 110
 
 
-def test_model_can_be_published_during_frozen_block_grace(tmp_path) -> None:
+def test_admission_starts_at_submission_finalization(tmp_path) -> None:
     model = tmp_path / "selector.safetensors"
     write_model(model, "hk1")
     downloads = 0
 
-    def download_after_publication(*args, **kwargs):
+    def download(*args, **kwargs):
         nonlocal downloads
         downloads += 1
         return model_downloader(model)(*args, **kwargs)
 
-    configured = replace(settings(tmp_path), publication_grace_blocks=2)
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
 
         waiting = process_next_admission(
             store,
             worker_id="admission",
-            settings=configured,
-            current_finalized_block=101,
+            settings=settings(tmp_path),
+            current_finalized_block=99,
             now_ms=100,
-            downloader=download_after_publication,
+            downloader=download,
         )
         assert waiting is None
         assert downloads == 0
@@ -319,14 +317,41 @@ def test_model_can_be_published_during_frozen_block_grace(tmp_path) -> None:
         admitted = process_next_admission(
             store,
             worker_id="admission",
-            settings=configured,
-            current_finalized_block=102,
+            settings=settings(tmp_path),
+            current_finalized_block=100,
             now_ms=200,
-            downloader=download_after_publication,
+            downloader=download,
         )
         assert admitted is not None and admitted.status is AdmissionStatus.ACCEPTED
         assert downloads == 1
         assert store.get_challenge(identifier).state is ChallengeState.SCORING
+
+
+def test_private_repository_fails_when_its_finalized_submission_is_next(tmp_path) -> None:
+    def not_public(*_args, **_kwargs):
+        raise ModelDownloadError("REPOSITORY_NOT_PUBLIC", "repository was not public")
+
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        first, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        second, _ = store.add_submission(submission_at(101, "hk2"), occurred_at_ms=2)
+        result = process_next_admission(
+            store, worker_id="admission", settings=settings(tmp_path),
+            current_finalized_block=100, now_ms=10, downloader=not_public,
+        )
+        assert result.challenge_id == first
+        assert result.status is AdmissionStatus.FAILED
+        assert result.code == "REPOSITORY_NOT_PUBLIC"
+        assert store.get_challenge(first).score_block == 100
+        assert store.get_challenge(second).state is ChallengeState.QUEUED
+
+        model = tmp_path / "second.safetensors"
+        write_model(model, "hk2")
+        result = process_next_admission(
+            store, worker_id="admission", settings=settings(tmp_path),
+            current_finalized_block=101, now_ms=20, downloader=model_downloader(model),
+        )
+        assert result.challenge_id == second
+        assert result.status is AdmissionStatus.ACCEPTED
 
 
 def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) -> None:

@@ -395,7 +395,6 @@ async def run_evaluator(
         cache_dir=Path(model_cache),
         max_model_bytes=track.model.max_bytes,
         tensor_schema=track.model.tensor_schema,
-        publication_grace_blocks=track.publication_grace_blocks,
         alert=alert,
         archive=None if batch_source is None else batch_source.archive_model,
         archive_rejection=None if batch_source is None else batch_source.archive_rejection,

@@ -74,19 +74,18 @@ existing output. **It does not check the complete tensor schema or competition e
 
 ```bash
 uv run hf auth login
-uv run hf upload YOUR_ACCOUNT/YOUR_MODEL selector.safetensors selector.safetensors --private
+uv run hf upload YOUR_ACCOUNT/YOUR_MODEL selector.safetensors selector.safetensors
 ```
 
-`--private` applies when creating a repository; it does not change an existing repository's
-visibility. Keep the repository private until your chain commitment finalizes to reduce the
-risk of someone copying and committing the tensors first. Changing hotkey metadata does not
-change the duplicate-model fingerprint.
+Ensure the repository is public when your finalized submission reaches FIFO admission.
+Uploading to an existing private repository does not make it public. Changing hotkey
+metadata does not change the duplicate-model fingerprint.
 
 Obtain the upload's **complete 40-character commit SHA** from the repository's commit history.
 Use that immutable revision, not `main`, a tag or a shortened hash. Do not modify the selected
 file after choosing the revision.
 
-### 4. Commit on-chain, then make the model public
+### 4. Commit on-chain
 
 **Only your hotkey's first VEDA submission on this track is eligible.** A malformed submission,
 invalid model or lost challenge consumes that opportunity; later submissions cannot replace it.
@@ -105,10 +104,10 @@ this checks submission fields, not the model or eligibility. The command sends o
 not automatically retry. If a transaction's outcome is uncertain, inspect its chain status
 before submitting again.
 
-After finalization, make the HF repository public. The current track allows a **300-block
-publication grace period**. When FIFO admission reaches your eligible submission, the pinned
-revision and file must be anonymously downloadable or the challenge fails. Keep them public
-through admission and durable archiving, confirmed by the `SCORING` state.
+When FIFO admission reaches your submission, the pinned HF revision and file must be
+anonymously downloadable or the challenge fails. Admission can start as soon as the
+commitment is finalized. Keep the repository public through admission and durable
+archiving, confirmed by the `SCORING` state.
 
 ## Evaluation and rewards
 

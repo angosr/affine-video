@@ -158,7 +158,6 @@ class TrackSpec:
     netuid: int
     mechid: int
     track_start_block: int
-    publication_grace_blocks: int
     source_pool_merkle_root: str
     source_commitments: tuple[SourceCommitmentSpec, ...]
     artifact_manifest_sha256: str
@@ -235,7 +234,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "mechid",
             "model",
             "netuid",
-            "publication_grace_blocks",
             "scoring",
             "source_commitments",
             "source_pool_merkle_root",
@@ -255,9 +253,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         "netuid": netuid,
         "mechid": _integer(root["mechid"], "mechid", minimum=0),
         "track_start_block": _integer(root["track_start_block"], "track_start_block", minimum=0),
-        "publication_grace_blocks": _integer(
-            root["publication_grace_blocks"], "publication_grace_blocks", minimum=1
-        ),
         "source_pool_merkle_root": _digest(
             root["source_pool_merkle_root"], "source_pool_merkle_root"
         ),
@@ -270,10 +265,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         "cache": _parse_cache(root["cache"]),
         "full_video": _parse_full_video(root["full_video"]),
     }
-    if values["cache"].minimum_generation_delay_blocks <= values["publication_grace_blocks"]:
-        raise TrackSpecError(
-            "minimum generation delay must exceed the model publication grace period"
-        )
     values["scoring"] = _parse_scoring(root["scoring"], values["model"].selector)
     values["source_commitments"] = _parse_source_commitments(
         root["source_commitments"],

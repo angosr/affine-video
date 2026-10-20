@@ -38,7 +38,6 @@
     }
   },
   "netuid": 120,
-  "publication_grace_blocks": 300,
   "full_video": {
     "black_frame_threshold": 0.01,
     "feature_model_sha256": "1f542c569f5e8912e30a156da860faff22a4ec08b4c432fb3cbbabded40dc016",

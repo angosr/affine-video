@@ -26,7 +26,6 @@ def valid_spec() -> dict:
         "netuid": 7,
         "mechid": 0,
         "track_start_block": 100,
-        "publication_grace_blocks": 2,
         "source_pool_merkle_root": source_root,
         "source_commitments": {
             "production": {"all": production},
@@ -131,7 +130,6 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.scoring.stratum_weight_map == {"all": 1.0}
     assert first.base_model.revision == "12" * 20
     assert first.mechid == 0
-    assert first.publication_grace_blocks == 2
     assert first.initial_champion.uid == 0
     assert first.initial_champion.repo_id == VEDA_REPO_ID
     assert first.cache.minimum_generation_delay_blocks == 4
@@ -141,12 +139,14 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert parse_track_spec(track_spec_dict(first)) == first
 
 
-def test_hidden_batch_seed_is_not_known_during_publication_grace() -> None:
+def test_hidden_batch_still_requires_a_future_generation_block() -> None:
     raw = valid_spec()
-    raw["cache"]["minimum_generation_delay_blocks"] = raw["publication_grace_blocks"]
+    raw["cache"]["minimum_generation_delay_blocks"] = 0
 
-    with pytest.raises(TrackSpecError, match="must exceed"):
+    with pytest.raises(TrackSpecError, match="greater than or equal to 1"):
         parse_track_spec(raw)
+    raw["cache"]["minimum_generation_delay_blocks"] = 1
+    assert parse_track_spec(raw).cache.minimum_generation_delay_blocks == 1
 
 
 def test_match_confidence_is_explicit_and_bound_to_the_spec_digest() -> None:
@@ -245,17 +245,6 @@ def test_production_shape_uses_bounded_hidden_route_sample() -> None:
     assert len(track.model.selector.routes) == 2_800
     assert track.scoring.sampled_route_count == 128
     assert track.scoring.case_count == 1536
-
-
-def test_publication_grace_is_positive_and_changes_digest() -> None:
-    invalid = valid_spec()
-    invalid["publication_grace_blocks"] = 0
-    with pytest.raises(TrackSpecError, match="greater than or equal to 1"):
-        parse_track_spec(invalid)
-
-    changed = valid_spec()
-    changed["publication_grace_blocks"] += 1
-    assert parse_track_spec(changed).digest != parse_track_spec(valid_spec()).digest
 
 
 def test_initial_champion_is_uid_zero_and_exactly_the_official_veda_model() -> None:
