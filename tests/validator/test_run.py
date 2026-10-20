@@ -199,6 +199,111 @@ def test_historical_terminal_does_not_fence_new_fifo_or_consume_public_prefix(pe
     assert case.store.public_challenge(old) == historical
 
 
+def test_retained_success_allows_new_admission_two_stages_and_publication(pending_evaluation):
+    """CPU lifecycle fixture, not GPU scoring or a replay of a real miner's result."""
+    case = pending_evaluation
+    old, _ = case.store.add_submission(replace(
+        submission_at(99, hotkey="historical-hotkey"), repo_id="owner/historical-model",
+    ))
+    original = case.store.public_challenge(old)
+    scored = scored_challenge(1, original["hotkey"], score=0.7, incumbent_score=0.7)
+    for key in ("challenge_id", "submission_id", "hotkey", "repo_id", "revision",
+                "block_height", "extrinsic_index", "event_index"):
+        scored[key] = original[key]
+    scored["score_block"] = scored["stages"][0]["score_block"] = 99
+    scored["evaluation_batch"]["generated_block"] = 99
+    history = resolve_tournament(
+        [scored], track_id="previous", track_spec_digest="cd" * 32,
+        netuid=case.track.netuid, minimum_gain=case.track.full_video.minimum_gain,
+        initial_champion=replace(genesis_champion(case.track), position=ChainPosition(90, 0, 0)),
+    ).matches
+    body = json.dumps(history[0].document, sort_keys=True, separators=(",", ":")).encode()
+    manifest = ArtifactManifest((Artifact(
+        HISTORICAL_MATCHES_PREFIX + history[0].object_name,
+        hashlib.sha256(body).hexdigest(), len(body), history[0].object_name,
+    ),))
+    raw = track_spec_dict(case.track)
+    raw["artifact_manifest_sha256"] = manifest.digest
+    case.track = parse_track_spec(raw)
+    case.store._connection.execute(
+        "UPDATE store_metadata SET value=? WHERE key='track_spec_digest'", (case.track.digest,),
+    )
+    case.store._connection.commit()
+    assert case.store.restore_public_matches(history) == 1
+    historical = case.store.public_challenge(old)
+    assert historical["state"] == "SUCCEEDED" and len(historical["stages"]) == 1
+    case.publisher._put_immutable(history[0].object_name, body)
+    arguments = {"version_key": 1, "runtime_manifest": manifest.encode(),
+                 "historical_matches": history}
+
+    def artifacts(limit):
+        chain = WeightChainState(
+            case.client._finalized, {case.track.initial_champion.hotkey: 0, HOTKEY: 1},
+            1, 1.0, 1, {},
+        )
+        return build_public_artifacts(case.store, case.track, chain, match_limit=limit, **arguments)
+
+    evaluated = []
+
+    def evaluate(task):
+        evaluated.append(task.state)
+        exact = task.state is ChallengeState.SCORING
+        return StageOutcome(0.9 if exact else 0.8, {
+            "stage": "scoring" if exact else "confirming",
+            "incumbent_score": 0.7, "paired_gain_lower_bound": 0.1,
+            "cache_sha256": ("de" if exact else "12") * 32,
+            "cache_generated_block": 100 if exact else 101,
+            "cache_plan_digest": ("ef" if exact else "34") * 32,
+            "cache_seed_block_hash": "0x" + "ab" * 32,
+            "requires_confirmation": exact,
+        })
+
+    async def cycle():
+        return await _complete_cycle(
+            case.client, case.store, netuid=case.track.netuid,
+            track_start_block=case.track.track_start_block,
+            admission_settings=case.work.admission_settings,
+            scoring_settings=case.work.scoring_settings, evaluator=evaluate,
+            worker_id="maintenance", downloader=case.work.downloader,
+            published_match_count=0, recovery_matches=history,
+        )
+
+    exact = asyncio.run(cycle())
+    assert exact.admission is not None, "retained history must not fence the new FIFO"
+    assert exact.admission.status is AdmissionStatus.ACCEPTED
+    assert exact.scoring.state is ChallengeState.CONFIRMING
+    prefix = artifacts(0)
+    assert prefix.matches == () and decode_weight_artifact(prefix.weights).plan.uids == (0,)
+    asyncio.run(case.publisher.publish(prefix))
+    case.client._finalized = 102
+    confirmation = asyncio.run(cycle())  # A fresh worker/SQLite connection resumes phase two.
+    assert confirmation.scoring.state is ChallengeState.SUCCEEDED
+    assert evaluated == [ChallengeState.SCORING, ChallengeState.CONFIRMING]
+    new = case.store.public_challenge(confirmation.scoring.challenge_id)
+    assert len(new["stages"]) == 2 and new["track_spec_digest"] == case.track.digest
+    assert case.store.public_challenge(old) == historical
+
+    # Only the new terminal decision fences work until its own seq1 is published.
+    fenced = asyncio.run(_pending_cycle(case, published_match_count=0))
+    assert not case.work.allowed and fenced.admission is None and fenced.scoring is None
+    current = artifacts(1)
+    assert len(current.matches) == 1
+    document = json.loads(current.matches[0][1])
+    assert document["sequence"] == 1 and document["challenge_id"] == new["challenge_id"]
+    assert document["outcome"] == MatchOutcome.CHALLENGER_WON
+    assert decode_weight_artifact(current.weights).plan.uids == (1,)
+    asyncio.run(case.publisher.publish(current))
+    # Fixture scores/cache hashes do not claim a real public payload/cold restore.
+    assert json.loads(case.transport.objects["isolated/heartbeat/summary.json"])["match_count"] == 1
+    name, payload = current.matches[0]
+    assert case.transport.objects["isolated/heartbeat/" + name] == payload
+    assert case.transport.objects["isolated/heartbeat/" + history[0].object_name] == body
+    assert case.store.public_challenge(old) == historical
+    assert case.store.model_owner(scored["model_digest"]) == old
+    repeated, _ = case.store.add_submission(submission_at(103, hotkey=historical["hotkey"]))
+    assert case.store.get_challenge(repeated).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+
+
 def test_continuous_evaluator_reaches_track_loading_without_external_webhook(monkeypatch):
     def load(_path):
         raise RuntimeError("reached track loading")
