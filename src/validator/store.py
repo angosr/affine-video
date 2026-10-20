@@ -1920,7 +1920,7 @@ class ChallengeStore:
             """
             SELECT stage, score, score_block, metrics_json, created_at_ms
             FROM stage_scores WHERE challenge_id = ?
-            ORDER BY created_at_ms
+            ORDER BY CASE stage WHEN 'SCORING' THEN 0 ELSE 1 END
             """,
             (row["challenge_id"],),
         ).fetchall()

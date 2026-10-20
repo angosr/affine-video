@@ -6,6 +6,7 @@ import pytest
 from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
 from validator.tournament import Champion, resolve_tournament
+from validator.weights import plan_champion_weight
 
 
 def make_submission(*, hotkey: str = "hk1") -> SubmissionRecord:
@@ -571,6 +572,76 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
         assert [stage["stage"] for stage in store.public_challenge(identifier)["stages"]] == [
             ChallengeState.SCORING
         ]
+
+
+@pytest.mark.parametrize("exact_time,confirmation_time", [(1000, 1000), (1000, 900)])
+@pytest.mark.parametrize("won", [False, True])
+def test_public_stages_follow_protocol_not_wall_clock(
+    tmp_path, exact_time, confirmation_time, won,
+) -> None:
+    digest = "ab" * 32
+    with ChallengeStore(tmp_path / "validator.db", track_spec_digest=digest) as store:
+        identifier, _ = store.add_submission(make_submission(), occurred_at_ms=10)
+        admission = store.claim_next_admission(
+            "admit", lease_ms=10000, ready_through_block=100, now_ms=20,
+        )
+        store.record_downloaded_model(
+            identifier, admission.lease_token, model_path="fixture.safetensors",
+            file_sha256="cd" * 32, size_bytes=123, occurred_at_ms=21,
+        )
+        assert store.register_validated_model(
+            identifier, admission.lease_token, model_digest="ef" * 32, occurred_at_ms=22,
+        ).accepted
+        full_score, full_gain = (0.8, 0.2) if won else (0.49, -0.01)
+        for index, (stage, score, gain, timestamp) in enumerate((
+            (ChallengeState.SCORING, 0.9, 0.3, exact_time),
+            (ChallengeState.CONFIRMING, full_score, full_gain, confirmation_time),
+        )):
+            lease = store.claim_next_scoring("score", lease_ms=10000, now_ms=30 + index)
+            assert lease.state is stage
+            metrics = {
+                "incumbent_score": 0.5, "paired_gain_lower_bound": gain,
+                "cache_sha256": f"{index + 1:02x}" * 32,
+                "cache_plan_digest": f"{index + 3:02x}" * 32,
+                "cache_generated_block": 150 + index,
+                "cache_seed_block_hash": "0x" + f"{index + 5:02x}" * 32,
+            }
+            store.record_stage_score(
+                identifier, lease.lease_token, stage, score=score,
+                score_block=200 + index, metrics=metrics, occurred_at_ms=timestamp,
+            )
+            if stage is ChallengeState.SCORING:
+                store.advance_leased(identifier, lease.lease_token, ChallengeState.CONFIRMING,
+                                     release=True, occurred_at_ms=timestamp)
+            else:
+                store.complete_challenge(
+                    identifier, ChallengeState.SUCCEEDED, lease_token=lease.lease_token,
+                    final_score=score, score_block=201, occurred_at_ms=timestamp,
+                )
+        public = store.public_challenge(identifier)
+        assert [stage["stage"] for stage in public["stages"]] == [
+            ChallengeState.SCORING, ChallengeState.CONFIRMING,
+        ]
+        assert [stage["created_at_ms"] for stage in public["stages"]] == [
+            exact_time, confirmation_time,
+        ]
+        assert public["paired_gain_lower_bound"] == full_gain
+        assert public["evaluation_batch"]["sha256"] == "02" * 32
+        snapshot = store.public_snapshot()["challenges"]
+        assert snapshot == [public]
+        tournament = resolve_tournament(
+            snapshot, track_id="track", track_spec_digest=digest, netuid=7,
+            minimum_gain=0.005, minimum_exact_gain=0.005,
+            initial_champion=genesis_champion(),
+        )
+        assert tournament.champion.hotkey == ("hk1" if won else "genesis-hotkey")
+        assert tournament.matches[0].document["evaluation"]["stages"][-1]["score"] == full_score
+        vector = plan_champion_weight(
+            tournament.champion, uid_by_hotkey={"genesis-hotkey": 0, "hk1": 7},
+            current_block=202, min_allowed_weights=1, max_weight=1.0,
+        )
+        assert vector.uids == ((7,) if won else (0,))
+        assert vector.weights == (1.0,)
 
 
 def test_stage_score_replay_must_be_identical(tmp_path) -> None:
