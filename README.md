@@ -127,6 +127,14 @@ archiving, confirmed by the `SCORING` state.
 5. Results are published in queue order. The champion receives this mechanism's full weight
    until replaced or no longer eligible; the registered UID0 baseline is the fallback.
 
+Maintenance releases retain confirmed champions and spent submission opportunities. The existing
+runtime manifest pins every prior immutable `matches/<track_id>/<sequence>.json` by its original
+key, SHA and size under `evidence/system-panel/history/`. Those original outcomes are carried
+forward without applying new thresholds or relabelling old scores. New matches restart sequence
+numbering only within the new track namespace. A cold evaluator verifies the original finalized
+chain submissions before rebuilding their local projections; it does not admit new work until
+recovery completes. Existing chain eligibility and UID0 fallback still apply.
+
 Infrastructure failures defer and retry the original challenge; they do not count as miner
 losses. Normal inventory waiting is not a failed attempt.
 After 600 finalized blocks from submission (or the exact decision for confirmation), continued

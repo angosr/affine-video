@@ -28,7 +28,7 @@ from validator.chunks import (
     verify_chunked_content,
 )
 from validator.production.batches import BatchDisclosure, public_selected_inputs_document
-from validator.production.commitment import verify_source_proof
+from validator.production.commitment import ArtifactManifest, verify_source_proof
 from validator.production.inventory import Inventory
 from validator.production.plan import (
     BatchPlan,
@@ -51,6 +51,8 @@ from validator.tournament import (
     Tournament,
     challenge_from_match,
     genesis_champion,
+    historical_champion,
+    recorded_match,
     resolve_tournament,
     validate_match_document,
 )
@@ -64,6 +66,7 @@ from validator.weights import (
 _HEX_32 = re.compile(r"^[0-9a-f]{64}$")
 _STORAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+HISTORICAL_MATCHES_PREFIX = "evidence/system-panel/history/"
 _MAX_WEIGHT_ARTIFACT_BYTES = 1024 * 1024
 _MAX_PUBLIC_OBJECT_BYTES = 1024 * 1024
 _SUMMARY_LEADERBOARD_LIMIT = 100
@@ -106,12 +109,14 @@ class PublicLedger:
     matches: tuple[MatchRecord, ...]
     disclosed_plan_digests: frozenset[str] = frozenset()
     committed_match_count: int = 0
+    historical_matches: tuple[MatchRecord, ...] = ()
 
     @property
     def required_finalized_block(self) -> int:
         committed = 0 if self.source_block is None else self.source_block
         decided = max(
-            (int(match.document["decided_block"]) for match in self.matches),
+            (int(match.document["decided_block"])
+             for match in (*self.historical_matches, *self.matches)),
             default=0,
         )
         return max(committed, decided)
@@ -140,10 +145,14 @@ def build_public_artifacts(
     system_matches: tuple[tuple[str, bytes], ...] = (),
     inventory_status: Mapping[str, Any] | None = None,
     evaluation_running: bool = False,
+    historical_matches: tuple[MatchRecord, ...] = (),
 ) -> PublicArtifacts | None:
     """Build bounded metadata without restoring or uploading disclosure payloads."""
 
     _verify_candidate_release(track, runtime_manifest, release_approval)
+    if any(match.document["decided_block"] > chain.finalized_block
+           for match in historical_matches):
+        raise PublicArtifactError("historical decision is newer than the finalized chain snapshot")
     cursor = store.chain_cursor()
     if cursor is None or cursor[0] != chain.finalized_block:
         return None
@@ -168,6 +177,7 @@ def build_public_artifacts(
         minimum_gain=track.full_video.minimum_gain,
         minimum_exact_gain=track.scoring.minimum_frontier_gain,
         initial_champion=initial,
+        historical_matches=historical_matches,
     )
     if match_limit is not None and len(tournament.matches) != match_limit:
         raise PublicArtifactError("the committed public match prefix is missing locally")
@@ -216,6 +226,7 @@ def build_public_artifacts(
         store.active_competitors(chain.uid_by_hotkey),
         snapshot["challenges"],
         system_matches=system_match_summaries(system_matches),
+        historical_matches=historical_matches,
     )
     if inventory_status is not None:
         status["inventory"] = {
@@ -330,10 +341,15 @@ def build_genesis_artifacts(
     runtime_manifest: bytes | None = None,
     release_approval: ReleaseApproval | None = None,
     system_matches: tuple[tuple[str, bytes], ...] = (),
+    historical_matches: tuple[MatchRecord, ...] = (),
+    excluded_hotkeys: frozenset[str] = frozenset(),
 ) -> PublicArtifacts:
-    """Build the complete pre-launch snapshot with UID0 as champion."""
+    """Build the pre-launch snapshot, retaining any confirmed historical champion."""
 
     _verify_candidate_release(track, runtime_manifest, release_approval)
+    if any(match.document["decided_block"] > chain.finalized_block
+           for match in historical_matches):
+        raise PublicArtifactError("historical decision is newer than the finalized chain snapshot")
     tournament = resolve_tournament(
         (),
         track_id=track.track_id,
@@ -342,15 +358,24 @@ def build_genesis_artifacts(
         minimum_gain=track.full_video.minimum_gain,
         minimum_exact_gain=track.scoring.minimum_frontier_gain,
         initial_champion=genesis_champion(track),
+        historical_matches=historical_matches,
     )
+    eligible_uids = {hotkey: uid for hotkey, uid in chain.uid_by_hotkey.items()
+                     if hotkey not in excluded_hotkeys or hotkey == track.initial_champion.hotkey}
     plan = plan_champion_weight(
         tournament.champion,
-        uid_by_hotkey=chain.uid_by_hotkey,
+        uid_by_hotkey=eligible_uids,
         current_block=chain.finalized_block,
         min_allowed_weights=chain.min_allowed_weights,
         max_weight=chain.max_weight,
     )
-    if plan is None:
+    if plan is None and tournament.champion.challenge_id != "genesis":
+        plan = plan_champion_weight(
+            genesis_champion(track), uid_by_hotkey=eligible_uids,
+            current_block=chain.finalized_block,
+            min_allowed_weights=chain.min_allowed_weights, max_weight=chain.max_weight,
+        )
+    if plan is None and tournament.champion.challenge_id == "genesis":
         raise PublicArtifactError("UID0 cannot receive the complete chain weight")
     weights = WeightArtifact(
         track_id=track.track_id,
@@ -378,6 +403,7 @@ def build_genesis_artifacts(
                 [],
                 [],
                 system_matches=system_match_summaries(system_matches),
+                historical_matches=historical_matches,
             )
         ),
         system_matches=system_matches,
@@ -652,6 +678,7 @@ class S3Repository:
         self._confirmed_immutable: dict[str, str] = {}
         self._writer_lock: Any | None = None
         self._system_match_cache: dict[tuple[str, str], dict[str, bytes]] = {}
+        self._history_cache: dict[tuple[str, str], tuple[MatchRecord, ...]] = {}
 
     def acquire_writer_lock(self, database: str | Path) -> None:
         """Hold the one evaluator deployment's filesystem lock until close or process exit."""
@@ -773,6 +800,24 @@ class S3Repository:
             await asyncio.to_thread(self._put_immutable, name, payload)
         for name, payload in artifacts.batch_groups:
             await asyncio.to_thread(self._put_immutable, name, payload)
+        if artifacts.runtime_manifest is not None:
+            track = parse_track_spec(track_document["spec"])
+            history = await asyncio.to_thread(
+                self._load_history, track, artifacts.runtime_manifest[1],
+            )
+            if history:
+                tournament = resolve_tournament(
+                    [challenge_from_match(_decode_canonical_object(body, name))
+                     for name, body in artifacts.matches],
+                    track_id=track.track_id, track_spec_digest=track.digest, netuid=track.netuid,
+                    minimum_gain=track.full_video.minimum_gain,
+                    minimum_exact_gain=track.scoring.minimum_frontier_gain,
+                    initial_champion=genesis_champion(track), historical_matches=history,
+                )
+                if artifacts.summary != _json_bytes(
+                    _summary_document(track, artifacts.source_block, tournament)
+                ):
+                    raise PublicArtifactError("public snapshot would reset its historical champion")
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
         await self.stage(artifacts)
@@ -957,18 +1002,77 @@ class S3Repository:
         except ValueError as exc:
             raise PublicArtifactError(f"immutable public {exc}") from exc
 
-    async def load(self, track: TrackSpec) -> PublicLedger:
+    async def load(
+        self, track: TrackSpec, *, runtime_manifest: bytes | None = None,
+    ) -> PublicLedger:
         """Load and verify the committed public tournament ledger from object storage."""
 
-        return await asyncio.to_thread(self._load, track)
+        return await asyncio.to_thread(self._load, track, runtime_manifest)
 
-    def _load(self, track: TrackSpec) -> PublicLedger:
+    def _load_history(
+        self, track: TrackSpec, runtime_manifest: bytes | None = None,
+    ) -> tuple[MatchRecord, ...]:
+        """Reuse original public match objects pinned by the existing release manifest."""
+        if (runtime_manifest is not None
+                and hashlib.sha256(runtime_manifest).hexdigest() != track.artifact_manifest_sha256):
+            raise PublicArtifactError("historical ledger runtime manifest is invalid")
+        key = (track.digest, track.artifact_manifest_sha256)
+        if key in self._history_cache:
+            return self._history_cache[key]
+        if runtime_manifest is None:
+            runtime_manifest = self._get_optional(
+                f"runtime/{track.artifact_manifest_sha256}/manifest.json",
+            )
+        if runtime_manifest is None:
+            if self._prefix == "tracks/main":
+                raise PublicArtifactError("formal ledger is missing its runtime manifest")
+            return ()
+        if hashlib.sha256(runtime_manifest).hexdigest() != track.artifact_manifest_sha256:
+            raise PublicArtifactError("historical ledger runtime manifest is invalid")
+        manifest = ArtifactManifest.decode(runtime_manifest)
+        matches = []
+        for artifact in manifest.artifacts:
+            if not artifact.logical_name.startswith(HISTORICAL_MATCHES_PREFIX):
+                continue
+            name = artifact.logical_name.removeprefix(HISTORICAL_MATCHES_PREFIX)
+            if (not re.fullmatch(r"matches/[a-z0-9][a-z0-9-]{0,63}/[0-9]{12}\.json", name)
+                    or artifact.object_key != name):
+                raise PublicArtifactError("historical match must reference its original public key")
+            payload = self._get_optional(name)
+            if (payload is None or len(payload) != artifact.size_bytes
+                    or hashlib.sha256(payload).hexdigest() != artifact.sha256):
+                raise PublicArtifactError("historical immutable match is missing or changed")
+            try:
+                record = recorded_match(
+                    _decode_canonical_object(payload, name), netuid=track.netuid,
+                )
+                if (record.object_name != name or record.document["track_id"] == track.track_id
+                        or record.document["track_spec_digest"] == track.digest):
+                    raise ValueError("historical match was rebound to the current track")
+            except ValueError as exc:
+                raise PublicArtifactError(f"historical immutable match is invalid: {name}") from exc
+            matches.append(record)
+        matches.sort(key=lambda match: (
+            match.document["submission"]["block_height"],
+            match.document["submission"]["extrinsic_index"],
+            match.document["submission"]["event_index"],
+        ))
+        result = tuple(matches)
+        try:
+            historical_champion(result, genesis_champion(track))
+        except ValueError as exc:
+            raise PublicArtifactError(f"historical champion chain is invalid: {exc}") from exc
+        self._history_cache[key] = result
+        return result
+
+    def _load(self, track: TrackSpec, runtime_manifest: bytes | None = None) -> PublicLedger:
+        history = self._load_history(track, runtime_manifest)
         track_payload = self._get_optional("track.json")
         summary_payload = self._get_optional("summary.json")
         if track_payload is None:
             if summary_payload is not None:
                 raise PublicArtifactError("public summary exists without its immutable track")
-            return self._uncommitted_ledger(track)
+            return self._uncommitted_ledger(track, history)
 
         track_document = _decode_track_document(track_payload)
         try:
@@ -976,7 +1080,7 @@ class S3Repository:
         except (KeyError, TypeError) as exc:
             raise PublicArtifactError("public track identity is invalid") from exc
         if stored_id != track.track_id:
-            return self._uncommitted_ledger(track)
+            return self._uncommitted_ledger(track, history)
         if track_document["track_spec_digest"] != track.digest:
             raise PublicArtifactError("an active track ID cannot change its specification")
 
@@ -985,7 +1089,7 @@ class S3Repository:
             else _decode_canonical_object(summary_payload, "summary")
         )
         if summary is None or summary.get("track_id") != track.track_id:
-            return self._uncommitted_ledger(track)
+            return self._uncommitted_ledger(track, history)
         expected_fields = {
             "track_id",
             "track_spec_digest",
@@ -1003,7 +1107,7 @@ class S3Repository:
         match_count = _integer(summary["match_count"], "match_count")
         matches: list[MatchRecord] = []
         committed_challenges: list[dict[str, Any]] = []
-        incumbent = genesis_champion(track)
+        incumbent = historical_champion(history, genesis_champion(track))
         for sequence in range(1, match_count + 1):
             name = f"matches/{track.track_id}/{sequence:012d}.json"
             payload = self._get_optional(name)
@@ -1038,6 +1142,7 @@ class S3Repository:
             minimum_gain=track.full_video.minimum_gain,
             minimum_exact_gain=track.scoring.minimum_frontier_gain,
             initial_champion=genesis_champion(track),
+            historical_matches=history,
         )
         if summary != _summary_document(track, source_block, tournament):
             raise PublicArtifactError("public summary does not match its immutable matches")
@@ -1046,18 +1151,23 @@ class S3Repository:
         complete_matches = tuple(matches)
         return self._recovered_ledger(
             track, complete_matches, source_block=source_block,
-            committed_count=match_count,
+            committed_count=match_count, history=history,
         )
 
-    def _uncommitted_ledger(self, track: TrackSpec) -> PublicLedger:
-        matches = tuple(self._load_following_matches(track, 1, genesis_champion(track)))
+    def _uncommitted_ledger(
+        self, track: TrackSpec, history: tuple[MatchRecord, ...] = (),
+    ) -> PublicLedger:
+        matches = tuple(self._load_following_matches(
+            track, 1, historical_champion(history, genesis_champion(track)),
+        ))
         return self._recovered_ledger(
-            track, matches, source_block=None, committed_count=0,
+            track, matches, source_block=None, committed_count=0, history=history,
         )
 
     def _recovered_ledger(
         self, track: TrackSpec, matches: tuple[MatchRecord, ...], *,
         source_block: int | None, committed_count: int,
+        history: tuple[MatchRecord, ...] = (),
     ) -> PublicLedger:
         self._verify_model_archives(matches)
         disclosures = self._load_batch_disclosures(track, matches)
@@ -1087,7 +1197,7 @@ class S3Repository:
             committed_count = max(committed_count, count)
             source_block = max(0 if source_block is None else source_block, weights.source_block)
         return PublicLedger(
-            source_block, matches, disclosures, committed_count,
+            source_block, matches, disclosures, committed_count, history,
         )
 
     def _load_following_matches(
@@ -1400,6 +1510,7 @@ class S3Repository:
                 raise PublicArtifactError("public track pointer is invalid") from exc
             if before_id == after_id or after_start <= before_start:
                 raise PublicArtifactError("public track pointer rollback is forbidden")
+            self._guard_track_history(before, after)
             return
         if name == "weights.json":
             before_weight = decode_weight_artifact(current)
@@ -1438,6 +1549,57 @@ class S3Repository:
             raise PublicArtifactError("public snapshot rollback is forbidden")
         if after_block == before_block:
             raise PublicArtifactError("one source block cannot identify two public snapshots")
+
+    def _guard_track_history(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
+        """A maintenance release must retain every original immutable match reference."""
+
+        def references(pointer: Mapping[str, Any]) -> set[tuple[str, str, int]]:
+            digest = pointer["spec"].get("artifact_manifest_sha256")
+            payload = None if digest is None else self._get_optional(
+                f"runtime/{digest}/manifest.json",
+            )
+            if payload is None:
+                return set()
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise PublicArtifactError("maintenance history manifest is invalid")
+            manifest = ArtifactManifest.decode(payload)
+            return {(artifact.object_key, artifact.sha256, artifact.size_bytes)
+                    for artifact in manifest.artifacts
+                    if artifact.logical_name.startswith(HISTORICAL_MATCHES_PREFIX)}
+
+        required = references(before)
+        track_id = before["spec"]["track_id"]
+        count = 0
+        summary = self._get_optional("summary.json")
+        if summary is not None:
+            document = _decode_canonical_object(summary, "summary")
+            if document.get("track_id") == track_id:
+                count = _integer(document.get("match_count"), "match_count")
+        weights = self._get_optional("weights.json")
+        weight = None
+        if weights is not None:
+            weight = decode_weight_artifact(weights)
+            if weight.track_id == track_id:
+                count = max(count, weight.match_sequence)
+        sequence = 1
+        while True:
+            name = f"matches/{track_id}/{sequence:012d}.json"
+            payload = self._get_optional(name)
+            if payload is None:
+                if sequence <= count:
+                    raise PublicArtifactError("maintenance cannot drop a missing original match")
+                break
+            digest = hashlib.sha256(payload).hexdigest()
+            if (weight is not None and weight.track_id == track_id
+                    and sequence == weight.match_sequence
+                    and digest != weight.terminal_match_sha256):
+                raise PublicArtifactError("maintenance history differs from the weight fence")
+            required.add((name, digest, len(payload)))
+            sequence += 1
+        if references(after) != required:
+            raise PublicArtifactError(
+                "maintenance cannot drop, replace or invent historical matches",
+            )
 
     def _active_track_id(self) -> str:
         payload = self._get_optional("track.json")
@@ -1554,6 +1716,7 @@ def _status_document(
     challenges: list[dict[str, Any]],
     *,
     system_matches: list[dict[str, Any]],
+    historical_matches: tuple[MatchRecord, ...] = (),
 ) -> dict[str, Any]:
     """Build the bounded live view used by the operator monitor."""
 
@@ -1622,16 +1785,35 @@ def _status_document(
                 ),
                 "outcome": "HISTORICAL" if historical else None if match is None else match.outcome,
                 "champion": is_champion,
-                "attempts": challenge["attempts"],
+                "attempts": (
+                    None if historical and challenge["created_at_ms"] == 0
+                    else challenge["attempts"]
+                ),
                 "error_code": challenge["error_code"],
                 "alert": challenge["state"] == "SYSTEM_BLOCKED",
             }
         )
+    champion = tournament.champion
+    original = next((match for match in historical_matches
+                     if match.challenge_id == champion.challenge_id), None)
+    if original is not None and not any(
+        row["challenge_id"] == champion.challenge_id for row in active_rows
+    ):
+        active_rows.append({
+            "uid": champion.uid,
+            "hotkey": champion.hotkey, "challenge_id": champion.challenge_id,
+            "track_spec_digest": original.document["track_spec_digest"],
+            "submission_block": champion.position.block, "state": "CHAMPION",
+            "queue_position": None, "match_sequence": None, "score": champion.score,
+            "incumbent_score": None, "score_gain": None, "batch_generated_block": None,
+            "outcome": "HISTORICAL", "champion": True, "attempts": None,
+            "error_code": None, "alert": False,
+        })
     waiting = [
         row
         for row in active_rows
         if row["match_sequence"] is None
-        and row["state"] not in {str(state) for state in TERMINAL_STATES}
+        and row["state"] not in {str(state) for state in TERMINAL_STATES} | {"CHAMPION"}
     ]
     waiting.sort(key=lambda row: (row["submission_block"], row["challenge_id"]))
     queue_positions = {
@@ -1639,7 +1821,7 @@ def _status_document(
     }
     for row in active_rows:
         row["queue_position"] = queue_positions.get(row["challenge_id"])
-    active_rows.sort(key=lambda row: row["uid"])
+    active_rows.sort(key=lambda row: (row["uid"] is None, row["uid"] or 0))
     return {
         "track_id": track.track_id,
         "track_spec_digest": track.digest,

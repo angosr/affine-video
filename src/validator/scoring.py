@@ -39,7 +39,12 @@ from validator.retries import (
     retry_stage,
 )
 from validator.store import ChallengeStore, LeasedChallenge
-from validator.tournament import genesis_champion, resolve_tournament
+from validator.tournament import (
+    MatchRecord,
+    challenge_from_match,
+    genesis_champion,
+    resolve_tournament,
+)
 
 
 class TemporaryScoringError(RuntimeError):
@@ -212,6 +217,7 @@ class PairedTrackEvaluator:
     batch_source: ReadyBatchSource | None = None
     confirmation_pool: ConfirmationWorkerPool | None = None
     inventory_status: Mapping[str, Any] | None = None
+    historical_matches: tuple[MatchRecord, ...] = ()
 
     def ready_through_block(self, current_finalized_block: int) -> int:
         """No artificial block delay: every finalized admitted submission is eligible."""
@@ -256,6 +262,7 @@ class PairedTrackEvaluator:
             minimum_gain=self.track.full_video.minimum_gain,
             minimum_exact_gain=self.track.scoring.minimum_frontier_gain,
             initial_champion=genesis_champion(self.track),
+            historical_matches=self.historical_matches,
         )
         incumbent = tournament.champion
         incumbent_task = self._incumbent_task(incumbent, snapshot["challenges"])
@@ -417,14 +424,24 @@ class PairedTrackEvaluator:
                 expected_hotkey=expected_hotkey,
             )
         else:
+            original = next((match for match in self.historical_matches
+                             if match.challenge_id == incumbent.challenge_id), None)
             record = next(
-                item for item in challenges if item["challenge_id"] == incumbent.challenge_id
+                (item for item in challenges if item["challenge_id"] == incumbent.challenge_id),
+                None if original is None else challenge_from_match(original.document),
             )
+            if record is None:
+                raise TemporaryScoringError(
+                    "INCUMBENT_MODEL_UNAVAILABLE", "confirmed champion facts are missing",
+                )
             expected_digest = record["model_digest"]
             expected_hotkey = incumbent.hotkey
             expected_sha256 = record["file_sha256"]
             expected_size = record["model_size_bytes"]
-            local_path = self.store.model_path(incumbent.challenge_id)
+            try:
+                local_path = self.store.model_path(incumbent.challenge_id)
+            except KeyError:
+                local_path = None
             path = None if local_path is None else Path(local_path)
             validated = self._validate_incumbent_candidate(
                 path,
@@ -454,8 +471,14 @@ class PairedTrackEvaluator:
                 )
             if validated is None:
                 try:
+                    archive_url = self.champion_archive_url
+                    if original is not None:
+                        archive_url = (
+                            f"{archive_url.rstrip('/').rsplit('/', 1)[0]}/"
+                            f"{original.document['track_id']}"
+                        )
                     path = download_chunked_file(
-                        f"{self.champion_archive_url.rstrip('/')}/{expected_sha256}/manifest.json",
+                        f"{archive_url.rstrip('/')}/{expected_sha256}/manifest.json",
                         cache_dir=self.model_cache / "champions",
                         expected_sha256=expected_sha256,
                         max_bytes=self.track.model.max_bytes,

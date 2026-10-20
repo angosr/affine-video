@@ -104,14 +104,15 @@ def challenge(
     }
 
 
-def resolve(items: list[dict]):
+def resolve(items: list[dict], *, history=(), minimum_gain=0.01):
     return resolve_tournament(
         items,
         track_id="track",
         track_spec_digest="ab" * 32,
         netuid=7,
-        minimum_gain=0.01,
+        minimum_gain=minimum_gain,
         initial_champion=genesis(),
+        historical_matches=history,
     )
 
 
@@ -130,13 +131,17 @@ def test_preproduced_confirmation_still_requires_two_independent_decisions():
 def test_previous_completed_loss_keeps_lifetime_uniqueness_without_relabelling():
     old = challenge(1, "alice", score=0.7, incumbent_score=0.7)
     old["track_spec_digest"] = "cd" * 32
+    history = resolve_tournament(
+        [old], track_id="previous", track_spec_digest="cd" * 32, netuid=7,
+        minimum_gain=0.01, initial_champion=genesis(),
+    ).matches
     repeated = challenge(2, "alice", state=ChallengeState.REJECTED_DUPLICATE_HOTKEY,
                          error_code="DUPLICATE_HOTKEY")
-    result = resolve([old, repeated])
+    result = resolve([old, repeated], history=history)
     assert len(result.matches) == 1 and result.matches[0].sequence == 1
     assert result.matches[0].challenge_id == repeated["challenge_id"]
     assert old["track_spec_digest"] == "cd" * 32 and old["final_score"] == 0.7
-    assert resolve([old]).matches == ()
+    assert resolve([old], history=history).matches == ()
 
 
 def test_previous_pending_or_promoted_challenge_forbids_silent_rebinding():
@@ -146,8 +151,29 @@ def test_previous_pending_or_promoted_challenge_forbids_silent_rebinding():
         resolve([pending])
     won = challenge(1, "alice", score=0.8, incumbent_score=0.7)
     won["track_spec_digest"] = "cd" * 32
-    with pytest.raises(ValueError, match="champion migration"):
+    with pytest.raises(ValueError, match="verified immutable match"):
         resolve([won])
+
+
+def test_confirmed_historical_champion_is_not_rejudged_by_new_thresholds():
+    old = challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    old["track_spec_digest"] = "cd" * 32
+    history = resolve_tournament(
+        [old], track_id="previous", track_spec_digest="cd" * 32, netuid=7,
+        minimum_gain=0.01, initial_champion=genesis(),
+    ).matches
+    frozen = dict(history[0].document)
+    # Its original 0.1 lower bound would fail the new 0.5 gate. It stays a win.
+    carried = resolve([old], history=history, minimum_gain=0.5)
+    assert carried.champion.hotkey == "alice" and carried.matches == ()
+    assert carried.champion.score == 0.8
+    lost = challenge(2, "bob", score=0.7, incumbent_score=0.7)
+    kept = resolve([old, lost], history=history, minimum_gain=0.5)
+    assert kept.champion.hotkey == "alice" and kept.champion.score == 0.7
+    won = challenge(3, "carol", score=0.95, incumbent_score=0.1, paired_gain=0.8)
+    replaced = resolve([old, lost, won], history=history, minimum_gain=0.5)
+    assert replaced.champion.hotkey == "carol"
+    assert history[0].document == frozen
 
 
 def test_fifo_matches_replace_champion_only_after_required_gain() -> None:

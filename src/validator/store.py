@@ -1564,6 +1564,8 @@ class ChallengeStore:
     def restore_public_matches(
         self,
         matches: Sequence[MatchRecord],
+        *,
+        submissions: Mapping[str, SubmissionRecord] | None = None,
     ) -> int:
         """Restore the locally available prefix of the verified public ledger."""
 
@@ -1578,7 +1580,7 @@ class ChallengeStore:
                     """
                     SELECT c.state, c.error_code, c.final_score, c.score_block,
                            c.file_sha256, c.model_digest,
-                           c.model_size_bytes, c.created_at_ms,
+                           c.model_size_bytes, c.created_at_ms, c.track_spec_digest,
                            s.submission_id, s.hotkey, s.repo_id, s.revision,
                            s.block_height, s.extrinsic_index, s.event_index
                     FROM challenges c
@@ -1588,7 +1590,103 @@ class ChallengeStore:
                     (match.challenge_id,),
                 ).fetchone()
                 if row is None:
-                    break
+                    record = None if submissions is None else submissions.get(
+                        document["submission_id"],
+                    )
+                    if record is None:
+                        break
+                    if (record.netuid != document["netuid"]
+                            or challenge_id(record.submission_id) != match.challenge_id
+                            or (record.hotkey, record.repo_id, record.revision,
+                                record.position.block, record.position.extrinsic_index,
+                                record.position.event_index) != (
+                                    submission["hotkey"], submission["repo_id"],
+                                    submission["revision"], submission["block_height"],
+                                    submission["extrinsic_index"], submission["event_index"],
+                                )):
+                        raise RuntimeError("public match conflicts with its finalized chain input")
+                    # Original wall-clock/attempt telemetry is not in the public
+                    # fact. Do not invent it or consume an admission attempt.
+                    self._connection.execute(
+                        """INSERT INTO submissions (
+                            submission_id, hotkey, netuid, block_hash, block_height,
+                            extrinsic_index, event_index, payload, repo_id, revision,
+                            admitted, created_at_ms
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                        (record.submission_id, record.hotkey, record.netuid, record.block_hash,
+                         record.position.block, record.position.extrinsic_index,
+                         record.position.event_index, record.payload, record.repo_id,
+                         record.revision, int(match.state not in {
+                             ChallengeState.REJECTED_DUPLICATE_HOTKEY,
+                             ChallengeState.REJECTED_OTHER_COMPETITION,
+                             ChallengeState.MALFORMED_SUBMISSION,
+                         })),
+                    )
+                    self._connection.execute(
+                        """INSERT INTO challenges (
+                            challenge_id, submission_id, state, track_spec_digest,
+                            created_at_ms, updated_at_ms
+                        ) VALUES (?, ?, ?, ?, 0, 0)""",
+                        (match.challenge_id, record.submission_id, ChallengeState.QUEUED,
+                         document["track_spec_digest"]),
+                    )
+                    self._connection.execute(
+                        """INSERT INTO commitment_choices (
+                            hotkey, netuid, block_hash, block_height, extrinsic_index,
+                            event_index, payload, submission_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(hotkey) DO UPDATE SET
+                            netuid=excluded.netuid, block_hash=excluded.block_hash,
+                            block_height=excluded.block_height,
+                            extrinsic_index=excluded.extrinsic_index,
+                            event_index=excluded.event_index, payload=excluded.payload,
+                            submission_id=excluded.submission_id
+                        WHERE (excluded.block_height, excluded.extrinsic_index,
+                               excluded.event_index) < (commitment_choices.block_height,
+                               commitment_choices.extrinsic_index, commitment_choices.event_index)
+                        """,
+                        (record.hotkey, record.netuid, record.block_hash, record.position.block,
+                         record.position.extrinsic_index, record.position.event_index,
+                         record.payload, record.submission_id),
+                    )
+                    # Startup may have scanned while the public ledger was
+                    # unavailable, but no admission is allowed before recovery.
+                    # Restore lifetime exclusion for those still-QUEUED rows.
+                    later = self._connection.execute(
+                        """SELECT c.challenge_id, c.state, c.created_at_ms
+                           FROM submissions s JOIN challenges c USING(submission_id)
+                           WHERE s.hotkey=? AND (s.block_height, s.extrinsic_index,
+                           s.event_index) > (?, ?, ?)""",
+                        (record.hotkey, record.position.block, record.position.extrinsic_index,
+                         record.position.event_index),
+                    ).fetchall()
+                    historical_ids = {item.challenge_id for item in matches}
+                    for item in later:
+                        if item["challenge_id"] in historical_ids:
+                            continue
+                        if item["state"] == ChallengeState.REJECTED_DUPLICATE_HOTKEY:
+                            continue
+                        if item["state"] != ChallengeState.QUEUED:
+                            raise RuntimeError("later hotkey opportunity was used before recovery")
+                        self._transition_locked(
+                            item["challenge_id"], ChallengeState.REJECTED_DUPLICATE_HOTKEY,
+                            timestamp=item["created_at_ms"], error_code="DUPLICATE_HOTKEY",
+                            error_summary=None, details={"duplicate_of": match.challenge_id},
+                        )
+                        self._connection.execute(
+                            "UPDATE submissions SET admitted=0 WHERE submission_id="
+                            "(SELECT submission_id FROM challenges WHERE challenge_id=?)",
+                            (item["challenge_id"],),
+                        )
+                    row = self._connection.execute(
+                        "SELECT c.*, s.hotkey, s.repo_id, s.revision, s.block_height, "
+                        "s.extrinsic_index, s.event_index FROM challenges c "
+                        "JOIN submissions s ON s.submission_id=c.submission_id "
+                        "WHERE c.challenge_id=?", (match.challenge_id,),
+                    ).fetchone()
+                if (ChallengeState(row["state"]) in TERMINAL_STATES
+                        and row["track_spec_digest"] not in (None, document["track_spec_digest"])):
+                    raise RuntimeError("public match conflicts with a terminal challenge origin")
                 expected_submission = (
                     document["submission_id"],
                     submission["hotkey"],
@@ -1731,6 +1829,10 @@ class ChallengeStore:
                         )
                     elif owner["challenge_id"] != match.challenge_id:
                         raise RuntimeError("public model ownership conflicts with local state")
+                self._connection.execute(
+                    "UPDATE challenges SET track_spec_digest = ? WHERE challenge_id = ?",
+                    (document["track_spec_digest"], match.challenge_id),
+                )
                 restored += 1
             self._connection.commit()
         except Exception:

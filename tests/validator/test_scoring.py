@@ -343,8 +343,9 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
     assert evaluated["evaluation_batch"]["plan_digest"] == batch.plan_digest
 
 
+@pytest.mark.parametrize("historical_public", [False, True])
 def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, historical_public,
 ) -> None:
     architecture = SelectorArchitecture(1, 1, 2, "float32")
     tensors = {
@@ -403,11 +404,41 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
             "model_size_bytes": validated.size_bytes,
         },
     )
-    monkeypatch.setattr(
-        scoring_module,
-        "download_chunked_file",
-        lambda *_args, **_kwargs: pytest.fail("private restore contacted public storage"),
-    )
+    if historical_public:
+        # The new release has no local old model or old private namespace. Keep
+        # the archived file/tensor/owner identities and original public track key.
+        from validator.tournament import MatchOutcome, MatchRecord
+        evaluator.store = SimpleNamespace(model_path=lambda _identifier: None)
+        evaluator.batch_source = None
+        evaluator.historical_matches = (MatchRecord(
+            1, incumbent.challenge_id, incumbent.hotkey, ChallengeState.SUCCEEDED,
+            0.8, 0.1, MatchOutcome.CHALLENGER_WON, incumbent,
+            {"track_id": "old-track", "submission_id": "old-submission",
+             "challenge_id": incumbent.challenge_id,
+             "submission": {"hotkey": incumbent.hotkey, "repo_id": incumbent.repo_id,
+                            "revision": incumbent.revision, "block_height": 100,
+                            "extrinsic_index": 0, "event_index": 0},
+             "evaluation": {"state": "SUCCEEDED", "error_code": None,
+                            "file_sha256": validated.file_sha256,
+                            "model_digest": validated.model_digest,
+                            "model_size_bytes": validated.size_bytes, "final_score": 0.8,
+                            "score_block": 110, "incumbent_score": 0.7,
+                            "paired_gain_lower_bound": 0.1, "evaluation_batch": None}},
+        ),)
+        def restore_original(url, **kwargs):
+            assert url == (
+                f"https://public.example/models/old-track/{validated.file_sha256}/manifest.json"
+            )
+            assert kwargs["expected_sha256"] == validated.file_sha256
+            return archived_path
+        monkeypatch.setattr(scoring_module, "download_chunked_file", restore_original)
+        challenges = ()
+    else:
+        monkeypatch.setattr(
+            scoring_module,
+            "download_chunked_file",
+            lambda *_args, **_kwargs: pytest.fail("private restore contacted public storage"),
+        )
 
     exact_incumbent = evaluator._incumbent_task(incumbent, challenges)
     client.objects.clear()

@@ -44,6 +44,27 @@ class Champion:
             "event_index": self.position.event_index,
         }
 
+    @classmethod
+    def from_public(cls, value: Mapping[str, Any]) -> Champion:
+        """Read an immutable recorded champion, never reselect one by its score."""
+        if not isinstance(value, Mapping) or set(value) != {
+            "challenge_id", "hotkey", "repo_id", "revision", "score", "uid", "source",
+            "block_height", "extrinsic_index", "event_index",
+        }:
+            raise ValueError("recorded champion fields are invalid")
+        result = cls(
+            _required_string(value, "challenge_id"), _required_string(value, "hotkey"),
+            _required_string(value, "repo_id"), _required_string(value, "revision"),
+            _score(value["score"], "champion score"), _position(value),
+            _optional_integer(value["uid"], "champion uid"), _required_string(value, "source"),
+        )
+        if ((result.challenge_id == "genesis") != (result.source == "VEDA_BASELINE")
+                or (result.source == "VEDA_BASELINE" and result.uid != 0)
+                or (result.source == "MINER" and result.uid is not None)
+                or result.source not in {"VEDA_BASELINE", "MINER"}):
+            raise ValueError("recorded champion source is invalid")
+        return result
+
 
 @dataclass(frozen=True, slots=True)
 class MatchRecord:
@@ -161,6 +182,7 @@ def resolve_tournament(
     minimum_gain: float,
     minimum_exact_gain: float | None = None,
     initial_champion: Champion,
+    historical_matches: tuple[MatchRecord, ...] = (),
 ) -> Tournament:
     """Resolve the contiguous terminal prefix in finalized submission order."""
 
@@ -186,6 +208,22 @@ def resolve_tournament(
     matches: list[MatchRecord] = []
     leaderboard_candidates: list[Champion] = [initial_champion]
     seen_hotkeys: set[str] = {initial_champion.hotkey}
+    historical_by_id = {}
+    if historical_matches:
+        # The release manifest pins the original public records. Their decisions
+        # are facts, not comparisons against this release's possibly new gates.
+        champion = historical_champion(historical_matches, initial_champion)
+        seen_hotkeys.update(record.hotkey for record in historical_matches)
+        historical_by_id = {record.challenge_id: record for record in historical_matches}
+        if champion.challenge_id == "genesis":
+            leaderboard_candidates = [champion]
+        for record in historical_matches:
+            if record.state is ChallengeState.SUCCEEDED:
+                fact = challenge_from_match(record.document)
+                leaderboard_candidates.append(Champion(
+                    record.challenge_id, record.hotkey, fact["repo_id"], fact["revision"],
+                    _score(fact["final_score"], "historical score"), _position(fact),
+                ))
 
     for challenge in challenges:
         state = ChallengeState(_required_string(challenge, "state"))
@@ -194,14 +232,15 @@ def resolve_tournament(
             _optional_digest(origin, "historical track digest")
             if state not in TERMINAL_STATES:
                 raise ValueError("an unfinished previous-track challenge cannot be rebound")
-            historical_stages = challenge.get("stages", [])
-            if len(historical_stages) == 2 and (
-                historical_stages[0].get("paired_gain_lower_bound", -1) > exact_gain
-                and historical_stages[1].get("paired_gain_lower_bound", -1) > minimum_gain
-            ):
-                raise ValueError(
-                    "a previous-track promotion requires coordinated champion migration"
-                )
+            recorded = historical_by_id.get(challenge["challenge_id"])
+            if recorded is None or recorded.document["track_spec_digest"] != origin:
+                raise ValueError("previous-track challenge has no verified immutable match")
+            expected = challenge_from_match(recorded.document)
+            for key in ("submission_id", "hotkey", "repo_id", "revision", "state",
+                        "file_sha256", "model_digest", "model_size_bytes", "final_score",
+                        "score_block", "block_height", "extrinsic_index", "event_index"):
+                if challenge.get(key) != expected[key]:
+                    raise ValueError("previous-track challenge conflicts with its immutable match")
             # Preserve completed facts and lifetime uniqueness, never re-label a
             # previous source/cache measurement as this track's match evidence.
             seen_hotkeys.add(_required_string(challenge, "hotkey"))
@@ -257,6 +296,93 @@ def resolve_tournament(
         {"rank": rank, **candidate.public()} for rank, candidate in enumerate(ranked, start=1)
     )
     return Tournament(tuple(matches), champion, leaderboard)
+
+
+def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
+    """Decode manifest-authenticated historical facts without rejudging old gates.
+
+    This is not an admission path for new decisions: the repository must first
+    verify the original immutable bytes against the coordinated runtime manifest.
+    """
+    if not isinstance(document, Mapping) or set(document) != {
+        "track_id", "track_spec_digest", "netuid", "sequence", "challenge_id", "submission_id",
+        "submission", "evaluation", "incumbent_before", "minimum_gain", "score_gain",
+        "outcome", "champion_after", "decided_block",
+    } or document["netuid"] != netuid:
+        raise ValueError("historical match fields or subnet are invalid")
+    _required_string(document, "track_id")
+    if _optional_digest(document["track_spec_digest"], "historical track digest") is None:
+        raise ValueError("historical track digest is missing")
+    if _integer(document["netuid"], "historical netuid") != netuid:
+        raise ValueError("historical match subnet differs")
+    sequence = _integer(document["sequence"], "historical sequence")
+    if sequence == 0:
+        raise ValueError("historical match sequence must be positive")
+    challenge = challenge_from_match(document)
+    state = ChallengeState(challenge["state"])
+    if state not in TERMINAL_STATES:
+        raise ValueError("historical match is not terminal")
+    before = Champion.from_public(document["incumbent_before"])
+    after = Champion.from_public(document["champion_after"])
+    outcome = MatchOutcome(document["outcome"])
+    position = _position(challenge)
+    decided = _integer(document["decided_block"], "historical decision block")
+    if decided < position.block:
+        raise ValueError("historical decision predates its submission")
+    score = None if challenge["final_score"] is None else _score(
+        challenge["final_score"], "historical score",
+    )
+    gain = None if document["score_gain"] is None else _gain(
+        document["score_gain"], "historical gain",
+    )
+    if state is ChallengeState.SUCCEEDED:
+        if any(_optional_digest(challenge[key], key) is None
+               for key in ("file_sha256", "model_digest")):
+            raise ValueError("historical scored model identity is missing")
+        if _integer(challenge["model_size_bytes"], "historical model size") == 0:
+            raise ValueError("historical model is empty")
+    if outcome is MatchOutcome.CHALLENGER_WON:
+        if (state is not ChallengeState.SUCCEEDED or score is None
+                or len(_evaluation_stages(challenge["stages"])) != 2
+                or after != Champion(challenge["challenge_id"], challenge["hotkey"],
+                                     challenge["repo_id"], challenge["revision"], score, position)):
+            raise ValueError("historical winner conflicts with its recorded model")
+    elif outcome is MatchOutcome.CHAMPION_RETAINED:
+        if (state is not ChallengeState.SUCCEEDED
+                or after != replace(before, score=_score(challenge["incumbent_score"],
+                                                        "historical incumbent score"))):
+            raise ValueError("historical retained champion is inconsistent")
+    elif state is ChallengeState.SUCCEEDED or after != before:
+        raise ValueError("historical failure changes its champion")
+    return MatchRecord(sequence, challenge["challenge_id"], challenge["hotkey"], state,
+                       score, gain, outcome, after, document)
+
+
+def historical_champion(matches: tuple[MatchRecord, ...], baseline: Champion) -> Champion:
+    """Fold the original FIFO outcome chain, including its last observed score."""
+    if not matches:
+        return baseline
+    first = Champion.from_public(matches[0].document["incumbent_before"])
+    if (
+        first.challenge_id, first.hotkey, first.repo_id, first.revision, first.uid, first.source,
+    ) != (
+        baseline.challenge_id, baseline.hotkey, baseline.repo_id, baseline.revision,
+        baseline.uid, baseline.source,
+    ):
+        raise ValueError("historical ledger does not start with the official baseline")
+    incumbent = first
+    sequences: dict[str, int] = {}
+    seen = set()
+    for match in matches:
+        track_id = match.document["track_id"]
+        expected_sequence = sequences.get(track_id, 0) + 1
+        if (match.sequence != expected_sequence or match.challenge_id in seen
+                or match.document["incumbent_before"] != incumbent.public()):
+            raise ValueError("historical match prefix or champion link is inconsistent")
+        sequences[track_id] = expected_sequence
+        seen.add(match.challenge_id)
+        incumbent = match.champion_after
+    return incumbent
 
 
 def _resolve_match(

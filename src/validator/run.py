@@ -23,7 +23,12 @@ from validator.admission import (
     process_next_admission,
 )
 from validator.alerts import webhook_alerter
-from validator.chain import ScanResult, scan_finalized_blocks, seed_legacy_exclusions
+from validator.chain import (
+    ScanResult,
+    finalized_commitments,
+    scan_finalized_blocks,
+    seed_legacy_exclusions,
+)
 from validator.download import DownloadedModel, download_chunked_asset, download_public_model
 from validator.production.batches import ReadyBatchSource
 from validator.production.commitment import ArtifactManifest
@@ -43,6 +48,7 @@ from validator.publication import (
 )
 from validator.queue import TERMINAL_STATES
 from validator.release import PRODUCTION_NETUID, require_release_approval
+from validator.scan import submission_from_commitment
 from validator.scoring import (
     EvaluatedStage,
     PairedTrackEvaluator,
@@ -82,7 +88,9 @@ class ArtifactRepository(Protocol):
 
     async def publish(self, artifacts: PublicArtifacts) -> None: ...
 
-    async def load(self, track: TrackSpec) -> PublicLedger: ...
+    async def load(
+        self, track: TrackSpec, *, runtime_manifest: bytes | None = None,
+    ) -> PublicLedger: ...
 
     async def load_system_matches(
         self, track: TrackSpec, runtime_manifest: bytes | None,
@@ -275,6 +283,20 @@ async def run_evaluator(
         raise ValueError("version identifier must be non-negative")
     alert = webhook_alerter(alert_webhook_url, service="veda-evaluator")
     track = load_track_spec(track_spec)
+    data_config = None
+    runtime_manifest_payload = None
+    if production_config is not None:
+        data_config = load_producer_config(production_config)
+        if data_config.track_spec.resolve() != Path(track_spec).resolve():
+            raise ValueError("production configuration uses a different track specification")
+        if data_config.validator_database.resolve() != Path(database).resolve():
+            raise ValueError("production configuration uses a different validator database")
+        runtime_manifest_payload = data_config.artifact_manifest.read_bytes()
+        if (
+            ArtifactManifest.decode(runtime_manifest_payload).digest
+            != track.artifact_manifest_sha256
+        ):
+            raise ValueError("artifact manifest does not match the track commitment")
     if production_config is not None:
         lock_publisher = getattr(publisher, "acquire_writer_lock", None)
         verify_public_storage = getattr(publisher, "verify_writes", None)
@@ -291,7 +313,10 @@ async def run_evaluator(
         )
         while True:
             try:
-                ledger = await publisher.load(track)
+                ledger = (
+                    await publisher.load(track) if runtime_manifest_payload is None
+                    else await publisher.load(track, runtime_manifest=runtime_manifest_payload)
+                )
                 break
             except Exception as exc:
                 _record_publication_failure(recovery_store, alert, exc)
@@ -320,6 +345,8 @@ async def run_evaluator(
                     return
                 await asyncio.sleep(poll_seconds)
     disclosed_plan_digests = set(getattr(ledger, "disclosed_plan_digests", ()))
+    historical_matches = tuple(getattr(ledger, "historical_matches", ()))
+    recovery_matches = (*historical_matches, *ledger.matches)
     cache_dir = Path(exact_cache)
     if not cache_dir.is_dir():
         raise ValueError("exact cache path must be a batch directory")
@@ -342,21 +369,17 @@ async def run_evaluator(
     batch_source = None
     confirmation_pool = None
     retry_store = None
-    runtime_manifest_payload = None
-    if production_config is not None:
-        data_config = load_producer_config(production_config)
-        if data_config.track_spec.resolve() != Path(track_spec).resolve():
-            raise ValueError("production configuration uses a different track specification")
-        if data_config.validator_database.resolve() != Path(database).resolve():
-            raise ValueError("production configuration uses a different validator database")
+    if data_config is not None:
         scoring_device = data_config.validate_evaluation_device(scoring_device)
         objects = PrivateObjectStore.from_evaluator_environment(
             bucket=data_config.storage_bucket,
             prefix=f"{data_config.storage_prefix}/tracks/{track.digest}",
         )
         objects.verify_conditional_writes()
-        runtime_manifest_payload = objects.get(ARTIFACT_MANIFEST_OBJECT).body
-        manifest = ArtifactManifest.decode(runtime_manifest_payload)
+        stored_manifest = objects.get(ARTIFACT_MANIFEST_OBJECT).body
+        if stored_manifest != runtime_manifest_payload:
+            raise ValueError("private runtime manifest differs from the verified local manifest")
+        manifest = ArtifactManifest.decode(stored_manifest)
         if manifest.digest != track.artifact_manifest_sha256:
             raise ValueError("artifact manifest does not match the track commitment")
         _require_production_release(track, runtime_manifest_payload, publisher)
@@ -424,6 +447,7 @@ async def run_evaluator(
             scoring_device=scoring_device,
             batch_source=batch_source,
             confirmation_pool=confirmation_pool,
+            historical_matches=historical_matches,
         )
         work = _EvaluationWorker(
             database=database, track_spec_digest=track.digest,
@@ -522,6 +546,11 @@ async def run_evaluator(
                         finalized_block = await client.finalized_block()
                         if finalized_block >= track.track_start_block:
                             break
+                        if historical_matches:
+                            await seed_legacy_exclusions(
+                                client, store, netuid=track.netuid,
+                                before_block=finalized_block,
+                            )
                         chain = await read_weight_chain_state(
                             client,
                             netuid=track.netuid,
@@ -535,6 +564,8 @@ async def run_evaluator(
                             runtime_manifest=runtime_manifest_payload,
                             release_approval=getattr(publisher, "release_approval", None),
                             system_matches=system_matches,
+                            historical_matches=historical_matches,
+                            excluded_hotkeys=store.legacy_excluded_hotkeys(),
                         )
                         try:
                             await publisher.publish(artifacts)
@@ -576,7 +607,7 @@ async def run_evaluator(
                             ),
                             published_match_count=published_match_count,
                             max_scan_blocks=max_scan_blocks,
-                            recovery_matches=ledger.matches[recovery_index:],
+                            recovery_matches=recovery_matches[recovery_index:],
                             # One height identifies one immutable public snapshot.
                             # Keep finished work leased until it can enter the next
                             # snapshot, including after a partially failed publication.
@@ -635,6 +666,7 @@ async def run_evaluator(
                                         "system_matches": system_matches,
                                         "inventory_status": evaluator.inventory_status,
                                         "evaluation_running": work.busy and not work.done,
+                                        "historical_matches": historical_matches,
                                         "release_approval": getattr(
                                             publisher, "release_approval", None,
                                         ),
@@ -897,6 +929,32 @@ async def process_cycle(
         raise ValueError("minimum finalized block cannot be negative")
     if type(published_match_count) is not int or published_match_count < 0:
         raise ValueError("published match count must be a non-negative integer")
+    # A fresh DB scans from this release's start, not historical submissions.
+    # Recover only manifest-authenticated decisions and their actual chain input
+    # before scanning/admitting new work; never fabricate old payload/hash fields.
+    known = {row["challenge_id"] for row in store.public_snapshot()["challenges"]}
+    missing = [match for match in recovery_matches if match.challenge_id not in known]
+    recovered_submissions = {}
+    if missing:
+        finalized = await client.finalized_block()
+        by_block = {}
+        for match in missing:
+            height = match.document["submission"]["block_height"]
+            if height > finalized:
+                raise RuntimeError("historical submission is not finalized")
+            if height not in by_block:
+                _, commitments = await finalized_commitments(
+                    client, netuid=netuid, block_height=height,
+                )
+                by_block[height] = {
+                    record.submission_id: record for item in commitments
+                    if (record := submission_from_commitment(item)) is not None
+                }
+            record = by_block[height].get(match.document["submission_id"])
+            if record is None:
+                raise RuntimeError("immutable match submission is absent from the finalized block")
+            recovered_submissions[record.submission_id] = record
+        store.restore_public_matches(recovery_matches, submissions=recovered_submissions)
     scan = await scan_finalized_blocks(
         client,
         store,

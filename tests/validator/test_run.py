@@ -18,8 +18,9 @@ from validator import run as run_module
 from validator.admission import AdmissionSettings, AdmissionStatus
 from validator.chain import ScanResult
 from validator.download import DownloadedModel
-from validator.production.commitment import SourceLeaf, SourcePool
+from validator.production.commitment import Artifact, ArtifactManifest, SourceLeaf, SourcePool
 from validator.publication import (
+    HISTORICAL_MATCHES_PREFIX,
     PublicArtifactError,
     S3Repository,
     build_public_artifacts,
@@ -30,7 +31,7 @@ from validator.queue import ChainPosition, ChallengeState
 from validator.run import EvaluationCycleResult, process_weight_cycle
 from validator.scoring import ScoringSettings, StageOutcome
 from validator.store import ChallengeStore
-from validator.tournament import Champion, MatchOutcome, resolve_tournament
+from validator.tournament import Champion, MatchOutcome, genesis_champion, resolve_tournament
 from validator.weights import (
     WeightArtifact,
     WeightChainState,
@@ -43,6 +44,97 @@ from validator.weights import (
 from .test_chain import HOTKEY, FakeClient, chain_block
 from .test_publication import MemoryS3
 from .test_store import submission_at
+from .test_tournament import challenge as scored_challenge
+
+
+@pytest.mark.parametrize("already_scanned", [False, True])
+@pytest.mark.parametrize("same_hotkey", [False, True])
+def test_empty_new_track_recovers_verified_old_submission_before_fifo(
+    tmp_path, already_scanned, same_hotkey,
+):
+    raw = valid_spec()
+    raw.update(track_id="maintenance", track_start_block=150)
+    track = parse_track_spec(raw)
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    old_block = chain_block(payload, 99)
+    new_block = chain_block(payload, 150)
+    new_hotkey = HOTKEY if same_hotkey else "new-hotkey"
+    new_block[1]["extrinsics"][0]["address"] = new_hotkey
+    new_block[2][1]["attributes"]["who"] = new_hotkey
+    client = FakeClient({99: old_block, 150: new_block, 151: empty_chain_block(151)})
+    with ChallengeStore(tmp_path / "old.db", track_spec_digest="cd" * 32) as old:
+        asyncio.run(run_module.scan_finalized_blocks(client, old, netuid=7,
+                                                    track_start_block=99, max_blocks=1))
+        facts = old.public_snapshot()["challenges"][0]
+        scored = scored_challenge(1, HOTKEY, score=0.7, incumbent_score=0.7)
+        for key in ("challenge_id", "submission_id", "hotkey", "repo_id", "revision",
+                    "block_height", "extrinsic_index", "event_index"):
+            scored[key] = facts[key]
+        scored["score_block"] = scored["stages"][0]["score_block"] = 110
+        scored["evaluation_batch"]["generated_block"] = 100
+        history = resolve_tournament(
+            [scored], track_id="previous", track_spec_digest="cd" * 32, netuid=7,
+            minimum_gain=0.001,
+            initial_champion=replace(genesis_champion(track), position=ChainPosition(90, 0, 0)),
+        ).matches
+    async def no_result(*, wait):
+        assert wait is False
+        return None
+    work = SimpleNamespace(scoring_settings=ScoringSettings(), busy=True,
+                           allowed=False, take=no_result)
+    with ChallengeStore(tmp_path / "fresh.db", track_spec_digest=track.digest) as store:
+        if already_scanned:
+            asyncio.run(run_module.scan_finalized_blocks(client, store, netuid=7,
+                                                        track_start_block=150))
+        for _ in range(2):
+            result = asyncio.run(run_module.process_cycle(
+                client, store, netuid=7, track_start_block=150, work=work,
+                recovery_matches=history,
+            ))
+            assert result.restored_matches == 1 and work.allowed is not same_hotkey
+        restored = store.public_challenge(history[0].challenge_id)
+        assert restored["state"] == "SUCCEEDED" and restored["track_spec_digest"] == "cd" * 32
+        replayed = resolve_tournament(
+            [restored], track_id="previous", track_spec_digest="cd" * 32, netuid=7,
+            minimum_gain=0.001,
+            initial_champion=replace(genesis_champion(track), position=ChainPosition(90, 0, 0)),
+        )
+        assert replayed.matches[0].document == history[0].document
+        assert store.model_owner(scored["model_digest"]) == history[0].challenge_id
+        assert store.chain_cursor()[0] == 151
+        new = store.public_snapshot()["challenges"][1]
+        assert new["hotkey"] == new_hotkey
+        assert new["state"] == ("REJECTED_DUPLICATE_HOTKEY" if same_hotkey else "QUEUED")
+        # Original hotkey's one opportunity remains spent after total DB loss.
+        repeat, _ = store.add_submission(replace(submission_at(152), hotkey=HOTKEY))
+        assert store.get_challenge(repeat).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+
+
+def test_missing_or_changed_historical_chain_input_never_opens_fifo(tmp_path):
+    from validator.scan import extract_submissions
+
+    payload = ModelSubmission("owner/model", "12" * 20).encode()
+    block_hash, block, events = chain_block(payload, 99)
+    submission = extract_submissions(
+        block_height=99, block_hash=block_hash, block=block, events=events, netuid=7,
+    )[0]
+    with ChallengeStore(tmp_path / "old.db") as old:
+        identifier, _ = old.add_submission(submission)
+        old.transition(identifier, ChallengeState.FETCHING)
+        old.transition(identifier, ChallengeState.PARTICIPANT_FAILED, error_code="NOT_PUBLIC")
+        history = resolve_tournament(
+            old.public_snapshot()["challenges"], track_id="previous", track_spec_digest="cd" * 32,
+            netuid=7, minimum_gain=0.001,
+            initial_champion=genesis_champion(parse_track_spec(valid_spec())),
+        ).matches
+    work = SimpleNamespace(scoring_settings=ScoringSettings(), allowed=False)
+    client = FakeClient({99: empty_chain_block(99), 150: empty_chain_block(150)})
+    with ChallengeStore(tmp_path / "fresh.db", track_spec_digest="ab" * 32) as store:
+        with pytest.raises(RuntimeError, match="absent from the finalized block"):
+            asyncio.run(run_module.process_cycle(client, store, netuid=7, track_start_block=150,
+                                                work=work, recovery_matches=history))
+        assert not work.allowed and store.public_snapshot()["challenges"] == []
+        assert store.chain_cursor() is None
 
 
 def test_historical_terminal_does_not_fence_new_fifo_or_consume_public_prefix(pending_evaluation):
@@ -58,6 +150,25 @@ def test_historical_terminal_does_not_fence_new_fifo_or_consume_public_prefix(pe
     )
     case.store._connection.commit()
     historical = case.store.public_challenge(old)
+    history = resolve_tournament(
+        [historical], track_id="previous", track_spec_digest="cd" * 32,
+        netuid=case.track.netuid, minimum_gain=case.track.full_video.minimum_gain,
+        initial_champion=replace(genesis_champion(case.track), position=ChainPosition(90, 0, 0)),
+    ).matches
+    original = json.dumps(history[0].document, sort_keys=True, separators=(",", ":")).encode()
+    manifest = ArtifactManifest((Artifact(
+        HISTORICAL_MATCHES_PREFIX + history[0].object_name,
+        hashlib.sha256(original).hexdigest(), len(original), history[0].object_name,
+    ),))
+    raw = track_spec_dict(case.track)
+    raw["artifact_manifest_sha256"] = manifest.digest
+    case.track = parse_track_spec(raw)
+    # This is the isolated target checkpoint's binding, not a live source DB edit.
+    case.store._connection.execute(
+        "UPDATE store_metadata SET value=? WHERE key='track_spec_digest'", (case.track.digest,),
+    )
+    case.store._connection.commit()
+    case.publisher._put_immutable(history[0].object_name, original)
 
     def unavailable(*_args, **_kwargs):
         from validator.download import ModelDownloadError
@@ -74,9 +185,11 @@ def test_historical_terminal_does_not_fence_new_fifo_or_consume_public_prefix(pe
     assert cycle.admission is not None
     assert case.store.public_challenge(old) == historical
     chain = WeightChainState(101, {case.track.initial_champion.hotkey: 0, HOTKEY: 1}, 1, 1.0, 1, {})
-    genesis = build_public_artifacts(case.store, case.track, chain, version_key=1, match_limit=0)
+    arguments = {"version_key": 1, "runtime_manifest": manifest.encode(),
+                 "historical_matches": history}
+    genesis = build_public_artifacts(case.store, case.track, chain, match_limit=0, **arguments)
     assert genesis.matches == ()
-    current = build_public_artifacts(case.store, case.track, chain, version_key=1, match_limit=1)
+    current = build_public_artifacts(case.store, case.track, chain, match_limit=1, **arguments)
     assert len(current.matches) == 1
     assert json.loads(current.matches[0][1])["challenge_id"] != old
     assert json.loads(current.summary)["match_count"] == 1

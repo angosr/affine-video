@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import io
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -12,7 +13,13 @@ from tests.scoring.test_spec import valid_spec
 from validator import chunks
 from validator import publication as publication_module
 from validator.production.batches import BatchDisclosure, DisclosureFile
-from validator.production.commitment import SourceLeaf, SourcePool, canonical_json
+from validator.production.commitment import (
+    Artifact,
+    ArtifactManifest,
+    SourceLeaf,
+    SourcePool,
+    canonical_json,
+)
 from validator.production.plan import (
     DenseReference,
     ReadyObject,
@@ -22,6 +29,7 @@ from validator.production.plan import (
     select_source_proofs,
 )
 from validator.publication import (
+    HISTORICAL_MATCHES_PREFIX,
     PublicArtifactError,
     PublicArtifacts,
     PublicFile,
@@ -206,6 +214,197 @@ def two_stage_challenge(value: dict) -> dict:
         },
     ]
     return result
+
+
+@pytest.fixture
+def maintenance_history():
+    """Canonical outcome facts, not GPU measurements or a second champion source."""
+    runtime = Artifact("runtime/source.zip", "ab" * 32, 1, "source")
+    previous_manifest = ArtifactManifest((runtime,))
+    raw = valid_spec()
+    raw["artifact_manifest_sha256"] = previous_manifest.digest
+    previous = parse_track_spec(raw)
+    winner = scored_challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    history = resolve_tournament(
+        [winner], track_id=previous.track_id, track_spec_digest=previous.digest, netuid=7,
+        minimum_gain=previous.full_video.minimum_gain,
+        initial_champion=genesis_champion(previous),
+    ).matches
+    body = canonical_json(history[0].document)
+    manifest = ArtifactManifest((Artifact(
+        HISTORICAL_MATCHES_PREFIX + history[0].object_name,
+        hashlib.sha256(body).hexdigest(), len(body), history[0].object_name,
+    ), runtime))
+    raw.update(track_id="maintenance", track_start_block=300,
+               artifact_manifest_sha256=manifest.digest)
+    raw["full_video"]["minimum_gain"] = 0.5  # Old win must not be rejudged.
+    current = parse_track_spec(raw)
+    chain = WeightChainState(300, {"genesis-hotkey": 0, "alice": 3}, 1, 1.0, 1, {})
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="test", prefix="isolated/maintenance")
+    original = build_genesis_artifacts(previous, chain, version_key=0,
+                                       runtime_manifest=previous_manifest.encode())
+    tournament = resolve_tournament(
+        [winner], track_id=previous.track_id, track_spec_digest=previous.digest, netuid=7,
+        minimum_gain=previous.full_video.minimum_gain,
+        initial_champion=genesis_champion(previous),
+    )
+    original = replace(
+        original,
+        matches=((history[0].object_name, body),),
+        summary=canonical_json(publication_module._summary_document(previous, 300, tournament)),
+        weights=encode_weight_artifact(WeightArtifact(
+            previous.track_id, previous.digest, 7, 0, 0, 300,
+            WeightPlan(300, ("alice",), (3,), (1.0,)),
+            match_sequence=1, terminal_match_sha256=hashlib.sha256(body).hexdigest(),
+        )),
+    )
+    asyncio.run(repository.publish(original))
+    return SimpleNamespace(
+        previous=previous, track=current, manifest=manifest,
+        chain=replace(chain, finalized_block=301),
+        history=history, body=body, client=client, repository=repository,
+    )
+
+
+def test_maintenance_cold_load_and_publication_carry_original_champion(maintenance_history):
+    case = maintenance_history
+    # Startup may precede the new mutable pointer. Original match bytes alone are
+    # sufficient, pinned in the existing manifest and read through the repository.
+    ledger = asyncio.run(case.repository.load(case.track, runtime_manifest=case.manifest.encode()))
+    assert ledger.matches == () and ledger.historical_matches == case.history
+    artifacts = build_genesis_artifacts(
+        case.track, case.chain, version_key=0, runtime_manifest=case.manifest.encode(),
+        historical_matches=ledger.historical_matches,
+    )
+    assert decode_weight_artifact(artifacts.weights).plan.uids == (3,)
+    summary = json.loads(artifacts.summary)
+    assert summary["champion"] == case.history[-1].champion_after.public()
+    assert summary["match_count"] == 0  # No cloned/relabelled historical matches.
+    assert json.loads(artifacts.status)["participants"][-1]["champion"] is True
+    asyncio.run(case.repository.publish(artifacts))
+    cold = S3Repository(case.client, bucket="test", prefix="isolated/maintenance")
+    restored = asyncio.run(cold.load(case.track))
+    assert restored.historical_matches == case.history and restored.matches == ()
+    assert case.client.objects[
+        "isolated/maintenance/" + case.history[0].object_name
+    ] == case.body
+    assert not any("matches/maintenance/" in key for key in case.client.objects)
+
+
+def test_maintenance_rejects_accidental_genesis_reset_before_pointers(maintenance_history):
+    case = maintenance_history
+    before = {key: value for key, value in case.client.objects.items()
+              if key.endswith(("track.json", "weights.json", "summary.json", "status.json"))}
+    forgotten = build_genesis_artifacts(
+        case.track, case.chain, version_key=0, runtime_manifest=case.manifest.encode(),
+    )
+    with pytest.raises(PublicArtifactError, match="reset its historical champion"):
+        asyncio.run(case.repository.publish(forgotten))
+    assert all(case.client.objects[key] == body for key, body in before.items())
+
+
+@pytest.mark.parametrize("excluded", [False, True])
+def test_maintenance_prestart_owner_loop_keeps_champion_and_existing_eligibility(
+    maintenance_history, tmp_path, monkeypatch, excluded,
+):
+    from scoring.spec import track_spec_dict
+    from validator import run as run_module
+
+    case = maintenance_history
+    raw = track_spec_dict(case.track)
+    raw["track_start_block"] = 400
+    track = parse_track_spec(raw)
+    case.client.objects[
+        f"isolated/maintenance/runtime/{case.manifest.digest}/manifest.json"
+    ] = case.manifest.encode()
+    class Client:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_args):
+            return None
+        async def finalized_block(self):
+            return 301
+    async def seed(_client, store, **kwargs):
+        assert kwargs == {"netuid": 7, "before_block": 301}
+        if excluded:
+            store.seed_legacy_exclusions({"alice": 300})
+    async def chain_state(_client, **kwargs):
+        assert kwargs == {"netuid": 7, "mechid": 0, "finalized_block": 301}
+        return case.chain
+    monkeypatch.setattr(run_module, "load_track_spec", lambda _path: track)
+    monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run_module.bt, "Client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(run_module, "seed_legacy_exclusions", seed)
+    monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
+    (tmp_path / "exact").mkdir()
+    asyncio.run(run_module.run_evaluator(
+        track_spec="unused", database=tmp_path / "fresh.db", model_cache=tmp_path / "models",
+        exact_cache=tmp_path / "exact", initial_model=tmp_path / "unused-baseline",
+        network="test", archive_endpoints=None, worker_id="fixture", publisher=case.repository,
+        once=True,
+    ))
+    weights = decode_weight_artifact(case.client.objects["isolated/maintenance/weights.json"])
+    assert weights.plan.uids == ((0,) if excluded else (3,))
+    summary = json.loads(case.client.objects["isolated/maintenance/summary.json"])
+    assert summary["champion"] == case.history[-1].champion_after.public()
+    assert summary["match_count"] == 0
+
+
+@pytest.mark.parametrize("uncommitted_tail", [False, True])
+def test_maintenance_cannot_drop_history_from_manifest(maintenance_history, uncommitted_tail):
+    case = maintenance_history
+    if uncommitted_tail:
+        pending = build_genesis_artifacts(case.previous, case.chain, version_key=0)
+        case.client.objects["isolated/maintenance/summary.json"] = pending.summary
+        case.client.objects["isolated/maintenance/weights.json"] = pending.weights
+    manifest = ArtifactManifest((Artifact("runtime/source.zip", "ab" * 32, 1, "source"),))
+    raw = valid_spec()
+    raw.update(track_id="maintenance", track_start_block=300,
+               artifact_manifest_sha256=manifest.digest)
+    track = parse_track_spec(raw)
+    forgotten = build_genesis_artifacts(track, case.chain, version_key=0,
+                                       runtime_manifest=manifest.encode())
+    with pytest.raises(PublicArtifactError, match="drop, replace or invent"):
+        asyncio.run(case.repository.publish(forgotten))
+    assert json.loads(case.client.objects["isolated/maintenance/track.json"])[
+        "track_spec_digest"
+    ] == case.previous.digest
+
+
+@pytest.mark.parametrize("damage", ["missing", "sha", "identity", "subnet", "sequence", "link"])
+def test_maintenance_history_fails_closed(maintenance_history, damage):
+    case = maintenance_history
+    name = case.history[0].object_name
+    body = case.body
+    if damage in {"identity", "subnet", "sequence", "link"}:
+        document = json.loads(body)
+        if damage == "identity":
+            document["track_id"] = case.track.track_id
+        elif damage == "subnet":
+            document["netuid"] = 8
+        elif damage == "sequence":
+            document["sequence"] = 2
+            name = name.replace("000000000001", "000000000002")
+        else:
+            document["incumbent_before"]["hotkey"] = "other-baseline"
+        body = canonical_json(document)
+    manifest = ArtifactManifest((Artifact(
+        HISTORICAL_MATCHES_PREFIX + name,
+        hashlib.sha256(body).hexdigest(), len(body), name,
+    ),))
+    raw = valid_spec()
+    raw.update(track_id="maintenance", track_start_block=300,
+               artifact_manifest_sha256=manifest.digest)
+    track = parse_track_spec(raw)
+    key = "isolated/maintenance/" + name
+    if damage == "missing":
+        case.client.objects.pop(key)
+    else:
+        case.client.objects[key] = body if damage != "sha" else body + b" "
+    cold = S3Repository(case.client, bucket="test", prefix="isolated/maintenance")
+    with pytest.raises(PublicArtifactError, match="historical"):
+        asyncio.run(cold.load(track, runtime_manifest=manifest.encode()))
 
 
 def test_weight_artifact_has_one_strict_canonical_representation() -> None:
@@ -594,20 +793,16 @@ def test_storage_publishes_immutable_facts_before_summary_and_weights() -> None:
 
 
 def test_runtime_manifest_is_content_addressed_and_published_before_track() -> None:
-    payload = b"runtime-manifest"
+    payload = ArtifactManifest((Artifact("runtime/source.zip", "ab" * 32, 1, "source"),)).encode()
     digest = hashlib.sha256(payload).hexdigest()
+    raw = valid_spec()
+    raw["artifact_manifest_sha256"] = digest
+    track = parse_track_spec(raw)
     client = MemoryS3()
     publisher = S3Repository(client, bucket="public-data", prefix="tracks/test")
-    artifacts = PublicArtifacts(
-        120,
-        pointer_track(),
-        b"summary",
-        pointer_weights(120),
-        (),
-        runtime_manifest=(
-            f"runtime/{digest}/manifest.json",
-            payload,
-        ),
+    artifacts = build_genesis_artifacts(
+        track, WeightChainState(120, {track.initial_champion.hotkey: 0}, 1, 1.0, 1, {}),
+        version_key=0, runtime_manifest=payload,
     )
 
     asyncio.run(publisher.publish(artifacts))
@@ -1175,7 +1370,10 @@ def test_storage_loader_recovers_match_uploaded_before_mutable_summary(tmp_path)
 
 @pytest.mark.parametrize("phase", ["previous", "track", "weights", "summary"])
 def test_loader_reconciles_fixed_path_cutover_without_parsing_previous_scoring_schema(phase):
-    track = parse_track_spec(valid_spec())
+    payload = ArtifactManifest((Artifact("runtime/source.zip", "ab" * 32, 1, "source"),)).encode()
+    raw = valid_spec()
+    raw["artifact_manifest_sha256"] = hashlib.sha256(payload).hexdigest()
+    track = parse_track_spec(raw)
     previous_spec = {
         "track_id": "previous-track", "netuid": track.netuid, "mechid": track.mechid,
         "track_start_block": 1, "retired_scoring_schema": {"version": "not-v2"},
@@ -1186,6 +1384,7 @@ def test_loader_reconciles_fixed_path_cutover_without_parsing_previous_scoring_s
     }
     client = MemoryS3()
     client.objects = {
+        f"tracks/main/runtime/{track.artifact_manifest_sha256}/manifest.json": payload,
         "tracks/main/track.json": canonical_json(previous_document),
         "tracks/main/weights.json": canonical_json({"track_id": "previous-track", "old_format": 1}),
         "tracks/main/summary.json": canonical_json({"track_id": "previous-track", "old_format": 1}),

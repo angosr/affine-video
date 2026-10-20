@@ -56,104 +56,9 @@ async def scan_finalized_blocks(
         current = store.chain_cursor()
         if current is not None and current[0] >= block_height:
             continue
-        block_hash = await client._substrate.block_hash(block_height)
-        block = await client._substrate.get_block(block_hash=block_hash)
-        if block is None:
-            raise RuntimeError(f"finalized block {block_height} is unavailable")
-        events = await client._substrate.events(block_hash)
-        commitments = extract_commitments(
-            block_height=block_height,
-            block_hash=block_hash,
-            block=block,
-            events=events,
-            netuid=netuid,
+        block_hash, commitments = await finalized_commitments(
+            client, netuid=netuid, block_height=block_height,
         )
-        reveals = extract_commitment_reveals(
-            block_height=block_height,
-            events=events,
-            netuid=netuid,
-        )
-        if reveals:
-            snapshot = await client.at(block_height)
-            current_commitments = await snapshot.subnets.commitments(netuid)
-            by_hotkey = _commitments_by_hotkey(current_commitments)
-            reveal_counts = Counter(reveal.hotkey for reveal in reveals)
-            reveal_offsets: Counter[str] = Counter()
-            for reveal in reveals:
-                offset = reveal_offsets[reveal.hotkey]
-                reveal_offsets[reveal.hotkey] += 1
-                item = by_hotkey.get(reveal.hotkey)
-                values = getattr(item, "revealed", ()) if item is not None else ()
-                context = {
-                    "block_height": block_height,
-                    "event_index": reveal.position.event_index,
-                    "hotkey": reveal.hotkey,
-                    "netuid": netuid,
-                }
-                if not isinstance(values, Sequence) or isinstance(
-                    values, (str, bytes, bytearray)
-                ):
-                    LOGGER.warning(
-                        "skipping malformed finalized commitment reveal history",
-                        extra=context,
-                    )
-                    values = ()
-                matching = []
-                for stored in values:
-                    if not isinstance(stored, (tuple, list)) or len(stored) != 2:
-                        LOGGER.warning(
-                            "skipping malformed finalized commitment reveal entry",
-                            extra=context,
-                        )
-                        continue
-                    height, value = stored
-                    if type(height) is not int or height < 0:
-                        LOGGER.warning(
-                            "skipping finalized commitment reveal with invalid block",
-                            extra=context,
-                        )
-                        continue
-                    if height != block_height:
-                        continue
-                    payload = revealed_payload(value)
-                    if payload is None:
-                        LOGGER.warning(
-                            "skipping undecodable finalized commitment reveal",
-                            extra=context,
-                        )
-                        continue
-                    if not payload:
-                        LOGGER.warning(
-                            "skipping empty finalized commitment reveal",
-                            extra=context,
-                        )
-                        continue
-                    matching.append(payload)
-                if len(matching) != reveal_counts[reveal.hotkey]:
-                    LOGGER.warning(
-                        "skipping unmatched finalized commitment reveal",
-                        extra={
-                            "block_height": block_height,
-                            "event_index": reveal.position.event_index,
-                            "hotkey": reveal.hotkey,
-                            "matching_plaintexts": len(matching),
-                            "reveal_events": reveal_counts[reveal.hotkey],
-                            "netuid": netuid,
-                        },
-                    )
-                    continue
-                commitments.append(
-                    ChainCommitment(
-                        reveal.hotkey,
-                        netuid,
-                        block_hash,
-                        reveal.position,
-                        # The pallet appends plaintexts and emits their events in
-                        # the same field order, including multiple fields per block.
-                        matching[offset],
-                    )
-                )
-        commitments.sort(key=lambda item: item.position)
         submissions = tuple(
             submission
             for commitment in commitments
@@ -189,6 +94,111 @@ async def scan_finalized_blocks(
         submissions_found += len(submissions)
 
     return ScanResult(first, last, last - first + 1, submissions_found)
+
+
+async def finalized_commitments(
+    client: Any, *, netuid: int, block_height: int,
+) -> tuple[str, list[ChainCommitment]]:
+    """Read one finalized block through the same raw/timelock decoding path."""
+    block_hash = await client._substrate.block_hash(block_height)
+    block = await client._substrate.get_block(block_hash=block_hash)
+    if block is None:
+        raise RuntimeError(f"finalized block {block_height} is unavailable")
+    events = await client._substrate.events(block_hash)
+    commitments = extract_commitments(
+        block_height=block_height,
+        block_hash=block_hash,
+        block=block,
+        events=events,
+        netuid=netuid,
+    )
+    reveals = extract_commitment_reveals(
+        block_height=block_height,
+        events=events,
+        netuid=netuid,
+    )
+    if reveals:
+        snapshot = await client.at(block_height)
+        current_commitments = await snapshot.subnets.commitments(netuid)
+        by_hotkey = _commitments_by_hotkey(current_commitments)
+        reveal_counts = Counter(reveal.hotkey for reveal in reveals)
+        reveal_offsets: Counter[str] = Counter()
+        for reveal in reveals:
+            offset = reveal_offsets[reveal.hotkey]
+            reveal_offsets[reveal.hotkey] += 1
+            item = by_hotkey.get(reveal.hotkey)
+            values = getattr(item, "revealed", ()) if item is not None else ()
+            context = {
+                "block_height": block_height,
+                "event_index": reveal.position.event_index,
+                "hotkey": reveal.hotkey,
+                "netuid": netuid,
+            }
+            if not isinstance(values, Sequence) or isinstance(
+                values, (str, bytes, bytearray)
+            ):
+                LOGGER.warning(
+                    "skipping malformed finalized commitment reveal history",
+                    extra=context,
+                )
+                values = ()
+            matching = []
+            for stored in values:
+                if not isinstance(stored, (tuple, list)) or len(stored) != 2:
+                    LOGGER.warning(
+                        "skipping malformed finalized commitment reveal entry",
+                        extra=context,
+                    )
+                    continue
+                height, value = stored
+                if type(height) is not int or height < 0:
+                    LOGGER.warning(
+                        "skipping finalized commitment reveal with invalid block",
+                        extra=context,
+                    )
+                    continue
+                if height != block_height:
+                    continue
+                payload = revealed_payload(value)
+                if payload is None:
+                    LOGGER.warning(
+                        "skipping undecodable finalized commitment reveal",
+                        extra=context,
+                    )
+                    continue
+                if not payload:
+                    LOGGER.warning(
+                        "skipping empty finalized commitment reveal",
+                        extra=context,
+                    )
+                    continue
+                matching.append(payload)
+            if len(matching) != reveal_counts[reveal.hotkey]:
+                LOGGER.warning(
+                    "skipping unmatched finalized commitment reveal",
+                    extra={
+                        "block_height": block_height,
+                        "event_index": reveal.position.event_index,
+                        "hotkey": reveal.hotkey,
+                        "matching_plaintexts": len(matching),
+                        "reveal_events": reveal_counts[reveal.hotkey],
+                        "netuid": netuid,
+                    },
+                )
+                continue
+            commitments.append(
+                ChainCommitment(
+                    reveal.hotkey,
+                    netuid,
+                    block_hash,
+                    reveal.position,
+                    # The pallet appends plaintexts and emits their events in
+                    # the same field order, including multiple fields per block.
+                    matching[offset],
+                )
+            )
+    commitments.sort(key=lambda item: item.position)
+    return block_hash, commitments
 
 
 async def seed_legacy_exclusions(
