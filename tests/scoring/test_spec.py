@@ -27,9 +27,6 @@ def valid_spec() -> dict:
         "mechid": 0,
         "track_start_block": 100,
         "publication_grace_blocks": 2,
-        "maximum_generation_batches": 10,
-        "maximum_effective_challenges": 2,
-        "track_close_grace_blocks": 50,
         "source_pool_merkle_root": source_root,
         "source_commitments": {
             "production": {"all": production},
@@ -95,7 +92,7 @@ def valid_spec() -> dict:
             "tail_mean_weight": 0.8,
             "stratum_weights": {"all": 1.0},
             "minimum_frontier_gain": 0.001,
-            "season_false_promotion_alpha": 0.1,
+            "match_confidence": 0.95,
             "bootstrap_resamples": 1000,
             "bootstrap_seed": 7,
         },
@@ -138,14 +135,9 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.initial_champion.uid == 0
     assert first.initial_champion.repo_id == VEDA_REPO_ID
     assert first.cache.minimum_generation_delay_blocks == 4
-    assert first.last_generation_block == 1100
-    assert first.last_submission_block == 896
-    assert first.track_close_block == 1150
     assert first.scoring.minimum_frontier_gain == 0.001
     assert first.scoring.case_count == 24
-    assert first.match_confidence == 0.95
-    assert first.maximum_nonempty_production_batches == 4
-    assert first.required_production_sources_per_stratum == 20
+    assert first.scoring.match_confidence == 0.95
     assert parse_track_spec(track_spec_dict(first)) == first
 
 
@@ -157,32 +149,30 @@ def test_hidden_batch_seed_is_not_known_during_publication_grace() -> None:
         parse_track_spec(raw)
 
 
-def test_track_reserves_enough_boundaries_to_drain_the_fifo_queue() -> None:
-    spec = parse_track_spec(valid_spec())
-    exact_block = spec.last_submission_block + spec.cache.minimum_generation_delay_blocks
-    assert (
-        exact_block
-        + spec.maximum_effective_challenges * spec.cache.generation_interval_blocks
-        == spec.last_generation_block
-    )
-
+def test_match_confidence_is_explicit_and_bound_to_the_spec_digest() -> None:
     raw = valid_spec()
-    raw["maximum_generation_batches"] = raw["maximum_effective_challenges"]
-
-    with pytest.raises(TrackSpecError, match="leave one exact boundary"):
+    original = parse_track_spec(raw)
+    raw["scoring"]["match_confidence"] = 0.9975
+    raw["scoring"]["bootstrap_resamples"] = 10_000
+    configured = parse_track_spec(raw)
+    assert configured.scoring.match_confidence == 0.9975
+    assert configured.digest != original.digest
+    raw["scoring"]["bootstrap_resamples"] = 3999
+    with pytest.raises(TrackSpecError, match="match error tail"):
         parse_track_spec(raw)
 
 
 def test_track_rejects_insufficient_production_sources_per_stratum() -> None:
     raw = valid_spec()
-    raw["source_commitments"]["production"]["all"].pop()
+    production = raw["source_commitments"]["production"]["all"]
+    raw["source_commitments"]["production"]["all"] = production[:7]
     digests = (
         raw["source_commitments"]["production"]["all"]
         + raw["source_commitments"]["audit"]["all"]
     )
     raw["source_pool_merkle_root"] = source_merkle_root(digests)
 
-    with pytest.raises(TrackSpecError, match="plus one reserve"):
+    with pytest.raises(TrackSpecError, match="two disjoint batches"):
         parse_track_spec(raw)
 
 

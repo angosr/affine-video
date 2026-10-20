@@ -310,8 +310,8 @@ def test_partial_worker_start_is_cleaned_up_and_pool_can_be_reused(monkeypatch) 
             budgets=(SimpleNamespace(target_blocks=16, calibrated_cost=1.0),),
             bootstrap_resamples=10,
             bootstrap_seed=1,
+            match_confidence=0.95,
         ),
-        match_confidence=0.95,
     )
     pool = ConfirmationWorkerPool(config, candidate_track, timeout_seconds=1)
 

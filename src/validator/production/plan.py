@@ -574,6 +574,20 @@ def select_query_tiles(
     return tuple(sorted(selected))
 
 
+def confirmation_source_digests(
+    plans: tuple[BatchPlan, ...], confirmation_challenge_ids: tuple[str, ...]
+) -> frozenset[str]:
+    """Keep each match's confirmation independent of its exact-stage source families."""
+
+    identifiers = frozenset(confirmation_challenge_ids)
+    return frozenset(
+        proof.leaf.digest
+        for plan in plans
+        if identifiers.intersection(plan.exact_challenge_ids)
+        for proof in plan.source_proofs
+    )
+
+
 def select_source_proofs(
     pool: SourcePool,
     *,
@@ -582,9 +596,9 @@ def select_source_proofs(
     strata: tuple[str, ...],
     sources_per_stratum: int,
     batch_seed: str,
-    used_source_digests: frozenset[str],
+    excluded_source_digests: frozenset[str],
 ) -> tuple[SourceProof, ...]:
-    """Select independent, unused families from one committed partition."""
+    """Select distinct source families for a fresh block-seeded rollout batch."""
 
     selected_digests = select_source_digests(
         commitments,
@@ -592,7 +606,7 @@ def select_source_proofs(
         strata=strata,
         sources_per_stratum=sources_per_stratum,
         batch_seed=batch_seed,
-        used_source_digests=used_source_digests,
+        excluded_source_digests=excluded_source_digests,
     )
     leaves = {leaf.digest: leaf for leaf in pool.leaves}
     if set(leaves) != {item.sha256 for item in commitments}:
@@ -610,7 +624,7 @@ def select_source_digests(
     strata: tuple[str, ...],
     sources_per_stratum: int,
     batch_seed: str,
-    used_source_digests: frozenset[str],
+    excluded_source_digests: frozenset[str],
 ) -> tuple[str, ...]:
     """Select sources from one salted partition published before the track."""
 
@@ -621,10 +635,10 @@ def select_source_digests(
     if type(sources_per_stratum) is not int or sources_per_stratum <= 0:
         raise ValueError("sources per stratum must be positive")
     known = {item.sha256 for item in commitments}
-    if len(known) != len(commitments) or not used_source_digests <= known:
-        raise ValueError("source commitment index or used set is invalid")
+    if len(known) != len(commitments) or not excluded_source_digests <= known:
+        raise ValueError("source commitment index or exclusion set is invalid")
     selected: list[str] = []
-    reserved = set(used_source_digests)
+    reserved = set(excluded_source_digests)
     for stratum in sorted(strata):
         candidates = tuple(
             item.sha256
@@ -648,25 +662,25 @@ def validate_source_selection_sequence(
     commitments: tuple[SourceCommitmentSpec, ...],
     scoring: ScoringSpec,
 ) -> None:
-    """Verify every disclosed plan against the public index and prior selections."""
+    """Verify seeded selections and disjoint exact/confirmation sources for each match."""
 
     ordered = tuple(sorted(plans, key=lambda plan: plan.generation_block))
     if len({plan.generation_block for plan in ordered}) != len(ordered):
         raise ValueError("source selection plans repeat a generation block")
-    used: set[str] = set()
-    for plan in ordered:
+    for index, plan in enumerate(ordered):
         expected = select_source_digests(
             commitments,
             partition="production",
             strata=tuple(scoring.stratum_weight_map),
             sources_per_stratum=scoring.rollouts_per_stratum,
             batch_seed=plan.batch_seed,
-            used_source_digests=frozenset(used),
+            excluded_source_digests=confirmation_source_digests(
+                ordered[:index], plan.confirmation_challenge_ids,
+            ),
         )
         actual = tuple(proof.leaf.digest for proof in plan.source_proofs)
         if actual != expected:
             raise ValueError("plan source selection differs from the public commitment index")
-        used.update(actual)
 
 
 def _rollouts(

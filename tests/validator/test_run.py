@@ -240,41 +240,29 @@ def test_pending_work_keeps_scanning_status_and_cas_weights_fresh(pending_evalua
     asyncio.run(execute())
 
 
-@pytest.mark.parametrize("fence", ["close", "abort", "publication"])
-def test_inflight_result_obeys_close_abort_and_publication_fences(pending_evaluation, fence):
+def test_inflight_result_obeys_publication_failure_fence(pending_evaluation):
     case = pending_evaluation
 
     async def execute():
         await _pending_cycle(case)
         await _eventually(case.entered.is_set)
         case.client._finalized = 105
-        if fence == "publication":
-            for _ in range(run_module.MAX_PUBLICATION_FAILURES):
-                case.store.record_publication_failure()
-            options = {}
-        else:
-            options = {"track_close_block": 103} if fence == "close" else {"track_aborted": True}
-        paused = await _pending_cycle(case, **options)
+        for _ in range(run_module.MAX_PUBLICATION_FAILURES):
+            case.store.record_publication_failure()
+        paused = await _pending_cycle(case)
         assert paused.scoring is None
         case.release.set()
         await _eventually(lambda: case.work.done)
-        result = await _pending_cycle(case, **options)
+        result = await _pending_cycle(case)
         challenge = case.store.public_snapshot()["challenges"][0]
-        assert challenge["final_score"] is None
-        assert challenge["stages"] == []
+        assert challenge["final_score"] is None and challenge["stages"] == []
         assert len(case.calls) == 1
-        if fence == "publication":
-            assert result.scoring is None and case.work.busy
-            await _publish_pending(case)
-            case.store.publication_succeeded()
-            result = await _pending_cycle(case)
-            assert result.scoring.state is ChallengeState.SUCCEEDED
-            assert not case.work.busy
-        else:
-            assert result.scoring.state is ChallengeState.SYSTEM_DEFERRED
-            expected = "TRACK_CLOSE_REACHED" if fence == "close" else "TRACK_ABORTED"
-            assert result.scoring.code == expected
-            assert not case.work.busy
+        assert result.scoring is None and case.work.busy
+        await _publish_pending(case)
+        case.store.publication_succeeded()
+        result = await _pending_cycle(case)
+        assert result.scoring.state is ChallengeState.SUCCEEDED
+        assert not case.work.busy
 
     asyncio.run(execute())
 
@@ -474,9 +462,8 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
 
 
 @pytest.mark.parametrize("mode", [
-    "success", "prepare_retry", "retry", "retry_exhaustion", "abort", "restart", "group_restart",
-    "abort_restart", "abort_lost_response", "abort_restart_lost_response",
-    "abort_running_lost_response",
+    "success", "prepare_retry", "retry", "retry_exhaustion", "restart", "group_restart",
+    "success_lost_response",
 ])
 def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     pending_evaluation, monkeypatch, tmp_path, mode,
@@ -496,9 +483,6 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     case = pending_evaluation
     lost_response = mode.endswith("_lost_response")
     mode = mode.removesuffix("_lost_response")
-    keep_running = mode == "abort_running"
-    if keep_running:
-        mode = "abort"
     blocks = {height: empty_chain_block(height) for height in range(100, 1201)}
     blocks[100] = chain_block(ModelSubmission("owner/model", "12" * 20).encode(), 100)
     second = chain_block(ModelSubmission("owner/second", "34" * 20).encode(), 402)
@@ -516,7 +500,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
                 case.pool, commitments=case.track.source_commitments, partition="production",
                 strata=("all",), sources_per_stratum=case.track.scoring.rollouts_per_stratum,
                 batch_seed=generation_seed(case.track.digest, block_hash),
-                used_source_digests=frozenset(used_sources),
+                excluded_source_digests=frozenset(used_sources),
             )
             used_sources.update(proof.leaf.digest for proof in proofs)
             plan = build_plan(
@@ -597,9 +581,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     upload_failures = 0
     prepare_failed = False
     group_failure_enabled = mode == "group_restart"
-    abort_event_failed = False
     height = 401
-    stopping = False
     owner_thread = threading.get_ident()
     original_resolve = run_module.resolve_public_disclosures
 
@@ -629,13 +611,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         return original_resolve(artifacts, **kwargs)
 
     def slow_upload(arguments):
-        nonlocal upload_failures, abort_event_failed
-        if (
-            mode == "abort_restart" and arguments["Key"].endswith("/track-aborted.json")
-            and not abort_event_failed
-        ):
-            abort_event_failed = True
-            raise OSError("interrupted after the terminal null weight fence")
+        nonlocal upload_failures
         if "/batch_groups/" in arguments["Key"] and group_failure_enabled:
             raise OSError("injected crash after match and before group")
         if arguments["Key"].endswith("/weights.json"):
@@ -690,7 +666,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     database = case.work.database
 
     def report(result):
-        nonlocal height, stopping
+        nonlocal height
         if result.cycle_error:
             failures.append(result.cycle_error)
             prepare_release.set()
@@ -698,16 +674,6 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
             raise StopLoop
         weights = decode_weight_artifact(transport.objects["isolated/slow-disclosure/weights.json"])
         assert weights.source_block == height
-        if stopping:
-            assert weights.track_aborted and weights.plan is None
-            prepare_release.set()
-            upload_release.set()
-            if keep_running and not all(
-                f"isolated/slow-disclosure/batch_groups/{plan.plan_digest}.json"
-                in transport.objects for plan in plans.values()
-            ):
-                return
-            raise StopLoop
         if weights.match_sequence == 1:
             assert weights.plan.uids == (1,)
             manifest_name = f"isolated/slow-disclosure/models/{case.track.track_id}/" + (
@@ -731,10 +697,6 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         if upload_entered.is_set() and not upload_release.is_set():
             upload_heads.append(height)
             if len(upload_heads) == 3:
-                if mode in {"abort", "abort_restart"}:
-                    stopping = True
-                    height = case.track.track_close_block + 1
-                    return
                 upload_release.set()
                 if mode == "restart":
                     height += 1
@@ -784,7 +746,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     if mode == "retry_exhaustion":
         assert upload_failures == run_module.MAX_PUBLICATION_FAILURES + 1
         assert max(retry_observed) == run_module.MAX_PUBLICATION_FAILURES
-    if mode in {"restart", "group_restart", "abort_restart"}:
+    if mode in {"restart", "group_restart"}:
         # Keep all remote immutable bytes, but discard the complete local database.
         # Reconcile the recovered public prefix without HF/model inference.
         database = tmp_path / "recovered.db"
@@ -795,30 +757,15 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         if mode == "group_restart":
             assert recovered_ledger.disclosed_plan_digests == frozenset()
             group_failure_enabled = False
-        if mode == "abort_restart":
-            assert abort_event_failed and recovered_ledger.aborted
-            assert not any(key.endswith("/track-aborted.json") for key in transport.objects)
-            frozen_weights = transport.objects["isolated/slow-disclosure/weights.json"]
-            writes_before = len(transport.calls)
         asyncio.run(execute(once=True))
-        if mode == "abort_restart":
-            assert transport.objects["isolated/slow-disclosure/weights.json"] == frozen_weights
-            assert [call["Key"] for call in transport.calls[writes_before:]] == [
-                f"isolated/slow-disclosure/events/{case.track.track_id}/track-aborted.json"
-            ]
         with ChallengeStore(database, track_spec_digest=case.track.digest) as recovered:
             assert recovered.public_snapshot()["challenges"][0]["state"] == ChallengeState.SUCCEEDED
     weights = decode_weight_artifact(transport.objects["isolated/slow-disclosure/weights.json"])
-    if mode in {"abort", "abort_restart"}:
-        assert weights.track_aborted and weights.plan is None
-        assert weights.match_sequence == 0
-    else:
-        assert weights.match_sequence == 1 and weights.plan.uids == (1,)
-        with ChallengeStore(database, track_spec_digest=case.track.digest) as recovered:
-            assert recovered.publication_failures() == 0
+    assert weights.match_sequence == 1 and weights.plan.uids == (1,)
+    with ChallengeStore(database, track_spec_digest=case.track.digest) as recovered:
+        assert recovered.publication_failures() == 0
     ledger = asyncio.run(publisher.load(case.track))
     assert len(ledger.matches) == 1
-    assert ledger.aborted is (mode in {"abort", "abort_restart"})
     assert ledger.disclosed_plan_digests == frozenset(plan.plan_digest for plan in plans.values())
 
 
@@ -964,7 +911,6 @@ def test_ledger_outage_scanning_reserves_uid0_and_recovers_from_chain_failure(
     with ChallengeStore(database, track_spec_digest=track.digest) as store:
         snapshot = store.public_snapshot()
         assert snapshot["challenges"][0]["state"] == ChallengeState.REJECTED_DUPLICATE_HOTKEY
-        assert store.effective_challenge_count() == 0
         assert store.chain_cursor()[0] == finalized_height
     assert reports[0].publication_error == "public ledger temporarily unavailable"
     if not chain_outage:
@@ -998,7 +944,7 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
     class Publisher:
         async def load(self, _track):
             return SimpleNamespace(
-                matches=(), required_finalized_block=0, aborted=False, committed_match_count=0,
+                matches=(), required_finalized_block=0, committed_match_count=0,
             )
 
     track = SimpleNamespace(
@@ -1007,8 +953,6 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
         netuid=120,
         track_start_block=100,
         publication_grace_blocks=1,
-        maximum_effective_challenges=10,
-        maximum_generation_batches=10,
         model=SimpleNamespace(
             max_bytes=1_000,
             tensor_schema={},
@@ -1025,8 +969,6 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
             case_count=1,
         ),
         initial_champion=SimpleNamespace(hotkey="uid0-hotkey"),
-        last_submission_block=1_000,
-        track_close_block=2_000,
     )
     attempts = 0
     clients = 0
@@ -1248,14 +1190,10 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
         paused = asyncio.run(
             _complete_cycle(client, store, minimum_finalized_block=102, **arguments)
         )
-        closed = asyncio.run(_complete_cycle(client, store, track_close_block=100, **arguments))
-        aborted = asyncio.run(_complete_cycle(client, store, track_aborted=True, **arguments))
         first = asyncio.run(_complete_cycle(client, store, **arguments))
 
         assert paused.scan.submissions_found == 1
         assert paused.admission is paused.scoring is None
-        assert closed.admission is closed.scoring is None
-        assert aborted.admission is aborted.scoring is None
         assert first.scan.blocks_scanned == 0
         assert first.admission is not None
         assert first.admission.status is AdmissionStatus.ACCEPTED
@@ -1264,52 +1202,7 @@ def test_cycle_connects_finalized_scan_admission_and_scoring(tmp_path) -> None:
         assert store.leaderboard()[0].final_score == pytest.approx(0.7)
 
 
-def test_closed_track_rejects_scanned_late_work_and_ignores_new_commitments(tmp_path) -> None:
-    payload = ModelSubmission("owner/model", "12" * 20).encode()
-    blocks = {height: empty_chain_block(height) for height in range(100, 122)}
-    blocks[100] = chain_block(payload, 100)
-    blocks[121] = chain_block(payload, 121)
-    client = FakeClient(blocks)
-    external_calls = 0
-
-    def forbidden(*_args, **_kwargs):
-        nonlocal external_calls
-        external_calls += 1
-        raise AssertionError("closed tracks cannot start admission or scoring")
-
-    with ChallengeStore(tmp_path / "validator.db", track_spec_digest="ab" * 32) as store:
-        cycle = asyncio.run(
-            _complete_cycle(
-                client,
-                store,
-                netuid=7,
-                track_start_block=100,
-                track_close_block=120,
-                admission_settings=AdmissionSettings(
-                    cache_dir=tmp_path / "cache",
-                    max_model_bytes=10_000,
-                    tensor_schema={"selector.weight": TensorSpec((2, 3), "float32")},
-                    publication_grace_blocks=1,
-                    last_submission_block=99,
-                ),
-                scoring_settings=ScoringSettings(),
-                evaluator=forbidden,
-                worker_id="validator-a",
-                downloader=forbidden,
-            )
-        )
-
-        challenges = store.public_snapshot()["challenges"]
-        assert cycle.finalized_block == 121
-        assert cycle.admission is cycle.scoring is None
-        assert external_calls == 0
-        assert len(challenges) == 1
-        assert challenges[0]["block_height"] == 100
-        assert challenges[0]["state"] == ChallengeState.REJECTED_TRACK_CLOSED
-        assert challenges[0]["error_code"] == "TRACK_CLOSED"
-
-
-def test_cycle_does_not_commit_a_stage_after_the_track_closes(tmp_path) -> None:
+def test_cycle_commits_a_stage_even_when_the_chain_advances(tmp_path) -> None:
     model_path = tmp_path / "selector.safetensors"
     save_file(
         {"selector.weight": np.ones((2, 3), dtype=np.float32)},
@@ -1334,7 +1227,6 @@ def test_cycle_does_not_commit_a_stage_after_the_track_closes(tmp_path) -> None:
                 store,
                 netuid=7,
                 track_start_block=100,
-                track_close_block=120,
                 admission_settings=AdmissionSettings(
                     cache_dir=tmp_path / "cache",
                     max_model_bytes=10_000,
@@ -1356,12 +1248,11 @@ def test_cycle_does_not_commit_a_stage_after_the_track_closes(tmp_path) -> None:
 
         assert cycle.finalized_block == 150
         assert cycle.scoring is not None
-        assert cycle.scoring.state is ChallengeState.SYSTEM_DEFERRED
-        assert cycle.scoring.code == "TRACK_CLOSE_REACHED"
+        assert cycle.scoring.state is ChallengeState.SUCCEEDED
         challenge = store.public_snapshot()["challenges"][0]
-        assert challenge["state"] == ChallengeState.SYSTEM_DEFERRED
-        assert challenge["final_score"] is None
-        assert challenge["stages"] == []
+        assert challenge["state"] == ChallengeState.SUCCEEDED
+        assert challenge["final_score"] == 0.9
+        assert len(challenge["stages"]) == 1
 
 
 def test_full_challenge_lifecycle_survives_restart_and_produces_weight_plan(tmp_path) -> None:
@@ -1580,7 +1471,7 @@ def test_publication_gate_survives_restarts_and_republishes_before_work(monkeypa
             if load_fail:
                 raise RuntimeError("public ledger unavailable on restart")
             return SimpleNamespace(
-                matches=(), required_finalized_block=0, aborted=False, committed_match_count=0,
+                matches=(), required_finalized_block=0, committed_match_count=0,
             )
 
         async def publish(self, artifacts):

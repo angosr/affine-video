@@ -5,7 +5,7 @@ The video model and inference code are fixed; miners submit selector weights, no
 service. The current champion receives all weight allocated within this mechanism, not the
 entire subnet's weight. UID0 starts as champion using the official VEDA selector.
 
-- [Live track specification](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/track.json): authoritative model, scoring and season parameters.
+- [Live track specification](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/track.json): authoritative model and scoring parameters.
 - [Leaderboard and queue](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/status.json) · [Match summary](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/summary.json).
 - [VEDA research](https://veda-sparse.github.io/) · [Reference model](https://huggingface.co/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview).
 
@@ -112,15 +112,16 @@ through admission and durable archiving, confirmed by the `SCORING` state.
 
 ## Evaluation and rewards
 
-1. Submissions enter a queue ordered by finalized block, extrinsic and event position. The current
-   track permits at most **20 effective challenges**; see the live status for the submission
-   cutoff and season state. A submission is not a reservation until admitted.
+1. Submissions enter a continuously open queue ordered by finalized block, extrinsic and event
+   position. There is no submission deadline or competition-wide challenge limit. Each hotkey
+   still has one submission opportunity.
 2. Admission checks registration, competition eligibility, model format, hotkey binding and
    duplicate tensors. Re-signing an earlier model or copying the baseline is not a new model.
 3. Challenger and champion run on the same newly seeded batch: 16 videos across four strata,
    eight sampled layer/head routes and three denoising steps, giving 384 paired cases. The batch
    boundary follows the submission; its finalized block hash determines selection. Confidence
    bounds group correlated cases by video rather than treating all 384 cases as independent.
+   Confidence is specified per comparison, not as a lifetime false-promotion guarantee.
 4. Passing the attention-quality/cost gate schedules a separate later batch for complete
    eight-step video inference at all three budgets. Only a challenger exceeding the frozen
    paired improvement thresholds in both stages becomes champion. Ties retain the champion.
@@ -132,6 +133,10 @@ losses. Waiting for a batch is not a failed attempt. Data and replay references 
 after every challenge sharing that batch finishes. Quality metrics, budgets and thresholds are
 defined by the live track, not adjustable per submission. Scores from different batches are not
 directly comparable; promotion uses the paired comparison with the incumbent.
+
+Data is produced on demand without a final batch number. Prompts may recur, but each batch uses
+fresh block-derived generation seeds; a challenge's exact and confirmation batches use disjoint
+source families. This generates new rollouts, not an unlimited supply of new prompts.
 
 ## Watch the competition
 

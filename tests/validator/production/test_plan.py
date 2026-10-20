@@ -36,6 +36,7 @@ from validator.production.plan import (
     ReadySampleCache,
     build_audit_evidence_plan,
     build_plan,
+    confirmation_source_digests,
     generation_seed,
     scheduled_generation_block,
     select_query_tiles,
@@ -88,7 +89,7 @@ def scoring() -> ScoringSpec:
         tail_mean_weight=0.8,
         stratum_weights=(("16:9@37", 1.0),),
         minimum_frontier_gain=0.001,
-        season_false_promotion_alpha=0.05,
+        match_confidence=0.95,
         bootstrap_resamples=1000,
         bootstrap_seed=7,
     )
@@ -217,7 +218,7 @@ def test_query_selection_excludes_global_rows_and_reserves_reference_quota() -> 
     assert not set(selected) & {20, 21}
 
 
-def test_source_selection_never_reuses_a_family() -> None:
+def test_source_selection_excludes_the_same_matches_exact_families() -> None:
     first = proof(0).leaf
     second = SourceLeaf(
         "production",
@@ -238,7 +239,7 @@ def test_source_selection_never_reuses_a_family() -> None:
         strata=("16:9@37",),
         sources_per_stratum=1,
         batch_seed="12" * 32,
-        used_source_digests=frozenset({first.digest}),
+        excluded_source_digests=frozenset({first.digest}),
     )
 
     assert selected[0].leaf.source_family_id == "family-1"
@@ -250,7 +251,7 @@ def test_source_selection_never_reuses_a_family() -> None:
             strata=("16:9@37",),
             sources_per_stratum=1,
             batch_seed="12" * 32,
-            used_source_digests=frozenset({first.digest, second.digest}),
+            excluded_source_digests=frozenset({first.digest, second.digest}),
         )
 
 
@@ -264,7 +265,7 @@ def test_source_selection_is_reproducible_from_the_public_index() -> None:
         strata=("16:9@37",),
         sources_per_stratum=2,
         batch_seed="34" * 32,
-        used_source_digests=frozenset(),
+        excluded_source_digests=frozenset(),
     )
 
     expected = select_source_digests(
@@ -273,7 +274,7 @@ def test_source_selection_is_reproducible_from_the_public_index() -> None:
         strata=("16:9@37",),
         sources_per_stratum=2,
         batch_seed="34" * 32,
-        used_source_digests=frozenset(),
+        excluded_source_digests=frozenset(),
     )
 
     assert tuple(item.leaf.digest for item in selected) == expected
@@ -303,7 +304,7 @@ def test_source_selection_is_partition_explicit_and_audit_is_deterministic() -> 
         "strata": ("16:9@37",),
         "sources_per_stratum": 2,
         "batch_seed": generation_seed(track_digest, block_hash),
-        "used_source_digests": frozenset(),
+        "excluded_source_digests": frozenset(),
     }
 
     selected = select_source_proofs(
@@ -379,7 +380,7 @@ def test_source_selection_rejects_invalid_partition(partition) -> None:
         "strata": ("16:9@37",),
         "sources_per_stratum": 1,
         "batch_seed": "78" * 32,
-        "used_source_digests": frozenset(),
+        "excluded_source_digests": frozenset(),
     }
 
     with pytest.raises(ValueError, match="production or audit"):
@@ -432,7 +433,7 @@ def test_source_selection_sequence_rejects_a_member_chosen_out_of_order() -> Non
         strata=("16:9@37",),
         sources_per_stratum=2,
         batch_seed=generation_seed("ab" * 32, block_hash),
-        used_source_digests=frozenset(),
+        excluded_source_digests=frozenset(),
     )
     arguments = {
         "track_spec_digest": "ab" * 32,
@@ -811,10 +812,10 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
 
 
 @pytest.mark.parametrize("state", ["PLANNED", "READY"])
-@pytest.mark.parametrize("initially_closed", [False, True])
+@pytest.mark.parametrize("cursor_block", [200, 10_000_000])
 @pytest.mark.parametrize("newer_ready_count", [0, 2])
-def test_producer_close_stops_pending_work_and_releases_workers(
-    monkeypatch, tmp_path, state, initially_closed, newer_ready_count,
+def test_producer_continues_at_arbitrary_heights_and_releases_workers(
+    monkeypatch, tmp_path, state, cursor_block, newer_ready_count,
 ) -> None:
     plan = build_plan(
         track_spec_digest="ab" * 32, generation_block=120,
@@ -867,7 +868,7 @@ def test_producer_close_stops_pending_work_and_releases_workers(
         ))
     database = tmp_path / "validator.db"
     with ChallengeStore(database, track_spec_digest=plan.track_spec_digest) as store:
-        store.advance_chain_cursor(201 if initially_closed else 200, "0x" + "cd" * 32)
+        store.advance_chain_cursor(cursor_block, "0x" + "cd" * 32)
     objects = AttemptObjects({
         f"plans/{item.generation_block}.json": item.encode() for item in (plan, *newer)
     })
@@ -894,7 +895,7 @@ def test_producer_close_stops_pending_work_and_releases_workers(
     service.config = SimpleNamespace(
         validator_database=database, work_dir=tmp_path, poll_seconds=0.01,
     )
-    service.track = SimpleNamespace(digest=plan.track_spec_digest, track_close_block=200)
+    service.track = SimpleNamespace(digest=plan.track_spec_digest)
     service.objects = objects
     service.pool = None
     service.alert = None
@@ -905,32 +906,26 @@ def test_producer_close_stops_pending_work_and_releases_workers(
         stale_before_execution.append(abandoned.exists())
         progress_before_execution.append(saved_unit.read_bytes() if saved_unit.exists() else None)
         executions.append(plan.plan_digest)
-        assert len(executions) == 1, "no attempt may start after the close cursor"
-        with ChallengeStore(database, track_spec_digest=plan.track_spec_digest) as store:
-            store.advance_chain_cursor(201, "0x" + "ef" * 32)
+        assert len(executions) == 1
         return plan
 
     service._execute = execute
-
-    def sleep(_seconds):
-        assert len(executions) <= 1, "producer kept retrying after close"
 
     monkeypatch.setattr(production_service, "PlanCoordinator", Coordinator)
     monkeypatch.setattr(
         production_service, "WorkerPool",
         lambda *_args: SimpleNamespace(close=lambda: closed_workers.append(True)),
     )
-    monkeypatch.setattr(production_service.time, "sleep", sleep)
-    service._run_locked(once=False)
+    service._run_locked(once=True)
 
-    expected = 0 if initially_closed else 1
+    expected = 1
     assert len(executions) == len(closed_workers) == expected
     assert _plan_attempt_count(objects, plan) == expected
     assert objects.get("plans/120.json") == original
-    assert stale_before_execution == ([] if initially_closed else [False])
-    assert progress_before_execution == ([] if initially_closed else [b"completed unit progress"])
+    assert stale_before_execution == [False]
+    assert progress_before_execution == [b"completed unit progress"]
     assert saved_unit.read_bytes() == b"completed unit progress"
-    assert abandoned.exists() is initially_closed
+    assert not abandoned.exists()
     assert all(objects.get(name) == stored for name, stored, _plan in rows)
 
 
@@ -986,7 +981,7 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
     service.config = SimpleNamespace(
         validator_database="unused.db", poll_seconds=0.01, work_dir=tmp_path,
     )
-    service.track = SimpleNamespace(digest=plan.track_spec_digest, track_close_block=200)
+    service.track = SimpleNamespace(digest=plan.track_spec_digest)
     service.objects = AttemptObjects(durable)
     service.pool = None
     service.alert = None
@@ -1017,6 +1012,8 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
     )
 
     def elapsed(seconds):
+        if completed:
+            raise KeyboardInterrupt
         assert seconds <= 60
         sleeps.append(seconds)
         clock[0] += 3_600_000
@@ -1030,7 +1027,8 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
 
     monkeypatch.setattr(production_service.time, "sleep", elapsed)
     service._execute = execute
-    service._run_locked(once=False)
+    with pytest.raises(KeyboardInterrupt):
+        service._run_locked(once=False)
     assert completed == [True] and closed == [True, True]
     assert sleeps
     assert _plan_attempt_count(AttemptObjects(durable), plan) == 8
@@ -1044,12 +1042,13 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
             return super().create_plan(name, payload)
 
     # Two hosts reaching the same due probe cannot both reserve its ordinal.
+    clock[0] += 3_600_000
     assert _reserve_plan_attempt(RacingObjects(durable), plan, now_ms=clock[0]) is None
     assert _plan_attempt_count(AttemptObjects(durable), plan) == 9
 
 
 @pytest.mark.parametrize(
-    "phase", ["database", "cursor", "create", "list", "prune", "reserve", "timeout"],
+    "phase", ["database", "create", "list", "prune", "reserve", "timeout"],
 )
 @pytest.mark.parametrize("once", [False, True])
 def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
@@ -1091,10 +1090,6 @@ def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
         def __exit__(self, *_args):
             return None
 
-        def chain_cursor(self):
-            fail("cursor")
-            return (201 if completed else 120, "0x" + "cd" * 32)
-
     class Coordinator:
         def __init__(self, **_kwargs):
             pass
@@ -1131,7 +1126,7 @@ def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
     service.config = SimpleNamespace(
         validator_database="unused.db", poll_seconds=0.01, work_dir=tmp_path,
     )
-    service.track = SimpleNamespace(digest=plan.track_spec_digest, track_close_block=200)
+    service.track = SimpleNamespace(digest=plan.track_spec_digest)
     service.objects = AttemptObjects()
     service.pool = None
     service.alert = lambda *args: alerts.append(args)
@@ -1142,7 +1137,12 @@ def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
     monkeypatch.setattr(production_service, "_reserve_plan_attempt", reserve)
     monkeypatch.setattr(production_service, "_prune_local_work", prune)
     monkeypatch.setattr(production_service, "_PRODUCER_ATTEMPT_TIMEOUT_SECONDS", 0.02)
-    monkeypatch.setattr(production_service.time, "sleep", lambda seconds: sleeps.append(seconds))
+    def sleep(seconds):
+        if completed:
+            raise KeyboardInterrupt
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(production_service.time, "sleep", sleep)
     monkeypatch.setattr(
         production_service, "WorkerPool",
         lambda *_args: SimpleNamespace(close=lambda: None),
@@ -1155,7 +1155,8 @@ def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
         assert _plan_attempt_count(service.objects, plan) == 0
         assert [details["failures"] for _, details in alerts] == [1]
     else:
-        service._run_locked(once=False)
+        with pytest.raises(KeyboardInterrupt):
+            service._run_locked(once=False)
         assert completed == [plan.plan_digest]
         assert _plan_attempt_count(service.objects, plan) == 1
         assert len(failures) == 6
@@ -1360,7 +1361,7 @@ def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch, tmp
     service.config = SimpleNamespace(
         validator_database="unused.db", poll_seconds=0.01, work_dir=tmp_path,
     )
-    service.track = SimpleNamespace(digest=plan.track_spec_digest, track_close_block=200)
+    service.track = SimpleNamespace(digest=plan.track_spec_digest)
     service.objects = objects
     service.pool = None
     service.alert = lambda event, details: alerts.append((event, details))
@@ -2068,8 +2069,6 @@ def test_plan_coordinator_skips_empty_intervals_and_rejects_a_conflicting_winner
         source_pool_merkle_root=pool.root,
         source_commitments=source_commitments(pool),
         track_start_block=100,
-        maximum_generation_batches=2,
-        maximum_effective_challenges=2,
         cache=SimpleNamespace(
             generation_interval_blocks=20,
             minimum_generation_delay_blocks=1,
@@ -2080,6 +2079,9 @@ def test_plan_coordinator_skips_empty_intervals_and_rejects_a_conflicting_winner
 
     class Store:
         admission_complete = False
+
+        def production_trigger_blocks(self):
+            return (100, 120)
 
         def admission_interval_complete(self, _first, _last):
             return self.admission_complete
@@ -2191,8 +2193,6 @@ def test_plan_coordinator_maps_confirmation_from_its_exact_decision_block() -> N
         source_pool_merkle_root=pool.root,
         source_commitments=source_commitments(pool),
         track_start_block=100,
-        maximum_generation_batches=2,
-        maximum_effective_challenges=2,
         cache=SimpleNamespace(
             generation_interval_blocks=20,
             minimum_generation_delay_blocks=1,
@@ -2202,6 +2202,9 @@ def test_plan_coordinator_maps_confirmation_from_its_exact_decision_block() -> N
     )
 
     class Store:
+        def production_trigger_blocks(self):
+            return (100, 125)
+
         def admission_interval_complete(self, _first, _last):
             return True
 
@@ -2244,6 +2247,76 @@ def test_plan_coordinator_maps_confirmation_from_its_exact_decision_block() -> N
     assert plan.confirmation_challenge_ids == ("confirm-a",)
 
 
+@pytest.mark.parametrize("sequence", [1, 81, 10_000_000])
+def test_coordinator_plans_only_work_boundaries_without_a_final_batch(sequence) -> None:
+    pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
+    block = 100 + 20 * sequence
+    trigger = block - 5
+    track = SimpleNamespace(
+        digest="ab" * 32, source_pool_merkle_root=pool.root,
+        source_commitments=source_commitments(pool), track_start_block=100,
+        cache=SimpleNamespace(generation_interval_blocks=20, minimum_generation_delay_blocks=1),
+        scoring=scoring(),
+        model=SimpleNamespace(selector=SimpleNamespace(routes=("route-0", "route-1"))),
+    )
+    hashes = []
+    store = SimpleNamespace(
+        chain_cursor=lambda: (block, "0x" + f"{block:064x}"),
+        production_trigger_blocks=lambda: (trigger,),
+        finalized_block_hash=lambda height: hashes.append(height) or "0x" + f"{height:064x}",
+        admission_interval_complete=lambda *_args: True,
+        admitted_challenge_ids=lambda *_args: ("challenge",),
+        confirmation_challenge_ids=lambda *_args: (),
+    )
+    objects = SimpleNamespace(
+        list_names=lambda _prefix: (),
+        create_plan=lambda _name, payload: StoredObject(payload, "etag"),
+    )
+    coordinator = PlanCoordinator(track=track, store=store, objects=objects, source_pool=pool)
+    plan = coordinator.create_next()
+    assert plan is not None and plan.generation_block == block
+    assert hashes == [block]
+
+
+def test_repeated_source_pool_generates_fresh_rollouts_and_disjoint_confirmation() -> None:
+    pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
+    commitments = source_commitments(pool)
+    plans = []
+    rollout_ids, noise_seeds = set(), set()
+    for index in range(100):
+        challenge = f"challenge-{index}"
+        exact = None
+        for confirmation in (False, True):
+            block = 120 + 20 * len(plans)
+            block_hash = "0x" + f"{block:064x}"
+            confirmations = (challenge,) if confirmation else ()
+            selected = select_source_proofs(
+                pool, commitments=commitments, partition="production", strata=("16:9@37",),
+                sources_per_stratum=2, batch_seed=generation_seed("ab" * 32, block_hash),
+                excluded_source_digests=confirmation_source_digests(tuple(plans), confirmations),
+            )
+            plan = build_plan(
+                track_spec_digest="ab" * 32, generation_block=block, block_hash=block_hash,
+                track_start_block=100, minimum_generation_delay_blocks=1,
+                generation_interval_blocks=20,
+                exact_challenge_ids=() if confirmation else (challenge,),
+                confirmation_challenge_ids=confirmations, source_proofs=selected,
+                scoring=scoring(), available_routes=("route-0", "route-1"),
+            )
+            if confirmation:
+                assert exact.isdisjoint(item.leaf.source_family_id for item in selected)
+            else:
+                exact = {item.leaf.source_family_id for item in selected}
+            for rollout in plan.rollouts:
+                assert rollout.rollout_id not in rollout_ids
+                assert rollout.noise_seed not in noise_seeds
+                rollout_ids.add(rollout.rollout_id)
+                noise_seeds.add(rollout.noise_seed)
+            plans.append(plan)
+    validate_source_selection_sequence(tuple(plans), commitments=commitments, scoring=scoring())
+    assert len(plans) == 200
+
+
 def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
     challenge_id = "12" * 32
@@ -2266,8 +2339,6 @@ def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
         source_pool_merkle_root=pool.root,
         source_commitments=source_commitments(pool),
         track_start_block=100,
-        maximum_generation_batches=2,
-        maximum_effective_challenges=2,
         cache=SimpleNamespace(
             generation_interval_blocks=20,
             minimum_generation_delay_blocks=1,
@@ -2307,6 +2378,9 @@ def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
             assert identifier == challenge_id
             assert stage is ChallengeState.SCORING
             return self.transition_applied
+
+        def production_trigger_blocks(self):
+            return (125,)
 
         def chain_cursor(self):
             return (140, "0x" + "ef" * 32)
@@ -2446,8 +2520,6 @@ def test_terminal_public_stage_projection_matches_private_archive() -> None:
 def test_source_pool_capacity_is_proved_before_production_starts() -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(6)))
     track = SimpleNamespace(
-        maximum_generation_batches=2,
-        maximum_effective_challenges=1,
         scoring=SimpleNamespace(
             rollouts_per_stratum=2,
             stratum_weight_map={"16:9@37": 1.0},
@@ -2455,27 +2527,24 @@ def test_source_pool_capacity_is_proved_before_production_starts() -> None:
     )
 
     _validate_source_capacity(pool, track)
-    track.maximum_generation_batches = 2
-    track.scoring.rollouts_per_stratum = 3
-    with pytest.raises(ValueError, match="reserve batch"):
+    track.scoring.rollouts_per_stratum = 4
+    with pytest.raises(ValueError, match="two disjoint batches"):
         _validate_source_capacity(pool, track)
 
 
-def test_source_capacity_counts_only_possible_nonempty_plans() -> None:
+def test_source_capacity_is_independent_of_competition_duration() -> None:
     track = SimpleNamespace(
-        maximum_generation_batches=80,
-        maximum_effective_challenges=20,
         scoring=SimpleNamespace(
             rollouts_per_stratum=4,
             stratum_weight_map={"16:9@37": 1.0},
         ),
     )
     _validate_source_capacity(
-        SourcePool(tuple(proof(index).leaf for index in range(164))),
+        SourcePool(tuple(proof(index).leaf for index in range(8))),
         track,
     )
-    with pytest.raises(ValueError, match="reserve batch"):
+    with pytest.raises(ValueError, match="two disjoint batches"):
         _validate_source_capacity(
-            SourcePool(tuple(proof(index).leaf for index in range(163))),
+            SourcePool(tuple(proof(index).leaf for index in range(7))),
             track,
         )

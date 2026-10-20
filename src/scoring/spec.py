@@ -130,7 +130,7 @@ class ScoringSpec:
     tail_mean_weight: float
     stratum_weights: tuple[tuple[str, float], ...]
     minimum_frontier_gain: float
-    season_false_promotion_alpha: float
+    match_confidence: float
     bootstrap_resamples: int
     bootstrap_seed: int
 
@@ -159,9 +159,6 @@ class TrackSpec:
     mechid: int
     track_start_block: int
     publication_grace_blocks: int
-    maximum_generation_batches: int
-    maximum_effective_challenges: int
-    track_close_grace_blocks: int
     source_pool_merkle_root: str
     source_commitments: tuple[SourceCommitmentSpec, ...]
     artifact_manifest_sha256: str
@@ -174,95 +171,8 @@ class TrackSpec:
     digest: str
 
     @property
-    def alpha_per_match(self) -> float:
-        return self.scoring.season_false_promotion_alpha / self.maximum_effective_challenges
-
-    @property
-    def match_confidence(self) -> float:
-        return 1.0 - self.alpha_per_match
-
-    @property
-    def last_generation_block(self) -> int:
-        return (
-            self.track_start_block
-            + self.maximum_generation_batches * self.cache.generation_interval_blocks
-        )
-
-    @property
-    def last_submission_block(self) -> int:
-        # Strict FIFO means a challenger that clears exact scoring must finish its
-        # own later confirmation before the next challenger can advance.  Reserve
-        # one generation boundary per possible effective challenger so every
-        # accepted queue can drain by ``last_generation_block``.
-        return (
-            self.last_generation_block
-            - self.maximum_effective_challenges * self.cache.generation_interval_blocks
-            - self.cache.minimum_generation_delay_blocks
-        )
-
-    @property
-    def track_close_block(self) -> int:
-        return self.last_generation_block + self.track_close_grace_blocks
-
-    @property
     def source_commitment_documents(self) -> tuple[dict[str, str], ...]:
         return tuple(asdict(item) for item in self.source_commitments)
-
-    @property
-    def maximum_nonempty_production_batches(self) -> int:
-        """Bound exact plus next-batch confirmations for a fully used season."""
-
-        return maximum_nonempty_production_batches(
-            maximum_generation_batches=self.maximum_generation_batches,
-            maximum_effective_challenges=self.maximum_effective_challenges,
-        )
-
-    @property
-    def required_production_sources_per_stratum(self) -> int:
-        return required_production_sources_per_stratum(
-            maximum_generation_batches=self.maximum_generation_batches,
-            maximum_effective_challenges=self.maximum_effective_challenges,
-            rollouts_per_stratum=self.scoring.rollouts_per_stratum,
-        )
-
-
-def maximum_nonempty_production_batches(
-    *,
-    maximum_generation_batches: int,
-    maximum_effective_challenges: int,
-) -> int:
-    """Return the worst exact/confirmation plan count that can contain work."""
-
-    if (
-        type(maximum_generation_batches) is not int
-        or type(maximum_effective_challenges) is not int
-        or maximum_effective_challenges <= 0
-        or maximum_generation_batches <= maximum_effective_challenges
-    ):
-        raise ValueError("generation capacity must exceed the effective challenge limit")
-    return maximum_effective_challenges + min(
-        maximum_effective_challenges,
-        maximum_generation_batches - maximum_effective_challenges,
-    )
-
-
-def required_production_sources_per_stratum(
-    *,
-    maximum_generation_batches: int,
-    maximum_effective_challenges: int,
-    rollouts_per_stratum: int,
-) -> int:
-    """Include one full independent batch beyond worst-case season demand."""
-
-    if type(rollouts_per_stratum) is not int or rollouts_per_stratum <= 0:
-        raise ValueError("rollouts per stratum must be positive")
-    return (
-        maximum_nonempty_production_batches(
-            maximum_generation_batches=maximum_generation_batches,
-            maximum_effective_challenges=maximum_effective_challenges,
-        )
-        + 1
-    ) * rollouts_per_stratum
 
 
 def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
@@ -322,8 +232,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "cache",
             "full_video",
             "initial_champion",
-            "maximum_effective_challenges",
-            "maximum_generation_batches",
             "mechid",
             "model",
             "netuid",
@@ -331,7 +239,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
             "scoring",
             "source_commitments",
             "source_pool_merkle_root",
-            "track_close_grace_blocks",
             "track_id",
             "track_start_block",
         },
@@ -343,9 +250,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     netuid = _integer(root["netuid"], "netuid", minimum=0)
     if netuid > 0xFFFF:
         raise TrackSpecError("netuid must fit in an unsigned 16-bit integer")
-    maximum_effective = _integer(
-        root["maximum_effective_challenges"], "maximum_effective_challenges", minimum=1
-    )
     values = {
         "track_id": track_id,
         "netuid": netuid,
@@ -353,13 +257,6 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         "track_start_block": _integer(root["track_start_block"], "track_start_block", minimum=0),
         "publication_grace_blocks": _integer(
             root["publication_grace_blocks"], "publication_grace_blocks", minimum=1
-        ),
-        "maximum_generation_batches": _integer(
-            root["maximum_generation_batches"], "maximum_generation_batches", minimum=2
-        ),
-        "maximum_effective_challenges": maximum_effective,
-        "track_close_grace_blocks": _integer(
-            root["track_close_grace_blocks"], "track_close_grace_blocks", minimum=1
         ),
         "source_pool_merkle_root": _digest(
             root["source_pool_merkle_root"], "source_pool_merkle_root"
@@ -377,22 +274,13 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         raise TrackSpecError(
             "minimum generation delay must exceed the model publication grace period"
         )
-    if values["maximum_generation_batches"] <= maximum_effective:
-        raise TrackSpecError(
-            "maximum generation batches must leave one exact boundary and one "
-            "confirmation boundary per effective challenge"
-        )
-    values["scoring"] = _parse_scoring(root["scoring"], values["model"].selector, maximum_effective)
+    values["scoring"] = _parse_scoring(root["scoring"], values["model"].selector)
     values["source_commitments"] = _parse_source_commitments(
         root["source_commitments"],
         expected_root=values["source_pool_merkle_root"],
         strata=frozenset(values["scoring"].stratum_weight_map),
     )
-    required_sources = required_production_sources_per_stratum(
-        maximum_generation_batches=values["maximum_generation_batches"],
-        maximum_effective_challenges=maximum_effective,
-        rollouts_per_stratum=values["scoring"].rollouts_per_stratum,
-    )
+    required_sources = 2 * values["scoring"].rollouts_per_stratum
     for stratum in values["scoring"].stratum_weight_map:
         available = sum(
             item.partition == "production" and item.generation_geometry == stratum
@@ -400,8 +288,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         )
         if available < required_sources:
             raise TrackSpecError(
-                "production source commitments cannot cover maximum non-empty batches "
-                f"plus one reserve for stratum {stratum}"
+                f"production source commitments cannot cover two disjoint batches for {stratum}"
             )
     if values["full_video"].minimum_gain < values["scoring"].minimum_frontier_gain:
         raise TrackSpecError("full-video minimum gain cannot be lower than the exact-stage gate")
@@ -532,7 +419,6 @@ def _parse_cache(value: Any) -> CacheSpec:
 def _parse_scoring(
     value: Any,
     selector: SelectorArchitecture,
-    maximum_effective: int,
 ) -> ScoringSpec:
     raw = _object(
         value,
@@ -546,7 +432,7 @@ def _parse_scoring(
             "rollouts_per_stratum",
             "sampled_route_count",
             "sampled_step_count",
-            "season_false_promotion_alpha",
+            "match_confidence",
             "step_selection_algorithm",
             "stratum_weights",
             "tail_mean_weight",
@@ -588,15 +474,15 @@ def _parse_scoring(
         raise TrackSpecError(f"step selection algorithm must be {STEP_SELECTION_ALGORITHM}")
     if query_algorithm != QUERY_SELECTION_ALGORITHM:
         raise TrackSpecError(f"query tile algorithm must be {QUERY_SELECTION_ALGORITHM}")
-    season_alpha = _unit(
-        raw["season_false_promotion_alpha"],
-        "season_false_promotion_alpha",
+    confidence = _unit(
+        raw["match_confidence"],
+        "match_confidence",
         include_zero=False,
         include_one=False,
     )
     resamples = _integer(raw["bootstrap_resamples"], "bootstrap_resamples", minimum=1)
-    if resamples < ceil(10 / (season_alpha / maximum_effective)):
-        raise TrackSpecError("bootstrap_resamples is too small for the season error tail")
+    if resamples < ceil(10 / (1 - confidence) - 1e-9):
+        raise TrackSpecError("bootstrap_resamples is too small for the match error tail")
     return ScoringSpec(
         budgets,
         routes,
@@ -609,7 +495,7 @@ def _parse_scoring(
         _unit(raw["tail_mean_weight"], "tail_mean_weight"),
         _weights(raw["stratum_weights"], "stratum"),
         _unit(raw["minimum_frontier_gain"], "minimum_frontier_gain", include_zero=False),
-        season_alpha,
+        confidence,
         resamples,
         _integer(raw["bootstrap_seed"], "bootstrap_seed", minimum=0),
     )

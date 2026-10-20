@@ -152,7 +152,7 @@ def test_scanner_skips_empty_commitment_and_processes_the_next_block(
     assert empty.hotkey == HOTKEY
 
 
-def test_scanner_advances_without_recording_commitments_after_track_close(tmp_path) -> None:
+def test_scanner_keeps_recording_commitments_without_a_submission_deadline(tmp_path) -> None:
     payload = ModelSubmission("owner/model", "12" * 20).encode()
     blocks = {height: chain_block(payload, height) for height in range(100, 103)}
     client = FakeClient(blocks)
@@ -164,19 +164,18 @@ def test_scanner_advances_without_recording_commitments_after_track_close(tmp_pa
                 store,
                 netuid=7,
                 track_start_block=100,
-                submission_end_block=100,
             )
         )
 
         assert result.blocks_scanned == 3
-        assert result.submissions_found == 1
+        assert result.submissions_found == 3
         assert store.chain_cursor() == (102, blocks[102][0])
-        assert len(store.public_snapshot()["challenges"]) == 1
+        assert len(store.public_snapshot()["challenges"]) == 3
 
 
 @pytest.mark.parametrize("timelocked", [False, True])
 @pytest.mark.parametrize("valid_signature", [False, True])
-def test_legacy_exclusion_is_observed_after_track_close(
+def test_legacy_exclusion_is_observed_while_submissions_remain_open(
     tmp_path, monkeypatch, timelocked, valid_signature,
 ) -> None:
     payload = ModelSubmission("owner/model", "12" * 20).encode()
@@ -203,10 +202,10 @@ def test_legacy_exclusion_is_observed_after_track_close(
     )
     with ChallengeStore(tmp_path / "validator.db") as store:
         result = asyncio.run(scan_finalized_blocks(
-            client, store, netuid=7, track_start_block=100, submission_end_block=100,
+            client, store, netuid=7, track_start_block=100,
         ))
-        assert result.blocks_scanned == 3 and result.submissions_found == 1
-        assert len(store.public_snapshot()["challenges"]) == 1
+        assert result.blocks_scanned == 3 and result.submissions_found == 2
+        assert len(store.public_snapshot()["challenges"]) == 2
         assert store.chain_cursor() == (102, blocks[102][0])
         assert store.legacy_excluded_hotkeys() == (
             frozenset({HOTKEY}) if valid_signature else frozenset()
@@ -388,9 +387,8 @@ def test_scanner_binds_multiple_timelock_fields_in_event_order(tmp_path, same_pa
 
 
 @pytest.mark.parametrize("activation_first", [False, True])
-@pytest.mark.parametrize("submissions_closed", [False, True])
 def test_multiple_timelock_fields_cannot_hide_signed_legacy_activation(
-    tmp_path, activation_first, submissions_closed,
+    tmp_path, activation_first,
 ):
     import base64
 
@@ -423,7 +421,6 @@ def test_multiple_timelock_fields_cannot_hide_signed_legacy_activation(
     with ChallengeStore(tmp_path / "validator.db") as store:
         result = asyncio.run(scan_finalized_blocks(
             client, store, netuid=7, track_start_block=100,
-            submission_end_block=100 if submissions_closed else None,
         ))
         assert result.submissions_found == 1
         assert store.active_competitors({hotkey: 1}) == []

@@ -88,7 +88,7 @@ class ConfirmationWorkerPool:
                 budget.target_blocks: budget.calibrated_cost
                 for budget in self.track.scoring.budgets
             },
-            confidence=self.track.match_confidence,
+            confidence=self.track.scoring.match_confidence,
             resamples=self.track.scoring.bootstrap_resamples,
             seed=self.track.scoring.bootstrap_seed,
         )

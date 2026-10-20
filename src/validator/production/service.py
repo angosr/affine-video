@@ -29,7 +29,7 @@ from scoring.cache import (
     validate_exact_cache_references,
     write_exact_cache_batch,
 )
-from scoring.spec import TrackSpec, load_track_spec, required_production_sources_per_stratum
+from scoring.spec import TrackSpec, load_track_spec
 from validator.alerts import webhook_alerter
 from validator.production.batches import ready_objects
 from validator.production.commitment import (
@@ -48,6 +48,8 @@ from validator.production.plan import (
     ReadySampleCache,
     RolloutPlan,
     build_plan,
+    confirmation_source_digests,
+    scheduled_generation_block,
     select_source_proofs,
     submission_interval,
     validate_source_selection_sequence,
@@ -154,15 +156,20 @@ class PlanCoordinator:
             return None
         existing = self.plans()
         by_block = {plan.generation_block: plan for _, _, plan in existing}
-        used_source_digests = {
-            proof.leaf.digest for _, _, plan in existing for proof in plan.source_proofs
-        }
         cursor = self.store.chain_cursor()
         if cursor is None:
             return None
         interval = self.track.cache.generation_interval_blocks
-        for sequence in range(1, self.track.maximum_generation_batches + 1):
-            block = self.track.track_start_block + sequence * interval
+        boundaries = sorted({
+            scheduled_generation_block(
+                trigger,
+                track_start_block=self.track.track_start_block,
+                minimum_generation_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
+                generation_interval_blocks=interval,
+            )
+            for trigger in self.store.production_trigger_blocks()
+        })
+        for block in boundaries:
             if block in by_block:
                 continue
             if cursor[0] < block:
@@ -194,7 +201,9 @@ class PlanCoordinator:
                 strata=tuple(self.track.scoring.stratum_weight_map),
                 sources_per_stratum=self.track.scoring.rollouts_per_stratum,
                 batch_seed=seed,
-                used_source_digests=frozenset(used_source_digests),
+                excluded_source_digests=confirmation_source_digests(
+                    tuple(row[2] for row in existing), confirmation_ids,
+                ),
             )
             plan = build_plan(
                 track_spec_digest=self.track.digest,
@@ -456,9 +465,6 @@ class ProducerService:
                             track_spec_digest=self.track.digest,
                         ) as store,
                     ):
-                        cursor = store.chain_cursor()
-                        if cursor is not None and cursor[0] > self.track.track_close_block:
-                            return
                         coordinator = PlanCoordinator(
                             track=self.track,
                             store=store,
@@ -1253,11 +1259,7 @@ def _prune_local_work(root: Path, retained: frozenset[str]) -> None:
 
 
 def _validate_source_capacity(pool: SourcePool, track: TrackSpec) -> None:
-    required = required_production_sources_per_stratum(
-        maximum_generation_batches=track.maximum_generation_batches,
-        maximum_effective_challenges=track.maximum_effective_challenges,
-        rollouts_per_stratum=track.scoring.rollouts_per_stratum,
-    )
+    required = 2 * track.scoring.rollouts_per_stratum
     for stratum in track.scoring.stratum_weight_map:
         families = {
             leaf.source_family_id
@@ -1266,7 +1268,7 @@ def _validate_source_capacity(pool: SourcePool, track: TrackSpec) -> None:
         }
         if len(families) < required:
             raise ValueError(
-                f"source pool cannot cover the track plus one reserve batch for stratum {stratum}"
+                f"source pool cannot cover two disjoint batches for stratum {stratum}"
             )
 
 

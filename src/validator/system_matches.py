@@ -60,7 +60,7 @@ def system_match_artifacts(
             else track.scoring.minimum_frontier_gain
         )
         if (
-            record["confidence"] != track.match_confidence
+            record["confidence"] != track.scoring.match_confidence
             or record["minimum_gain"] != minimum_gain
             or tuple(record["budgets"])
             != tuple(budget.target_blocks for budget in track.scoring.budgets)

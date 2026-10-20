@@ -442,55 +442,6 @@ def test_concurrent_stale_summary_write_is_fenced() -> None:
     assert json.loads(client.objects["tracks/test/summary.json"])["source_block"] == 12
 
 
-def test_track_abort_fences_concurrent_stale_weight_refresh() -> None:
-    def encoded(value):
-        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-
-    track = encoded({"spec": {"track_id": "track"}, "track_spec_digest": "ab" * 32})
-
-    def artifacts(block, *, aborted=False):
-        plan = None if aborted else WeightPlan(block, ("hk",), (1,), (1.0,))
-        weights = encode_weight_artifact(
-            WeightArtifact("track", "ab" * 32, 7, 0, 0, block, plan, aborted)
-        )
-        return PublicArtifacts(
-            source_block=block,
-            track=track,
-            summary=encoded({"track_id": "track", "source_block": block, "match_count": 0}),
-            weights=weights,
-            matches=(),
-            abort=("events/track/track-aborted.json", encoded({"event": "TRACK_ABORTED"}))
-            if aborted
-            else None,
-        )
-
-    client = MemoryS3()
-    stale = S3Repository(client, bucket="public-data", prefix="tracks/test")
-    current = S3Repository(client, bucket="public-data", prefix="tracks/test")
-    asyncio.run(current.publish(artifacts(9)))
-
-    def interleave(arguments):
-        if arguments["Key"] != "tracks/test/weights.json" or "IfMatch" not in arguments:
-            return
-        client.before_put = None
-        asyncio.run(current.publish(artifacts(11, aborted=True)))
-
-    client.before_put = interleave
-    with pytest.raises(PublicArtifactError, match="fenced"):
-        asyncio.run(stale.publish(artifacts(10)))
-
-    published = decode_weight_artifact(client.objects["tracks/test/weights.json"])
-    assert published.source_block == 11
-    assert published.plan is None
-    assert published.track_aborted is True
-    assert "tracks/test/events/track/track-aborted.json" in client.objects
-
-    summary = client.objects["tracks/test/summary.json"]
-    with pytest.raises(PublicArtifactError, match="cannot resume"):
-        asyncio.run(current.publish(artifacts(12)))
-    assert client.objects["tracks/test/summary.json"] == summary
-
-
 def test_pointer_from_previous_track_cannot_overwrite_active_track() -> None:
     def encoded(value):
         return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -1010,16 +961,15 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
     assert len(restored) == (cache_state != "valid")
 
 
-@pytest.mark.parametrize("after_close", [False, True])
+@pytest.mark.parametrize("switch_block", [252, 1252])
 def test_legacy_switch_stops_rewards_without_rewriting_or_losing_match_history(
-    tmp_path, after_close,
+    tmp_path, switch_block,
 ) -> None:
     track = parse_track_spec(valid_spec())
     record = submission_at(101, hotkey="alice")
     model = tmp_path / "model.safetensors"
     model.write_bytes(b"model")
     model_sha = hashlib.sha256(model.read_bytes()).hexdigest()
-    switch_block = track.track_close_block + 1 if after_close else 252
     client = MemoryS3()
     repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
 
@@ -1093,61 +1043,12 @@ def test_legacy_switch_stops_rewards_without_rewriting_or_losing_match_history(
         assert store.active_competitors({"alice": 4}) == []
 
 
-def test_empty_track_publishes_uid_zero_veda_as_genesis_champion() -> None:
+@pytest.mark.parametrize("block", [120, 100_000_000])
+def test_empty_track_publishes_uid_zero_veda_as_genesis_champion(block) -> None:
     track = parse_track_spec(valid_spec())
-    store = SimpleNamespace(
-        chain_cursor=lambda: (120, "0x" + "12" * 32),
-        public_snapshot=lambda: {"challenges": []},
-        active_competitors=lambda _mapping: [],
-        legacy_excluded_hotkeys=lambda: frozenset(),
-    )
-    chain = WeightChainState(
-        120,
-        {track.initial_champion.hotkey: 0},
-        1,
-        1.0,
-        10,
-        {track.initial_champion.hotkey: 0},
-    )
-
-    artifacts = build_public_artifacts(store, track, chain, version_key=0)
-
-    assert artifacts is not None
-    weights = decode_weight_artifact(artifacts.weights)
-    summary = json.loads(artifacts.summary)
-    status = json.loads(artifacts.status)
-    assert weights.plan == WeightPlan(
-        120,
-        (track.initial_champion.hotkey,),
-        (0,),
-        (1.0,),
-    )
-    assert summary["match_count"] == 0
-    assert summary["champion"]["uid"] == 0
-    assert summary["champion"]["source"] == "VEDA_BASELINE"
-    assert status["participants"][0]["challenge_id"] == "genesis"
-    assert status["participants"][0]["champion"] is True
-    assert status["track_phase"] == "ACCEPTING"
-    assert status["last_submission_block"] == 896
-    assert status["track_close_block"] == 1150
-
-
-@pytest.mark.parametrize("event_failure", [False, True])
-def test_track_abort_stops_weight_refresh_after_close_grace(event_failure) -> None:
-    track = parse_track_spec(valid_spec())
-    snapshot = {
-        "challenges": [
-            {
-                "challenge_id": "blocked-challenge",
-                "submission_id": "blocked-submission",
-                "state": "SYSTEM_BLOCKED",
-            }
-        ]
-    }
-    block = track.track_close_block + 1
     store = SimpleNamespace(
         chain_cursor=lambda: (block, "0x" + "12" * 32),
-        public_snapshot=lambda: snapshot,
+        public_snapshot=lambda: {"challenges": []},
         active_competitors=lambda _mapping: [],
         legacy_excluded_hotkeys=lambda: frozenset(),
     )
@@ -1163,78 +1064,21 @@ def test_track_abort_stops_weight_refresh_after_close_grace(event_failure) -> No
     artifacts = build_public_artifacts(store, track, chain, version_key=0)
 
     assert artifacts is not None
-    assert decode_weight_artifact(artifacts.weights).plan is None
+    weights = decode_weight_artifact(artifacts.weights)
+    summary = json.loads(artifacts.summary)
     status = json.loads(artifacts.status)
-    assert status["track_phase"] == "TRACK_ABORTED"
-    assert status["abort"] == {
-        "reason": "UNFINISHED_SYSTEM_WORK_AFTER_CLOSE_GRACE",
-        "abort_block": track.track_close_block + 1,
-    }
-    assert artifacts.abort is not None
-
-    client = MemoryS3()
-    existing = encode_weight_artifact(
-        WeightArtifact(
-            track.track_id,
-            track.digest,
-            track.netuid,
-            track.mechid,
-            0,
-            block - 1,
-            WeightPlan(
-                block - 1,
-                (track.initial_champion.hotkey,),
-                (0,),
-                (1.0,),
-            ),
-        )
+    assert weights.plan == WeightPlan(
+        block,
+        (track.initial_champion.hotkey,),
+        (0,),
+        (1.0,),
     )
-    client.objects["tracks/test/weights.json"] = existing
-    repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
-    with pytest.raises(PublicArtifactError, match="null weight fence"):
-        asyncio.run(repository.finalize_abort(track))
-    if event_failure:
-        def fail_event(arguments):
-            if arguments["Key"].endswith("/track-aborted.json"):
-                client.before_put = None
-                raise OSError("interrupted after null weights and before abort event")
-
-        client.before_put = fail_event
-        with pytest.raises(OSError, match="interrupted"):
-            asyncio.run(repository.publish(artifacts))
-        assert f"tracks/test/{artifacts.abort[0]}" not in client.objects
-    else:
-        asyncio.run(repository.publish(artifacts))
-    stopped = decode_weight_artifact(client.objects["tracks/test/weights.json"])
-    assert stopped.source_block == block
-    assert stopped.plan is None
-    assert stopped.track_aborted is True
-
-    ledger = asyncio.run(repository.load(track))
-    assert ledger.aborted is True
-    weights_before = client.objects["tracks/test/weights.json"]
-    writes_before = len(client.calls)
-    asyncio.run(repository.finalize_abort(track))
-    assert client.objects[f"tracks/test/{artifacts.abort[0]}"] == artifacts.abort[1]
-    assert client.objects["tracks/test/weights.json"] == weights_before
-    assert [call["Key"] for call in client.calls[writes_before:]] == (
-        [f"tracks/test/{artifacts.abort[0]}"] if event_failure else []
-    )
-    recovered_store = SimpleNamespace(
-        chain_cursor=lambda: (block, "0x" + "12" * 32),
-        public_snapshot=lambda: {"challenges": []},
-        active_competitors=lambda _mapping: [],
-        legacy_excluded_hotkeys=lambda: frozenset(),
-    )
-    recovered = build_public_artifacts(
-        recovered_store,
-        track,
-        chain,
-        version_key=0,
-        track_aborted=ledger.aborted,
-    )
-    assert recovered is not None and decode_weight_artifact(recovered.weights).plan is None
-    assert json.loads(recovered.status)["track_phase"] == "TRACK_ABORTED"
+    assert summary["match_count"] == 0
+    assert summary["champion"]["uid"] == 0
+    assert summary["champion"]["source"] == "VEDA_BASELINE"
+    assert status["participants"][0]["challenge_id"] == "genesis"
+    assert status["participants"][0]["champion"] is True
+    assert status["track_phase"] == "ACCEPTING"
 
 
 def test_storage_loader_recovers_match_uploaded_before_mutable_summary(tmp_path) -> None:
@@ -1413,7 +1257,7 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         strata=tuple(track.scoring.stratum_weight_map),
         sources_per_stratum=track.scoring.rollouts_per_stratum,
         batch_seed=generation_seed(track.digest, block_hash),
-        used_source_digests=frozenset(),
+        excluded_source_digests=frozenset(),
     )
     plan = build_plan(
         track_spec_digest=track.digest,
@@ -1719,10 +1563,6 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         netuid=7,
         mechid=2,
         track_start_block=100,
-        maximum_generation_batches=10,
-        track_close_grace_blocks=50,
-        last_submission_block=999,
-        track_close_block=1150,
         initial_champion=SimpleNamespace(
             uid=0,
             hotkey="genesis-hotkey",

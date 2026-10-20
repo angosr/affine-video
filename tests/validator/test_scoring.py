@@ -72,7 +72,7 @@ def scoring_spec(*, routes: int, rollouts: int = 1) -> ScoringSpec:
         tail_mean_weight=0.8,
         stratum_weights=(("all", 1.0),),
         minimum_frontier_gain=0.001,
-        season_false_promotion_alpha=0.05,
+        match_confidence=0.95,
         bootstrap_resamples=20,
         bootstrap_seed=7,
     )
@@ -127,9 +127,6 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
         mechid=0,
         track_start_block=1,
         publication_grace_blocks=1,
-        maximum_generation_batches=10,
-        maximum_effective_challenges=1,
-        track_close_grace_blocks=10,
         source_pool_merkle_root="cd" * 32,
         source_commitments=(SourceCommitmentSpec("cd" * 32, "production", "all"),),
         artifact_manifest_sha256="ef" * 32,
@@ -215,11 +212,6 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
             "admission", lease_ms=1_000, ready_through_block=100, now_ms=2
         )
         assert lease is not None
-        assert store.reserve_season_slot(
-            identifier,
-            lease.lease_token,
-            maximum_effective_challenges=track.maximum_effective_challenges,
-        )
         store.record_downloaded_model(
             identifier,
             lease.lease_token,
@@ -1055,7 +1047,7 @@ def test_finite_overflowing_selector_finishes_once_and_releases_fifo(tmp_path) -
     track = SimpleNamespace(
         model=SimpleNamespace(selector=architecture),
         scoring=scoring_spec(routes=1, rollouts=4),
-        cache=SimpleNamespace(exact_max_bytes=1_000_000), match_confidence=0.95,
+        cache=SimpleNamespace(exact_max_bytes=1_000_000),
     )
     incumbent = replace(
         sample_task(), challenge_id="genesis", model_path=str(paths["baseline"]),

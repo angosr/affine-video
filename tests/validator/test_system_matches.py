@@ -75,7 +75,7 @@ def benchmark(monkeypatch):
         "hardware": "CPU synthetic fixture",
         "scope": "unit_test_not_gpu_acceptance",
         "phase": "exact",
-        "confidence": track.match_confidence,
+        "confidence": track.scoring.match_confidence,
         "minimum_gain": track.scoring.minimum_frontier_gain,
         "budgets": tuple(budget.target_blocks for budget in track.scoring.budgets),
         "cluster_unit": "source_video",

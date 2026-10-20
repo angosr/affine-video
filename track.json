@@ -15,9 +15,6 @@
   },
   "artifact_manifest_sha256": "8286478b5f5b65e2a4f34d1f51c0137af5ecec0ad3ff92332978d46ff502d65f",
   "source_pool_merkle_root": "11844a47d2e1ee5192a8b4b170fd396941313b4de9abdbbd5d0493f2b9026477",
-  "maximum_generation_batches": 80,
-  "maximum_effective_challenges": 20,
-  "track_close_grace_blocks": 3600,
   "initial_champion": {
     "evaluation_file_sha256": "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f",
     "file_sha256": "2a8d8845c5342756a2781e8e69563940e4bb573c9a40ebb534915ff8fd76573a",
@@ -78,7 +75,7 @@
     "rollouts_per_stratum": 4,
     "sampled_route_count": 8,
     "sampled_step_count": 3,
-    "season_false_promotion_alpha": 0.05,
+    "match_confidence": 0.9975,
     "step_selection_algorithm": "sha256-window-without-replacement-v1",
     "stratum_weights": {
       "1:1@72": 0.25,

@@ -55,7 +55,7 @@ def test_monitor_renders_all_active_competitors_in_uid_order() -> None:
     assert "do not affect tournament rank" in rendered
 
 
-@pytest.mark.parametrize("phase", ["SCHEDULED", "ACCEPTING", "DRAINING", "CLOSED", "TRACK_ABORTED"])
+@pytest.mark.parametrize("phase", ["SCHEDULED", "ACCEPTING"])
 def test_monitor_displays_only_the_reported_phase(phase):
     rendered = render_status(
         {"netuid": 120, "source_block": 12345, "track_phase": phase, "participants": []},

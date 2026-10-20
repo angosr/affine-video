@@ -88,7 +88,6 @@ class PublicArtifacts:
     system_matches: tuple[tuple[str, bytes], ...] = ()
     files: tuple[PublicFile, ...] = ()
     runtime_manifest: tuple[str, bytes] | None = None
-    abort: tuple[str, bytes] | None = None
     batch_groups: tuple[tuple[str, bytes], ...] = ()
 
 
@@ -104,7 +103,6 @@ class PublicFile:
 class PublicLedger:
     source_block: int | None
     matches: tuple[MatchRecord, ...]
-    aborted: bool = False
     disclosed_plan_digests: frozenset[str] = frozenset()
     committed_match_count: int = 0
 
@@ -137,7 +135,6 @@ def build_public_artifacts(
     match_limit: int | None = None,
     model_resolver: Callable[[str, int], Path] | None = None,
     runtime_manifest: bytes | None = None,
-    track_aborted: bool = False,
     release_approval: ReleaseApproval | None = None,
     system_matches: tuple[tuple[str, bytes], ...] = (),
 ) -> PublicArtifacts | None:
@@ -148,14 +145,6 @@ def build_public_artifacts(
     if cursor is None or cursor[0] != chain.finalized_block:
         return None
     snapshot = store.public_snapshot()
-    unfinished = [
-        challenge
-        for challenge in snapshot["challenges"]
-        if challenge["state"] not in {state.value for state in TERMINAL_STATES}
-    ]
-    aborted = track_aborted or (
-        chain.finalized_block > track.track_close_block and bool(unfinished)
-    )
     initial = genesis_champion(track)
     if match_limit is not None and (type(match_limit) is not int or match_limit < 0):
         raise ValueError("public match limit must be a non-negative integer")
@@ -174,30 +163,28 @@ def build_public_artifacts(
     if any(match.document["decided_block"] > chain.finalized_block for match in tournament.matches):
         raise PublicArtifactError("a terminal decision is newer than the finalized chain snapshot")
     match_sequence, terminal_match_sha256 = _terminal_match_fence(tournament)
-    plan = None
-    if not aborted:
-        # Contest switches withdraw rewards without rewriting historical matches.
-        excluded = store.legacy_excluded_hotkeys()
-        eligible_uids = {
-            hotkey: uid
-            for hotkey, uid in chain.uid_by_hotkey.items()
-            if hotkey not in excluded or hotkey == initial.hotkey
-        }
+    # Contest switches withdraw rewards without rewriting historical matches.
+    excluded = store.legacy_excluded_hotkeys()
+    eligible_uids = {
+        hotkey: uid
+        for hotkey, uid in chain.uid_by_hotkey.items()
+        if hotkey not in excluded or hotkey == initial.hotkey
+    }
+    plan = plan_champion_weight(
+        tournament.champion,
+        uid_by_hotkey=eligible_uids,
+        current_block=chain.finalized_block,
+        min_allowed_weights=chain.min_allowed_weights,
+        max_weight=chain.max_weight,
+    )
+    if plan is None and tournament.champion.challenge_id != initial.challenge_id:
         plan = plan_champion_weight(
-            tournament.champion,
+            initial,
             uid_by_hotkey=eligible_uids,
             current_block=chain.finalized_block,
             min_allowed_weights=chain.min_allowed_weights,
             max_weight=chain.max_weight,
         )
-        if plan is None and tournament.champion.challenge_id != initial.challenge_id:
-            plan = plan_champion_weight(
-                initial,
-                uid_by_hotkey=eligible_uids,
-                current_block=chain.finalized_block,
-                min_allowed_weights=chain.min_allowed_weights,
-                max_weight=chain.max_weight,
-            )
     artifact = WeightArtifact(
         track_id=track.track_id,
         track_spec_digest=track.digest,
@@ -206,7 +193,6 @@ def build_public_artifacts(
         version_key=version_key,
         source_block=chain.finalized_block,
         plan=plan,
-        track_aborted=aborted,
         match_sequence=match_sequence,
         terminal_match_sha256=terminal_match_sha256,
     )
@@ -218,7 +204,6 @@ def build_public_artifacts(
         tournament,
         store.active_competitors(chain.uid_by_hotkey),
         snapshot["challenges"],
-        track_aborted=aborted,
         system_matches=system_match_summaries(system_matches),
     )
     files: dict[str, PublicFile] = {}
@@ -255,7 +240,6 @@ def build_public_artifacts(
         system_matches=system_matches,
         files=tuple(files.values()),
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
-        abort=_track_abort_artifact(track) if aborted else None,
     )
 
 
@@ -750,15 +734,6 @@ class S3Repository:
         weight_fence = decode_weight_artifact(artifacts.weights)
         if weight_fence.track_id != track_id:
             raise PublicArtifactError("public weights target a different track")
-        abort_name = f"events/{track_id}/track-aborted.json"
-        if artifacts.abort is None:
-            if weight_fence.track_aborted:
-                raise PublicArtifactError("track-aborted weights require the immutable event")
-            existing_abort = await asyncio.to_thread(self._get_optional, abort_name)
-            if existing_abort is not None:
-                raise PublicArtifactError("an aborted public track cannot resume")
-        elif artifacts.abort[0] != abort_name or not weight_fence.track_aborted:
-            raise PublicArtifactError("track abort requires its null weight fence")
         if artifacts.runtime_manifest is not None:
             await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
         for artifact in artifacts.files:
@@ -773,8 +748,6 @@ class S3Repository:
         await self.stage(artifacts)
         await asyncio.to_thread(self._put_mutable, "track.json", artifacts.track)
         await asyncio.to_thread(self._put_mutable, "weights.json", artifacts.weights)
-        if artifacts.abort is not None:
-            await asyncio.to_thread(self._put_immutable, *artifacts.abort)
         await asyncio.to_thread(self._put_mutable, "summary.json", artifacts.summary)
         status = artifacts.status
         if status is not None and (artifacts.system_matches or self._system_match_cache):
@@ -1045,19 +1018,18 @@ class S3Repository:
         complete_matches = tuple(matches)
         return self._recovered_ledger(
             track, complete_matches, source_block=source_block,
-            committed_count=match_count, aborted=self._load_track_abort(track),
+            committed_count=match_count,
         )
 
     def _uncommitted_ledger(self, track: TrackSpec) -> PublicLedger:
         matches = tuple(self._load_following_matches(track, 1, genesis_champion(track)))
         return self._recovered_ledger(
             track, matches, source_block=None, committed_count=0,
-            aborted=self._load_track_abort(track),
         )
 
     def _recovered_ledger(
         self, track: TrackSpec, matches: tuple[MatchRecord, ...], *,
-        source_block: int | None, committed_count: int, aborted: bool,
+        source_block: int | None, committed_count: int,
     ) -> PublicLedger:
         self._verify_model_archives(matches)
         disclosures = self._load_batch_disclosures(track, matches)
@@ -1086,40 +1058,9 @@ class S3Repository:
                 raise PublicArtifactError("public weight fence does not bind its immutable prefix")
             committed_count = max(committed_count, count)
             source_block = max(0 if source_block is None else source_block, weights.source_block)
-            aborted = aborted or weights.track_aborted
         return PublicLedger(
-            source_block, matches, aborted, disclosures, committed_count,
+            source_block, matches, disclosures, committed_count,
         )
-
-    async def finalize_abort(self, track: TrackSpec) -> None:
-        """Finish an interrupted terminal event; never refresh or revive weights."""
-
-        await asyncio.to_thread(self._finalize_abort, track)
-
-    def _finalize_abort(self, track: TrackSpec) -> None:
-        if self._load_track_abort(track):
-            return
-        payload = self._get_optional("weights.json")
-        if payload is None:
-            raise PublicArtifactError("track abort requires its durable null weight fence")
-        fence = decode_weight_artifact(payload)
-        if (
-            fence.track_id != track.track_id or fence.track_spec_digest != track.digest
-            or fence.netuid != track.netuid or fence.mechid != track.mechid
-            or not fence.track_aborted or fence.plan is not None
-        ):
-            raise PublicArtifactError("track abort requires its durable null weight fence")
-        self._put_immutable(*_track_abort_artifact(track))
-
-    def _load_track_abort(self, track: TrackSpec) -> bool:
-        name, expected = _track_abort_artifact(track)
-        payload = self._get_optional(name)
-        if payload is None:
-            return False
-        if payload != expected:
-            raise PublicArtifactError("public track-abort fact is invalid")
-        self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
-        return True
 
     def _load_following_matches(
         self,
@@ -1590,26 +1531,11 @@ def _status_document(
     competitors: list[dict[str, Any]],
     challenges: list[dict[str, Any]],
     *,
-    track_aborted: bool = False,
     system_matches: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Build the bounded live view used by the operator monitor."""
 
-    unfinished = [
-        challenge
-        for challenge in challenges
-        if challenge["state"] not in {state.value for state in TERMINAL_STATES}
-    ]
-    if track_aborted or (source_block > track.track_close_block and unfinished):
-        phase = "TRACK_ABORTED"
-    elif source_block < track.track_start_block:
-        phase = "SCHEDULED"
-    elif source_block <= track.last_submission_block:
-        phase = "ACCEPTING"
-    elif source_block <= track.track_close_block:
-        phase = "DRAINING"
-    else:
-        phase = "CLOSED"
+    phase = "SCHEDULED" if source_block < track.track_start_block else "ACCEPTING"
     challenge_by_id = {item["submission_id"]: item for item in challenges}
     match_by_id = {item.challenge_id: item for item in tournament.matches}
     initial = genesis_champion(track)
@@ -1690,35 +1616,10 @@ def _status_document(
         "netuid": track.netuid,
         "source_block": source_block,
         "track_phase": phase,
-        "last_submission_block": track.last_submission_block,
-        "track_close_block": track.track_close_block,
-        "abort": (
-            None
-            if phase != "TRACK_ABORTED"
-            else {
-                "reason": "UNFINISHED_SYSTEM_WORK_AFTER_CLOSE_GRACE",
-                "abort_block": track.track_close_block + 1,
-            }
-        ),
         "champion": tournament.champion.public(),
         "system_matches": system_matches,
         "participants": active_rows,
     }
-
-
-def _track_abort_artifact(track: TrackSpec) -> tuple[str, bytes]:
-    return (
-        f"events/{track.track_id}/track-aborted.json",
-        _json_bytes(
-            {
-                "event": "TRACK_ABORTED",
-                "reason": "UNFINISHED_SYSTEM_WORK_AFTER_CLOSE_GRACE",
-                "track_id": track.track_id,
-                "track_spec_digest": track.digest,
-                "abort_block": track.track_close_block + 1,
-            }
-        ),
-    )
 
 
 def _decode_canonical_object(payload: bytes, name: str) -> dict[str, Any]:

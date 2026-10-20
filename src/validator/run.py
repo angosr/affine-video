@@ -41,7 +41,7 @@ from validator.publication import (
     resolve_public_disclosures,
     validate_public_weights_url,
 )
-from validator.queue import TERMINAL_STATES, ChallengeState
+from validator.queue import TERMINAL_STATES
 from validator.release import PRODUCTION_NETUID, require_release_approval
 from validator.scoring import (
     EvaluatedStage,
@@ -292,8 +292,6 @@ async def run_evaluator(
         while True:
             try:
                 ledger = await publisher.load(track)
-                if ledger.aborted:
-                    await publisher.finalize_abort(track)
                 break
             except Exception as exc:
                 _record_publication_failure(recovery_store, alert, exc)
@@ -305,7 +303,6 @@ async def run_evaluator(
                         scan = await scan_finalized_blocks(
                             client, recovery_store, netuid=track.netuid,
                             track_start_block=track.track_start_block,
-                            submission_end_block=track.track_close_block,
                             max_blocks=max_scan_blocks,
                         )
                         finalized_block = await client.finalized_block()
@@ -399,8 +396,6 @@ async def run_evaluator(
         max_model_bytes=track.model.max_bytes,
         tensor_schema=track.model.tensor_schema,
         publication_grace_blocks=track.publication_grace_blocks,
-        maximum_effective_challenges=track.maximum_effective_challenges,
-        last_submission_block=track.last_submission_block,
         alert=alert,
         archive=None if batch_source is None else batch_source.archive_model,
         archive_rejection=None if batch_source is None else batch_source.archive_rejection,
@@ -441,7 +436,6 @@ async def run_evaluator(
         # Join the owner before closing its confirmation processes or main connection.
         resources.callback(work.close)
         recovery_index = 0
-        track_aborted = ledger.aborted
         publication: PublicArtifacts | None = None
         published_match_count = ledger.committed_match_count
         staged_match_count = published_match_count
@@ -466,7 +460,7 @@ async def run_evaluator(
                 system_match_task = None
             now = asyncio.get_running_loop().time()
             if (
-                not track_aborted and system_match_loader is not None
+                system_match_loader is not None
                 and system_match_task is None and now >= next_system_match_refresh
             ):
                 system_match_task = asyncio.create_task(
@@ -482,12 +476,6 @@ async def run_evaluator(
         def start_publication() -> asyncio.Task[PublicArtifacts]:
             assert pending_artifacts is not None
             artifacts = pending_artifacts
-            if publication is not None and publication.abort is not None:
-                # Finish historical uploads behind the irreversible null-weight
-                # fence; never retry them as a request to resume the track.
-                artifacts = replace(
-                    artifacts, abort=publication.abort, weights=publication.weights,
-                )
             return asyncio.create_task(_stage_publication(
                 artifacts,
                 terminal_ids=frozenset(
@@ -505,13 +493,6 @@ async def run_evaluator(
                     await asyncio.shield(publication_task)
                 except Exception as exc:
                     _record_publication_failure(store, alert, exc)
-                    # One bounded shutdown attempt handles a lost PUT response.
-                    # Persistent outages remain recorded for restart recovery.
-                    if publication is not None and publication.abort is not None:
-                        try:
-                            await asyncio.shield(start_publication())
-                        except Exception as retry_exc:
-                            _record_publication_failure(store, alert, retry_exc)
 
         resources.push_async_callback(finish_publication)
         resources.push_async_callback(close_system_match_refresh)
@@ -525,11 +506,6 @@ async def run_evaluator(
                         finalized_block = await client.finalized_block()
                         if finalized_block >= track.track_start_block:
                             break
-                        if track_aborted:
-                            if once:
-                                return
-                            await asyncio.sleep(poll_seconds)
-                            continue
                         chain = await read_weight_chain_state(
                             client,
                             netuid=track.netuid,
@@ -593,8 +569,6 @@ async def run_evaluator(
                                 ledger.required_finalized_block,
                                 0 if publication is None else publication.source_block + 1,
                             ),
-                            track_close_block=track.track_close_block,
-                            track_aborted=track_aborted,
                         )
                         recovery_index += result.restored_matches
                         refresh_system_matches()
@@ -615,7 +589,7 @@ async def run_evaluator(
                                 if (
                                     publication_task is not None and publication_task.done()
                                     and (
-                                        track_aborted or publication is None
+                                        publication is None
                                         or chain.finalized_block > publication.source_block
                                     )
                                 ):
@@ -644,7 +618,6 @@ async def run_evaluator(
                                         ),
                                         "runtime_manifest": runtime_manifest_payload,
                                         "system_matches": system_matches,
-                                        "track_aborted": track_aborted,
                                         "release_approval": getattr(
                                             publisher, "release_approval", None,
                                         ),
@@ -663,7 +636,6 @@ async def run_evaluator(
                                                 len(candidate.matches) > published_match_count
                                                 or reconcile_publication
                                             )
-                                            and (candidate.abort is None or track_aborted)
                                         ):
                                             pending_artifacts = candidate
                                             reconcile_publication = False
@@ -686,21 +658,14 @@ async def run_evaluator(
                                     publication = None
                                     continue
                                 artifacts = publication
-                                if artifacts is not None and track_aborted:
-                                    # Aborted tracks may finish immutable history,
-                                    # but must never refresh mutable reward pointers.
-                                    if pending_artifacts is not None and publication_task is None:
-                                        publication_task = start_publication()
-                                elif artifacts is not None:
+                                if artifacts is not None:
                                     await publisher.publish(artifacts)
                                     # publish() completes the full continuous match prefix,
                                     # disclosures and fenced pointers before clearing this gate.
                                     published_match_count = staged_match_count
                                     if pending_artifacts is None:
                                         store.publication_succeeded()
-                                    if artifacts.abort is not None:
-                                        track_aborted = True
-                                    elif pending_artifacts is not None and publication_task is None:
+                                    if pending_artifacts is not None and publication_task is None:
                                         publication_task = start_publication()
                                     if (
                                         batch_source is not None and pending_artifacts is None
@@ -927,32 +892,23 @@ async def process_cycle(
     max_scan_blocks: int = 100,
     recovery_matches: Sequence[MatchRecord] = (),
     minimum_finalized_block: int = 0,
-    track_close_block: int | None = None,
-    track_aborted: bool = False,
 ) -> EvaluationCycleResult:
     """Scan/publish independently of one leased FIFO task; commit on the owner loop."""
 
-    admission_settings = work.admission_settings
     scoring_settings = work.scoring_settings
     if minimum_finalized_block < 0:
         raise ValueError("minimum finalized block cannot be negative")
     if type(published_match_count) is not int or published_match_count < 0:
         raise ValueError("published match count must be a non-negative integer")
-    if track_close_block is not None and track_close_block < 0:
-        raise ValueError("track close block cannot be negative")
     scan = await scan_finalized_blocks(
         client,
         store,
         netuid=netuid,
         track_start_block=track_start_block,
-        submission_end_block=track_close_block,
         max_blocks=max_scan_blocks,
     )
     finalized_block = await client.finalized_block()
-    restored_matches = store.restore_public_matches(
-        recovery_matches,
-        maximum_effective_challenges=admission_settings.maximum_effective_challenges,
-    )
+    restored_matches = store.restore_public_matches(recovery_matches)
     cursor = store.chain_cursor()
     if (
         finalized_block < minimum_finalized_block
@@ -967,22 +923,16 @@ async def process_cycle(
             None,
             restored_matches=restored_matches,
         )
-    track_closed = track_close_block is not None and finalized_block > track_close_block
     terminal_prefix = 0
     for challenge in store.public_snapshot()["challenges"]:
         if challenge["state"] not in TERMINAL_STATES:
             break
         terminal_prefix += 1
     work.allowed = not (
-        work_paused or terminal_prefix > published_match_count or track_aborted or track_closed
+        work_paused or terminal_prefix > published_match_count
         or store.publication_failures() >= MAX_PUBLICATION_FAILURES
     )
-    if track_closed and admission_settings.last_submission_block is not None:
-        store.reject_submissions_after(
-            admission_settings.last_submission_block,
-            decision_block=finalized_block,
-        )
-    if not work.allowed and not ((track_aborted or track_closed) and work.done):
+    if not work.allowed:
         return EvaluationCycleResult(
             finalized_block,
             scan,
@@ -1010,30 +960,12 @@ async def process_cycle(
                 summary=str(exc) or type(exc).__name__,
             )
         else:
-            if track_aborted or (
-                track_close_block is not None and finalized_block > track_close_block
-            ):
-                reason = "TRACK_ABORTED" if track_aborted else "TRACK_CLOSE_REACHED"
-                wait_at = evaluated.clock()
-                store.wait_leased(
-                    evaluated.task.challenge_id,
-                    evaluated.task.lease_token,
-                    retry_after_ms=wait_at + scoring_settings.retry_base_ms,
-                    reason=reason,
-                    occurred_at_ms=wait_at,
-                )
-                scoring = ScoringOutcome(
-                    evaluated.task.challenge_id,
-                    ChallengeState.SYSTEM_DEFERRED,
-                    reason,
-                )
-            else:
-                scoring = commit_evaluated_scoring(
-                    store,
-                    evaluated,
-                    current_finalized_block=finalized_block,
-                    settings=scoring_settings,
-                )
+            scoring = commit_evaluated_scoring(
+                store,
+                evaluated,
+                current_finalized_block=finalized_block,
+                settings=scoring_settings,
+            )
     else:
         scoring = evaluated
     return EvaluationCycleResult(

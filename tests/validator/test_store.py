@@ -64,33 +64,6 @@ def test_submission_replay_is_idempotent(tmp_path) -> None:
         assert len(store.challenge_events(identifier)) == 1
 
 
-def test_late_submissions_are_terminalized_atomically(tmp_path) -> None:
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        eligible, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
-        late, _ = store.add_submission(
-            submission_at(121, hotkey="late-hotkey"), occurred_at_ms=20
-        )
-
-        assert (
-            store.reject_submissions_after(
-                120,
-                decision_block=130,
-                occurred_at_ms=30,
-            )
-            == 1
-        )
-        assert store.reject_submissions_after(120, decision_block=130) == 0
-        assert store.get_challenge(eligible).state is ChallengeState.QUEUED
-        rejected = store.get_challenge(late)
-        assert rejected.state is ChallengeState.REJECTED_TRACK_CLOSED
-        assert rejected.error_code == "TRACK_CLOSED"
-        assert rejected.score_block == 130
-        assert [event.state for event in store.challenge_events(late)] == [
-            ChallengeState.QUEUED,
-            ChallengeState.REJECTED_TRACK_CLOSED,
-        ]
-
-
 def test_transition_updates_projection_and_appends_history(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(make_submission(), occurred_at_ms=10)
@@ -285,11 +258,6 @@ def test_model_owner_lookup_validates_and_returns_the_registered_challenge(tmp_p
             "worker", lease_ms=1_000, ready_through_block=1_000, now_ms=13
         )
         assert task is not None
-        assert store.reserve_season_slot(
-            identifier,
-            task.lease_token,
-            maximum_effective_challenges=None,
-        )
         digest = "ab" * 32
         registration = store.register_validated_model(
             identifier,
@@ -303,56 +271,6 @@ def test_model_owner_lookup_validates_and_returns_the_registered_challenge(tmp_p
         assert store.model_owner("cd" * 32) is None
         with pytest.raises(ValueError, match="digest"):
             store.model_owner("bad")
-
-
-def test_season_reservation_enforces_capacity_before_model_registration(tmp_path) -> None:
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        first_id, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
-        second_id, _ = store.add_submission(
-            submission_at(101, hotkey="hk2"), occurred_at_ms=11
-        )
-        store.transition(first_id, ChallengeState.FETCHING, occurred_at_ms=12)
-        store.transition(first_id, ChallengeState.VALIDATING, occurred_at_ms=13)
-        first = store.claim_next_admission(
-            "worker", lease_ms=1_000, ready_through_block=1_000, now_ms=14
-        )
-        assert first is not None
-        assert store.reserve_season_slot(
-            first_id,
-            first.lease_token,
-            maximum_effective_challenges=1,
-        )
-        assert store.register_validated_model(
-            first_id,
-            first.lease_token,
-            model_digest="ab" * 32,
-            occurred_at_ms=15,
-        ).accepted
-
-        store.transition(second_id, ChallengeState.FETCHING, occurred_at_ms=16)
-        store.transition(second_id, ChallengeState.VALIDATING, occurred_at_ms=17)
-        second = store.claim_next_admission(
-            "worker", lease_ms=1_000, ready_through_block=1_000, now_ms=18
-        )
-        assert second is not None
-        reserved = store.reserve_season_slot(
-            second_id,
-            second.lease_token,
-            maximum_effective_challenges=1,
-        )
-
-        assert not reserved
-        assert store.effective_challenge_count() == 1
-        assert not store.has_season_slot(second_id)
-        assert store.model_owner("cd" * 32) is None
-        assert store.get_challenge(second_id).state is ChallengeState.VALIDATING
-        with pytest.raises(RuntimeError, match="no reserved season slot"):
-            store.register_validated_model(
-                second_id,
-                second.lease_token,
-                model_digest="cd" * 32,
-                occurred_at_ms=19,
-            )
 
 
 def test_uid_zero_baseline_hotkey_is_cleanly_rejected_as_duplicate(tmp_path) -> None:
@@ -554,7 +472,7 @@ def test_later_participant_failure_preserves_previous_authoritative_score(tmp_pa
         assert store.leaderboard()[0].final_score == 0.9
 
 
-def test_failed_admission_public_match_does_not_consume_season_slot(tmp_path) -> None:
+def test_failed_admission_public_match_restores_without_model_ownership(tmp_path) -> None:
     digest = "ab" * 32
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest=digest) as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
@@ -579,12 +497,9 @@ def test_failed_admission_public_match_does_not_consume_season_slot(tmp_path) ->
         assert (
             store.restore_public_matches(
                 tournament.matches,
-                maximum_effective_challenges=1,
             )
             == 1
         )
-        assert not store.has_season_slot(identifier)
-        assert store.effective_challenge_count() == 0
         assert store.model_owner("ef" * 32) is None
 
 
@@ -640,22 +555,18 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
         assert (
             store.restore_public_matches(
                 tournament.matches,
-                maximum_effective_challenges=1,
             )
             == 1
         )
         assert (
             store.restore_public_matches(
                 tournament.matches,
-                maximum_effective_challenges=1,
             )
             == 1
         )
         restored = store.get_challenge(identifier)
         assert restored.state is ChallengeState.SUCCEEDED
         assert restored.final_score == 0.8
-        assert store.effective_challenge_count() == 1
-        assert store.has_season_slot(identifier)
         assert store.leaderboard()[0].challenge_id == identifier
         assert [stage["stage"] for stage in store.public_challenge(identifier)["stages"]] == [
             ChallengeState.SCORING
@@ -781,11 +692,6 @@ def test_deferred_admission_blocks_later_model_ownership_until_retry(tmp_path) -
             "worker", lease_ms=100, ready_through_block=10_000, now_ms=100
         )
         assert first is not None
-        assert store.reserve_season_slot(
-            first_id,
-            first.lease_token,
-            maximum_effective_challenges=None,
-        )
         store.defer_leased(
             first_id,
             first.lease_token,
@@ -806,11 +712,6 @@ def test_deferred_admission_blocks_later_model_ownership_until_retry(tmp_path) -
         assert retry is not None
         assert retry.challenge_id == first_id
         assert retry.state is ChallengeState.FETCHING
-        assert store.reserve_season_slot(
-            first_id,
-            retry.lease_token,
-            maximum_effective_challenges=None,
-        )
 
         store.advance_leased(
             first_id,
@@ -913,11 +814,6 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
             "secret-worker", lease_ms=1_000, ready_through_block=10_000, now_ms=20
         )
         assert lease is not None
-        assert store.reserve_season_slot(
-            identifier,
-            lease.lease_token,
-            maximum_effective_challenges=None,
-        )
         store.record_downloaded_model(
             identifier,
             lease.lease_token,
@@ -1054,108 +950,3 @@ def test_public_challenge_reads_state_and_history_from_one_snapshot(monkeypatch,
         assert challenge["state"] == ChallengeState.QUEUED
         assert [event["state"] for event in challenge["events"]] == [ChallengeState.QUEUED]
         assert writer.get_challenge(identifier).state is ChallengeState.FETCHING
-
-
-@pytest.mark.parametrize("blocked", [False, True])
-def test_pending_season_reservation_survives_database_restart(tmp_path, blocked) -> None:
-    path = tmp_path / "validator.db"
-    with ChallengeStore(path) as store:
-        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=1)
-        task = store.claim_next_admission(
-            "worker", lease_ms=1_000, ready_through_block=100, now_ms=2
-        )
-        assert task is not None
-        assert store.reserve_season_slot(
-            identifier, task.lease_token, maximum_effective_challenges=1
-        )
-        if blocked:
-            store.block_leased(
-                identifier, task.lease_token, error_code="OUTAGE", error_summary="outage",
-                retry_after_ms=30,
-                occurred_at_ms=3,
-            )
-    with ChallengeStore(path) as restored:
-        assert restored.has_season_slot(identifier)
-        assert restored.effective_challenge_count() == 1
-
-
-@pytest.mark.parametrize("participant_error", [False, True])
-def test_model_entering_exact_keeps_capacity_regardless_of_outcome(tmp_path, participant_error):
-    path = tmp_path / "validator.db"
-    with ChallengeStore(path) as store:
-        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=1)
-        task = store.claim_next_admission(
-            "worker", lease_ms=1_000, ready_through_block=100, now_ms=2
-        )
-        assert task is not None
-        assert store.reserve_season_slot(
-            identifier, task.lease_token, maximum_effective_challenges=1
-        )
-        store.record_downloaded_model(
-            identifier, task.lease_token, model_path="selector.safetensors",
-            file_sha256="cd" * 32, size_bytes=123, occurred_at_ms=3,
-        )
-        store.register_validated_model(
-            identifier, task.lease_token, model_digest="ab" * 32, occurred_at_ms=4
-        )
-        store.complete_challenge(
-            identifier,
-            ChallengeState.PARTICIPANT_FAILED if participant_error else ChallengeState.SUCCEEDED,
-            error_code="MODEL_NONFINITE" if participant_error else None,
-            final_score=None if participant_error else 0.0,
-            occurred_at_ms=5,
-        )
-        assert store.has_season_slot(identifier)
-    with ChallengeStore(path) as restored:
-        assert restored.has_season_slot(identifier)
-        assert restored.effective_challenge_count() == 1
-
-
-def test_public_recovery_preserves_only_effective_slots_and_fifo_sequence(tmp_path):
-    digest = "ab" * 32
-    submissions = [submission_at(100 + i, hotkey=f"hk{i}") for i in range(4)]
-    with ChallengeStore(tmp_path / "original.db", track_spec_digest=digest) as store:
-        for index, submission in enumerate(submissions):
-            identifier, _ = store.add_submission(submission, occurred_at_ms=10 * index + 1)
-            task = store.claim_next_admission(
-                "worker", lease_ms=1_000, ready_through_block=200, now_ms=10 * index + 2
-            )
-            assert task is not None
-            assert store.reserve_season_slot(
-                identifier, task.lease_token, maximum_effective_challenges=2
-            )
-            if index != 0:
-                store.record_downloaded_model(
-                    identifier, task.lease_token, model_path="selector.safetensors",
-                    file_sha256=f"{index:02x}" * 32, size_bytes=123,
-                    occurred_at_ms=10 * index + 3,
-                )
-            if index >= 2:
-                store.register_validated_model(
-                    identifier, task.lease_token, model_digest=f"{index:02x}" * 32,
-                    occurred_at_ms=10 * index + 4,
-                )
-            store.complete_challenge(
-                identifier, ChallengeState.PARTICIPANT_FAILED,
-                error_code=("REPOSITORY_UNAVAILABLE", "MODEL_SCHEMA_INVALID", "MODEL_NONFINITE",
-                            "MODEL_NONFINITE")[index],
-                occurred_at_ms=10 * index + 5,
-            )
-        expected = list(store._connection.execute(
-            "SELECT sequence, challenge_id FROM season_slots ORDER BY sequence"
-        ))
-        matches = resolve_tournament(
-            store.public_snapshot()["challenges"], track_id="track",
-            track_spec_digest=digest, netuid=7, minimum_gain=0.001,
-            minimum_exact_gain=0.5, initial_champion=genesis_champion(),
-        ).matches
-        assert len(expected) == 2
-    with ChallengeStore(tmp_path / "restored.db", track_spec_digest=digest) as restored:
-        for submission in submissions:
-            restored.add_submission(submission, occurred_at_ms=1)
-        assert restored.restore_public_matches(matches, maximum_effective_challenges=2) == 4
-        actual = list(restored._connection.execute(
-            "SELECT sequence, challenge_id FROM season_slots ORDER BY sequence"
-        ))
-        assert [tuple(row) for row in actual] == [tuple(row) for row in expected]
-        assert restored.effective_challenge_count() == 2

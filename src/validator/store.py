@@ -243,11 +243,6 @@ class ChallengeStore:
                 challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id)
             );
 
-            CREATE TABLE IF NOT EXISTS season_slots (
-                sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
-                challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id)
-            );
-
             CREATE TABLE IF NOT EXISTS commitment_choices (
                 hotkey TEXT PRIMARY KEY,
                 netuid INTEGER NOT NULL,
@@ -272,12 +267,6 @@ class ChallengeStore:
             CREATE INDEX IF NOT EXISTS challenges_state_order
                 ON challenges (state, created_at_ms);
 
-            DELETE FROM season_slots
-            WHERE challenge_id IN (
-                SELECT challenge_id FROM challenges WHERE state = 'PARTICIPANT_FAILED'
-            ) AND challenge_id NOT IN (
-                SELECT challenge_id FROM model_owners
-            );
             COMMIT;
             """
         )
@@ -512,11 +501,6 @@ class ChallengeStore:
         ).fetchone()
         return None if row is None else row["value"]
 
-    def effective_challenge_count(self) -> int:
-        """Return effective challenges plus pending admission reservations."""
-
-        return int(self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0])
-
     def publication_failures(self) -> int:
         row = self._connection.execute(
             "SELECT value FROM store_metadata WHERE key = 'publication_failures'"
@@ -548,16 +532,6 @@ class ChallengeStore:
                 "DELETE FROM store_metadata WHERE key = 'publication_failures'"
             )
 
-    def has_season_slot(self, identifier: str) -> bool:
-        """Return whether a challenge reserves or permanently consumed a season slot."""
-
-        return (
-            self._connection.execute(
-                "SELECT 1 FROM season_slots WHERE challenge_id = ?", (identifier,)
-            ).fetchone()
-            is not None
-        )
-
     def model_owner(self, model_digest: str) -> str | None:
         """Return the challenge that already owns canonical selector weights."""
 
@@ -572,53 +546,6 @@ class ChallengeStore:
             (model_digest.lower(),),
         ).fetchone()
         return None if row is None else row["challenge_id"]
-
-    def reserve_season_slot(
-        self,
-        identifier: str,
-        lease_token: str,
-        *,
-        maximum_effective_challenges: int | None,
-    ) -> bool:
-        """Reserve FIFO capacity before I/O; invalid admission releases it atomically."""
-
-        if maximum_effective_challenges is not None and maximum_effective_challenges <= 0:
-            raise ValueError("maximum effective challenges must be positive")
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            current = self._require_lease_locked(identifier, lease_token)
-            if current not in {ChallengeState.FETCHING, ChallengeState.VALIDATING}:
-                raise ValueError("challenge is not in admission")
-            existing = self._connection.execute(
-                "SELECT sequence FROM season_slots WHERE challenge_id = ?",
-                (identifier,),
-            ).fetchone()
-            if existing is not None:
-                self._connection.commit()
-                return True
-            slot_count = int(
-                self._connection.execute("SELECT COUNT(*) FROM season_slots").fetchone()[0]
-            )
-            if (
-                maximum_effective_challenges is not None
-                and slot_count >= maximum_effective_challenges
-            ):
-                self._connection.commit()
-                return False
-            next_sequence = int(
-                self._connection.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM season_slots"
-                ).fetchone()[0]
-            )
-            self._connection.execute(
-                "INSERT INTO season_slots (sequence, challenge_id) VALUES (?, ?)",
-                (next_sequence, identifier),
-            )
-            self._connection.commit()
-            return True
-        except Exception:
-            self._connection.rollback()
-            raise
 
     def chain_cursor(self) -> tuple[int, str] | None:
         row = self._connection.execute(
@@ -636,8 +563,7 @@ class ChallengeStore:
         rows = self._connection.execute(
             """
             SELECT c.challenge_id
-            FROM season_slots slot
-            JOIN challenges c ON c.challenge_id = slot.challenge_id
+            FROM challenges c
             JOIN model_owners owner ON owner.challenge_id = c.challenge_id
             JOIN submissions s ON s.submission_id = c.submission_id
             WHERE s.block_height BETWEEN ? AND ?
@@ -646,6 +572,20 @@ class ChallengeStore:
             (first_block, last_block),
         ).fetchall()
         return tuple(row["challenge_id"] for row in rows)
+
+    def production_trigger_blocks(self) -> tuple[int, ...]:
+        """Index work boundaries without iterating through an unbounded idle history."""
+
+        rows = self._connection.execute(
+            """
+            SELECT block_height FROM submissions WHERE admitted = 1
+            UNION
+            SELECT score_block FROM stage_scores WHERE stage = ?
+            ORDER BY 1
+            """,
+            (ChallengeState.SCORING,),
+        ).fetchall()
+        return tuple(row[0] for row in rows)
 
     def admission_interval_complete(self, first_block: int, last_block: int) -> bool:
         """Return whether every eligible submission in an interval has left admission."""
@@ -920,70 +860,6 @@ class ChallengeStore:
             raise
         return identifier, True
 
-    def reject_submissions_after(
-        self,
-        last_submission_block: int,
-        *,
-        decision_block: int,
-        occurred_at_ms: int | None = None,
-    ) -> int:
-        """Terminalize scanned submissions that cannot belong to this track."""
-
-        if min(last_submission_block, decision_block) < 0:
-            raise ValueError("submission cutoff and decision block must be non-negative")
-        if decision_block < last_submission_block:
-            raise ValueError("decision block cannot precede the submission cutoff")
-        timestamp = _timestamp(occurred_at_ms)
-        terminal = tuple(state.value for state in TERMINAL_STATES)
-        placeholders = ",".join("?" for _ in terminal)
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            rows = self._connection.execute(
-                f"""
-                SELECT challenge.challenge_id, challenge.state, submission.block_height
-                FROM challenges challenge
-                JOIN submissions submission
-                  ON submission.submission_id = challenge.submission_id
-                WHERE submission.block_height > ?
-                  AND challenge.state NOT IN ({placeholders})
-                ORDER BY submission.block_height, submission.extrinsic_index,
-                         submission.event_index
-                """,
-                (last_submission_block, *terminal),
-            ).fetchall()
-            for row in rows:
-                current = ChallengeState(row["state"])
-                if current not in {ChallengeState.QUEUED, ChallengeState.FETCHING}:
-                    raise RuntimeError(
-                        "an ineligible late submission advanced beyond admission"
-                    )
-                if row["block_height"] > decision_block:
-                    raise RuntimeError("late submission is newer than its decision block")
-                self._transition_locked(
-                    row["challenge_id"],
-                    ChallengeState.REJECTED_TRACK_CLOSED,
-                    timestamp=timestamp,
-                    error_code="TRACK_CLOSED",
-                    error_summary=(
-                        "submission is later than the final frozen evaluation interval"
-                    ),
-                    details={"final_score": None},
-                )
-                self._connection.execute(
-                    """
-                    UPDATE challenges
-                    SET final_score = NULL, score_block = ?
-                    WHERE challenge_id = ?
-                    """,
-                    (decision_block, row["challenge_id"]),
-                )
-                self._clear_lease_locked(row["challenge_id"])
-            self._connection.commit()
-            return len(rows)
-        except Exception:
-            self._connection.rollback()
-            raise
-
     def claim_next_admission(
         self,
         worker_id: str,
@@ -1240,7 +1116,7 @@ class ChallengeStore:
         model_digest: str,
         occurred_at_ms: int | None = None,
     ) -> ModelRegistration:
-        """Assign unique model ownership and enter scoring for a reserved challenge."""
+        """Assign unique model ownership and enter scoring."""
 
         if len(model_digest) != 64:
             raise ValueError("model digest must contain 32 bytes")
@@ -1250,12 +1126,6 @@ class ChallengeStore:
             current = self._require_lease_locked(identifier, lease_token)
             if current is not ChallengeState.VALIDATING:
                 raise ValueError("challenge is not validating")
-            slot = self._connection.execute(
-                "SELECT sequence FROM season_slots WHERE challenge_id = ?",
-                (identifier,),
-            ).fetchone()
-            if slot is None:
-                raise RuntimeError("validated model has no reserved season slot")
             owner = self._connection.execute(
                 """
                 SELECT o.challenge_id, c.state
@@ -1754,13 +1624,6 @@ class ChallengeStore:
                 (final_score, effective_score_block, file_sha256, model_size_bytes, identifier),
             )
 
-            if target is ChallengeState.PARTICIPANT_FAILED and row["state"] in {
-                ChallengeState.FETCHING,
-                ChallengeState.VALIDATING,
-            }:
-                self._connection.execute(
-                    "DELETE FROM season_slots WHERE challenge_id = ?", (identifier,)
-                )
             self._clear_lease_locked(identifier)
             self._connection.commit()
         except Exception:
@@ -1801,13 +1664,9 @@ class ChallengeStore:
     def restore_public_matches(
         self,
         matches: Sequence[MatchRecord],
-        *,
-        maximum_effective_challenges: int | None = None,
     ) -> int:
         """Restore the locally available prefix of the verified public ledger."""
 
-        if maximum_effective_challenges is not None and maximum_effective_challenges <= 0:
-            raise ValueError("maximum effective challenges must be positive")
         restored = 0
         self._connection.execute("BEGIN IMMEDIATE")
         try:
@@ -1957,46 +1816,9 @@ class ChallengeStore:
                                 row["created_at_ms"] + index,
                             ),
                         )
-                if target is ChallengeState.SUCCEEDED or (
-                    target is ChallengeState.PARTICIPANT_FAILED
-                    and evaluation["model_digest"] is not None
-                    and evaluation["error_code"] not in {"EXACT_DUPLICATE", "REFERENCE_DUPLICATE"}
-                ):
-                    slot = self._connection.execute(
-                        "SELECT sequence FROM season_slots WHERE challenge_id = ?",
-                        (match.challenge_id,),
-                    ).fetchone()
-                    if slot is None:
-                        slot_count = int(
-                            self._connection.execute(
-                                "SELECT COUNT(*) FROM season_slots"
-                            ).fetchone()[0]
-                        )
-                        if (
-                            maximum_effective_challenges is not None
-                            and slot_count >= maximum_effective_challenges
-                        ):
-                            raise RuntimeError(
-                                "public matches exceed the frozen effective challenge capacity"
-                            )
-                        next_sequence = int(
-                            self._connection.execute(
-                                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM season_slots"
-                            ).fetchone()[0]
-                        )
-                        self._connection.execute(
-                            "INSERT INTO season_slots (sequence, challenge_id) VALUES (?, ?)",
-                            (next_sequence, match.challenge_id),
-                        )
-                elif target is ChallengeState.PARTICIPANT_FAILED:
-                    self._connection.execute(
-                        "DELETE FROM season_slots WHERE challenge_id = ?", (match.challenge_id,)
-                    )
-
                 model_digest = evaluation["model_digest"]
                 if model_digest is not None and evaluation["error_code"] not in {
                     "EXACT_DUPLICATE",
-                    "TRACK_CAPACITY_REACHED",
                 }:
                     owner = self._connection.execute(
                         "SELECT challenge_id FROM model_owners WHERE model_digest = ?",

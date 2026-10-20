@@ -329,27 +329,6 @@ def test_model_can_be_published_during_frozen_block_grace(tmp_path) -> None:
         assert store.get_challenge(identifier).state is ChallengeState.SCORING
 
 
-def test_submission_after_final_evaluation_interval_is_rejected_without_download(tmp_path) -> None:
-    configured = replace(settings(tmp_path), last_submission_block=100)
-
-    def unexpected_download(*_args, **_kwargs):
-        raise AssertionError("closed track submission was downloaded")
-
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        identifier, _ = store.add_submission(submission_at(101, "hk1"), occurred_at_ms=1)
-        outcome = process_next_admission(
-            store,
-            worker_id="admission",
-            settings=configured,
-            current_finalized_block=10_000,
-            now_ms=100,
-            downloader=unexpected_download,
-        )
-
-        assert outcome is not None and outcome.code == "TRACK_CLOSED"
-        assert store.get_challenge(identifier).state is ChallengeState.REJECTED_TRACK_CLOSED
-
-
 def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) -> None:
     first_model = tmp_path / "first.safetensors"
     second_model = tmp_path / "second.safetensors"
@@ -403,55 +382,16 @@ def test_admission_accepts_first_digest_and_rejects_later_duplicate(tmp_path) ->
         assert [(item[0], item[1]) for item in archived] == [(first_id, first_model)]
 
 
-def test_frozen_effective_challenge_limit_is_enforced(tmp_path) -> None:
-    first_model = tmp_path / "first.safetensors"
+def test_deferred_earlier_submission_blocks_fifo_until_recovery(tmp_path) -> None:
+    configured = settings(tmp_path)
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
     second_model = tmp_path / "second.safetensors"
-    write_model(first_model, "hk1")
     save_file(
-        {"selector.weight": np.zeros((2, 2), dtype=np.float32)},
+        {"selector.weight": np.full((2, 2), 2, dtype=np.float32)},
         second_model,
         metadata={"hotkey": "hk2"},
     )
-    configured = replace(settings(tmp_path), maximum_effective_challenges=1)
-    second_downloads = 0
-
-    def count_second_download(*args, **kwargs):
-        nonlocal second_downloads
-        second_downloads += 1
-        return model_downloader(second_model)(*args, **kwargs)
-
-    with ChallengeStore(tmp_path / "validator.db") as store:
-        store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
-        first = process_next_admission(
-            store,
-            worker_id="admission",
-            settings=configured,
-            current_finalized_block=10_000,
-            now_ms=100,
-            downloader=model_downloader(first_model),
-        )
-        second_id, _ = store.add_submission(
-            submission_at(101, "hk2", "other/model"), occurred_at_ms=2
-        )
-        second = process_next_admission(
-            store,
-            worker_id="admission",
-            settings=configured,
-            current_finalized_block=10_000,
-            now_ms=200,
-            downloader=count_second_download,
-        )
-
-        assert first is not None and first.status is AdmissionStatus.ACCEPTED
-        assert second is not None and second.code == "TRACK_CAPACITY_REACHED"
-        assert store.get_challenge(second_id).state is ChallengeState.REJECTED_TRACK_CAPACITY
-        assert second_downloads == 0
-
-
-def test_deferred_earlier_submission_blocks_fifo_while_retaining_its_slot(tmp_path) -> None:
-    configured = replace(settings(tmp_path), maximum_effective_challenges=1)
-    model = tmp_path / "selector.safetensors"
-    write_model(model, "hk1")
     downloads = 0
 
     def initially_unavailable(*args, **kwargs):
@@ -461,7 +401,8 @@ def test_deferred_earlier_submission_blocks_fifo_while_retaining_its_slot(tmp_pa
             raise ModelDownloadError(
                 "DOWNLOAD_TEMPORARY_FAILURE", "temporary outage", temporary=True
             )
-        return model_downloader(model)(*args, **kwargs)
+        selected = model if args[0] == "owner/model" else second_model
+        return model_downloader(selected)(*args, **kwargs)
 
     with ChallengeStore(tmp_path / "validator.db") as store:
         first_id, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
@@ -486,7 +427,6 @@ def test_deferred_earlier_submission_blocks_fifo_while_retaining_its_slot(tmp_pa
         )
 
         assert first is not None and first.status is AdmissionStatus.DEFERRED
-        assert store.has_season_slot(first_id)
         assert not store.admission_interval_complete(100, 100)
         assert blocked_by_fifo is None
 
@@ -499,7 +439,6 @@ def test_deferred_earlier_submission_blocks_fifo_while_retaining_its_slot(tmp_pa
             downloader=initially_unavailable,
         )
         assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
-        assert store.has_season_slot(first_id)
         assert store.admission_interval_complete(100, 100)
 
         second = process_next_admission(
@@ -510,9 +449,39 @@ def test_deferred_earlier_submission_blocks_fifo_while_retaining_its_slot(tmp_pa
             now_ms=30_101,
             downloader=initially_unavailable,
         )
-        assert second is not None and second.code == "TRACK_CAPACITY_REACHED"
-        assert store.get_challenge(second_id).state is ChallengeState.REJECTED_TRACK_CAPACITY
-        assert downloads == 2
+        assert second is not None and second.status is AdmissionStatus.ACCEPTED
+        assert store.get_challenge(second_id).state is ChallengeState.SCORING
+        assert downloads == 3
+
+
+def test_admission_remains_open_after_many_challenges_at_late_blocks(tmp_path) -> None:
+    with ChallengeStore(tmp_path / "validator.db") as store:
+        for index in range(25):
+            hotkey = f"miner-{index}"
+            model = tmp_path / f"selector-{index}.safetensors"
+            save_file(
+                {"selector.weight": np.full((2, 2), index + 1, dtype=np.float32)},
+                model,
+                metadata={"hotkey": hotkey},
+            )
+            block = 100_000_000 + index
+            identifier, _ = store.add_submission(
+                submission_at(block, hotkey, f"owner/model-{index}"),
+                occurred_at_ms=10 * index + 1,
+            )
+            outcome = process_next_admission(
+                store, worker_id="admission", settings=settings(tmp_path),
+                current_finalized_block=block + 2, now_ms=10 * index + 2,
+                downloader=model_downloader(model),
+            )
+            assert outcome is not None and outcome.status is AdmissionStatus.ACCEPTED
+            digest = store.public_challenge(identifier)["model_digest"]
+            assert store.model_owner(digest) == identifier
+            store.complete_challenge(
+                identifier, ChallengeState.SUCCEEDED, final_score=0.5,
+                score_block=block + 2, occurred_at_ms=10 * index + 3,
+            )
+        assert len(store.leaderboard()) == 25
 
 
 def test_same_repository_revision_is_rejected_before_redownload(tmp_path) -> None:
@@ -553,11 +522,11 @@ def test_same_repository_revision_is_rejected_before_redownload(tmp_path) -> Non
         assert store.get_challenge(second_id).state is ChallengeState.PARTICIPANT_FAILED
 
 
-def test_many_invalid_admissions_release_capacity_but_consume_each_hotkey(tmp_path) -> None:
+def test_many_invalid_admissions_consume_only_each_submitting_hotkey(tmp_path) -> None:
     def missing(*_args, **_kwargs):
         raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "repository is private")
 
-    configured = replace(settings(tmp_path), maximum_effective_challenges=20)
+    configured = settings(tmp_path)
     with ChallengeStore(tmp_path / "validator.db") as store:
         for index in range(20):
             identifier, _ = store.add_submission(
@@ -568,8 +537,6 @@ def test_many_invalid_admissions_release_capacity_but_consume_each_hotkey(tmp_pa
                 current_finalized_block=10_000, now_ms=100 + index, downloader=missing,
             )
             assert failed is not None and failed.status is AdmissionStatus.FAILED
-            assert not store.has_season_slot(identifier)
-            assert store.effective_challenge_count() == 0
 
         duplicate, _ = store.add_submission(
             submission_at(120, "invalid-0"), occurred_at_ms=200
@@ -583,11 +550,9 @@ def test_many_invalid_admissions_release_capacity_but_consume_each_hotkey(tmp_pa
             current_finalized_block=10_000, now_ms=202, downloader=model_downloader(model),
         )
         assert accepted is not None and accepted.status is AdmissionStatus.ACCEPTED
-        assert store.has_season_slot(valid_id)
-        assert store.effective_challenge_count() == 1
 
 
-def test_invalid_model_releases_the_only_effective_challenge_slot(tmp_path) -> None:
+def test_invalid_model_does_not_prevent_the_next_valid_admission(tmp_path) -> None:
     invalid_model = tmp_path / "invalid.safetensors"
     valid_model = tmp_path / "valid.safetensors"
     save_file(
@@ -596,7 +561,7 @@ def test_invalid_model_releases_the_only_effective_challenge_slot(tmp_path) -> N
         metadata={"hotkey": "invalid"},
     )
     write_model(valid_model, "valid")
-    configured = replace(settings(tmp_path), maximum_effective_challenges=1)
+    configured = settings(tmp_path)
 
     with ChallengeStore(tmp_path / "validator.db") as store:
         invalid_id, _ = store.add_submission(
@@ -613,7 +578,6 @@ def test_invalid_model_releases_the_only_effective_challenge_slot(tmp_path) -> N
 
         assert invalid is not None and invalid.status is AdmissionStatus.FAILED
         assert store.get_challenge(invalid_id).error_code == "MODEL_SCHEMA_INVALID"
-        assert store.effective_challenge_count() == 0
 
         valid_id, _ = store.add_submission(
             submission_at(101, "valid", "valid/model"), occurred_at_ms=2
@@ -628,8 +592,6 @@ def test_invalid_model_releases_the_only_effective_challenge_slot(tmp_path) -> N
         )
 
         assert valid is not None and valid.status is AdmissionStatus.ACCEPTED
-        assert store.effective_challenge_count() == 1
-        assert store.has_season_slot(valid_id)
 
 
 def test_copied_reference_cannot_front_run_model_owner(tmp_path) -> None:
@@ -882,8 +844,6 @@ def test_archive_failure_defers_without_consuming_the_submission(tmp_path) -> No
         challenge = store.get_challenge(identifier)
         assert challenge.state is ChallengeState.SYSTEM_DEFERRED
         assert challenge.error_code == "MODEL_ARCHIVE_UNAVAILABLE"
-        assert store.has_season_slot(identifier)
-        assert store.effective_challenge_count() == 1
         assert store.leaderboard() == []
         assert alerts == [
             (
@@ -907,7 +867,7 @@ def test_archive_retry_after_restart_reuses_validated_download_without_hf(tmp_pa
         if len(archived) == 1:
             raise RuntimeError("temporary object-storage outage")
 
-    configured = replace(settings(tmp_path), archive=archive, maximum_effective_challenges=1)
+    configured = replace(settings(tmp_path), archive=archive)
     database = tmp_path / "validator.db"
     with ChallengeStore(database) as store:
         identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
@@ -921,7 +881,6 @@ def test_archive_retry_after_restart_reuses_validated_download_without_hf(tmp_pa
         )
         assert first is not None and first.code == "MODEL_ARCHIVE_UNAVAILABLE"
         assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_DEFERRED
-        assert store.effective_challenge_count() == 1
 
     def no_repository_access(*_args, **_kwargs):
         raise AssertionError("cached validation retry must not depend on HF availability")
@@ -937,7 +896,6 @@ def test_archive_retry_after_restart_reuses_validated_download_without_hf(tmp_pa
         )
         assert result is not None and result.status is AdmissionStatus.ACCEPTED
         assert restored.get_challenge(identifier).state is ChallengeState.SCORING
-        assert restored.effective_challenge_count() == 1
         assert restored.leaderboard() == []
 
     assert len(archived) == 2

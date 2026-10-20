@@ -144,7 +144,7 @@ class FilePairedEvaluator:
                     stratum_weights=scoring.stratum_weight_map,
                     step_window_weights=scoring.step_window_weight_map,
                     tail_mean_weight=scoring.tail_mean_weight,
-                    confidence=self.track.match_confidence,
+                    confidence=self.track.scoring.match_confidence,
                     resamples=scoring.bootstrap_resamples,
                     seed=scoring.bootstrap_seed,
                     device=self.scoring_device,

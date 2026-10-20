@@ -63,7 +63,7 @@ class WeightArtifact:
     version_key: int
     source_block: int
     plan: WeightPlan | None
-    track_aborted: bool = False
+    track_aborted: bool = False  # Retained on the public wire format for existing weight setters.
     match_sequence: int = 0
     terminal_match_sha256: str | None = None
 
