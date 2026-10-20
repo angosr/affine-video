@@ -145,7 +145,7 @@ def test_scanner_skips_empty_commitment_and_processes_the_next_block(
     empty = next(
         record
         for record in caplog.records
-        if record.message == "skipping empty finalized commitment"
+        if record.message.startswith("skipping empty finalized commitment ")
     )
     assert empty.block_height == 100
     assert empty.event_index == 1
@@ -472,11 +472,18 @@ def test_scanner_skips_empty_reveal_and_processes_the_next_block(
     empty = next(
         record
         for record in caplog.records
-        if record.message == "skipping empty finalized commitment reveal"
+        if record.message.startswith("skipping empty finalized commitment reveal")
     )
     assert empty.block_height == 100
     assert empty.event_index == 0
     assert empty.hotkey == HOTKEY
+    # The real default message-only formatter must render the coordinates too;
+    # LogRecord.extra alone was invisible in the running service's stderr.
+    rendered = logging.Formatter("%(message)s").format(empty)
+    assert '"block_height": 100' in rendered
+    assert '"event_index": 0' in rendered
+    assert '"hotkey": "' + HOTKEY + '"' in rendered
+    assert '"netuid": 7' in rendered
 
 
 def test_scanner_skips_malformed_reveal_entries_without_losing_following_work(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -12,6 +13,13 @@ from validator.queue import ChainPosition, submission_id
 from validator.store import SubmissionRecord
 
 LOGGER = logging.getLogger(__name__)
+
+
+def log_commitment_warning(
+    logger: logging.Logger, message: str, *, extra: Mapping[str, Any],
+) -> None:
+    """Keep safe chain coordinates in the rendered log, even without a formatter."""
+    logger.warning("%s %s", message, json.dumps(dict(extra), sort_keys=True), extra=dict(extra))
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,21 +59,25 @@ def extract_commitment_reveals(
             continue
         hotkey = _attribute(event, "who")
         if not isinstance(hotkey, str) or not hotkey:
-            LOGGER.warning(
+            log_commitment_warning(
+                LOGGER,
                 "skipping commitment reveal with invalid hotkey",
-                extra={"block_height": block_height, "event_index": event_position},
+                extra={"block_height": block_height, "event_index": event_position,
+                       "hotkey": None, "netuid": netuid},
             )
             continue
         extrinsic_index = event.get("extrinsic_idx")
         if extrinsic_index is None:
             extrinsic_index = 0
         if type(extrinsic_index) is not int or extrinsic_index < 0:
-            LOGGER.warning(
+            log_commitment_warning(
+                LOGGER,
                 "skipping commitment reveal with invalid extrinsic index",
                 extra={
                     "block_height": block_height,
                     "event_index": event_position,
                     "hotkey": hotkey,
+                    "netuid": netuid,
                 },
             )
             continue
@@ -125,7 +137,8 @@ def extract_commitments(
         if extrinsic.get("address") != hotkey:
             raise RuntimeError("commitment signer does not match its chain event")
         if not payload:
-            LOGGER.warning(
+            log_commitment_warning(
+                LOGGER,
                 "skipping empty finalized commitment",
                 extra={
                     "block_height": block_height,

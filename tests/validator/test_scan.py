@@ -188,3 +188,5 @@ def test_malformed_timelock_reveal_is_skipped_without_losing_valid_reveals(caplo
 
     assert len(records) == 1
     assert "invalid extrinsic index" in caplog.text
+    assert '"block_height": 123' in caplog.text
+    assert '"event_index": 0' in caplog.text

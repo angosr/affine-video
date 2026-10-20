@@ -13,6 +13,7 @@ from validator.scan import (
     ChainCommitment,
     extract_commitment_reveals,
     extract_commitments,
+    log_commitment_warning,
     revealed_payload,
     submission_from_commitment,
 )
@@ -137,7 +138,8 @@ async def finalized_commitments(
             if not isinstance(values, Sequence) or isinstance(
                 values, (str, bytes, bytearray)
             ):
-                LOGGER.warning(
+                log_commitment_warning(
+                    LOGGER,
                     "skipping malformed finalized commitment reveal history",
                     extra=context,
                 )
@@ -145,14 +147,16 @@ async def finalized_commitments(
             matching = []
             for stored in values:
                 if not isinstance(stored, (tuple, list)) or len(stored) != 2:
-                    LOGGER.warning(
+                    log_commitment_warning(
+                        LOGGER,
                         "skipping malformed finalized commitment reveal entry",
                         extra=context,
                     )
                     continue
                 height, value = stored
                 if type(height) is not int or height < 0:
-                    LOGGER.warning(
+                    log_commitment_warning(
+                        LOGGER,
                         "skipping finalized commitment reveal with invalid block",
                         extra=context,
                     )
@@ -161,20 +165,23 @@ async def finalized_commitments(
                     continue
                 payload = revealed_payload(value)
                 if payload is None:
-                    LOGGER.warning(
+                    log_commitment_warning(
+                        LOGGER,
                         "skipping undecodable finalized commitment reveal",
                         extra=context,
                     )
                     continue
                 if not payload:
-                    LOGGER.warning(
+                    log_commitment_warning(
+                        LOGGER,
                         "skipping empty finalized commitment reveal",
                         extra=context,
                     )
                     continue
                 matching.append(payload)
             if len(matching) != reveal_counts[reveal.hotkey]:
-                LOGGER.warning(
+                log_commitment_warning(
+                    LOGGER,
                     "skipping unmatched finalized commitment reveal",
                     extra={
                         "block_height": block_height,
