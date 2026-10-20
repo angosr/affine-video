@@ -230,6 +230,21 @@ class PairedTrackEvaluator:
             model_digest=record["model_digest"],
         )
 
+    def inventory_deadline_block(self, task: LeasedChallenge) -> int:
+        """Supply watchdog, not a generation schedule or an eligibility delay.
+
+        The original submission/exact-decision block survives cold replay; a
+        missing producer cannot restart this budget with each new local DB.
+        Available stock is always claimed immediately, even after this bound.
+        """
+        start = task.position.block
+        if task.state is ChallengeState.CONFIRMING:
+            exact = self.store.stage_score(task.challenge_id, ChallengeState.SCORING)
+            if exact is None:
+                raise TemporaryScoringError("SCORING_RECORD_MISSING", "exact decision is missing")
+            start = exact.score_block
+        return start + 600  # About two hours at the chain's 12-second block time.
+
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         snapshot = self.store.public_snapshot()
         task = self._restore_challenger(task, snapshot["challenges"])
@@ -685,7 +700,7 @@ def evaluate_next_scoring(
             archived = None if settings.restore_stage is None else settings.restore_stage(task)
             batch_ready = getattr(evaluator, "batch_ready", None)
             if archived is None and batch_ready is not None and not batch_ready(task):
-                deadline = getattr(evaluator, "batch_deadline_block", None)
+                deadline = getattr(evaluator, "inventory_deadline_block", None)
                 deadline_block = None if deadline is None else deadline(task)
                 if deadline_block is not None and current_finalized_block > deadline_block:
                     state = _defer_or_fail(

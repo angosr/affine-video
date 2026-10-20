@@ -905,7 +905,7 @@ def test_private_stage_archive_resumes_fifo_without_missing_batch(tmp_path, stag
             store.transition(identifier, stage, occurred_at_ms=14)
         task = store.claim_next_scoring("lost", lease_ms=10, now_ms=20)
         assert task is not None
-        source.archive_stage(task, StageOutcome(0.0, {"cache_generated_block": 120}), 150)
+        source.archive_stage(task, StageOutcome(0.0, {}), 150)
 
     # Local DB/result loss: replay the same submission, leaving only the private archive.
     with ChallengeStore(tmp_path / "recovered.db") as store:
@@ -1237,7 +1237,7 @@ def test_overdue_batch_uses_bounded_retries_and_push_alerts(tmp_path) -> None:
         def batch_ready(self, _task):
             return False
 
-        def batch_deadline_block(self, _task):
+        def inventory_deadline_block(self, _task):
             return 100
 
         def __call__(self, _task):
@@ -1277,6 +1277,52 @@ def test_overdue_batch_uses_bounded_retries_and_push_alerts(tmp_path) -> None:
             "SCORING_RETRY_STARTED",
             "SCORING_RETRY_EXHAUSTED",
         ]
+
+
+def test_real_inventory_supply_watchdog_survives_cold_databases_and_retains_fifo(tmp_path):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="watchdog")
+    retries = PrivateRetryStore(objects, track_spec_digest="ab" * 32)
+    alerts = []
+    settings = ScoringSettings(
+        retry_base_ms=10, retry_max_ms=100, max_attempts=2,
+        restore_retry=retries.restore, record_retry=retries.record_failure,
+        alert=lambda event, _details: alerts.append(event),
+    )
+
+    class MissingInventory:
+        available = False
+
+        def claim_ready(self, *_args, **_kwargs):
+            return self.available
+
+    source = MissingInventory()
+    identifiers = []
+    for attempt, now in enumerate((20, 30, 31)):
+        with ChallengeStore(tmp_path / f"cold-{attempt}.db") as store:
+            identifier = ready_for_scoring(store)
+            later, _ = store.add_submission(submission_at(101, hotkey="later"))
+            store.transition(later, ChallengeState.FETCHING)
+            store.transition(later, ChallengeState.VALIDATING)
+            store.transition(later, ChallengeState.SCORING)
+            identifiers.append(identifier)
+            evaluator = PairedTrackEvaluator(
+                track=SimpleNamespace(), store=store, cache_dir=tmp_path, model_cache=tmp_path,
+                initial_model_path=tmp_path / "unused", champion_archive_url="unused",
+                timeout_seconds=1, batch_source=source,
+            )
+            result = process_next_scoring(
+                store, worker_id="worker", settings=settings,
+                current_finalized_block=100 + 12 * 24 * 300, evaluator=evaluator, now_ms=now,
+            )
+            assert result.challenge_id == identifier
+            assert result.code == "EVALUATION_BATCH_TIMEOUT"
+            assert result.state is (
+                ChallengeState.SYSTEM_DEFERRED if attempt == 0 else ChallengeState.SYSTEM_BLOCKED
+            )
+            assert store.get_challenge(later).state is ChallengeState.SCORING
+            assert store.get_challenge(identifier).state is not ChallengeState.PARTICIPANT_FAILED
+    assert len(set(identifiers)) == 1
+    assert alerts == ["SCORING_RETRY_STARTED", "SCORING_RETRY_EXHAUSTED"]
 
 
 def test_scoring_retry_ceiling_cools_down_then_recovers_automatically(tmp_path) -> None:

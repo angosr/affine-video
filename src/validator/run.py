@@ -922,6 +922,8 @@ async def process_cycle(
         )
     terminal_prefix = 0
     for challenge in store.public_snapshot()["challenges"]:
+        if challenge.get("track_spec_digest") not in (None, store.track_spec_digest()):
+            continue
         if challenge["state"] not in TERMINAL_STATES:
             break
         terminal_prefix += 1

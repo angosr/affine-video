@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -41,6 +42,48 @@ from validator.weights import (
 
 from .test_chain import HOTKEY, FakeClient, chain_block
 from .test_publication import MemoryS3
+from .test_store import submission_at
+
+
+def test_historical_terminal_does_not_fence_new_fifo_or_consume_public_prefix(pending_evaluation):
+    case = pending_evaluation
+    old, _ = case.store.add_submission(replace(submission_at(99), hotkey="historical-hotkey"))
+    case.store.transition(old, ChallengeState.FETCHING)
+    case.store.transition(
+        old, ChallengeState.PARTICIPANT_FAILED, error_code="NOT_PUBLIC",
+    )
+    # A retained terminal row in a copied migration checkpoint keeps its origin.
+    case.store._connection.execute(
+        "UPDATE challenges SET track_spec_digest=? WHERE challenge_id=?", ("cd" * 32, old),
+    )
+    case.store._connection.commit()
+    historical = case.store.public_challenge(old)
+
+    def unavailable(*_args, **_kwargs):
+        from validator.download import ModelDownloadError
+        raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "private", temporary=False)
+
+    cycle = asyncio.run(_complete_cycle(
+        case.client, case.store, netuid=case.track.netuid,
+        track_start_block=case.track.track_start_block,
+        admission_settings=case.work.admission_settings,
+        scoring_settings=case.work.scoring_settings,
+        evaluator=lambda _task: pytest.fail("rejected model was scored"), worker_id="new-track",
+        downloader=unavailable, published_match_count=0,
+    ))
+    assert cycle.admission is not None
+    assert case.store.public_challenge(old) == historical
+    chain = WeightChainState(101, {case.track.initial_champion.hotkey: 0, HOTKEY: 1}, 1, 1.0, 1, {})
+    genesis = build_public_artifacts(case.store, case.track, chain, version_key=1, match_limit=0)
+    assert genesis.matches == ()
+    current = build_public_artifacts(case.store, case.track, chain, version_key=1, match_limit=1)
+    assert len(current.matches) == 1
+    assert json.loads(current.matches[0][1])["challenge_id"] != old
+    assert json.loads(current.summary)["match_count"] == 1
+    asyncio.run(case.publisher.publish(current))
+    cold = S3Repository(case.transport, bucket="test", prefix="isolated/heartbeat")
+    assert asyncio.run(cold.load(case.track)).committed_match_count == 1
+    assert case.store.public_challenge(old) == historical
 
 
 def test_continuous_evaluator_reaches_track_loading_without_external_webhook(monkeypatch):

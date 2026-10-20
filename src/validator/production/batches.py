@@ -319,10 +319,35 @@ class ReadyBatchSource:
         generated_block = document["metrics"].get("cache_generated_block")
         if generated_block is not None and (
             type(generated_block) is not int
-            or generated_block < task.position.block
+            or generated_block < 0
             or generated_block > document["score_block"]
         ):
             raise RuntimeError("archived stage batch conflicts with its decision block")
+        if generated_block is not None:
+            plan = self._allocated_plan(
+                task.challenge_id, confirmation=task.state.value == "CONFIRMING",
+            )
+            expected_batch = {
+                "cache_generated_block": plan.generation_block,
+                "cache_plan_digest": plan.plan_digest,
+                "cache_seed_block_hash": plan.block_hash,
+                "cache_sha256": plan.exact.sha256,
+            }
+            if any(document["metrics"].get(key) != value
+                   for key, value in expected_batch.items()):
+                raise RuntimeError("archived stage conflicts with its allocated READY batch")
+            _, authority = self.inventory.read()
+            claim = next(row for row in authority["claims"]
+                         if row["plan_digest"] == plan.plan_digest)
+            admission = self.objects.get(self._admission_name(task.challenge_id))
+            identity = json.loads(admission.body)
+            if (claim["file_sha256"] != task.file_sha256
+                    or identity.get("model_digest") != claim["model_digest"]
+                    or identity.get("file_sha256") != task.file_sha256
+                    or identity.get("track_spec_digest") != self.track.digest
+                    or identity.get("challenge_id") != task.challenge_id
+                    or _json(identity) != admission.body):
+                raise RuntimeError("archived stage conflicts with its allocated model")
         return ArchivedStage(
             float(document["score"]),
             document["score_block"],

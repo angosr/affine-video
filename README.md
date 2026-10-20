@@ -128,7 +128,11 @@ archiving, confirmed by the `SCORING` state.
    until replaced or no longer eligible; the registered UID0 baseline is the fallback.
 
 Infrastructure failures defer and retry the original challenge; they do not count as miner
-losses. Waiting for inventory is not a failed attempt. Each batch belongs to one challenge/stage
+losses. Normal inventory waiting is not a failed attempt.
+After 600 finalized blocks from submission (or the exact decision for confirmation), continued
+inventory shortage raises a durable infrastructure retry/alert instead of waiting silently;
+it still preserves the original opportunity and FIFO, and ready stock is claimed immediately.
+Each batch belongs to one challenge/stage
 and cannot be reused by a later model. Its data, committed secret and replay references are
 disclosed only after that challenge finishes. Quality metrics, budgets and thresholds are
 defined by the live track, not adjustable per submission. Scores from different batches are not

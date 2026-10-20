@@ -1,4 +1,5 @@
 import hashlib
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ import pytest
 
 from scoring.spec import parse_track_spec
 from tests.scoring.test_spec import valid_spec
+from tests.validator.test_store import submission_at
 from validator.production.batches import ReadyBatchSource
 from validator.production.commitment import SourceLeaf, SourcePool, canonical_json
 from validator.production.inventory import ALLOCATION_OBJECT, Inventory
@@ -21,6 +23,9 @@ from validator.production.plan import (
 )
 from validator.production.service import PlanCoordinator
 from validator.production.storage import PrivateObjectStore
+from validator.queue import ChallengeState
+from validator.scoring import ScoringSettings, StageOutcome, process_next_scoring
+from validator.store import ChallengeStore
 
 from .test_storage import MemoryS3
 
@@ -59,8 +64,13 @@ def make_plan(case, block, slot=0, *, ready=True):
     if ready:
         item = ReadyObject("exact/file.npz", "23" * 32, 100)
         plan = plan.ready(
-            exact=item, sample_cache=ReadySampleCache(item, item),
-            dense_references=tuple(DenseReference(rollout.rollout_id, item, item)
+            exact=item, sample_cache=ReadySampleCache(
+                replace(item, object_key="inputs/index.json"),
+                replace(item, object_key="inputs/text.safetensors"),
+            ),
+            dense_references=tuple(DenseReference(
+                rollout.rollout_id, replace(item, object_key="videos/file.mp4"),
+                replace(item, object_key="latents/file.safetensors"))
                                    for rollout in plan.rollouts),
         )
     return plan
@@ -86,6 +96,76 @@ def test_inventory_plan_is_secret_committed_and_unassigned(inventory_case):
         (plan,), commitments=inventory_case.track.source_commitments,
         scoring=inventory_case.track.scoring,
     )
+
+
+@pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
+def test_preproduced_archive_survives_cold_db_without_bulk(inventory_case, tmp_path, stage):
+    case = inventory_case
+    plans = (make_plan(case, 150), make_plan(case, 151, 1))
+    for plan in plans:
+        case.objects.create_plan(f"plans/{plan.generation_block}.json", plan.encode())
+    source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path / "empty")
+
+    def prepare(store):
+        identifier, _ = store.add_submission(submission_at(200))
+        store.transition(identifier, ChallengeState.FETCHING)
+        store.transition(identifier, ChallengeState.VALIDATING)
+        store.transition(identifier, ChallengeState.SCORING)
+        if stage is ChallengeState.CONFIRMING:
+            store.transition(identifier, stage)
+        task = store.claim_next_scoring("test", lease_ms=10, now_ms=20)
+        return replace(task, file_sha256="b2" * 32)
+
+    with ChallengeStore(tmp_path / "original.db", track_spec_digest=case.track.digest) as store:
+        task = prepare(store)
+        identity = {"format": "veda-admission-model-v1", **source._admission_identity(task),
+                    "file_sha256": "b2" * 32, "model_digest": "c3" * 32, "size_bytes": 100}
+        case.objects.create_plan(
+            source._admission_name(task.challenge_id), canonical_json(identity),
+        )
+        claim(source.inventory, plans, task.challenge_id)
+        if stage is ChallengeState.CONFIRMING:
+            claim(source.inventory, plans, task.challenge_id, "CONFIRMING")
+        plan = plans[stage is ChallengeState.CONFIRMING]
+        metrics = {
+            "cache_generated_block": plan.generation_block, "cache_plan_digest": plan.plan_digest,
+            "cache_seed_block_hash": plan.block_hash, "cache_sha256": plan.exact.sha256,
+            "incumbent_score": 0.8, "paired_gain_lower_bound": -0.1,
+        }
+        source.archive_stage(task, StageOutcome(0.7, metrics), 210)
+
+    with ChallengeStore(tmp_path / "cold.db", track_spec_digest=case.track.digest) as store:
+        cold = prepare(store)
+        restored = source.restore_stage(cold)
+        assert restored.score == 0.7 and restored.score_block == 210
+        assert restored.metrics == metrics
+        store._connection.execute(
+            "UPDATE challenges SET file_sha256=? WHERE challenge_id=?",
+            (cold.file_sha256, cold.challenge_id),
+        )
+        store._connection.commit()
+        # The initial lease expires; the original archived decision, not GPU I/O, resumes FIFO.
+        result = process_next_scoring(
+            store, worker_id="recover", current_finalized_block=220, now_ms=31,
+            settings=ScoringSettings(restore_stage=source.restore_stage),
+            evaluator=lambda _task: pytest.fail("an archived stage was re-scored"),
+        )
+        assert result.state is ChallengeState.SUCCEEDED
+        assert store.stage_score(cold.challenge_id, stage).score_block == 210
+        assert not source.content.root.exists() or not any(source.content.root.iterdir())
+
+    for key, value in {
+        "cache_plan_digest": "ff" * 32, "cache_sha256": "ee" * 32,
+        "cache_seed_block_hash": "0x" + "dd" * 32, "cache_generated_block": 152,
+    }.items():
+        name = source._stage_name(task.challenge_id, stage.value)
+        stored = case.objects.get(name)
+        altered = json.loads(stored.body)
+        altered["metrics"][key] = value
+        case.objects.replace_plan(name, canonical_json(altered), etag=stored.etag)
+        with pytest.raises(RuntimeError, match="allocated READY"):
+            source.restore_stage(task)
+        case.objects.replace_plan(name, stored.body, etag=case.objects.get(name).etag)
 
 
 def test_claim_is_fifo_idempotent_model_bound_and_cold_recoverable(inventory_case):

@@ -151,8 +151,17 @@ def build_public_artifacts(
     initial = genesis_champion(track)
     if match_limit is not None and (type(match_limit) is not int or match_limit < 0):
         raise ValueError("public match limit must be a non-negative integer")
+    challenges = snapshot["challenges"]
+    if match_limit is not None:
+        # Historical terminal rows retain lifetime uniqueness, but never consume
+        # this track's independently numbered, immutable publication prefix.
+        historical = [row for row in challenges
+                      if row.get("track_spec_digest") not in (None, track.digest)]
+        current = [row for row in challenges
+                   if row.get("track_spec_digest") in (None, track.digest)]
+        challenges = historical + current[:match_limit]
     tournament = resolve_tournament(
-        snapshot["challenges"] if match_limit is None else snapshot["challenges"][:match_limit],
+        challenges,
         track_id=track.track_id,
         track_spec_digest=track.digest,
         netuid=track.netuid,
