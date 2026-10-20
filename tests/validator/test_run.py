@@ -1249,8 +1249,6 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
         ),
         cache=SimpleNamespace(
             exact_max_bytes=1_000,
-            minimum_generation_delay_blocks=1,
-            generation_interval_blocks=1,
         ),
         scoring=SimpleNamespace(
             budgets=[SimpleNamespace(target_blocks=1)],

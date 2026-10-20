@@ -1,5 +1,6 @@
 import pytest
 
+from validator.production.commitment import canonical_json
 from validator.queue import ChainPosition, ChallengeState
 from validator.tournament import (
     Champion,
@@ -153,6 +154,35 @@ def test_previous_pending_or_promoted_challenge_forbids_silent_rebinding():
     won["track_spec_digest"] = "cd" * 32
     with pytest.raises(ValueError, match="verified immutable match"):
         resolve([won])
+
+
+@pytest.mark.parametrize("old_video_gate", [0.005, 0.02])
+@pytest.mark.parametrize("new_gate", [0.005, 0.02])
+def test_historical_two_stage_outcome_requires_proof_not_current_thresholds(
+    old_video_gate, new_gate,
+):
+    old = challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    old["track_spec_digest"] = "cd" * 32
+    old["paired_gain_lower_bound"] = 0.01
+    for stage in old["stages"]:
+        stage["paired_gain_lower_bound"] = 0.01
+    history = resolve_tournament(
+        [old], track_id="previous", track_spec_digest="cd" * 32, netuid=7,
+        minimum_gain=old_video_gate, minimum_exact_gain=0.005,
+        initial_champion=genesis(),
+    ).matches
+    original_bytes = canonical_json(history[0].document)
+    with pytest.raises(ValueError, match="verified immutable match"):
+        resolve([old], minimum_gain=new_gate)
+    result = resolve([old], history=history, minimum_gain=new_gate)
+    won = old_video_gate < 0.01
+    assert history[0].outcome is (
+        MatchOutcome.CHALLENGER_WON if won else MatchOutcome.CHAMPION_RETAINED
+    )
+    assert result.champion == history[0].champion_after
+    assert result.champion.hotkey == ("alice" if won else "genesis-hotkey")
+    assert result.matches == ()
+    assert canonical_json(history[0].document) == original_bytes
 
 
 def test_confirmed_historical_champion_is_not_rejudged_by_new_thresholds():

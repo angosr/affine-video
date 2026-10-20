@@ -1701,10 +1701,6 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         ),
         scoring=SimpleNamespace(minimum_frontier_gain=0.001),
         full_video=SimpleNamespace(minimum_gain=0.001),
-        cache=SimpleNamespace(
-            minimum_generation_delay_blocks=1,
-            generation_interval_blocks=100,
-        ),
     )
     chain = WeightChainState(
         120,

@@ -1733,7 +1733,6 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         source_pool_merkle_root=pool.root,
         source_commitments=source_commitments(pool),
         track_start_block=100,
-        cache=SimpleNamespace(generation_interval_blocks=20, minimum_generation_delay_blocks=1),
         scoring=scoring(),
         model=SimpleNamespace(selector=SimpleNamespace(routes=("route-0", "route-1", "route-2"))),
     )
