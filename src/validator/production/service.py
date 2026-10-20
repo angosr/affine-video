@@ -41,6 +41,7 @@ from validator.production.commitment import (
     verify_source_proof,
 )
 from validator.production.config import ProducerConfig, load_producer_config
+from validator.production.inventory import ALLOCATION_OBJECT, Inventory
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
@@ -48,10 +49,8 @@ from validator.production.plan import (
     ReadySampleCache,
     RolloutPlan,
     build_plan,
-    confirmation_source_digests,
-    scheduled_generation_block,
+    generation_seed,
     select_source_proofs,
-    submission_interval,
     validate_source_selection_sequence,
 )
 from validator.production.runtime import trajectory_tensor_key
@@ -62,7 +61,6 @@ from validator.production.storage import (
     LATENTS_NAMESPACE,
     PLANS_NAMESPACE,
     SOURCE_POOL_OBJECT,
-    STAGES_NAMESPACE,
     VIDEOS_NAMESPACE,
     LocalBatchStore,
     PreconditionFailed,
@@ -71,7 +69,6 @@ from validator.production.storage import (
     StoredObject,
 )
 from validator.production.workers import close_workers
-from validator.queue import TERMINAL_STATES, ChallengeState
 from validator.store import ChallengeStore
 
 _FAST_PLAN_ATTEMPTS = 5
@@ -97,7 +94,7 @@ class UnitResult:
 class ProducerCycle:
     planned_block: int | None
     ready_block: int | None
-    waiting_for_cursor: bool
+    inventory_idle: bool
 
 
 class PlanCoordinator:
@@ -132,6 +129,8 @@ class PlanCoordinator:
         rows = []
         prefix = f"{PLANS_NAMESPACE}/"
         for name in self.objects.list_names(prefix):
+            if name == ALLOCATION_OBJECT:
+                continue
             if not name.startswith(prefix) or not name.endswith(".json"):
                 raise RuntimeError("private plan index contains an unexpected object")
             stored = self.objects.get(name)
@@ -151,143 +150,56 @@ class PlanCoordinator:
             raise RuntimeError("private plan source selection is invalid") from exc
         return tuple(rows)
 
-    def create_next(self) -> BatchPlan | None:
-        if not self._stage_recovery_complete():
-            return None
+    def create_next(self, *, disk_bytes: int = 0) -> BatchPlan | None:
         existing = self.plans()
-        by_block = {plan.generation_block: plan for _, _, plan in existing}
-        cursor = self.store.chain_cursor()
-        if cursor is None:
+        _, authority = Inventory(self.objects, self.track.digest).read()
+        unavailable = {
+            row["plan_digest"] for row in authority["claims"] + authority["invalidations"]
+        }
+        available = [plan for _, _, plan in existing if plan.plan_digest not in unavailable]
+        counts = [sum(plan.inventory_slot == slot for plan in available) for slot in (0, 1)]
+        slot = min((0, 1), key=lambda value: (counts[value], value))
+        if counts[slot] >= self.track.cache.inventory_target_batches // 2:
             return None
-        interval = self.track.cache.generation_interval_blocks
-        boundaries = sorted({
-            scheduled_generation_block(
-                trigger,
-                track_start_block=self.track.track_start_block,
-                minimum_generation_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
-                generation_interval_blocks=interval,
-            )
-            for trigger in self.store.production_trigger_blocks()
-        })
-        for block in boundaries:
-            if block in by_block:
-                continue
-            if cursor[0] < block:
-                return None
-            block_hash = self.store.finalized_block_hash(block)
-            if block_hash is None:
-                raise RuntimeError("generation block hash is absent from the finalized scan")
-            first, last = submission_interval(
-                block,
-                track_start_block=self.track.track_start_block,
-                minimum_generation_delay_blocks=(self.track.cache.minimum_generation_delay_blocks),
-                generation_interval_blocks=interval,
-            )
-            if not self.store.admission_interval_complete(first, last):
-                return None
-            exact_ids = self.store.admitted_challenge_ids(first, last)
-            confirmation_ids = self.store.confirmation_challenge_ids(first, last)
-            if not exact_ids and not confirmation_ids:
-                continue
-            seed = hashlib.sha256(
-                b"veda-evaluation-batch-v1"
-                + bytes.fromhex(self.track.digest)
-                + bytes.fromhex(block_hash.removeprefix("0x"))
-            ).hexdigest()
-            proofs = select_source_proofs(
-                self.source_pool,
-                commitments=self.track.source_commitments,
-                partition="production",
-                strata=tuple(self.track.scoring.stratum_weight_map),
-                sources_per_stratum=self.track.scoring.rollouts_per_stratum,
-                batch_seed=seed,
-                excluded_source_digests=confirmation_source_digests(
-                    tuple(row[2] for row in existing), confirmation_ids,
-                ),
-            )
-            plan = build_plan(
-                track_spec_digest=self.track.digest,
-                generation_block=block,
-                block_hash=block_hash,
-                track_start_block=self.track.track_start_block,
-                minimum_generation_delay_blocks=(self.track.cache.minimum_generation_delay_blocks),
-                generation_interval_blocks=interval,
-                exact_challenge_ids=exact_ids,
-                confirmation_challenge_ids=confirmation_ids,
-                source_proofs=proofs,
-                scoring=self.track.scoring,
-                available_routes=self.track.model.selector.routes,
-            )
-            name = _plan_name(block)
-            try:
-                self.objects.create_plan(name, plan.encode())
-            except PreconditionFailed as exc:
-                winner = BatchPlan.decode(self.objects.get(name).body)
-                self._validate_plan(name, winner)
-                if winner.planned_document() != plan.planned_document():
-                    raise RuntimeError(
-                        "private plan conflicts with the deterministic schedule"
-                    ) from exc
-                return winner
-            return plan
-        return None
-
-    def _stage_recovery_complete(self) -> bool:
-        """Fence planning until every private stage fact is present in SQLite."""
-
-        for name in self.objects.list_names(f"{STAGES_NAMESPACE}/"):
-            parts = name.split("/")
-            if (
-                len(parts) != 3
-                or parts[0] != STAGES_NAMESPACE
-                or not parts[2].endswith(".json")
-            ):
-                raise RuntimeError("private stage index contains an unexpected object")
-            challenge_id = parts[1]
-            stage_name = parts[2][:-5]
-            try:
-                challenge_bytes = bytes.fromhex(challenge_id)
-                stage = ChallengeState(stage_name)
-            except ValueError as exc:
-                raise RuntimeError("private stage index contains an invalid object") from exc
-            if len(challenge_bytes) != 32 or stage not in {
-                ChallengeState.SCORING,
-                ChallengeState.CONFIRMING,
-            }:
-                raise RuntimeError("private stage index contains an invalid object")
-
-            stored = self.objects.get(name)
-            try:
-                document = json.loads(stored.body)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError("private stage archive is invalid") from exc
-            if (
-                not isinstance(document, dict)
-                or document.get("format") != "veda-stage-result-v1"
-                or document.get("track_spec_digest") != self.track.digest
-                or document.get("challenge_id") != challenge_id
-                or document.get("stage") != stage.value
-            ):
-                raise RuntimeError("private stage archive conflicts with its object key")
-
-            recovered = self.store.stage_score(challenge_id, stage)
-            if recovered is None:
-                return False
-            local_state = self.store.get_challenge(challenge_id).state
-            metrics_match = recovered.metrics == document.get("metrics")
-            if not metrics_match and local_state in TERMINAL_STATES:
-                metrics_match = recovered.metrics == _public_stage_metrics(
-                    document.get("metrics")
-                )
-            if (
-                recovered.score != document.get("score")
-                or recovered.score_block != document.get("score_block")
-                or not metrics_match
-            ):
-                raise RuntimeError("local stage fact conflicts with its private archive")
-            if not self.store.stage_transition_applied(challenge_id, stage):
-                return False
-        return True
+        # Reserve scratch + canonical content + assembly space before starting a unit.
+        if disk_bytes + 3 * self.track.cache.exact_max_bytes > self.track.cache.inventory_max_bytes:
+            return None
+        # An in-flight item is completed before another reservation is made.
+        if any(plan.state == "PLANNED" for plan in available):
+            return None
+        cursor = self.store.chain_cursor()
+        if cursor is None or cursor[0] < self.track.track_start_block:
+            return None
+        block, block_hash = cursor
+        if any(plan.generation_block == block for _, _, plan in existing):
+            return None
+        secret = secrets.token_hex(32)
+        seed = generation_seed(self.track.digest, block_hash, secret)
+        proofs = select_source_proofs(
+            self.source_pool,
+            commitments=self.track.source_commitments,
+            partition="production",
+            strata=tuple(self.track.scoring.stratum_weight_map),
+            sources_per_stratum=self.track.scoring.rollouts_per_stratum,
+            batch_seed=seed,
+            excluded_source_digests=frozenset(), inventory_slot=slot,
+        )
+        plan = build_plan(
+            track_spec_digest=self.track.digest,
+            generation_block=block, block_hash=block_hash, secret=secret,
+            inventory_slot=slot,
+            source_proofs=proofs, scoring=self.track.scoring,
+            available_routes=self.track.model.selector.routes,
+        )
+        name = _plan_name(block)
+        try:
+            self.objects.create_plan(name, plan.encode())
+        except PreconditionFailed:
+            # Randomness is frozen by the first successful create, never regenerated on retry.
+            winner = BatchPlan.decode(self.objects.get(name).body)
+            self._validate_plan(name, winner)
+            return winner
+        return plan
 
     def _validate_plan(self, name: str, plan: BatchPlan) -> None:
         if name != _plan_name(plan.generation_block):
@@ -307,22 +219,6 @@ class PlanCoordinator:
             for proof in plan.source_proofs
         ):
             raise RuntimeError("private plan contains an invalid source proof")
-
-
-def _public_stage_metrics(value: object) -> dict[str, object]:
-    """Project a private score result onto the fields preserved in public matches."""
-
-    if not isinstance(value, Mapping):
-        return {}
-    keys = (
-        "incumbent_score",
-        "paired_gain_lower_bound",
-        "cache_sha256",
-        "cache_generated_block",
-        "cache_plan_digest",
-        "cache_seed_block_hash",
-    )
-    return {key: value[key] for key in keys if key in value}
 
 
 class WorkerPool:
@@ -471,13 +367,39 @@ class ProducerService:
                             objects=self.objects,
                             source_pool=self.pool,
                         )
-                        created = coordinator.create_next()
+                        plans = coordinator.plans()
+                        inventory = Inventory(self.objects, self.track.digest)
+                        # A missing unclaimed READY is fenced before anybody can claim it.
+                        for _, _, item in plans:
+                            if item.state == "READY":
+                                self._needs_regeneration(item)
+                        _, authority = inventory.read()
+                        invalid = {row["plan_digest"] for row in authority["invalidations"]}
+                        retained_objects = {
+                            item.sha256 for _, _, plan in plans
+                            if plan.plan_digest not in invalid for item in ready_objects(plan)
+                        }
+                        for _, _, plan in plans:
+                            if plan.plan_digest in invalid:
+                                for item in ready_objects(plan):
+                                    if item.sha256 not in retained_objects:
+                                        self.content.path(item.sha256).unlink(missing_ok=True)
+                        created = coordinator.create_next(
+                            disk_bytes=_work_bytes(self.config.work_dir),
+                        )
                         plans = coordinator.plans()
                         pending = next(
-                            (row for row in plans if row[2].state == "PLANNED"
-                             or self._needs_regeneration(row[2])), None,
+                            (row for row in plans if row[2].plan_digest not in invalid
+                             and (row[2].state == "PLANNED"
+                                  or self._needs_regeneration(row[2]))), None,
                         )
-                        retained = _retained_plan_digests(plans)
+                        retained = frozenset(
+                            plan.plan_digest for _, _, plan in plans
+                            if plan.plan_digest not in invalid
+                            and self.objects.get_optional(
+                                f"disclosed/{plan.plan_digest}.json"
+                            ) is None
+                        )
                         if pending is not None:
                             retained |= {pending[2].plan_digest}
                         _prune_local_work(self.config.work_dir, retained)
@@ -692,8 +614,30 @@ class ProducerService:
             for item in ready_objects(plan):
                 self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)
         except StorageError:
-            return True
+            return not Inventory(self.objects, self.track.digest).invalidate_unassigned(
+                plan.plan_digest,
+            )
         return False
+
+
+def _work_bytes(root: Path) -> int:
+    """Count allocated bytes once per inode, including producer scratch/hardlinks."""
+
+    seen = set()
+    total = 0
+    for directory, _dirs, files in os.walk(root, followlinks=False):
+        for name in files:
+            path = Path(directory) / name
+            try:
+                stat = path.lstat()
+            except FileNotFoundError:
+                continue
+            identity = (stat.st_dev, stat.st_ino)
+            if path.is_symlink() or identity in seen:
+                continue
+            seen.add(identity)
+            total += stat.st_blocks * 512
+    return total
 
 
 def run_producer(config_path: str | Path, *, once: bool = False) -> None:
@@ -1221,18 +1165,6 @@ def _work_directory_lock(root: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _retained_plan_digests(
-    rows: tuple[tuple[str, StoredObject, BatchPlan], ...],
-) -> frozenset[str]:
-    planned = {plan.plan_digest for _, _, plan in rows if plan.state == "PLANNED"}
-    ready = sorted(
-        (plan for _, _, plan in rows if plan.state == "READY"),
-        key=lambda plan: plan.generation_block,
-        reverse=True,
-    )
-    return frozenset(planned | {plan.plan_digest for plan in ready[:2]})
-
-
 def _prune_local_work(root: Path, retained: frozenset[str]) -> None:
     """Prune scratch under the producer lock; never touch sealed content.
 
@@ -1278,7 +1210,7 @@ def _report_cycle(cycle: ProducerCycle) -> None:
             {
                 "planned_block": cycle.planned_block,
                 "ready_block": cycle.ready_block,
-                "waiting_for_cursor": cycle.waiting_for_cursor,
+                "inventory_idle": cycle.inventory_idle,
             },
             sort_keys=True,
         ),

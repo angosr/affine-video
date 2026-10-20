@@ -21,7 +21,6 @@ from scoring.cache import (
     CacheLoadError,
     ExactCacheBatch,
     ExactCacheReader,
-    select_exact_cache_batch,
 )
 from scoring.exact import score_selector_pair
 from scoring.model import ModelValidationError, ValidatedModel, validate_model
@@ -30,7 +29,6 @@ from scoring.spec import TrackSpec
 from validator.download import ModelDownloadError, download_chunked_file, download_public_model
 from validator.production.batches import ReadyBatchSource
 from validator.production.confirmation import ConfirmationWorkerPool
-from validator.production.plan import scheduled_generation_block
 from validator.queue import ChallengeState, require_transition
 from validator.retries import (
     RetryRecorder,
@@ -197,7 +195,7 @@ def verify_initial_champion(
 
 @dataclass(slots=True)
 class PairedTrackEvaluator:
-    """Score challenger and current champion on one post-submission cache batch."""
+    """Score the FIFO challenger on its once-only hidden inventory allocation."""
 
     track: TrackSpec
     store: ChallengeStore
@@ -213,46 +211,24 @@ class PairedTrackEvaluator:
     scoring_device: str | None = None
     batch_source: ReadyBatchSource | None = None
     confirmation_pool: ConfirmationWorkerPool | None = None
+    inventory_status: Mapping[str, Any] | None = None
 
     def ready_through_block(self, current_finalized_block: int) -> int:
-        """Latest submission or stage-decision block whose batch boundary is final."""
-
-        start = self.track.track_start_block
-        interval = self.track.cache.generation_interval_blocks
-        if current_finalized_block < start:
-            return -1
-        boundary = start + ((current_finalized_block - start) // interval) * interval
-        return boundary - self.track.cache.minimum_generation_delay_blocks
+        """No artificial block delay: every finalized admitted submission is eligible."""
+        return current_finalized_block
 
     def batch_ready(self, task: LeasedChallenge) -> bool:
         """Distinguish expected producer lag from an evaluation failure."""
 
         if self.batch_source is None:
             return True
-        return self.batch_source.is_ready(
+        record = self.store.public_challenge(task.challenge_id)
+        return self.batch_source.claim_ready(
             task.challenge_id,
             confirmation=task.state is ChallengeState.CONFIRMING,
+            file_sha256=task.file_sha256,
+            model_digest=record["model_digest"],
         )
-
-    def batch_deadline_block(self, task: LeasedChallenge) -> int:
-        """Return the finalized block after which a missing batch is an outage."""
-
-        if task.state is ChallengeState.SCORING:
-            basis_block = task.position.block
-        elif task.state is ChallengeState.CONFIRMING:
-            exact = self.store.stage_score(task.challenge_id, ChallengeState.SCORING)
-            if exact is None:
-                raise RuntimeError("confirmation is missing its completed exact decision")
-            basis_block = exact.score_block
-        else:
-            raise ValueError("batch deadline requires a scoring stage")
-        scheduled = scheduled_generation_block(
-            basis_block,
-            track_start_block=self.track.track_start_block,
-            minimum_generation_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
-            generation_interval_blocks=self.track.cache.generation_interval_blocks,
-        )
-        return scheduled + self.track.cache.generation_interval_blocks
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         snapshot = self.store.public_snapshot()
@@ -265,7 +241,6 @@ class PairedTrackEvaluator:
             minimum_gain=self.track.full_video.minimum_gain,
             minimum_exact_gain=self.track.scoring.minimum_frontier_gain,
             initial_champion=genesis_champion(self.track),
-            minimum_generation_delay_blocks=(self.track.cache.minimum_generation_delay_blocks),
         )
         incumbent = tournament.champion
         incumbent_task = self._incumbent_task(incumbent, snapshot["challenges"])
@@ -357,14 +332,13 @@ class PairedTrackEvaluator:
             exact = self.store.stage_score(challenger.challenge_id, ChallengeState.SCORING)
             if exact is None:
                 raise RuntimeError("confirmation is missing its completed exact decision")
-            expected_block = scheduled_generation_block(
-                exact.score_block,
-                track_start_block=self.track.track_start_block,
-                minimum_generation_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
-                generation_interval_blocks=self.track.cache.generation_interval_blocks,
+            exact_plan = self.batch_source._allocated_plan(
+                challenger.challenge_id, confirmation=False,
             )
-            if batch.plan.generation_block != expected_block:
-                raise RuntimeError("confirmation batch does not follow the exact decision block")
+            if (batch.plan.plan_digest == exact_plan.plan_digest or {
+                proof.leaf.source_family_id for proof in exact_plan.source_proofs
+            }.intersection(proof.leaf.source_family_id for proof in batch.plan.source_proofs)):
+                raise RuntimeError("confirmation inventory is not independent of exact")
             self._require_finalized_seed_hash(batch.plan.generation_block, batch.plan.block_hash)
             result = self.confirmation_pool.run(
                 challenger_path=challenger.model_path or "",
@@ -388,38 +362,10 @@ class PairedTrackEvaluator:
         )
 
     def _batch(self, task: LeasedChallenge) -> ExactCacheBatch:
-        scoring = self.track.scoring
         try:
             if self.batch_source is None:
-                batch = select_exact_cache_batch(
-                    self.cache_dir,
-                    submission_block=task.position.block,
-                    minimum_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
-                    track_start_block=self.track.track_start_block,
-                    generation_interval_blocks=self.track.cache.generation_interval_blocks,
-                    expected_track_spec_digest=self.track.digest,
-                    max_bytes=self.track.cache.exact_max_bytes,
-                    head_dim=self.track.model.selector.head_dim,
-                    tile_size=128,
-                    routes=self.track.model.selector.routes,
-                    strata=scoring.stratum_weight_map,
-                    sampled_route_count=scoring.sampled_route_count,
-                    rollouts_per_stratum=scoring.rollouts_per_stratum,
-                    sampled_step_count=scoring.sampled_step_count,
-                    query_tiles_per_case=scoring.query_tiles_per_case,
-                )
-            else:
-                batch = self.batch_source.exact_batch(task.challenge_id)
-                expected_block = scheduled_generation_block(
-                    task.position.block,
-                    track_start_block=self.track.track_start_block,
-                    minimum_generation_delay_blocks=(
-                        self.track.cache.minimum_generation_delay_blocks
-                    ),
-                    generation_interval_blocks=self.track.cache.generation_interval_blocks,
-                )
-                if batch.generated_block != expected_block:
-                    raise CacheLoadError("challenge READY plan uses the wrong generation block")
+                raise CacheLoadError("a durable inventory allocation is required")
+            batch = self.batch_source.exact_batch(task.challenge_id)
             self._require_finalized_seed_hash(batch.generated_block, batch.seed_block_hash)
             if self.track.cache.generator != "veda-private-rollout-v1":
                 raise CacheLoadError("track cache generator is unsupported")
@@ -431,7 +377,8 @@ class PairedTrackEvaluator:
         """Reject both stages unless their seed matches the finalized chain snapshot."""
 
         expected_hash = (
-            None if self.seed_block_hashes is None else self.seed_block_hashes.get(generated_block)
+            self.store.finalized_block_hash(generated_block)
+            if self.seed_block_hashes is None else self.seed_block_hashes.get(generated_block)
         )
         if not isinstance(expected_hash, str) or seed_block_hash.lower() != expected_hash.lower():
             raise CacheLoadError("cache seed hash does not match its finalized generation block")

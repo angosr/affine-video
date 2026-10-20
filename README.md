@@ -116,26 +116,31 @@ archiving, confirmed by the `SCORING` state.
    still has one submission opportunity.
 2. Admission checks registration, competition eligibility, model format, hotkey binding and
    duplicate tensors. Re-signing an earlier model or copying the baseline is not a new model.
-3. Challenger and champion run on the same newly seeded batch: 16 videos across four strata,
-   eight sampled layer/head routes and three denoising steps, giving 384 paired cases. The batch
-   boundary follows the submission; its finalized block hash determines selection. Confidence
+3. Challenger and champion run on the same hidden inventory batch: 16 videos across four strata,
+   eight sampled layer/head routes and three denoising steps, giving 384 paired cases. The FIFO
+   scorer claims the oldest available batch once; retries retain that allocation. Confidence
    bounds group correlated cases by video rather than treating all 384 cases as independent.
    Confidence is specified per comparison, not as a lifetime false-promotion guarantee.
-4. Passing the attention-quality/cost gate schedules a separate later batch for complete
+4. Passing the attention-quality/cost gate claims a source-independent hidden batch for complete
    eight-step video inference at all three budgets. Only a challenger exceeding the frozen
    paired improvement thresholds in both stages becomes champion. Ties retain the champion.
 5. Results are published in queue order. The champion receives this mechanism's full weight
    until replaced or no longer eligible; the registered UID0 baseline is the fallback.
 
 Infrastructure failures defer and retry the original challenge; they do not count as miner
-losses. Waiting for a batch is not a failed attempt. Data and replay references are disclosed
-after every challenge sharing that batch finishes. Quality metrics, budgets and thresholds are
+losses. Waiting for inventory is not a failed attempt. Each batch belongs to one challenge/stage
+and cannot be reused by a later model. Its data, committed secret and replay references are
+disclosed only after that challenge finishes. Quality metrics, budgets and thresholds are
 defined by the live track, not adjustable per submission. Scores from different batches are not
 directly comparable; promotion uses the paired comparison with the incumbent.
 
-Data is produced on demand without a final batch number. Prompts may recur, but each batch uses
-fresh block-derived generation seeds; a challenge's exact and confirmation batches use disjoint
-source families. This generates new rollouts, not an unlimited supply of new prompts.
+The existing producer fills a small hidden inventory even without miners, pausing at the track's
+batch-count and disk-byte limits. Generation combines a finalized block hash with a committed
+private 256-bit secret; public block hashes alone cannot reconstruct unused inventory. Production
+commitments have two fixed, family-disjoint halves; each challenge uses opposite halves for its
+two stages. Confirmation may already exist before the exact decision. Lost unclaimed data is
+CAS-invalidated and replenished; assigned hashes and archived results never change. Prompts may
+recur with new secret-seeded rollouts; this is not an unlimited supply of new prompts.
 
 ## Watch the competition
 
@@ -145,7 +150,8 @@ uv run veda monitor --watch 30
 ```
 
 The read-only CLI shows UIDs, hotkey prefixes, champion, queue positions, match numbers, scores,
-outcomes and retry alerts. It needs no wallet, GPU or storage key. `status.json` is the current
+outcomes, inventory counts, waiting/computing activity and retry alerts. It needs no wallet, GPU
+or storage key. `status.json` is the current
 view; `summary.json` includes the committed match count and latest match. Immutable match records
 use `matches/<track_id>/<12-digit-sequence>.json` under the same public `tracks/main/` prefix.
 

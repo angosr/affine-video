@@ -63,6 +63,7 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
         "UID",
         "HOTKEY",
         "STATUS",
+        "ACTIVITY",
         "QUEUE",
         "MATCH",
         "TRIES",
@@ -92,6 +93,7 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
                 str(raw.get("uid", "?")),
                 hotkey[:6],
                 status_text,
+                str(raw.get("activity", "-")),
                 f"{yellow}#{queue}{reset}" if queue is not None else "-",
                 f"#{match}" if match is not None else "-",
                 str(raw.get("attempts", 0)),
@@ -107,6 +109,11 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
             widths[index] = max(widths[index], len(cell))
     separator = "  ".join("─" * width for width in widths)
     lines = [title, "", _format_row(headers, widths), separator]
+    inventory = status.get("inventory")
+    if isinstance(inventory, Mapping):
+        lines.insert(1, f"Hidden inventory: {inventory.get('ready_batches', 0)} ready / "
+                     f"{inventory.get('producing_batches', 0)} producing / "
+                     f"{inventory.get('target_batches', '?')} target")
     if rows:
         lines.extend(
             _format_colored_row(row, plain, widths)

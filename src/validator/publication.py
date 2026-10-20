@@ -29,12 +29,13 @@ from validator.chunks import (
 )
 from validator.production.batches import BatchDisclosure, public_selected_inputs_document
 from validator.production.commitment import verify_source_proof
+from validator.production.inventory import Inventory
 from validator.production.plan import (
     BatchPlan,
     build_plan,
     validate_source_selection_sequence,
 )
-from validator.queue import TERMINAL_STATES, ChallengeState
+from validator.queue import TERMINAL_STATES
 from validator.release import PRODUCTION_TRACK_ID, ReleaseApproval, require_release_approval
 from validator.s3 import client_config, is_missing, is_precondition_failed
 from validator.store import ChallengeStore
@@ -137,6 +138,8 @@ def build_public_artifacts(
     runtime_manifest: bytes | None = None,
     release_approval: ReleaseApproval | None = None,
     system_matches: tuple[tuple[str, bytes], ...] = (),
+    inventory_status: Mapping[str, Any] | None = None,
+    evaluation_running: bool = False,
 ) -> PublicArtifacts | None:
     """Build bounded metadata without restoring or uploading disclosure payloads."""
 
@@ -156,7 +159,6 @@ def build_public_artifacts(
         minimum_gain=track.full_video.minimum_gain,
         minimum_exact_gain=track.scoring.minimum_frontier_gain,
         initial_champion=initial,
-        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
     )
     if match_limit is not None and len(tournament.matches) != match_limit:
         raise PublicArtifactError("the committed public match prefix is missing locally")
@@ -206,6 +208,26 @@ def build_public_artifacts(
         snapshot["challenges"],
         system_matches=system_match_summaries(system_matches),
     )
+    if inventory_status is not None:
+        status["inventory"] = {
+            key: value for key, value in inventory_status.items() if key != "allocated_stages"
+        }
+        allocated = set(inventory_status["allocated_stages"])
+        challenges_by_id = {item["challenge_id"]: item for item in snapshot["challenges"]}
+        for row in status["participants"]:
+            if row["queue_position"] != 1:
+                continue
+            state = row["state"]
+            stage = state
+            if state == "SYSTEM_DEFERRED":
+                events = challenges_by_id[row["challenge_id"]].get("events", [])
+                stage = events[-1].get("previous_state") if events else None
+            if stage in {"SCORING", "CONFIRMING"}:
+                row["activity"] = (
+                    "WAIT_INVENTORY" if (row["challenge_id"], stage) not in allocated
+                    else "COMPUTING" if evaluation_running
+                    else "RETRY_WAIT" if state == "SYSTEM_DEFERRED" else "READY"
+                )
     files: dict[str, PublicFile] = {}
     for match in tournament.matches:
         evaluation = match.document["evaluation"]
@@ -311,7 +333,6 @@ def build_genesis_artifacts(
         minimum_gain=track.full_video.minimum_gain,
         minimum_exact_gain=track.scoring.minimum_frontier_gain,
         initial_champion=genesis_champion(track),
-        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
     )
     plan = plan_champion_weight(
         tournament.champion,
@@ -990,7 +1011,6 @@ class S3Repository:
                     minimum_gain=track.full_video.minimum_gain,
                     minimum_exact_gain=track.scoring.minimum_frontier_gain,
                     incumbent=incumbent,
-                    minimum_generation_delay_blocks=(track.cache.minimum_generation_delay_blocks),
                 )
             except ValueError as exc:
                 raise PublicArtifactError(f"public match is invalid: {name}") from exc
@@ -1009,7 +1029,6 @@ class S3Repository:
             minimum_gain=track.full_video.minimum_gain,
             minimum_exact_gain=track.scoring.minimum_frontier_gain,
             initial_champion=genesis_champion(track),
-            minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
         )
         if summary != _summary_document(track, source_block, tournament):
             raise PublicArtifactError("public summary does not match its immutable matches")
@@ -1085,7 +1104,6 @@ class S3Repository:
                     minimum_gain=track.full_video.minimum_gain,
                     minimum_exact_gain=track.scoring.minimum_frontier_gain,
                     incumbent=incumbent,
-                    minimum_generation_delay_blocks=(track.cache.minimum_generation_delay_blocks),
                 )
             except ValueError as exc:
                 raise PublicArtifactError(f"public match is invalid: {name}") from exc
@@ -1129,6 +1147,7 @@ class S3Repository:
             raise PublicArtifactError("public matches identify multiple plans for one block")
 
         verified = {}
+        allocations = {}
         for plan_digest, used_batches in batches.items():
             record_name = f"batch_groups/{plan_digest}.json"
             payload = self._get_optional(record_name)
@@ -1137,65 +1156,38 @@ class S3Repository:
             document = _decode_canonical_object(payload, record_name)
             if set(document) != {
                 "format",
+                "allocation",
                 "plan",
                 "public_dense_references",
                 "public_exact_object",
                 "public_selected_inputs",
-            } or document["format"] != "veda-batch-disclosure-v1":
+            } or document["format"] != "veda-batch-disclosure-v2":
                 raise PublicArtifactError("public batch disclosure fields are invalid")
             try:
                 plan = BatchPlan.decode(_json_bytes(document["plan"]))
             except (TypeError, ValueError) as exc:
                 raise PublicArtifactError("public batch disclosure plan is invalid") from exc
-            challenge_ids = set(plan.exact_challenge_ids + plan.confirmation_challenge_ids)
-            if (
-                plan.state != "READY"
-                or plan.plan_digest != plan_digest
-                or plan.track_spec_digest != track.digest
-                or not challenge_ids
-                or not challenge_ids.issubset(terminal_ids)
-            ):
-                raise PublicArtifactError("public batch disclosure conflicts with the ledger")
+            allocation = document["allocation"]
             uses = stage_uses.get(plan_digest, [])
-            exact_ids = tuple(
-                match.challenge_id
-                for match, stage in uses
-                if stage["stage"] == ChallengeState.SCORING
-            )
-            confirmation_ids = tuple(
-                match.challenge_id
-                for match, stage in uses
-                if stage["stage"] == ChallengeState.CONFIRMING
-            )
+            try:
+                Inventory.validate_claim(allocation, plan)
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                raise PublicArtifactError("public inventory allocation is invalid") from exc
             if (
-                exact_ids != plan.exact_challenge_ids
-                or confirmation_ids != plan.confirmation_challenge_ids
+                plan.plan_digest != plan_digest
+                or plan.track_spec_digest != track.digest
+                or allocation["challenge_id"] not in terminal_ids
+                or len(uses) != 1
             ):
-                raise PublicArtifactError(
-                    "public batch disclosure challenge assignment is invalid"
-                )
-            for match, stage in uses:
-                if stage["stage"] == ChallengeState.SCORING:
-                    scheduled_from = match.document["submission"]["block_height"]
-                else:
-                    exact_stages = [
-                        item
-                        for item in match.document["evaluation"]["stages"]
-                        if item["stage"] == ChallengeState.SCORING
-                    ]
-                    if len(exact_stages) != 1:
-                        raise PublicArtifactError(
-                            "public confirmation is missing its exact decision"
-                        )
-                    scheduled_from = exact_stages[0]["score_block"]
-                if not (
-                    plan.submission_first_block
-                    <= scheduled_from
-                    <= plan.submission_last_block
-                ):
-                    raise PublicArtifactError(
-                        "public batch disclosure uses the wrong generation boundary"
-                    )
+                raise PublicArtifactError("public inventory conflicts with the ledger")
+            match, stage = uses[0]
+            if (
+                allocation["challenge_id"] != match.challenge_id
+                or allocation["stage"] != stage["stage"]
+                or allocation["file_sha256"] != match.document["evaluation"]["file_sha256"]
+                or allocation["model_digest"] != match.document["evaluation"]["model_digest"]
+            ):
+                raise PublicArtifactError("public inventory claimant differs from its match")
             commitment_digests = tuple(item.sha256 for item in track.source_commitments)
             if any(
                 not verify_source_proof(
@@ -1210,11 +1202,8 @@ class S3Repository:
                 track_spec_digest=track.digest,
                 generation_block=plan.generation_block,
                 block_hash=plan.block_hash,
-                track_start_block=track.track_start_block,
-                minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
-                generation_interval_blocks=track.cache.generation_interval_blocks,
-                exact_challenge_ids=plan.exact_challenge_ids,
-                confirmation_challenge_ids=plan.confirmation_challenge_ids,
+                secret=plan.secret,
+                inventory_slot=plan.inventory_slot,
                 source_proofs=plan.source_proofs,
                 scoring=track.scoring,
                 available_routes=track.model.selector.routes,
@@ -1266,7 +1255,8 @@ class S3Repository:
                 assert isinstance(object_name, str)
                 files.append((object_name, item.sha256, item.size_bytes))
             expected = {
-                "format": "veda-batch-disclosure-v1",
+                "format": "veda-batch-disclosure-v2",
+                "allocation": allocation,
                 "plan": plan.document(),
                 "public_exact_object": exact_name,
                 "public_dense_references": public_references,
@@ -1277,7 +1267,30 @@ class S3Repository:
             for object_name, sha256, size_bytes in files:
                 self._verify_public_file(object_name, sha256, size_bytes)
             verified[plan_digest] = (plan, record_name, payload)
+            if any(row["ordinal"] == allocation["ordinal"] for row in allocations.values()):
+                raise PublicArtifactError("public inventory allocation ordinal is reused")
+            allocations[plan_digest] = allocation
 
+        # The stage ledger identifies both allocations even when confirmation was
+        # generated before the exact decision. Prove independent source families.
+        for match in matches:
+            stages = match.document["evaluation"]["stages"]
+            plans = [
+                verified[stage["evaluation_batch"]["plan_digest"]][0]
+                for stage in stages if stage.get("evaluation_batch", {}).get("plan_digest")
+                in verified
+            ]
+            if len(plans) == 2 and (
+                plans[0].inventory_slot == plans[1].inventory_slot or {
+                    proof.leaf.source_family_id for proof in plans[0].source_proofs
+                }.intersection(proof.leaf.source_family_id for proof in plans[1].source_proofs)
+            ):
+                raise PublicArtifactError("confirmation disclosure reuses exact sources")
+            if len(plans) == 2 and (
+                allocations[plans[0].plan_digest]["ordinal"]
+                >= allocations[plans[1].plan_digest]["ordinal"]
+            ):
+                raise PublicArtifactError("confirmation allocation predates exact allocation")
         prefix = []
         for plan_digest in sorted(generation_blocks, key=generation_blocks.__getitem__):
             row = verified.get(plan_digest)
@@ -1572,25 +1585,33 @@ def _status_document(
         if challenge is None:
             raise PublicArtifactError("active commitment has no local challenge")
         match = match_by_id.get(challenge["challenge_id"])
+        historical = (
+            challenge.get("track_spec_digest") is not None
+            and challenge["track_spec_digest"] != track.digest
+        )
         is_champion = tournament.champion.challenge_id == challenge["challenge_id"]
         active_rows.append(
             {
                 "uid": competitor["uid"],
                 "hotkey": competitor["hotkey"],
                 "challenge_id": challenge["challenge_id"],
+                "track_spec_digest": challenge.get("track_spec_digest", track.digest),
                 "submission_block": competitor["block_height"],
                 "state": challenge["state"],
                 "queue_position": None,
                 "match_sequence": None if match is None else match.sequence,
                 "score": (tournament.champion.score if is_champion else challenge["final_score"]),
                 "incumbent_score": challenge["incumbent_score"],
-                "score_gain": None if match is None else match.score_gain,
+                "score_gain": (
+                    challenge.get("paired_gain_lower_bound") if historical
+                    else None if match is None else match.score_gain
+                ),
                 "batch_generated_block": (
                     None
                     if challenge["evaluation_batch"] is None
                     else challenge["evaluation_batch"]["generated_block"]
                 ),
-                "outcome": None if match is None else match.outcome,
+                "outcome": "HISTORICAL" if historical else None if match is None else match.outcome,
                 "champion": is_champion,
                 "attempts": challenge["attempts"],
                 "error_code": challenge["error_code"],

@@ -133,7 +133,6 @@ def validate_match_document(
     minimum_gain: float,
     minimum_exact_gain: float | None = None,
     incumbent: Champion,
-    minimum_generation_delay_blocks: int = 1,
 ) -> MatchRecord:
     """Strictly validate one stored match and its link to the previous champion."""
 
@@ -147,7 +146,6 @@ def validate_match_document(
         minimum_gain=minimum_gain,
         minimum_exact_gain=minimum_gain if minimum_exact_gain is None else minimum_exact_gain,
         incumbent=incumbent,
-        minimum_generation_delay_blocks=minimum_generation_delay_blocks,
     )
     if dict(record.document) != dict(document):
         raise ValueError("stored match is not the canonical tournament decision")
@@ -163,7 +161,6 @@ def resolve_tournament(
     minimum_gain: float,
     minimum_exact_gain: float | None = None,
     initial_champion: Champion,
-    minimum_generation_delay_blocks: int = 1,
 ) -> Tournament:
     """Resolve the contiguous terminal prefix in finalized submission order."""
 
@@ -190,10 +187,28 @@ def resolve_tournament(
     leaderboard_candidates: list[Champion] = [initial_champion]
     seen_hotkeys: set[str] = {initial_champion.hotkey}
 
-    for sequence, challenge in enumerate(challenges, start=1):
+    for challenge in challenges:
         state = ChallengeState(_required_string(challenge, "state"))
+        origin = challenge.get("track_spec_digest") or track_spec_digest
+        if origin != track_spec_digest:
+            _optional_digest(origin, "historical track digest")
+            if state not in TERMINAL_STATES:
+                raise ValueError("an unfinished previous-track challenge cannot be rebound")
+            historical_stages = challenge.get("stages", [])
+            if len(historical_stages) == 2 and (
+                historical_stages[0].get("paired_gain_lower_bound", -1) > exact_gain
+                and historical_stages[1].get("paired_gain_lower_bound", -1) > minimum_gain
+            ):
+                raise ValueError(
+                    "a previous-track promotion requires coordinated champion migration"
+                )
+            # Preserve completed facts and lifetime uniqueness, never re-label a
+            # previous source/cache measurement as this track's match evidence.
+            seen_hotkeys.add(_required_string(challenge, "hotkey"))
+            continue
         if state not in TERMINAL_STATES:
             break
+        sequence = len(matches) + 1
         hotkey = _required_string(challenge, "hotkey")
         repeated = hotkey in seen_hotkeys
         rejected_as_duplicate = state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
@@ -209,7 +224,6 @@ def resolve_tournament(
             minimum_gain=minimum_gain,
             minimum_exact_gain=exact_gain,
             incumbent=champion,
-            minimum_generation_delay_blocks=minimum_generation_delay_blocks,
         )
         matches.append(record)
         if state is ChallengeState.SUCCEEDED:
@@ -255,7 +269,6 @@ def _resolve_match(
     minimum_gain: float,
     minimum_exact_gain: float,
     incumbent: Champion,
-    minimum_generation_delay_blocks: int,
 ) -> tuple[MatchRecord, Champion]:
     identifier = _required_string(challenge, "challenge_id")
     submission_id = _required_string(challenge, "submission_id")
@@ -274,9 +287,9 @@ def _resolve_match(
     score_gain: float | None = None
     stages = _evaluation_stages(
         challenge.get("stages", []),
-        submission_block=position.block,
-        minimum_delay_blocks=minimum_generation_delay_blocks,
     )
+    if any(stage["score_block"] < position.block for stage in stages):
+        raise ValueError("stage decision block cannot precede its submission")
 
     if state is ChallengeState.SUCCEEDED:
         if repo_id is None or revision is None:
@@ -291,10 +304,10 @@ def _resolve_match(
         candidate = Champion(identifier, hotkey, repo_id, revision, score, position)
         incumbent_score = _score(challenge.get("incumbent_score"), "incumbent_score")
         score_block = _integer(challenge["score_block"], "score_block")
+        if score_block < position.block:
+            raise ValueError("decision block cannot precede its submission")
         batch = _evaluation_batch(
             challenge.get("evaluation_batch"),
-            submission_block=position.block,
-            minimum_delay_blocks=minimum_generation_delay_blocks,
         )
         if score_block < batch["generated_block"]:
             raise ValueError("decision block cannot precede its evaluation batch")
@@ -323,8 +336,8 @@ def _resolve_match(
             confirmation_batch = confirmation.get("evaluation_batch")
             if exact_batch is None or confirmation_batch is None:
                 raise ValueError("both scoring stages must identify their evaluation batch")
-            if confirmation_batch["generated_block"] <= exact_stage["score_block"]:
-                raise ValueError("confirmation batch must be generated after the exact decision")
+            if confirmation_batch["plan_digest"] == exact_batch["plan_digest"]:
+                raise ValueError("confirmation must use independent inventory")
             if confirmation["score_block"] < confirmation_batch["generated_block"]:
                 raise ValueError("confirmation decision predates its evaluation batch")
         final_stage = stages[-1]
@@ -490,9 +503,6 @@ def _optional_digest(value: Any, name: str) -> str | None:
 
 def _evaluation_batch(
     value: Any,
-    *,
-    submission_block: int,
-    minimum_delay_blocks: int,
 ) -> dict[str, Any]:
     expected = {
         "sha256",
@@ -505,8 +515,6 @@ def _evaluation_batch(
     sha256 = _optional_digest(value["sha256"], "evaluation batch sha256")
     plan_digest = _optional_digest(value["plan_digest"], "evaluation batch plan_digest")
     generated_block = _integer(value["generated_block"], "evaluation batch generated_block")
-    if generated_block < submission_block + minimum_delay_blocks:
-        raise ValueError("evaluation batch predates the submission boundary")
     assert sha256 is not None and plan_digest is not None
     seed_block_hash = _block_hash(value["seed_block_hash"])
     object_name = f"batches/{sha256}/manifest.json"
@@ -523,9 +531,6 @@ def _evaluation_batch(
 
 def _evaluation_stages(
     value: Any,
-    *,
-    submission_block: int,
-    minimum_delay_blocks: int,
 ) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("evaluation stages must be a list")
@@ -544,6 +549,8 @@ def _evaluation_stages(
         seen.add(stage)
         score = _score(row.get("score"), "stage score")
         score_block = _integer(row.get("score_block"), "stage score_block")
+        if result and score_block < result[-1]["score_block"]:
+            raise ValueError("stage decisions cannot run backwards")
         document: dict[str, Any] = {
             "score": score,
             "score_block": score_block,
@@ -552,8 +559,6 @@ def _evaluation_stages(
         if row.get("evaluation_batch") is not None:
             batch = _evaluation_batch(
                 row["evaluation_batch"],
-                submission_block=submission_block,
-                minimum_delay_blocks=minimum_delay_blocks,
             )
             if score_block < batch["generated_block"]:
                 raise ValueError("stage decision block cannot precede its evaluation batch")

@@ -313,13 +313,16 @@ def test_worker_setup_failure_alerts_and_does_not_poison_next_task(pending_evalu
     asyncio.run(execute())
 
 
-@pytest.mark.parametrize("benchmark_refresh", ["normal", "slow", "error"])
+@pytest.mark.parametrize("benchmark_refresh", [
+    "normal", "slow", "error", "inventory_slow", "inventory_error",
+])
 def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     pending_evaluation, monkeypatch, tmp_path, benchmark_refresh,
 ):
     case = pending_evaluation
     entered, release = threading.Event(), threading.Event()
     admission_gate = threading.Event()
+    inventory_gate = threading.Event()
     calls, reports, failures = [], [], []
     snapshots = []
     benchmark_calls = []
@@ -340,7 +343,27 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     client = Client(case.client._substrate.blocks)
     client._finalized = 102
 
-    if benchmark_refresh != "normal":
+    if benchmark_refresh.startswith("inventory_"):
+        original_evaluator = run_module.PairedTrackEvaluator
+
+        def inventory_plans():
+            assert threading.get_ident() != owner
+            benchmark_calls.append(benchmark_refresh)
+            if benchmark_refresh == "inventory_error":
+                raise OSError("private inventory read unavailable")
+            if not inventory_gate.wait(5):
+                raise OSError("test did not release inventory read")
+            return ()
+
+        def evaluator_factory(**kwargs):
+            evaluator = original_evaluator(**kwargs)
+            evaluator.batch_source = SimpleNamespace(
+                _plans=inventory_plans, inventory_status=lambda _plans: {},
+            )
+            return evaluator
+
+        monkeypatch.setattr(run_module, "PairedTrackEvaluator", evaluator_factory)
+    elif benchmark_refresh != "normal":
         async def load_benchmarks(_track, _manifest):
             benchmark_calls.append(benchmark_refresh)
             if benchmark_refresh == "error":
@@ -412,6 +435,7 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
         assert weights.source_block == published_block
         assert weights.plan.uids == (0,)
         if len(reports) == 3:
+            inventory_gate.set()
             release.set()
             raise StopLoop
         client._finalized += 1
@@ -420,7 +444,6 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_module.bt, "Client", lambda *_args, **_kwargs: client)
     monkeypatch.setattr(run_module, "seed_legacy_exclusions", no_seed)
-    monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", no_seed)
     monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
     monkeypatch.setattr(run_module, "process_next_admission", admission)
     monkeypatch.setattr(run_module, "evaluate_next_scoring", scoring)
@@ -445,6 +468,7 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
         with pytest.raises(StopLoop):
             asyncio.run(execute())
     finally:
+        inventory_gate.set()
         admission_gate.set()
         release.set()
     assert not failures
@@ -470,6 +494,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
 ):
     """CPU orchestration/real byte uploads; fixture scores are not quality evidence."""
 
+    from tests.validator.production.test_storage import MemoryS3 as PrivateMemoryS3
     from validator.production.batches import ReadyBatchSource
     from validator.production.plan import (
         DenseReference,
@@ -479,6 +504,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         generation_seed,
         select_source_proofs,
     )
+    from validator.production.storage import PrivateObjectStore
 
     case = pending_evaluation
     lost_response = mode.endswith("_lost_response")
@@ -499,16 +525,14 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
             proofs = select_source_proofs(
                 case.pool, commitments=case.track.source_commitments, partition="production",
                 strata=("all",), sources_per_stratum=case.track.scoring.rollouts_per_stratum,
-                batch_seed=generation_seed(case.track.digest, block_hash),
+                batch_seed=generation_seed(case.track.digest, block_hash, "a5" * 32),
                 excluded_source_digests=frozenset(used_sources),
+                inventory_slot=0 if generation == 200 else 1,
             )
             used_sources.update(proof.leaf.digest for proof in proofs)
-            plan = build_plan(
+            plan = build_plan(secret="a5" * 32, inventory_slot=0 if generation == 200 else 1,
                 track_spec_digest=case.track.digest, generation_block=generation,
-                block_hash=block_hash, track_start_block=100,
-                minimum_generation_delay_blocks=4, generation_interval_blocks=100,
-                exact_challenge_ids=(challenge_id,) if generation == 200 else (),
-                confirmation_challenge_ids=(challenge_id,) if generation == 400 else (),
+                block_hash=block_hash,
                 source_proofs=proofs, scoring=case.track.scoring,
                 available_routes=case.track.model.selector.routes,
             )
@@ -541,7 +565,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
 
     source = ReadyBatchSource(
         track=case.track, cache_dir=tmp_path / "restored",
-        objects=SimpleNamespace(download_content=lambda key, *_args, **_kwargs: paths[key]),
+        objects=PrivateObjectStore(PrivateMemoryS3(), bucket="test", prefix="private-fixture"),
     )
     source._plan_by_digest = lambda digest: next(
         plan for plan in plans.values() if plan.plan_digest == digest
@@ -553,6 +577,13 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         if not plans:
             build_groups(task.challenge_id)
         exact = task.state is ChallengeState.SCORING
+        with ChallengeStore(case.work.database, track_spec_digest=case.track.digest) as observer:
+            admitted = observer.public_challenge(task.challenge_id)
+        source.inventory.claim(
+            challenge_id=task.challenge_id, stage=task.state.value,
+            file_sha256=admitted["file_sha256"], model_digest=admitted["model_digest"],
+            plans=tuple(plans.values()),
+        )
         plan = plans[200 if exact else 400]
         return StageOutcome(0.9, {
             "stage": "scoring" if exact else "confirming",
@@ -710,7 +741,6 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_module.bt, "Client", lambda *_args, **_kwargs: Client(blocks))
     monkeypatch.setattr(run_module, "seed_legacy_exclusions", no_seed)
-    monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", no_seed)
     monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
     monkeypatch.setattr(run_module, "resolve_public_disclosures", slow_resolve)
     monkeypatch.setattr(run_module, "process_next_admission", no_work)
@@ -876,7 +906,6 @@ def test_ledger_outage_scanning_reserves_uid0_and_recovers_from_chain_failure(
     monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_module.bt, "Client", lambda *_args, **_kwargs: Client(blocks))
     monkeypatch.setattr(run_module, "seed_legacy_exclusions", no_seed)
-    monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", no_seed)
     monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
     monkeypatch.setattr(run_module, "webhook_alerter", lambda *_args, **_kwargs: None)
     (tmp_path / "batches").mkdir()
@@ -1000,7 +1029,6 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
     monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_module.bt, "Client", client_factory)
     monkeypatch.setattr(run_module, "seed_legacy_exclusions", seed)
-    monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", seed)
     monkeypatch.setattr(run_module, "process_cycle", process)
     monkeypatch.setattr(run_module.asyncio, "sleep", no_sleep)
     (tmp_path / "exact.npz").mkdir()
@@ -1065,7 +1093,7 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
     monkeypatch.setattr(run_module, "submit_weights", submit)
 
     async def execute():
-        track = run_module.load_track_spec("track.json")
+        track = parse_track_spec({**valid_spec(), "netuid": 120, "mechid": 1})
         artifact = WeightArtifact(
             track.track_id,
             track.digest,
@@ -1111,7 +1139,7 @@ def test_independent_validator_fetches_checks_and_submits_public_weights(monkeyp
 
 
 def test_independent_validator_rejects_weights_for_another_track() -> None:
-    track = run_module.load_track_spec("track.json")
+    track = parse_track_spec({**valid_spec(), "netuid": 120, "mechid": 1})
     artifact = WeightArtifact(
         "another-track",
         track.digest,
@@ -1494,7 +1522,6 @@ def test_publication_gate_survives_restarts_and_republishes_before_work(monkeypa
     monkeypatch.setattr(run_module, "verify_initial_champion", lambda *_a, **_k: None)
     monkeypatch.setattr(run_module.bt, "Client", lambda *_a, **_k: Client(blocks))
     monkeypatch.setattr(run_module, "seed_legacy_exclusions", no_op)
-    monkeypatch.setattr(run_module, "_refresh_seed_block_hashes", no_op)
     monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
     monkeypatch.setattr(run_module, "process_next_admission", work)
     monkeypatch.setattr(run_module, "evaluate_next_scoring", work)

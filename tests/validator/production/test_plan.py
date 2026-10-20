@@ -29,6 +29,7 @@ from validator.production.commitment import (
     canonical_json,
     verify_source_proof,
 )
+from validator.production.inventory import Inventory
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
@@ -36,18 +37,15 @@ from validator.production.plan import (
     ReadySampleCache,
     build_audit_evidence_plan,
     build_plan,
-    confirmation_source_digests,
     generation_seed,
-    scheduled_generation_block,
+    inventory_commitment,
     select_query_tiles,
     select_source_digests,
     select_source_proofs,
-    submission_interval,
     validate_source_selection_sequence,
 )
 from validator.production.runtime import DenseRolloutRuntime, trajectory_tensor_key
 from validator.production.service import (
-    PlanCoordinator,
     ProducerService,
     UnitResult,
     WorkerPool,
@@ -59,9 +57,16 @@ from validator.production.service import (
     _work_directory_lock,
     _write_unit_completion,
 )
-from validator.production.storage import LocalBatchStore, PreconditionFailed, StoredObject
+from validator.production.storage import (
+    LocalBatchStore,
+    PreconditionFailed,
+    PrivateObjectStore,
+    StoredObject,
+)
 from validator.queue import ChainPosition, ChallengeState
 from validator.store import ChallengeStore
+
+from .test_storage import MemoryS3
 
 
 def scoring() -> ScoringSpec:
@@ -131,40 +136,13 @@ def ready_sample_cache() -> ReadySampleCache:
     )
 
 
-def test_batch_schedule_has_one_exact_submission_interval() -> None:
-    assert (
-        scheduled_generation_block(
-            119,
-            track_start_block=100,
-            minimum_generation_delay_blocks=1,
-            generation_interval_blocks=20,
-        )
-        == 120
-    )
-    assert submission_interval(
-        120,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-    ) == (100, 119)
-    assert submission_interval(
-        140,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-    ) == (120, 139)
-
-
 def test_plan_is_deterministic_and_only_transitions_to_ready_once() -> None:
-    arguments = {
+    arguments = { "secret": "a5" * 32, "inventory_slot": 0,
         "track_spec_digest": "ab" * 32,
         "generation_block": 120,
         "block_hash": "0x" + "cd" * 32,
-        "track_start_block": 100,
-        "minimum_generation_delay_blocks": 1,
-        "generation_interval_blocks": 20,
-        "exact_challenge_ids": ("exact-a",),
-        "confirmation_challenge_ids": ("confirm-a",),
+
+
         "source_proofs": (proof(0), proof(1)),
         "scoring": scoring(),
         "available_routes": ("route-0", "route-1", "route-2"),
@@ -173,7 +151,7 @@ def test_plan_is_deterministic_and_only_transitions_to_ready_once() -> None:
     second = build_plan(**arguments)
 
     assert first == second
-    assert first.submission_first_block == 100
+    assert first.secret_commitment == inventory_commitment(first.secret)
     assert len(first.selected_routes) == 2
     assert len(first.selected_steps) == 3
     assert len(first.rollouts) == 2
@@ -303,7 +281,7 @@ def test_source_selection_is_partition_explicit_and_audit_is_deterministic() -> 
     arguments = {
         "strata": ("16:9@37",),
         "sources_per_stratum": 2,
-        "batch_seed": generation_seed(track_digest, block_hash),
+        "batch_seed": generation_seed(track_digest, block_hash, "a5" * 32),
         "excluded_source_digests": frozenset(),
     }
 
@@ -327,27 +305,18 @@ def test_source_selection_is_partition_explicit_and_audit_is_deterministic() -> 
     assert set(expected).isdisjoint(production)
     assert expected == select_source_digests(commitments, partition="audit", **arguments)
 
-    audit_plan = build_audit_evidence_plan(
+    audit_plan = build_audit_evidence_plan(secret="a5" * 32,
         track_spec_digest=track_digest,
         generation_block=120,
         block_hash=block_hash,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        evidence_id="audit-panel-0",
         source_proofs=selected,
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
     )
-    production_plan = build_plan(
+    production_plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest=track_digest,
         generation_block=120,
         block_hash=block_hash,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=("production-challenge",),
-        confirmation_challenge_ids=(),
         source_proofs=production_proofs,
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
@@ -366,7 +335,7 @@ def test_source_selection_is_partition_explicit_and_audit_is_deterministic() -> 
         )
         for proof in audit_plan.source_proofs
     )
-    with pytest.raises(ValueError, match="public commitment index"):
+    with pytest.raises(ValueError, match="inventory requires a source slot"):
         validate_source_selection_sequence(
             (audit_plan,), commitments=commitments, scoring=scoring()
         )
@@ -407,15 +376,10 @@ def test_live_batch_plan_rejects_audit_sources() -> None:
     audit_proofs = tuple(pool.proof(leaf.source_id) for leaf in leaves)
 
     with pytest.raises(ValueError, match="production sources"):
-        build_plan(
+        build_plan(secret="a5" * 32, inventory_slot=0,
             track_spec_digest="ab" * 32,
             generation_block=120,
             block_hash="0x" + "cd" * 32,
-            track_start_block=100,
-            minimum_generation_delay_blocks=1,
-            generation_interval_blocks=20,
-            exact_challenge_ids=("challenge",),
-            confirmation_challenge_ids=(),
             source_proofs=audit_proofs,
             scoring=scoring(),
             available_routes=("route-0", "route-1", "route-2"),
@@ -432,18 +396,15 @@ def test_source_selection_sequence_rejects_a_member_chosen_out_of_order() -> Non
         partition="production",
         strata=("16:9@37",),
         sources_per_stratum=2,
-        batch_seed=generation_seed("ab" * 32, block_hash),
-        excluded_source_digests=frozenset(),
+        batch_seed=generation_seed("ab" * 32, block_hash, "a5" * 32),
+        excluded_source_digests=frozenset(), inventory_slot=0,
     )
-    arguments = {
+    arguments = { "secret": "a5" * 32, "inventory_slot": 0,
         "track_spec_digest": "ab" * 32,
         "generation_block": 120,
         "block_hash": block_hash,
-        "track_start_block": 100,
-        "minimum_generation_delay_blocks": 1,
-        "generation_interval_blocks": 20,
-        "exact_challenge_ids": ("challenge",),
-        "confirmation_challenge_ids": (),
+
+
         "scoring": scoring(),
         "available_routes": ("route-0", "route-1", "route-2"),
     }
@@ -498,15 +459,10 @@ def test_source_pool_rejects_duplicate_families_before_selection() -> None:
 
 def test_every_rollout_uses_a_distinct_source_family() -> None:
     proofs = tuple(proof(index) for index in range(4))
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=(),
-        confirmation_challenge_ids=(),
         source_proofs=proofs,
         scoring=replace(scoring(), rollouts_per_stratum=4),
         available_routes=("route-0", "route-1", "route-2"),
@@ -593,15 +549,10 @@ def test_local_work_directory_allows_only_one_producer(tmp_path) -> None:
 
 
 def test_worker_pool_has_a_plan_wall_clock_ceiling() -> None:
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=(),
-        confirmation_challenge_ids=(),
         source_proofs=(proof(0), proof(1)),
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
@@ -639,11 +590,9 @@ class AttemptObjects:
 
 @pytest.fixture
 def local_producer(tmp_path, monkeypatch):
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32, generation_block=120,
-        block_hash="0x" + "cd" * 32, track_start_block=100,
-        minimum_generation_delay_blocks=1, generation_interval_blocks=20,
-        exact_challenge_ids=("challenge",), confirmation_challenge_ids=(),
+        block_hash="0x" + "cd" * 32,
         source_proofs=(proof(0), proof(1)), scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
     )
@@ -728,9 +677,9 @@ def test_producer_cas_loser_requires_identical_ready(local_producer, winner_chan
                 reference, video=replace(reference.video, sha256="33" * 32),
             ), *remaining))
         elif winner_change == "plan":
-            changed = {**candidate.planned_document(), "exact_challenge_ids": ["other"]}
+            changed = {**candidate.planned_document(), "inventory_slot": 1}
             candidate = replace(
-                candidate, exact_challenge_ids=("other",),
+                candidate, inventory_slot=1,
                 plan_digest=hashlib.sha256(canonical_json(changed)).hexdigest(),
             )
         winner_body.append(candidate.encode())
@@ -769,6 +718,10 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
     )
     assert ready.state == "READY"
     assert not service._needs_regeneration(ready)
+    Inventory(objects, plan.track_spec_digest).claim(
+        challenge_id="a1" * 32, stage="SCORING", file_sha256="b2" * 32,
+        model_digest="c3" * 32, plans=(ready,),
+    )
     immutable_ready = objects.get("plans/120.json")
     objects.create_plan("stages/challenge/SCORING.json", b"immutable scored result")
     shutil.rmtree(service.content.root)
@@ -798,13 +751,13 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
     )
     monkeypatch.setattr(source, "_plans", lambda: (("plans/120.json", ready),))
     with pytest.raises(production_service.StorageError):
-        source._plan_for("challenge", confirmation=False)
+        source._plan_for("a1" * 32, confirmation=False)
     payload[0] = b"deterministic exact fixture"
     recovered = service._execute(
         "plans/120.json", immutable_ready, ready, workers, deadline=time.monotonic() + 30,
     )
     assert recovered.encode() == immutable_ready.body
-    assert source._plan_for("challenge", confirmation=False) == ready
+    assert source._plan_for("a1" * 32, confirmation=False) == ready
     assert not service._needs_regeneration(ready)
     assert objects.get(f"interruptions/{plan.plan_digest}.json") == interruption
     assert objects.get("plans/120.json") == immutable_ready
@@ -817,11 +770,9 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
 def test_producer_continues_at_arbitrary_heights_and_releases_workers(
     monkeypatch, tmp_path, state, cursor_block, newer_ready_count,
 ) -> None:
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32, generation_block=120,
-        block_hash="0x" + "cd" * 32, track_start_block=100,
-        minimum_generation_delay_blocks=1, generation_interval_blocks=20,
-        exact_challenge_ids=("challenge",), confirmation_challenge_ids=(),
+        block_hash="0x" + "cd" * 32,
         source_proofs=(proof(0), proof(1)), scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
     )
@@ -846,11 +797,9 @@ def test_producer_continues_at_arbitrary_heights_and_releases_workers(
     saved_unit.write_bytes(b"completed unit progress")
     newer = []
     for block in (140, 160)[:newer_ready_count]:
-        item = build_plan(
+        item = build_plan(secret="a5" * 32, inventory_slot=0,
             track_spec_digest=plan.track_spec_digest, generation_block=block,
-            block_hash="0x" + f"{block:064x}", track_start_block=100,
-            minimum_generation_delay_blocks=1, generation_interval_blocks=20,
-            exact_challenge_ids=(f"challenge-{block}",), confirmation_challenge_ids=(),
+            block_hash="0x" + f"{block:064x}",
             source_proofs=(proof(0), proof(1)), scoring=scoring(),
             available_routes=("route-0", "route-1", "route-2"),
         )
@@ -885,7 +834,7 @@ def test_producer_continues_at_arbitrary_heights_and_releases_workers(
         def __init__(self, **_kwargs):
             pass
 
-        def create_next(self):
+        def create_next(self, **_kwargs):
             return None
 
         def plans(self):
@@ -932,15 +881,10 @@ def test_producer_continues_at_arbitrary_heights_and_releases_workers(
 def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
     monkeypatch, tmp_path,
 ) -> None:
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=("challenge",),
-        confirmation_challenge_ids=(),
         source_proofs=(proof(0), proof(1)),
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
@@ -969,7 +913,7 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
         def __init__(self, **_kwargs):
             pass
 
-        def create_next(self):
+        def create_next(self, **_kwargs):
             return None
 
         def plans(self):
@@ -1054,15 +998,10 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
 def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
     monkeypatch, tmp_path, phase, once,
 ) -> None:
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=("challenge",),
-        confirmation_challenge_ids=(),
         source_proofs=(proof(0), proof(1)),
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
@@ -1094,7 +1033,7 @@ def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
         def __init__(self, **_kwargs):
             pass
 
-        def create_next(self):
+        def create_next(self, **_kwargs):
             fail("create")
             return None
 
@@ -1321,15 +1260,10 @@ def test_producer_worker_constructs_teacher_once_on_first_cache_miss(tmp_path, m
 
 
 def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch, tmp_path) -> None:
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=("challenge",),
-        confirmation_challenge_ids=(),
         source_proofs=(proof(0), proof(1)),
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
@@ -1346,7 +1280,7 @@ def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch, tmp
         def __init__(self, **_kwargs):
             pass
 
-        def create_next(self):
+        def create_next(self, **_kwargs):
             return None
 
         def plans(self):
@@ -1387,15 +1321,10 @@ def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch, tmp
 def test_producer_attempt_deadline_covers_post_generation_work(
     tmp_path, monkeypatch, slow_step
 ) -> None:
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=("challenge",),
-        confirmation_challenge_ids=(),
         source_proofs=(proof(0), proof(1)),
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
@@ -1454,15 +1383,10 @@ def test_producer_attempt_deadline_covers_post_generation_work(
 def test_producer_attempt_deadline_interrupts_blocking_post_generation_work(
     tmp_path, monkeypatch, blocking_step
 ) -> None:
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=("challenge",),
-        confirmation_challenge_ids=(),
         source_proofs=(proof(0), proof(1)),
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
@@ -1523,15 +1447,10 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(
     tmp_path, monkeypatch, dense_mutation
 ) -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=("challenge",),
-        confirmation_challenge_ids=(),
         source_proofs=tuple(pool.proof(f"source-{index}") for index in range(2)),
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
@@ -1651,15 +1570,10 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
     tmp_path, dense_mutation
 ) -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
-    planned = build_plan(
+    planned = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=("challenge",),
-        confirmation_challenge_ids=(),
         source_proofs=tuple(pool.proof(f"source-{index}") for index in range(2)),
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
@@ -1812,27 +1726,8 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
         source._restore_exact(inconsistent_ready)
 
 
-@pytest.mark.parametrize("terminal_ids", [frozenset(), frozenset({"a"}), frozenset({"b"})])
-def test_disclosure_does_not_restore_files_until_the_whole_group_is_terminal(
-    tmp_path, monkeypatch, terminal_ids,
-) -> None:
-    source = ReadyBatchSource(track=SimpleNamespace(), objects=object(), cache_dir=tmp_path)
-    plan = SimpleNamespace(
-        exact=object(), exact_challenge_ids=("a",), confirmation_challenge_ids=("b",),
-    )
-    monkeypatch.setattr(source, "_plan_by_digest", lambda _digest: plan)
-
-    def unexpected_restore(_plan):
-        raise AssertionError("a nonterminal batch group must not restore any payload")
-
-    monkeypatch.setattr(source, "_restore_exact", unexpected_restore)
-    monkeypatch.setattr(source, "_restore_sample_cache", unexpected_restore)
-    assert source.public_disclosure("ab" * 32, terminal_ids) is None
-    assert list(tmp_path.iterdir()) == []
-
-
 def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_path) -> None:
-    pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
+    pool = SourcePool(tuple(proof(index).leaf for index in range(8)))
     track = SimpleNamespace(
         digest="ab" * 32,
         source_pool_merkle_root=pool.root,
@@ -1842,16 +1737,16 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         scoring=scoring(),
         model=SimpleNamespace(selector=SimpleNamespace(routes=("route-0", "route-1", "route-2"))),
     )
-    planned = build_plan(
+    planned = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest=track.digest,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        track_start_block=100,
-        minimum_generation_delay_blocks=1,
-        generation_interval_blocks=20,
-        exact_challenge_ids=("exact-a",),
-        confirmation_challenge_ids=("confirm-a",),
-        source_proofs=tuple(pool.proof(f"source-{index}") for index in range(2)),
+        source_proofs=select_source_proofs(
+            pool, commitments=track.source_commitments, partition="production",
+            strata=("16:9@37",), sources_per_stratum=2,
+            batch_seed=generation_seed(track.digest, "0x" + "cd" * 32, "a5" * 32),
+            inventory_slot=0, excluded_source_digests=frozenset(),
+        ),
         scoring=track.scoring,
         available_routes=track.model.selector.routes,
     )
@@ -1889,39 +1784,36 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         sample_cache=ReadySampleCache(index_object, text_object),
     )
 
-    class Objects:
-        def __init__(self, plan=ready_plan):
-            self.small = {}
-            self.plan = plan
+    def make_objects(plan=ready_plan):
+        objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="test")
+        earlier = build_plan(
+            track_spec_digest=track.digest, generation_block=119,
+            block_hash="0x" + "ab" * 32, secret="b6" * 32, inventory_slot=1,
+            source_proofs=select_source_proofs(
+                pool, commitments=track.source_commitments, partition="production",
+                strata=("16:9@37",), sources_per_stratum=2,
+                batch_seed=generation_seed(track.digest, "0x" + "ab" * 32, "b6" * 32),
+                inventory_slot=1, excluded_source_digests=frozenset(),
+            ), scoring=track.scoring, available_routes=track.model.selector.routes,
+        )
+        earlier = earlier.ready(
+            exact=plan.exact, sample_cache=plan.sample_cache,
+            dense_references=tuple(
+                replace(ref, rollout_id=rollout.rollout_id)
+                for ref, rollout in zip(plan.dense_references, earlier.rollouts, strict=True)
+            ),
+        )
+        objects.create_plan("plans/119.json", earlier.encode())
+        objects.create_plan("plans/120.json", plan.encode())
+        inventory = Inventory(objects, track.digest)
+        for stage in ("SCORING", "CONFIRMING"):
+            inventory.claim(
+                challenge_id="a1" * 32, stage=stage, file_sha256="b2" * 32,
+                model_digest="c3" * 32, plans=(earlier, plan),
+            )
+        return objects
 
-        def list_names(self, _prefix):
-            return ("plans/120.json",)
-
-        def get(self, name):
-            if name in self.small:
-                return self.small[name]
-            return StoredObject(self.plan.encode(), "etag")
-
-        def get_optional(self, name):
-            return self.small.get(name)
-
-        def create_plan(self, name, payload):
-            stored = StoredObject(payload, hashlib.sha256(payload).hexdigest())
-            existing = self.small.setdefault(name, stored)
-            if existing.body != payload:
-                raise RuntimeError("conflicting archive")
-            return existing
-
-        def download_content(self, object_name, destination, *, sha256, size_bytes):
-            content = payloads[object_name]
-            assert len(content) == size_bytes
-            assert hashlib.sha256(content).hexdigest() == sha256
-            path = Path(destination)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content)
-            return path
-
-    objects = Objects()
+    objects = make_objects()
     content_dir = tmp_path / "content"
     content_store = LocalBatchStore(content_dir)
     for key, content in payloads.items():
@@ -1939,18 +1831,18 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     exact_path.write_bytes(b"exact")
     source._restore_exact = lambda _plan: SimpleNamespace(sha256="12" * 32, path=exact_path)
 
-    restored = source.confirmation_batch("confirm-a")
+    restored = source.confirmation_batch("a1" * 32)
 
     assert restored.plan == ready_plan
     assert restored.exact.sha256 == "12" * 32
     assert len(restored.latent_paths) == 2
-    terminal_ids = frozenset({"exact-a", "confirm-a"})
+    terminal_ids = frozenset({"a1" * 32})
     disclosure = source.public_disclosure(ready_plan.plan_digest, terminal_ids)
     assert disclosure is not None
-    assert disclosure.challenge_ids == ("exact-a", "confirm-a")
+    assert disclosure.challenge_ids == ("a1" * 32,)
     assert disclosure.record_name == f"batch_groups/{ready_plan.plan_digest}.json"
     assert len(disclosure.files) == 7
-    with pytest.raises(RuntimeError, match="no scheduled"):
+    with pytest.raises(RuntimeError, match="no allocated"):
         source.confirmation_batch("other")
 
     mismatched_track = SimpleNamespace(
@@ -1962,7 +1854,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     with pytest.raises(RuntimeError, match="source proof"):
         ReadyBatchSource(
             track=mismatched_track,
-            objects=Objects(),
+            objects=objects,
             cache_dir=tmp_path,
         ).public_disclosure(ready_plan.plan_digest, terminal_ids)
 
@@ -1973,15 +1865,15 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     with pytest.raises(RuntimeError, match="outside its runtime namespace"):
         ReadyBatchSource(
             track=track,
-            objects=Objects(wrong_namespace),
+            objects=make_objects(wrong_namespace),
             cache_dir=tmp_path,
         ).public_disclosure(ready_plan.plan_digest, terminal_ids)
 
     exact = tmp_path / f"{ready_plan.generation_block}-{ready_plan.exact.sha256}.npz"
     exact.write_bytes(b"temporary")
     assert (tmp_path / "dense" / ready_plan.plan_digest).is_dir()
-    assert source.prune_disclosed({"exact-a"}) == 0
-    assert source.prune_disclosed({"exact-a", "confirm-a"}) == 4
+    assert source.prune_disclosed({"b2" * 32}) == 0
+    assert source.prune_disclosed({"a1" * 32}) == 4
     assert not exact.exists()
     assert not (tmp_path / "dense" / ready_plan.plan_digest).exists()
 
@@ -2060,461 +1952,6 @@ def test_admission_archive_restores_model_by_challenge_identity(tmp_path) -> Non
     assert restored.path.read_bytes() == b"validated selector"
     assert restored.file_sha256 == file_sha256
     assert restored.download_host == "private-archive"
-
-
-def test_plan_coordinator_skips_empty_intervals_and_rejects_a_conflicting_winner() -> None:
-    pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
-    track = SimpleNamespace(
-        digest="ab" * 32,
-        source_pool_merkle_root=pool.root,
-        source_commitments=source_commitments(pool),
-        track_start_block=100,
-        cache=SimpleNamespace(
-            generation_interval_blocks=20,
-            minimum_generation_delay_blocks=1,
-        ),
-        scoring=scoring(),
-        model=SimpleNamespace(selector=SimpleNamespace(routes=("route-0", "route-1"))),
-    )
-
-    class Store:
-        admission_complete = False
-
-        def production_trigger_blocks(self):
-            return (100, 120)
-
-        def admission_interval_complete(self, _first, _last):
-            return self.admission_complete
-
-        def chain_cursor(self):
-            return (140, "0x" + "ef" * 32)
-
-        def finalized_block_hash(self, block):
-            return "0x" + f"{block:064x}"
-
-        def admitted_challenge_ids(self, first, last):
-            return ("exact-a",) if (first, last) == (120, 139) else ()
-
-        def confirmation_challenge_ids(self, _first, _last):
-            return ()
-
-    class Objects:
-        def __init__(self):
-            self.payload = None
-
-        def list_names(self, _prefix):
-            return ()
-
-        def create_plan(self, name, payload):
-            self.payload = (name, payload)
-            return StoredObject(payload, "etag")
-
-    store = Store()
-    objects = Objects()
-    coordinator = PlanCoordinator(
-        track=track,
-        store=store,
-        objects=objects,
-        source_pool=pool,
-    )
-
-    assert coordinator.create_next() is None
-    assert objects.payload is None
-
-    store.admission_complete = True
-    plan = coordinator.create_next()
-
-    assert plan is not None
-    assert plan.generation_block == 140
-    assert plan.exact_challenge_ids == ("exact-a",)
-    assert objects.payload is not None and objects.payload[0] == "plans/140.json"
-
-    conflicting = build_plan(
-        track_spec_digest=track.digest,
-        generation_block=plan.generation_block,
-        block_hash=plan.block_hash,
-        track_start_block=track.track_start_block,
-        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
-        generation_interval_blocks=track.cache.generation_interval_blocks,
-        exact_challenge_ids=("different-challenge",),
-        confirmation_challenge_ids=(),
-        source_proofs=plan.source_proofs,
-        scoring=track.scoring,
-        available_routes=track.model.selector.routes,
-    )
-
-    class ConflictObjects(Objects):
-        def create_plan(self, _name, _payload):
-            raise PreconditionFailed("lost conditional create")
-
-        def get(self, _name):
-            return StoredObject(conflicting.encode(), "winner-etag")
-
-    with pytest.raises(RuntimeError, match="deterministic schedule"):
-        PlanCoordinator(
-            track=track,
-            store=store,
-            objects=ConflictObjects(),
-            source_pool=pool,
-        ).create_next()
-
-    recovered = plan.ready(
-        exact=ReadyObject("exact/batch.npz", "12" * 32, 100),
-        dense_references=tuple(
-            DenseReference(
-                rollout.rollout_id,
-                ReadyObject(f"videos/{index}.mp4", f"{index + 1:064x}", 100),
-                ReadyObject(f"latents/{index}.safetensors", f"{index + 3:064x}", 200),
-            )
-            for index, rollout in enumerate(plan.rollouts)
-        ),
-        sample_cache=ready_sample_cache(),
-    )
-
-    class RecoveryObjects(ConflictObjects):
-        def get(self, _name):
-            return StoredObject(recovered.encode(), "winner-etag")
-
-    assert (
-        PlanCoordinator(
-            track=track,
-            store=store,
-            objects=RecoveryObjects(),
-            source_pool=pool,
-        ).create_next()
-        == recovered
-    )
-
-
-def test_plan_coordinator_maps_confirmation_from_its_exact_decision_block() -> None:
-    pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
-    track = SimpleNamespace(
-        digest="ab" * 32,
-        source_pool_merkle_root=pool.root,
-        source_commitments=source_commitments(pool),
-        track_start_block=100,
-        cache=SimpleNamespace(
-            generation_interval_blocks=20,
-            minimum_generation_delay_blocks=1,
-        ),
-        scoring=scoring(),
-        model=SimpleNamespace(selector=SimpleNamespace(routes=("route-0", "route-1"))),
-    )
-
-    class Store:
-        def production_trigger_blocks(self):
-            return (100, 125)
-
-        def admission_interval_complete(self, _first, _last):
-            return True
-
-        def chain_cursor(self):
-            return (140, "0x" + "ef" * 32)
-
-        def finalized_block_hash(self, block):
-            return "0x" + f"{block:064x}"
-
-        def admitted_challenge_ids(self, _first, _last):
-            return ()
-
-        def confirmation_challenge_ids(self, first, last):
-            return ("confirm-a",) if (first, last) == (120, 139) else ()
-
-    class Objects:
-        def __init__(self):
-            self.payload = None
-
-        def list_names(self, _prefix):
-            return ()
-
-        def create_plan(self, name, payload):
-            self.payload = (name, payload)
-            return StoredObject(payload, "etag-next")
-
-    objects = Objects()
-    coordinator = PlanCoordinator(
-        track=track,
-        store=Store(),
-        objects=objects,
-        source_pool=pool,
-    )
-
-    plan = coordinator.create_next()
-
-    assert plan is not None
-    assert plan.generation_block == 140
-    assert plan.exact_challenge_ids == ()
-    assert plan.confirmation_challenge_ids == ("confirm-a",)
-
-
-@pytest.mark.parametrize("sequence", [1, 81, 10_000_000])
-def test_coordinator_plans_only_work_boundaries_without_a_final_batch(sequence) -> None:
-    pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
-    block = 100 + 20 * sequence
-    trigger = block - 5
-    track = SimpleNamespace(
-        digest="ab" * 32, source_pool_merkle_root=pool.root,
-        source_commitments=source_commitments(pool), track_start_block=100,
-        cache=SimpleNamespace(generation_interval_blocks=20, minimum_generation_delay_blocks=1),
-        scoring=scoring(),
-        model=SimpleNamespace(selector=SimpleNamespace(routes=("route-0", "route-1"))),
-    )
-    hashes = []
-    store = SimpleNamespace(
-        chain_cursor=lambda: (block, "0x" + f"{block:064x}"),
-        production_trigger_blocks=lambda: (trigger,),
-        finalized_block_hash=lambda height: hashes.append(height) or "0x" + f"{height:064x}",
-        admission_interval_complete=lambda *_args: True,
-        admitted_challenge_ids=lambda *_args: ("challenge",),
-        confirmation_challenge_ids=lambda *_args: (),
-    )
-    objects = SimpleNamespace(
-        list_names=lambda _prefix: (),
-        create_plan=lambda _name, payload: StoredObject(payload, "etag"),
-    )
-    coordinator = PlanCoordinator(track=track, store=store, objects=objects, source_pool=pool)
-    plan = coordinator.create_next()
-    assert plan is not None and plan.generation_block == block
-    assert hashes == [block]
-
-
-def test_repeated_source_pool_generates_fresh_rollouts_and_disjoint_confirmation() -> None:
-    pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
-    commitments = source_commitments(pool)
-    plans = []
-    rollout_ids, noise_seeds = set(), set()
-    for index in range(100):
-        challenge = f"challenge-{index}"
-        exact = None
-        for confirmation in (False, True):
-            block = 120 + 20 * len(plans)
-            block_hash = "0x" + f"{block:064x}"
-            confirmations = (challenge,) if confirmation else ()
-            selected = select_source_proofs(
-                pool, commitments=commitments, partition="production", strata=("16:9@37",),
-                sources_per_stratum=2, batch_seed=generation_seed("ab" * 32, block_hash),
-                excluded_source_digests=confirmation_source_digests(tuple(plans), confirmations),
-            )
-            plan = build_plan(
-                track_spec_digest="ab" * 32, generation_block=block, block_hash=block_hash,
-                track_start_block=100, minimum_generation_delay_blocks=1,
-                generation_interval_blocks=20,
-                exact_challenge_ids=() if confirmation else (challenge,),
-                confirmation_challenge_ids=confirmations, source_proofs=selected,
-                scoring=scoring(), available_routes=("route-0", "route-1"),
-            )
-            if confirmation:
-                assert exact.isdisjoint(item.leaf.source_family_id for item in selected)
-            else:
-                exact = {item.leaf.source_family_id for item in selected}
-            for rollout in plan.rollouts:
-                assert rollout.rollout_id not in rollout_ids
-                assert rollout.noise_seed not in noise_seeds
-                rollout_ids.add(rollout.rollout_id)
-                noise_seeds.add(rollout.noise_seed)
-            plans.append(plan)
-    validate_source_selection_sequence(tuple(plans), commitments=commitments, scoring=scoring())
-    assert len(plans) == 200
-
-
-def test_plan_coordinator_waits_for_private_stage_recovery() -> None:
-    pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
-    challenge_id = "12" * 32
-    archived = {
-        "format": "veda-stage-result-v1",
-        "track_spec_digest": "ab" * 32,
-        "challenge_id": challenge_id,
-        "submission_id": "submission-a",
-        "hotkey": "hotkey-a",
-        "repo_id": "owner/repo",
-        "revision": "34" * 20,
-        "file_sha256": "56" * 32,
-        "stage": ChallengeState.SCORING.value,
-        "score": 0.8,
-        "score_block": 125,
-        "metrics": {"cache_generated_block": 120, "requires_confirmation": True},
-    }
-    track = SimpleNamespace(
-        digest="ab" * 32,
-        source_pool_merkle_root=pool.root,
-        source_commitments=source_commitments(pool),
-        track_start_block=100,
-        cache=SimpleNamespace(
-            generation_interval_blocks=20,
-            minimum_generation_delay_blocks=1,
-        ),
-        scoring=scoring(),
-        model=SimpleNamespace(selector=SimpleNamespace(routes=("route-0", "route-1"))),
-    )
-
-    class Store:
-        score_recovered = False
-        transition_applied = False
-
-        def admission_interval_complete(self, _first, _last):
-            return True
-
-        def stage_score(self, identifier, stage):
-            assert identifier == challenge_id
-            assert stage is ChallengeState.SCORING
-            if not self.score_recovered:
-                return None
-            return SimpleNamespace(
-                score=archived["score"],
-                score_block=archived["score_block"],
-                metrics=archived["metrics"],
-            )
-
-        def get_challenge(self, identifier):
-            assert identifier == challenge_id
-            state = (
-                ChallengeState.CONFIRMING
-                if self.transition_applied
-                else ChallengeState.SCORING
-            )
-            return SimpleNamespace(state=state)
-
-        def stage_transition_applied(self, identifier, stage):
-            assert identifier == challenge_id
-            assert stage is ChallengeState.SCORING
-            return self.transition_applied
-
-        def production_trigger_blocks(self):
-            return (125,)
-
-        def chain_cursor(self):
-            return (140, "0x" + "ef" * 32)
-
-        def finalized_block_hash(self, block):
-            return "0x" + f"{block:064x}"
-
-        def admitted_challenge_ids(self, _first, _last):
-            return ()
-
-        def confirmation_challenge_ids(self, first, last):
-            if self.transition_applied and (first, last) == (120, 139):
-                return (challenge_id,)
-            return ()
-
-    class Objects:
-        plan = None
-
-        def list_names(self, prefix):
-            if prefix == "stages/":
-                return (f"stages/{challenge_id}/SCORING.json",)
-            return ()
-
-        def get(self, name):
-            assert name == f"stages/{challenge_id}/SCORING.json"
-            return StoredObject(json.dumps(archived).encode(), "stage-etag")
-
-        def create_plan(self, name, payload):
-            self.plan = (name, payload)
-            return StoredObject(payload, "plan-etag")
-
-    store = Store()
-    objects = Objects()
-    coordinator = PlanCoordinator(
-        track=track,
-        store=store,
-        objects=objects,
-        source_pool=pool,
-    )
-
-    assert coordinator.create_next() is None
-    assert objects.plan is None
-
-    store.score_recovered = True
-    assert coordinator.create_next() is None
-    assert objects.plan is None
-
-    store.transition_applied = True
-    plan = coordinator.create_next()
-
-    assert plan is not None
-    assert plan.generation_block == 140
-    assert plan.confirmation_challenge_ids == (challenge_id,)
-
-
-def test_terminal_public_stage_projection_matches_private_archive() -> None:
-    pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
-    challenge_id = "12" * 32
-    public_metrics = {
-        "incumbent_score": 0.7,
-        "paired_gain_lower_bound": 0.02,
-        "cache_sha256": "34" * 32,
-        "cache_generated_block": 120,
-        "cache_plan_digest": "56" * 32,
-        "cache_seed_block_hash": "0x" + "78" * 32,
-    }
-    archived = {
-        "format": "veda-stage-result-v1",
-        "track_spec_digest": "ab" * 32,
-        "challenge_id": challenge_id,
-        "submission_id": "submission-a",
-        "hotkey": "hotkey-a",
-        "repo_id": "owner/repo",
-        "revision": "34" * 20,
-        "file_sha256": "56" * 32,
-        "stage": ChallengeState.SCORING.value,
-        "score": 0.8,
-        "score_block": 125,
-        "metrics": {
-            **public_metrics,
-            "case_count": 384,
-            "exact_score": 0.8,
-            "requires_confirmation": True,
-        },
-    }
-    track = SimpleNamespace(
-        digest="ab" * 32,
-        source_pool_merkle_root=pool.root,
-        source_commitments=source_commitments(pool),
-    )
-
-    class Store:
-        state = ChallengeState.SUCCEEDED
-
-        def stage_score(self, identifier, stage):
-            assert identifier == challenge_id
-            assert stage is ChallengeState.SCORING
-            return SimpleNamespace(
-                score=archived["score"],
-                score_block=archived["score_block"],
-                metrics=public_metrics,
-            )
-
-        def get_challenge(self, identifier):
-            assert identifier == challenge_id
-            return SimpleNamespace(state=self.state)
-
-        def stage_transition_applied(self, identifier, stage):
-            assert identifier == challenge_id
-            assert stage is ChallengeState.SCORING
-            return True
-
-    class Objects:
-        def list_names(self, prefix):
-            assert prefix == "stages/"
-            return (f"stages/{challenge_id}/SCORING.json",)
-
-        def get(self, name):
-            assert name == f"stages/{challenge_id}/SCORING.json"
-            return StoredObject(json.dumps(archived).encode(), "stage-etag")
-
-    store = Store()
-    coordinator = PlanCoordinator(
-        track=track,
-        store=store,
-        objects=Objects(),
-        source_pool=pool,
-    )
-
-    assert coordinator._stage_recovery_complete()
-
-    store.state = ChallengeState.CONFIRMING
-    with pytest.raises(RuntimeError, match="conflicts with its private archive"):
-        coordinator._stage_recovery_complete()
 
 
 def test_source_pool_capacity_is_proved_before_production_starts() -> None:

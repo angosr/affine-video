@@ -1,4 +1,4 @@
-"""Deterministic generation plans and their one-way READY transition."""
+"""Secret-seeded, challenge-independent inventory plans and their READY seal."""
 
 from __future__ import annotations
 
@@ -138,10 +138,9 @@ class BatchPlan:
     generation_block: int
     block_hash: str
     batch_seed: str
-    submission_first_block: int
-    submission_last_block: int
-    exact_challenge_ids: tuple[str, ...]
-    confirmation_challenge_ids: tuple[str, ...]
+    secret: str
+    secret_commitment: str
+    inventory_slot: int | None
     source_proofs: tuple[SourceProof, ...]
     selected_routes: tuple[str, ...]
     selected_steps: tuple[SelectedStep, ...]
@@ -157,12 +156,19 @@ class BatchPlan:
         _digest_bytes(self.track_spec_digest, "track specification digest")
         _digest_bytes(self.block_hash.removeprefix("0x"), "generation block hash")
         _digest_bytes(self.batch_seed, "batch seed")
+        _digest_bytes(self.secret, "inventory secret")
+        if self.secret_commitment != inventory_commitment(self.secret):
+            raise ValueError("inventory secret differs from its commitment")
+        if self.batch_seed != generation_seed(self.track_spec_digest, self.block_hash, self.secret):
+            raise ValueError("batch seed differs from its committed secret")
+        if self.inventory_slot is not None and (
+            type(self.inventory_slot) is not int or self.inventory_slot not in {0, 1}
+        ):
+            raise ValueError("inventory source slot must be zero or one")
         _digest_bytes(self.query_selection_seed, "query selection seed")
         _digest_bytes(self.plan_digest, "plan digest")
         if type(self.generation_block) is not int or self.generation_block < 0:
             raise ValueError("generation block must be non-negative")
-        if not 0 <= self.submission_first_block <= self.submission_last_block:
-            raise ValueError("submission interval is invalid")
         if (
             not self.source_proofs
             or not self.selected_routes
@@ -171,8 +177,6 @@ class BatchPlan:
         ):
             raise ValueError("batch plan selection cannot be empty")
         for values, name in (
-            (self.exact_challenge_ids, "exact challenge"),
-            (self.confirmation_challenge_ids, "confirmation challenge"),
             (self.selected_routes, "selected route"),
         ):
             if len(set(values)) != len(values) or any(not value for value in values):
@@ -206,16 +210,15 @@ class BatchPlan:
             {
                 "batch_seed": self.batch_seed,
                 "block_hash": self.block_hash,
-                "confirmation_challenge_ids": self.confirmation_challenge_ids,
-                "exact_challenge_ids": self.exact_challenge_ids,
+                "secret": self.secret,
+                "secret_commitment": self.secret_commitment,
+                "inventory_slot": self.inventory_slot,
                 "generation_block": self.generation_block,
                 "query_selection_seed": self.query_selection_seed,
                 "rollouts": self.rollouts,
                 "selected_routes": self.selected_routes,
                 "selected_steps": self.selected_steps,
                 "source_proofs": self.source_proofs,
-                "submission_first_block": self.submission_first_block,
-                "submission_last_block": self.submission_last_block,
                 "track_spec_digest": self.track_spec_digest,
             }
         )
@@ -266,8 +269,9 @@ class BatchPlan:
         common = {
             "batch_seed",
             "block_hash",
-            "confirmation_challenge_ids",
-            "exact_challenge_ids",
+            "secret",
+            "secret_commitment",
+            "inventory_slot",
             "format",
             "generation_block",
             "plan_digest",
@@ -277,15 +281,13 @@ class BatchPlan:
             "selected_steps",
             "source_proofs",
             "state",
-            "submission_first_block",
-            "submission_last_block",
             "track_spec_digest",
         }
         state = value.get("state")
         expected = common | (
             {"dense_references", "exact", "sample_cache"} if state == "READY" else set()
         )
-        if set(value) != expected or value.get("format") != "veda-generation-plan-v1":
+        if set(value) != expected or value.get("format") != "veda-inventory-plan-v1":
             raise ValueError("batch plan fields or format are invalid")
 
         def strings(name: str) -> tuple[str, ...]:
@@ -315,10 +317,9 @@ class BatchPlan:
             generation_block=value["generation_block"],
             block_hash=value["block_hash"],
             batch_seed=value["batch_seed"],
-            submission_first_block=value["submission_first_block"],
-            submission_last_block=value["submission_last_block"],
-            exact_challenge_ids=strings("exact_challenge_ids"),
-            confirmation_challenge_ids=strings("confirmation_challenge_ids"),
+            secret=value["secret"],
+            secret_commitment=value["secret_commitment"],
+            inventory_slot=value["inventory_slot"],
             source_proofs=tuple(SourceProof.from_document(row) for row in proofs_value),
             selected_routes=strings("selected_routes"),
             selected_steps=steps,
@@ -337,26 +338,20 @@ def build_plan(
     track_spec_digest: str,
     generation_block: int,
     block_hash: str,
-    track_start_block: int,
-    minimum_generation_delay_blocks: int,
-    generation_interval_blocks: int,
-    exact_challenge_ids: tuple[str, ...],
-    confirmation_challenge_ids: tuple[str, ...],
+    secret: str,
+    inventory_slot: int,
     source_proofs: tuple[SourceProof, ...],
     scoring: ScoringSpec,
     available_routes: tuple[str, ...],
 ) -> BatchPlan:
-    """Build the sole plan selected by one finalized generation block."""
+    """Build an inventory item without knowing any future challenger identity."""
 
     return _build_plan(
         track_spec_digest=track_spec_digest,
         generation_block=generation_block,
         block_hash=block_hash,
-        track_start_block=track_start_block,
-        minimum_generation_delay_blocks=minimum_generation_delay_blocks,
-        generation_interval_blocks=generation_interval_blocks,
-        exact_challenge_ids=exact_challenge_ids,
-        confirmation_challenge_ids=confirmation_challenge_ids,
+        secret=secret,
+        inventory_slot=inventory_slot,
         source_proofs=source_proofs,
         scoring=scoring,
         available_routes=available_routes,
@@ -369,27 +364,19 @@ def build_audit_evidence_plan(
     track_spec_digest: str,
     generation_block: int,
     block_hash: str,
-    track_start_block: int,
-    minimum_generation_delay_blocks: int,
-    generation_interval_blocks: int,
-    evidence_id: str,
+    secret: str,
     source_proofs: tuple[SourceProof, ...],
     scoring: ScoringSpec,
     available_routes: tuple[str, ...],
 ) -> BatchPlan:
     """Build an audit-only launch-evidence plan outside the live coordinator."""
 
-    if not isinstance(evidence_id, str) or not evidence_id:
-        raise ValueError("audit evidence ID cannot be empty")
     return _build_plan(
         track_spec_digest=track_spec_digest,
         generation_block=generation_block,
         block_hash=block_hash,
-        track_start_block=track_start_block,
-        minimum_generation_delay_blocks=minimum_generation_delay_blocks,
-        generation_interval_blocks=generation_interval_blocks,
-        exact_challenge_ids=(evidence_id,),
-        confirmation_challenge_ids=(),
+        secret=secret,
+        inventory_slot=None,
         source_proofs=source_proofs,
         scoring=scoring,
         available_routes=available_routes,
@@ -402,23 +389,18 @@ def _build_plan(
     track_spec_digest: str,
     generation_block: int,
     block_hash: str,
-    track_start_block: int,
-    minimum_generation_delay_blocks: int,
-    generation_interval_blocks: int,
-    exact_challenge_ids: tuple[str, ...],
-    confirmation_challenge_ids: tuple[str, ...],
+    secret: str,
+    inventory_slot: int | None,
     source_proofs: tuple[SourceProof, ...],
     scoring: ScoringSpec,
     available_routes: tuple[str, ...],
     source_partition: str,
 ) -> BatchPlan:
-    batch_seed = generation_seed(track_spec_digest, block_hash)
-    first, last = submission_interval(
-        generation_block,
-        track_start_block=track_start_block,
-        minimum_generation_delay_blocks=minimum_generation_delay_blocks,
-        generation_interval_blocks=generation_interval_blocks,
-    )
+    if source_partition == "production" and (
+        type(inventory_slot) is not int or inventory_slot not in {0, 1}
+    ):
+        raise ValueError("production inventory requires a source slot")
+    batch_seed = generation_seed(track_spec_digest, block_hash, secret)
     routes = _ranked(available_routes, batch_seed, "route")[: scoring.sampled_route_count]
     if len(routes) != scoring.sampled_route_count:
         raise ValueError("not enough selector routes for the batch plan")
@@ -437,10 +419,9 @@ def _build_plan(
         "generation_block": generation_block,
         "block_hash": "0x" + block_hash.removeprefix("0x").lower(),
         "batch_seed": batch_seed,
-        "submission_first_block": first,
-        "submission_last_block": last,
-        "exact_challenge_ids": tuple(exact_challenge_ids),
-        "confirmation_challenge_ids": tuple(confirmation_challenge_ids),
+        "secret": secret,
+        "secret_commitment": inventory_commitment(secret),
+        "inventory_slot": inventory_slot,
         "source_proofs": tuple(source_proofs),
         "selected_routes": routes,
         "selected_steps": steps,
@@ -451,51 +432,19 @@ def _build_plan(
     return BatchPlan(**arguments, plan_digest=digest)
 
 
-def generation_seed(track_spec_digest: str, block_hash: str) -> str:
+def inventory_commitment(secret: str) -> str:
+    return hashlib.sha256(
+        b"veda-inventory-secret-v1\0" + _digest_bytes(secret, "inventory secret")
+    ).hexdigest()
+
+
+def generation_seed(track_spec_digest: str, block_hash: str, secret: str) -> str:
     track = _digest_bytes(track_spec_digest, "track specification digest")
     block = _digest_bytes(block_hash.removeprefix("0x"), "generation block hash")
-    return hashlib.sha256(b"veda-evaluation-batch-v1" + track + block).hexdigest()
-
-
-def scheduled_generation_block(
-    submission_block: int,
-    *,
-    track_start_block: int,
-    minimum_generation_delay_blocks: int,
-    generation_interval_blocks: int,
-) -> int:
-    if min(submission_block, track_start_block) < 0:
-        raise ValueError("block heights must be non-negative")
-    if min(minimum_generation_delay_blocks, generation_interval_blocks) <= 0:
-        raise ValueError("generation timing must be positive")
-    earliest = submission_block + minimum_generation_delay_blocks
-    offset = max(0, earliest - track_start_block)
-    return (
-        track_start_block
-        + ((offset + generation_interval_blocks - 1) // generation_interval_blocks)
-        * generation_interval_blocks
-    )
-
-
-def submission_interval(
-    generation_block: int,
-    *,
-    track_start_block: int,
-    minimum_generation_delay_blocks: int,
-    generation_interval_blocks: int,
-) -> tuple[int, int]:
-    if generation_block < track_start_block:
-        raise ValueError("generation block predates the track")
-    if (generation_block - track_start_block) % generation_interval_blocks:
-        raise ValueError("generation block is not on a scheduled boundary")
-    last = generation_block - minimum_generation_delay_blocks
-    first = max(
-        track_start_block,
-        generation_block - generation_interval_blocks - minimum_generation_delay_blocks + 1,
-    )
-    if last < first:
-        raise ValueError("generation boundary has no valid submission interval")
-    return first, last
+    return hashlib.sha256(
+        b"veda-inventory-batch-v1\0" + track + block
+        + _digest_bytes(secret, "inventory secret")
+    ).hexdigest()
 
 
 def select_steps(batch_seed: str, scoring: ScoringSpec) -> tuple[SelectedStep, ...]:
@@ -574,20 +523,6 @@ def select_query_tiles(
     return tuple(sorted(selected))
 
 
-def confirmation_source_digests(
-    plans: tuple[BatchPlan, ...], confirmation_challenge_ids: tuple[str, ...]
-) -> frozenset[str]:
-    """Keep each match's confirmation independent of its exact-stage source families."""
-
-    identifiers = frozenset(confirmation_challenge_ids)
-    return frozenset(
-        proof.leaf.digest
-        for plan in plans
-        if identifiers.intersection(plan.exact_challenge_ids)
-        for proof in plan.source_proofs
-    )
-
-
 def select_source_proofs(
     pool: SourcePool,
     *,
@@ -597,6 +532,7 @@ def select_source_proofs(
     sources_per_stratum: int,
     batch_seed: str,
     excluded_source_digests: frozenset[str],
+    inventory_slot: int | None = None,
 ) -> tuple[SourceProof, ...]:
     """Select distinct source families for a fresh block-seeded rollout batch."""
 
@@ -607,6 +543,7 @@ def select_source_proofs(
         sources_per_stratum=sources_per_stratum,
         batch_seed=batch_seed,
         excluded_source_digests=excluded_source_digests,
+        inventory_slot=inventory_slot,
     )
     leaves = {leaf.digest: leaf for leaf in pool.leaves}
     if set(leaves) != {item.sha256 for item in commitments}:
@@ -625,11 +562,17 @@ def select_source_digests(
     sources_per_stratum: int,
     batch_seed: str,
     excluded_source_digests: frozenset[str],
+    inventory_slot: int | None = None,
 ) -> tuple[str, ...]:
     """Select sources from one salted partition published before the track."""
 
     if partition not in {"production", "audit"}:
         raise ValueError("source partition must be production or audit")
+    if inventory_slot is not None and (
+        partition != "production" or type(inventory_slot) is not int
+        or inventory_slot not in {0, 1}
+    ):
+        raise ValueError("inventory source slot requires production and zero or one")
     if not strata or len(set(strata)) != len(strata):
         raise ValueError("source strata must be non-empty and unique")
     if type(sources_per_stratum) is not int or sources_per_stratum <= 0:
@@ -640,13 +583,16 @@ def select_source_digests(
     selected: list[str] = []
     reserved = set(excluded_source_digests)
     for stratum in sorted(strata):
-        candidates = tuple(
+        universe = tuple(sorted(
             item.sha256
             for item in commitments
             if item.partition == partition
             and item.generation_geometry == stratum
-            and item.sha256 not in reserved
-        )
+        ))
+        # Two public, fixed family-disjoint halves remove any need to choose new
+        # sources after seeing an exact result. The secret still hides the sample.
+        candidates = universe if inventory_slot is None else universe[inventory_slot::2]
+        candidates = tuple(digest for digest in candidates if digest not in reserved)
         ranked = _ranked(candidates, batch_seed, f"source:{stratum}")
         chosen_for_stratum = ranked[:sources_per_stratum]
         if len(chosen_for_stratum) != sources_per_stratum:
@@ -662,21 +608,22 @@ def validate_source_selection_sequence(
     commitments: tuple[SourceCommitmentSpec, ...],
     scoring: ScoringSpec,
 ) -> None:
-    """Verify seeded selections and disjoint exact/confirmation sources for each match."""
+    """Verify every production item's public half and secret-seeded ranking."""
 
     ordered = tuple(sorted(plans, key=lambda plan: plan.generation_block))
     if len({plan.generation_block for plan in ordered}) != len(ordered):
         raise ValueError("source selection plans repeat a generation block")
-    for index, plan in enumerate(ordered):
+    for plan in ordered:
+        if plan.inventory_slot not in {0, 1}:
+            raise ValueError("production inventory requires a source slot")
         expected = select_source_digests(
             commitments,
             partition="production",
             strata=tuple(scoring.stratum_weight_map),
             sources_per_stratum=scoring.rollouts_per_stratum,
             batch_seed=plan.batch_seed,
-            excluded_source_digests=confirmation_source_digests(
-                ordered[:index], plan.confirmation_challenge_ids,
-            ),
+            excluded_source_digests=frozenset(),
+            inventory_slot=plan.inventory_slot,
         )
         actual = tuple(proof.leaf.digest for proof in plan.source_proofs)
         if actual != expected:
@@ -749,17 +696,16 @@ def _planned_document(arguments: dict[str, Any]) -> dict[str, Any]:
     return {
         "batch_seed": arguments["batch_seed"],
         "block_hash": arguments["block_hash"],
-        "confirmation_challenge_ids": list(arguments["confirmation_challenge_ids"]),
-        "exact_challenge_ids": list(arguments["exact_challenge_ids"]),
-        "format": "veda-generation-plan-v1",
+        "secret": arguments["secret"],
+        "secret_commitment": arguments["secret_commitment"],
+        "inventory_slot": arguments["inventory_slot"],
+        "format": "veda-inventory-plan-v1",
         "generation_block": arguments["generation_block"],
         "query_selection_seed": arguments["query_selection_seed"],
         "rollouts": [rollout.document() for rollout in arguments["rollouts"]],
         "selected_routes": list(arguments["selected_routes"]),
         "selected_steps": [step.document() for step in arguments["selected_steps"]],
         "source_proofs": [proof.document() for proof in arguments["source_proofs"]],
-        "submission_first_block": arguments["submission_first_block"],
-        "submission_last_block": arguments["submission_last_block"],
         "track_spec_digest": arguments["track_spec_digest"],
     }
 

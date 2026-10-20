@@ -59,6 +59,12 @@ class MemoryS3:
     def delete_object(self, *, Bucket, Key):
         self.objects.pop((Bucket, Key), None)
 
+    def list_objects_v2(self, *, Bucket, Prefix):
+        return {"Contents": [
+            {"Key": key} for bucket, key in sorted(self.objects)
+            if bucket == Bucket and key.startswith(Prefix)
+        ]}
+
 
 def precondition_failed():
     error = RuntimeError("precondition failed")

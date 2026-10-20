@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isclose
@@ -24,6 +25,7 @@ from scoring.spec import TrackSpec
 from validator.admission import RejectedAdmission
 from validator.download import DownloadedModel
 from validator.production.commitment import canonical_json, verify_source_proof
+from validator.production.inventory import ALLOCATION_OBJECT, Inventory
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
@@ -119,6 +121,7 @@ class ReadyBatchSource:
         )
         self.validation_device = validation_device
         self._validated_exact: set[str] = set()
+        self.inventory = Inventory(objects, track.digest)
 
     def _admission_identity(self, task: object) -> dict[str, object]:
         return {
@@ -431,19 +434,64 @@ class ReadyBatchSource:
         validate_selected_sample_cache(destination, plan)
         return destination
 
-    def is_ready(self, challenge_id: str, *, confirmation: bool) -> bool:
-        """Return whether the one frozen plan for this stage reached READY."""
+    def claim_ready(
+        self, challenge_id: str, *, confirmation: bool, file_sha256: str, model_digest: str,
+    ) -> bool:
+        """CAS-claim available inventory for the current leased, admitted FIFO stage."""
 
-        matches = []
-        for _name, plan in self._plans():
-            identifiers = (
-                plan.confirmation_challenge_ids if confirmation else plan.exact_challenge_ids
-            )
-            if challenge_id in identifiers:
-                matches.append(plan)
-        if len(matches) > 1:
-            raise RuntimeError("challenge is assigned to multiple private plans")
-        return bool(matches and matches[0].state == "READY")
+        stage = "CONFIRMING" if confirmation else "SCORING"
+        admission = self.objects.get_optional(self._admission_name(challenge_id))
+        if admission is None:
+            raise RuntimeError("inventory claim has no durable admission")
+        document = json.loads(admission.body)
+        if (document.get("format") != "veda-admission-model-v1"
+                or document.get("track_spec_digest") != self.track.digest
+                or document.get("challenge_id") != challenge_id
+                or document.get("file_sha256") != file_sha256
+                or document.get("model_digest") != model_digest
+                or _json(document) != admission.body):
+            raise RuntimeError("inventory claim admission identity is invalid")
+        plans = tuple(plan for _, plan in self._plans())
+        # Availability is checked before CAS. A producer invalidating lost data
+        # races on this same authority, so it cannot discard a winning claim.
+        _, authority = self.inventory.read()
+        claimed = {row["plan_digest"] for row in authority["claims"]}
+        for plan in plans:
+            if plan.state != "READY" or plan.plan_digest in claimed:
+                continue
+            try:
+                for item in ready_objects(plan):
+                    self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)
+            except RuntimeError:
+                self.inventory.invalidate_unassigned(plan.plan_digest)
+        claim = self.inventory.claim(
+            challenge_id=challenge_id, stage=stage,
+            file_sha256=file_sha256, model_digest=model_digest,
+            plans=plans,
+        )
+        return claim is not None
+
+    def inventory_status(self, plans: tuple[BatchPlan, ...]) -> dict[str, object]:
+        """Expose commitments/counts only; seeds, proofs and inputs stay private."""
+
+        _, authority = self.inventory.read()
+        unavailable = {
+            row["plan_digest"] for row in authority["claims"] + authority["invalidations"]
+        }
+        available = [plan for plan in plans if plan.plan_digest not in unavailable]
+        return {
+            "observed_at_ns": time.time_ns(),
+            "ready_batches": sum(plan.state == "READY" for plan in available),
+            "producing_batches": sum(plan.state == "PLANNED" for plan in available),
+            "target_batches": self.track.cache.inventory_target_batches,
+            "max_bytes": self.track.cache.inventory_max_bytes,
+            "commitments": [{
+                "plan_digest": plan.plan_digest, "secret_commitment": plan.secret_commitment,
+                "generation_block": plan.generation_block, "state": plan.state,
+            } for plan in available],
+            "allocated_stages": [(row["challenge_id"], row["stage"])
+                                 for row in authority["claims"]],
+        }
 
     def public_disclosure(
         self,
@@ -453,9 +501,13 @@ class ReadyBatchSource:
         """Restore replay bytes only after every challenge sharing the batch is terminal."""
 
         plan = self._plan_by_digest(plan_digest)
-        challenge_ids = tuple(
-            dict.fromkeys(plan.exact_challenge_ids + plan.confirmation_challenge_ids)
-        )
+        _, authority = self.inventory.read()
+        claims = [row for row in authority["claims"] if row["plan_digest"] == plan_digest]
+        if len(claims) != 1:
+            raise RuntimeError("disclosure requires one immutable inventory claim")
+        allocation = claims[0]
+        self.inventory.validate_claim(allocation, plan)
+        challenge_ids = (allocation["challenge_id"],)
         if not set(challenge_ids).issubset(terminal_challenge_ids):
             return None
         assert plan.exact is not None
@@ -506,7 +558,8 @@ class ReadyBatchSource:
             files.append(DisclosureFile(object_name, path, item.sha256))
         record = canonical_json(
             {
-                "format": "veda-batch-disclosure-v1",
+                "format": "veda-batch-disclosure-v2",
+                "allocation": allocation,
                 "plan": plan.document(),
                 "public_exact_object": f"batches/{plan.exact.sha256}/manifest.json",
                 "public_dense_references": references,
@@ -543,15 +596,19 @@ class ReadyBatchSource:
 
         removed = 0
         plans = self._plans()
+        _, authority = self.inventory.read()
+        claims = {row["plan_digest"]: row for row in authority["claims"]}
         retained = {
             item.sha256
             for _name, plan in plans
-            if not set(plan.exact_challenge_ids + plan.confirmation_challenge_ids)
-            <= terminal_challenge_ids
+            if plan.plan_digest not in claims
+            or claims[plan.plan_digest]["challenge_id"] not in terminal_challenge_ids
             for item in ready_objects(plan)
         }
         for _name, plan in plans:
-            references = set(plan.exact_challenge_ids + plan.confirmation_challenge_ids)
+            references = (
+                {claims[plan.plan_digest]["challenge_id"]} if plan.plan_digest in claims else set()
+            )
             if plan.state != "READY" or not references or not references <= terminal_challenge_ids:
                 continue
             assert plan.exact is not None
@@ -582,33 +639,35 @@ class ReadyBatchSource:
                     self.content.path(item.sha256).unlink(missing_ok=True)
         return removed
 
-    def _plan_for(self, challenge_id: str, *, confirmation: bool) -> BatchPlan:
+    def _allocated_plan(self, challenge_id: str, *, confirmation: bool) -> BatchPlan:
+        """Read immutable allocation metadata, without demanding its bulk bytes."""
+
         if not challenge_id:
             raise ValueError("challenge ID cannot be empty")
-        matches = []
-        for _name, plan in self._plans():
-            identifiers = (
-                plan.confirmation_challenge_ids if confirmation else plan.exact_challenge_ids
-            )
-            if challenge_id in identifiers:
-                matches.append(plan)
-        if len(matches) > 1:
-            raise RuntimeError("challenge is assigned to multiple private plans")
-        if matches and matches[0].state == "READY":
-            interruption = f"interruptions/{matches[0].plan_digest}.json"
-            if self.objects.get_optional(interruption) is not None:
-                # A past failure stays immutable; matching restored bytes clear its live fence.
-                for item in ready_objects(matches[0]):
-                    self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)
-            return matches[0]
-        if matches:
-            raise RuntimeError("challenge batch is not READY")
-        raise RuntimeError("challenge has no scheduled private batch")
+        _, authority = self.inventory.read()
+        stage = "CONFIRMING" if confirmation else "SCORING"
+        claim = next((row for row in authority["claims"]
+                      if row["challenge_id"] == challenge_id and row["stage"] == stage), None)
+        if claim is not None:
+            plan = self._plan_by_digest(claim["plan_digest"])
+            self.inventory.validate_claim(claim, plan)
+            return plan
+        raise RuntimeError("challenge has no allocated hidden inventory")
+
+    def _plan_for(self, challenge_id: str, *, confirmation: bool) -> BatchPlan:
+        plan = self._allocated_plan(challenge_id, confirmation=confirmation)
+        if self.objects.get_optional(f"interruptions/{plan.plan_digest}.json") is not None:
+            # A past failure stays immutable; matching restored bytes clear its live fence.
+            for item in ready_objects(plan):
+                self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)
+        return plan
 
     def _plans(self) -> tuple[tuple[str, BatchPlan], ...]:
         rows = []
         prefix = f"{PLANS_NAMESPACE}/"
         for name in self.objects.list_names(prefix):
+            if name == ALLOCATION_OBJECT:
+                continue
             if not name.startswith(prefix) or not name.endswith(".json"):
                 raise RuntimeError("private plan index contains an unexpected object")
             plan = BatchPlan.decode(self.objects.get(name).body)
@@ -644,11 +703,8 @@ class ReadyBatchSource:
             track_spec_digest=self.track.digest,
             generation_block=plan.generation_block,
             block_hash=plan.block_hash,
-            track_start_block=self.track.track_start_block,
-            minimum_generation_delay_blocks=self.track.cache.minimum_generation_delay_blocks,
-            generation_interval_blocks=self.track.cache.generation_interval_blocks,
-            exact_challenge_ids=plan.exact_challenge_ids,
-            confirmation_challenge_ids=plan.confirmation_challenge_ids,
+            secret=plan.secret,
+            inventory_slot=plan.inventory_slot,
             source_proofs=plan.source_proofs,
             scoring=self.track.scoring,
             available_routes=self.track.model.selector.routes,

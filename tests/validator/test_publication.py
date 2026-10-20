@@ -1003,7 +1003,6 @@ def test_legacy_switch_stops_rewards_without_rewriting_or_losing_match_history(
             [challenge], track_id=track.track_id, track_spec_digest=track.digest,
             netuid=track.netuid, minimum_gain=track.full_video.minimum_gain,
             minimum_exact_gain=track.scoring.minimum_frontier_gain,
-            minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
             initial_champion=genesis_champion(track),
         )
         store.restore_public_matches(tournament.matches)
@@ -1256,18 +1255,13 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         partition="production",
         strata=tuple(track.scoring.stratum_weight_map),
         sources_per_stratum=track.scoring.rollouts_per_stratum,
-        batch_seed=generation_seed(track.digest, block_hash),
-        excluded_source_digests=frozenset(),
+        batch_seed=generation_seed(track.digest, block_hash, "a5" * 32),
+        excluded_source_digests=frozenset(), inventory_slot=0,
     )
-    plan = build_plan(
+    plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest=track.digest,
         generation_block=200,
         block_hash=block_hash,
-        track_start_block=track.track_start_block,
-        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
-        generation_interval_blocks=track.cache.generation_interval_blocks,
-        exact_challenge_ids=("challenge",),
-        confirmation_challenge_ids=(),
         source_proofs=proofs,
         scoring=track.scoring,
         available_routes=track.model.selector.routes,
@@ -1310,6 +1304,12 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         dense_references=tuple(references),
         sample_cache=sample_cache,
     )
+    allocation = {
+        "ordinal": 1, "challenge_id": "a1" * 32, "stage": "SCORING",
+        "plan_digest": ready.plan_digest,
+        "ready_sha256": hashlib.sha256(ready.encode()).hexdigest(),
+        "file_sha256": "b2" * 32, "model_digest": "c3" * 32,
+    }
     public_references = []
     for reference in ready.dense_references:
         public = {"rollout_id": reference.rollout_id}
@@ -1322,7 +1322,8 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         public_references.append(public)
     record = canonical_json(
         {
-            "format": "veda-batch-disclosure-v1",
+            "format": "veda-batch-disclosure-v2",
+            "allocation": allocation,
             "plan": ready.document(),
             "public_exact_object": f"batches/{exact.sha256}/manifest.json",
             "public_dense_references": public_references,
@@ -1349,14 +1350,15 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         "object": f"batches/{exact.sha256}/manifest.json",
     }
     match = SimpleNamespace(
-        challenge_id="challenge",
+        challenge_id="a1" * 32,
         document={
-            "submission": {"block_height": ready.submission_first_block},
+            "submission": {"block_height": 300},
             "evaluation": {
+                "file_sha256": "b2" * 32, "model_digest": "c3" * 32,
                 "stages": [
                     {
                         "stage": "SCORING",
-                        "score_block": ready.generation_block,
+                        "score_block": 301,
                         "evaluation_batch": batch,
                     }
                 ],
@@ -1390,20 +1392,18 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
             prefix="tracks/test",
         )._load_batch_disclosures(track, (match,))
 
-    wrong_boundary = SimpleNamespace(
-        challenge_id="challenge",
-        document={
-            **match.document,
-            "submission": {"block_height": ready.submission_first_block - 1},
-        },
+    # Inventory may be generated before submission. Changing that historical
+    # submission height alone does not change the fixed READY/claim binding.
+    later_submission = SimpleNamespace(
+        challenge_id="a1" * 32,
+        document={**match.document, "submission": {"block_height": 301}},
     )
-    with pytest.raises(PublicArtifactError, match="wrong generation boundary"):
-        S3Repository(client, bucket="public-data", prefix="tracks/test")._load_batch_disclosures(
-            track, (wrong_boundary,)
-        )
+    assert S3Repository(
+        client, bucket="public-data", prefix="tracks/test",
+    )._load_batch_disclosures(track, (later_submission,)) == frozenset({ready.plan_digest})
 
     wrong_assignment = SimpleNamespace(
-        challenge_id="challenge",
+        challenge_id="a1" * 32,
         document={
             **match.document,
             "evaluation": {
@@ -1417,94 +1417,24 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
             },
         },
     )
-    with pytest.raises(PublicArtifactError, match="challenge assignment"):
+    with pytest.raises(PublicArtifactError, match="claimant"):
         S3Repository(client, bucket="public-data", prefix="tracks/test")._load_batch_disclosures(
             track, (wrong_assignment,)
         )
 
-    confirmation_plan = build_plan(
-        track_spec_digest=track.digest,
-        generation_block=ready.generation_block,
-        block_hash=ready.block_hash,
-        track_start_block=track.track_start_block,
-        minimum_generation_delay_blocks=track.cache.minimum_generation_delay_blocks,
-        generation_interval_blocks=track.cache.generation_interval_blocks,
-        exact_challenge_ids=(),
-        confirmation_challenge_ids=("challenge",),
-        source_proofs=proofs,
-        scoring=track.scoring,
-        available_routes=track.model.selector.routes,
-    )
-    confirmation_ready = confirmation_plan.ready(
-        exact=exact,
-        dense_references=tuple(references),
-        sample_cache=sample_cache,
-    )
-    confirmation_record = canonical_json(
-        {
-            "format": "veda-batch-disclosure-v1",
-            "plan": confirmation_ready.document(),
-            "public_exact_object": f"batches/{exact.sha256}/manifest.json",
-            "public_dense_references": public_references,
-            "public_selected_inputs": {
-                "condition": None,
-                "index": {
-                    "object": f"batch_inputs/{input_index.sha256}/manifest.json",
-                    "sha256": input_index.sha256,
-                    "size_bytes": input_index.size_bytes,
-                },
-                "text": {
-                    "object": f"batch_inputs/{text.sha256}/manifest.json",
-                    "sha256": text.sha256,
-                    "size_bytes": text.size_bytes,
-                },
-            },
-        }
-    )
-    publisher._put_immutable(
-        f"batch_groups/{confirmation_ready.plan_digest}.json",
-        confirmation_record,
-    )
-    confirmation_batch = {
-        **batch,
-        "plan_digest": confirmation_ready.plan_digest,
+    missing_batch = {
+        **batch, "generated_block": ready.generation_block - 1, "plan_digest": "00" * 32,
     }
-    earlier_batch = {
-        **batch,
-        "generated_block": ready.generation_block
-        - track.cache.generation_interval_blocks,
-        "plan_digest": "00" * 32,
-    }
-    exact_score_block = max(
-        earlier_batch["generated_block"],
-        confirmation_ready.submission_first_block,
+    earlier_missing = SimpleNamespace(
+        challenge_id="dd" * 32,
+        document={"evaluation": {
+            "stages": [{"stage": "SCORING", "evaluation_batch": missing_batch}],
+            "evaluation_batch": missing_batch,
+        }},
     )
-    gap_match = SimpleNamespace(
-        challenge_id="challenge",
-        document={
-            "submission": {"block_height": track.track_start_block},
-            "evaluation": {
-                "stages": [
-                    {
-                        "stage": "SCORING",
-                        "score_block": exact_score_block,
-                        "evaluation_batch": earlier_batch,
-                    },
-                    {
-                        "stage": "CONFIRMING",
-                        "score_block": confirmation_ready.generation_block,
-                        "evaluation_batch": confirmation_batch,
-                    },
-                ],
-                "evaluation_batch": confirmation_batch,
-            }
-        },
-    )
-    assert (
-        S3Repository(client, bucket="public-data", prefix="tracks/test")
-        ._load_batch_disclosures(track, (gap_match,))
-        == frozenset()
-    )
+    assert S3Repository(
+        client, bucket="public-data", prefix="tracks/test",
+    )._load_batch_disclosures(track, (earlier_missing, match)) == frozenset()
 
     client.objects.pop(f"tracks/test/batches/{exact.sha256}/part-00000")
     with pytest.raises(PublicArtifactError, match="chunk is missing"):

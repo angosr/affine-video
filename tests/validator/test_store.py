@@ -873,7 +873,7 @@ def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:
         assert challenge["events"][-1]["error_summary"] == "frozen cache is unavailable"
 
 
-def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -> None:
+def test_confirmation_retries_preserve_the_exact_stage_transition(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         store.transition(identifier, ChallengeState.FETCHING, occurred_at_ms=11)
@@ -901,9 +901,6 @@ def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -
         assert store.stage_transition_applied(identifier, ChallengeState.SCORING)
         assert not store.stage_transition_applied(identifier, ChallengeState.CONFIRMING)
 
-        assert store.confirmation_challenge_ids(149, 149) == ()
-        assert store.confirmation_challenge_ids(150, 150) == (identifier,)
-        assert store.confirmation_challenge_ids(151, 151) == ()
 
         confirming = store.claim_next_scoring("confirm", lease_ms=1_000, now_ms=17)
         assert confirming is not None
@@ -915,7 +912,6 @@ def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -
             error_summary="batch is still being generated",
             occurred_at_ms=18,
         )
-        assert store.confirmation_challenge_ids(150, 150) == (identifier,)
         assert store.stage_transition_applied(identifier, ChallengeState.SCORING)
         assert not store.stage_transition_applied(identifier, ChallengeState.CONFIRMING)
 
@@ -929,7 +925,6 @@ def test_confirmation_planning_uses_the_exact_batch_generation_block(tmp_path) -
             retry_after_ms=30,
             occurred_at_ms=21,
         )
-        assert store.confirmation_challenge_ids(150, 150) == (identifier,)
         assert store.stage_transition_applied(identifier, ChallengeState.SCORING)
         assert not store.stage_transition_applied(identifier, ChallengeState.CONFIRMING)
 

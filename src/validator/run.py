@@ -421,7 +421,6 @@ async def run_evaluator(
             timeout_seconds=scoring_timeout_seconds,
             max_memory_bytes=scoring_max_memory_bytes,
             max_cpu_seconds=scoring_max_cpu_seconds,
-            seed_block_hashes={},
             scoring_device=scoring_device,
             batch_source=batch_source,
             confirmation_pool=confirmation_pool,
@@ -446,9 +445,12 @@ async def run_evaluator(
         system_match_task: asyncio.Task[tuple[tuple[str, bytes], ...]] | None = None
         next_system_match_refresh = 0.0
         system_match_loader = getattr(publisher, "load_system_matches", None)
+        inventory_task: asyncio.Task[dict[str, object]] | None = None
+        next_inventory_refresh = 0.0
 
-        def refresh_system_matches() -> None:
+        def refresh_metadata() -> None:
             nonlocal system_match_task, system_matches, next_system_match_refresh
+            nonlocal inventory_task, next_inventory_refresh
             if system_match_task is not None and system_match_task.done():
                 try:
                     system_matches = system_match_task.result()
@@ -466,11 +468,26 @@ async def run_evaluator(
                     system_match_loader(track, runtime_manifest_payload),
                 )
                 next_system_match_refresh = now + 300.0
+            if inventory_task is not None and inventory_task.done():
+                try:
+                    evaluator.inventory_status = inventory_task.result()
+                except Exception as exc:
+                    _LOG.warning("inventory refresh failed; retaining last observation: %s", exc)
+                inventory_task = None
+            source = evaluator.batch_source
+            if source is not None and inventory_task is None and now >= next_inventory_refresh:
+                def load_inventory() -> dict[str, object]:
+                    return source.inventory_status(tuple(
+                        plan for _, plan in source._plans()
+                    ))
+                inventory_task = asyncio.create_task(asyncio.to_thread(load_inventory))
+                next_inventory_refresh = now + 30.0
 
         async def close_system_match_refresh() -> None:
-            if system_match_task is not None:
-                system_match_task.cancel()
-                await asyncio.gather(system_match_task, return_exceptions=True)
+            tasks = [task for task in (system_match_task, inventory_task) if task is not None]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         def start_publication() -> asyncio.Task[PublicArtifacts]:
             assert pending_artifacts is not None
@@ -498,10 +515,10 @@ async def run_evaluator(
         consecutive_cycle_errors = 0
         while True:
             try:
-                refresh_system_matches()
+                refresh_metadata()
                 async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
                     while True:
-                        refresh_system_matches()
+                        refresh_metadata()
                         finalized_block = await client.finalized_block()
                         if finalized_block >= track.track_start_block:
                             break
@@ -545,8 +562,7 @@ async def run_evaluator(
                         before_block=track.track_start_block - 1,
                     )
                     while True:
-                        refresh_system_matches()
-                        await _refresh_seed_block_hashes(client, evaluator)
+                        refresh_metadata()
                         result = await process_cycle(
                             client,
                             store,
@@ -570,7 +586,7 @@ async def run_evaluator(
                             ),
                         )
                         recovery_index += result.restored_matches
-                        refresh_system_matches()
+                        refresh_metadata()
                         cursor = store.chain_cursor()
                         if (
                             cursor is not None
@@ -617,6 +633,8 @@ async def run_evaluator(
                                         ),
                                         "runtime_manifest": runtime_manifest_payload,
                                         "system_matches": system_matches,
+                                        "inventory_status": evaluator.inventory_status,
+                                        "evaluation_running": work.busy and not work.done,
                                         "release_approval": getattr(
                                             publisher, "release_approval", None,
                                         ),
@@ -746,26 +764,6 @@ def _record_publication_failure(
                 "error": (str(error) or type(error).__name__)[:500],
             },
         )
-
-
-async def _refresh_seed_block_hashes(
-    client: Any,
-    evaluator: PairedTrackEvaluator,
-) -> None:
-    """Pin every reached generation boundary to its finalized chain hash."""
-
-    hashes = evaluator.seed_block_hashes
-    if hashes is None:
-        return
-    finalized = await client.finalized_block()
-    start = evaluator.track.track_start_block
-    interval = evaluator.track.cache.generation_interval_blocks
-    for height in range(start, finalized + 1, interval):
-        if height not in hashes:
-            value = await client._substrate.block_hash(height)
-            if not isinstance(value, str) or len(value.removeprefix("0x")) != 64:
-                raise RuntimeError(f"finalized block {height} has an invalid hash")
-            hashes[height] = value
 
 
 async def run_validator(

@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import tempfile
 import zipfile
@@ -20,14 +19,12 @@ from numpy.lib.format import read_array_header_1_0, read_array_header_2_0, read_
 
 from scoring.exact import ExactCase, validate_dense_reference
 from scoring.spec import EXACT_CACHE_FORMAT
-from validator.production.plan import scheduled_generation_block
 
 
 class CacheLoadError(ValueError):
     """Raised when a frozen scoring cache is missing, changed, or malformed."""
 
 
-_BATCH_NAME = re.compile(r"^(0|[1-9][0-9]*)-([0-9a-f]{64})[.]npz$")
 _ARRAY_FIELDS = (
     "q",
     "k",
@@ -291,65 +288,6 @@ def inspect_exact_cache_batch(path: str | Path, *, max_bytes: int) -> ExactCache
     sha256 = _file_sha256(cache_path)
     _verify_archive(cache_path, sha256, max_bytes)
     return _batch_from_metadata(cache_path, sha256, _read_metadata(cache_path))
-
-
-def select_exact_cache_batch(
-    directory: str | Path,
-    *,
-    submission_block: int,
-    minimum_delay_blocks: int,
-    track_start_block: int,
-    generation_interval_blocks: int,
-    expected_track_spec_digest: str,
-    max_bytes: int,
-    head_dim: int,
-    tile_size: int,
-    routes: tuple[str, ...],
-    strata: Mapping[str, float],
-    sampled_route_count: int,
-    rollouts_per_stratum: int,
-    sampled_step_count: int,
-    query_tiles_per_case: int,
-) -> ExactCacheBatch:
-    expected_block = scheduled_generation_block(
-        submission_block,
-        track_start_block=track_start_block,
-        minimum_generation_delay_blocks=minimum_delay_blocks,
-        generation_interval_blocks=generation_interval_blocks,
-    )
-    root = Path(directory)
-    candidates = []
-    try:
-        paths = sorted(root.glob("*.npz"))
-    except OSError as exc:
-        raise CacheLoadError("cache batch directory cannot be read") from exc
-    for path in paths:
-        match = _BATCH_NAME.fullmatch(path.name)
-        if match is None:
-            raise CacheLoadError("cache batch filename is invalid")
-        if int(match.group(1)) == expected_block:
-            candidates.append((match.group(2), path))
-    if len(candidates) != 1:
-        raise CacheLoadError("the scheduled exact cache batch is unavailable or ambiguous")
-    named_sha256, path = candidates[0]
-    batch = inspect_exact_cache_batch(path, max_bytes=max_bytes)
-    if batch.generated_block != expected_block or batch.sha256 != named_sha256:
-        raise CacheLoadError("cache batch filename does not match its content")
-    validate_exact_cache(
-        path,
-        expected_sha256=batch.sha256,
-        expected_track_spec_digest=expected_track_spec_digest,
-        max_bytes=max_bytes,
-        head_dim=head_dim,
-        tile_size=tile_size,
-        routes=routes,
-        strata=strata,
-        sampled_route_count=sampled_route_count,
-        rollouts_per_stratum=rollouts_per_stratum,
-        sampled_step_count=sampled_step_count,
-        query_tiles_per_case=query_tiles_per_case,
-    )
-    return batch
 
 
 def validate_exact_cache(

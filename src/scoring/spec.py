@@ -75,8 +75,8 @@ class InitialChampionSpec:
 @dataclass(frozen=True, slots=True)
 class CacheSpec:
     exact_max_bytes: int
-    minimum_generation_delay_blocks: int
-    generation_interval_blocks: int
+    inventory_target_batches: int
+    inventory_max_bytes: int
     generator: str
     format: str
     storage_dtype: str
@@ -378,9 +378,9 @@ def _parse_cache(value: Any) -> CacheSpec:
             "compute_dtype",
             "exact_max_bytes",
             "format",
-            "generation_interval_blocks",
+            "inventory_target_batches",
             "generator",
-            "minimum_generation_delay_blocks",
+            "inventory_max_bytes",
             "storage_dtype",
         },
         "cache",
@@ -391,14 +391,19 @@ def _parse_cache(value: Any) -> CacheSpec:
     cache_format = _nonempty_string(raw["format"], "cache format")
     if cache_format != EXACT_CACHE_FORMAT:
         raise TrackSpecError(f"cache format must be {EXACT_CACHE_FORMAT}")
+    target = _integer(raw["inventory_target_batches"], "inventory target batches", minimum=2)
+    if target > 8 or target % 2:
+        raise TrackSpecError("inventory target batches must be even and between 2 and 8")
+    maximum = _integer(raw["inventory_max_bytes"], "inventory max bytes", minimum=1)
+    exact_maximum = _integer(raw["exact_max_bytes"], "exact cache max bytes", minimum=1)
+    if maximum < 3 * target * exact_maximum:
+        raise TrackSpecError(
+            "inventory byte limit must reserve every target batch and its assembly space"
+        )
     return CacheSpec(
-        _integer(raw["exact_max_bytes"], "exact cache max bytes", minimum=1),
-        _integer(
-            raw["minimum_generation_delay_blocks"],
-            "minimum generation delay blocks",
-            minimum=1,
-        ),
-        _integer(raw["generation_interval_blocks"], "generation interval blocks", minimum=1),
+        exact_maximum,
+        target,
+        maximum,
         generator,
         cache_format,
         _choice(raw["storage_dtype"], "storage_dtype", {"float16"}),

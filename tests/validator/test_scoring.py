@@ -278,17 +278,22 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
         elif cache_loss == "corrupt":
             challenger_path.write_bytes(b"broken")
         evaluator.batch_source = source
-        monkeypatch.setattr(source, "is_ready", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(source, "claim_ready", lambda *_args, **_kwargs: True)
         monkeypatch.setattr(source, "exact_batch", lambda _identifier: batch)
         if stage == "confirmation":
             confirmation = SimpleNamespace(
                 plan=SimpleNamespace(
                     generation_block=101, plan_digest=batch.plan_digest,
                     block_hash=batch.seed_block_hash,
+                    source_proofs=(SimpleNamespace(leaf=SimpleNamespace(source_family_id="full")),),
                 ),
                 exact=batch,
             )
             monkeypatch.setattr(source, "confirmation_batch", lambda _identifier: confirmation)
+            monkeypatch.setattr(source, "_allocated_plan", lambda *_a, **_k: SimpleNamespace(
+                plan_digest="99" * 32,
+                source_proofs=(SimpleNamespace(leaf=SimpleNamespace(source_family_id="exact")),),
+            ))
             monkeypatch.setattr(
                 store, "stage_score", lambda *_args: SimpleNamespace(score_block=100)
             )
@@ -432,10 +437,19 @@ def test_both_stages_require_the_finalized_generation_hash(
         "wrong": {101: "0x" + "cd" * 32},
         "valid": {101: block_hash.upper()},
     }[hash_state]
-    plan = SimpleNamespace(generation_block=101, block_hash=block_hash, plan_digest="12" * 32)
+    plan = SimpleNamespace(
+        generation_block=101, block_hash=block_hash, plan_digest="12" * 32,
+        source_proofs=(SimpleNamespace(leaf=SimpleNamespace(source_family_id="full")),),
+    )
     exact = SimpleNamespace(generated_block=101, seed_block_hash=block_hash, sha256="34" * 32)
     batch = SimpleNamespace(plan=plan, exact=exact)
-    source = SimpleNamespace(exact_batch=lambda _id: exact, confirmation_batch=lambda _id: batch)
+    source = SimpleNamespace(
+        exact_batch=lambda _id: exact, confirmation_batch=lambda _id: batch,
+        _allocated_plan=lambda *_a, **_k: SimpleNamespace(
+            plan_digest="99" * 32,
+            source_proofs=(SimpleNamespace(leaf=SimpleNamespace(source_family_id="exact")),),
+        ),
+    )
     calls = []
 
     def confirm(**kwargs):
@@ -447,7 +461,10 @@ def test_both_stages_require_the_finalized_generation_hash(
 
     evaluator = PairedTrackEvaluator(
         track=SimpleNamespace(track_start_block=1, cache=cache_spec(), scoring=object()),
-        store=SimpleNamespace(stage_score=lambda *_a: SimpleNamespace(score_block=100)),
+        store=SimpleNamespace(
+            stage_score=lambda *_a: SimpleNamespace(score_block=100),
+            finalized_block_hash=lambda _height: None,
+        ),
         cache_dir=tmp_path, model_cache=tmp_path, initial_model_path=tmp_path / "unused",
         champion_archive_url="unused", timeout_seconds=1,
         seed_block_hashes=expected, batch_source=source,

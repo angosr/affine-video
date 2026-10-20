@@ -9,7 +9,6 @@ from scoring.cache import (
     ExactCacheReader,
     assemble_exact_cache_batch,
     inspect_exact_cache_batch,
-    select_exact_cache_batch,
     validate_exact_cache,
     write_exact_cache_batch,
 )
@@ -143,29 +142,6 @@ def test_cache_rejects_rehashed_dense_values_that_do_not_match_qkv(tmp_path) -> 
         validate_exact_cache(batch.path, **validation_arguments(batch))
 
 
-def test_selects_only_the_scheduled_generation_batch(tmp_path) -> None:
-    batch = write_batch(tmp_path)
-    arguments = validation_arguments(batch)
-    arguments.pop("expected_sha256")
-    selected = select_exact_cache_batch(
-        tmp_path,
-        submission_block=119,
-        minimum_delay_blocks=1,
-        track_start_block=100,
-        generation_interval_blocks=20,
-        **arguments,
-    )
-
-    assert selected == batch
-    with pytest.raises(CacheLoadError, match="scheduled"):
-        select_exact_cache_batch(
-            tmp_path,
-            submission_block=120,
-            minimum_delay_blocks=1,
-            track_start_block=100,
-            generation_interval_blocks=20,
-            **arguments,
-        )
 
 
 def test_written_file_digest_matches_batch_identity(tmp_path) -> None:

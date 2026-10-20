@@ -452,7 +452,6 @@ def test_deferred_earlier_submission_blocks_fifo_until_recovery(tmp_path) -> Non
         )
 
         assert first is not None and first.status is AdmissionStatus.DEFERRED
-        assert not store.admission_interval_complete(100, 100)
         assert blocked_by_fifo is None
 
         retried = process_next_admission(
@@ -464,7 +463,6 @@ def test_deferred_earlier_submission_blocks_fifo_until_recovery(tmp_path) -> Non
             downloader=initially_unavailable,
         )
         assert retried is not None and retried.status is AdmissionStatus.ACCEPTED
-        assert store.admission_interval_complete(100, 100)
 
         second = process_next_admission(
             store,

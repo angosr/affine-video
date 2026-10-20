@@ -59,8 +59,8 @@ def valid_spec() -> dict:
         },
         "cache": {
             "exact_max_bytes": 1_000_000,
-            "minimum_generation_delay_blocks": 4,
-            "generation_interval_blocks": 100,
+            "inventory_target_batches": 2,
+            "inventory_max_bytes": 10_000_000,
             "generator": "veda-private-rollout-v1",
             "format": "veda-exact-cache-v2",
             "storage_dtype": "float16",
@@ -132,21 +132,24 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert first.mechid == 0
     assert first.initial_champion.uid == 0
     assert first.initial_champion.repo_id == VEDA_REPO_ID
-    assert first.cache.minimum_generation_delay_blocks == 4
+    assert first.cache.inventory_target_batches == 2
     assert first.scoring.minimum_frontier_gain == 0.001
     assert first.scoring.case_count == 24
     assert first.scoring.match_confidence == 0.95
     assert parse_track_spec(track_spec_dict(first)) == first
 
 
-def test_hidden_batch_still_requires_a_future_generation_block() -> None:
+@pytest.mark.parametrize("field,value", [
+    ("inventory_target_batches", 1), ("inventory_target_batches", 3),
+    ("inventory_target_batches", 10), ("inventory_max_bytes", 5_999_999),
+])
+def test_hidden_inventory_has_small_count_and_byte_bounds(field, value) -> None:
     raw = valid_spec()
-    raw["cache"]["minimum_generation_delay_blocks"] = 0
+    raw["cache"][field] = value
 
-    with pytest.raises(TrackSpecError, match="greater than or equal to 1"):
+    with pytest.raises(TrackSpecError, match="inventory"):
         parse_track_spec(raw)
-    raw["cache"]["minimum_generation_delay_blocks"] = 1
-    assert parse_track_spec(raw).cache.minimum_generation_delay_blocks == 1
+    assert parse_track_spec(valid_spec()).cache.inventory_target_batches == 2
 
 
 def test_match_confidence_is_explicit_and_bound_to_the_spec_digest() -> None:

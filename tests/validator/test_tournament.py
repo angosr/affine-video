@@ -115,6 +115,41 @@ def resolve(items: list[dict]):
     )
 
 
+def test_preproduced_confirmation_still_requires_two_independent_decisions():
+    item = challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    for stage in item["stages"]:
+        stage["evaluation_batch"]["generated_block"] = 100
+    item["evaluation_batch"] = item["stages"][-1]["evaluation_batch"]
+    assert resolve([item]).matches[0].outcome is MatchOutcome.CHALLENGER_WON
+    item["stages"][-1]["evaluation_batch"] = item["stages"][0]["evaluation_batch"]
+    item["evaluation_batch"] = item["stages"][-1]["evaluation_batch"]
+    with pytest.raises(ValueError, match="independent inventory"):
+        resolve([item])
+
+
+def test_previous_completed_loss_keeps_lifetime_uniqueness_without_relabelling():
+    old = challenge(1, "alice", score=0.7, incumbent_score=0.7)
+    old["track_spec_digest"] = "cd" * 32
+    repeated = challenge(2, "alice", state=ChallengeState.REJECTED_DUPLICATE_HOTKEY,
+                         error_code="DUPLICATE_HOTKEY")
+    result = resolve([old, repeated])
+    assert len(result.matches) == 1 and result.matches[0].sequence == 1
+    assert result.matches[0].challenge_id == repeated["challenge_id"]
+    assert old["track_spec_digest"] == "cd" * 32 and old["final_score"] == 0.7
+    assert resolve([old]).matches == ()
+
+
+def test_previous_pending_or_promoted_challenge_forbids_silent_rebinding():
+    pending = challenge(1, "alice", state=ChallengeState.SCORING)
+    pending["track_spec_digest"] = "cd" * 32
+    with pytest.raises(ValueError, match="unfinished previous-track"):
+        resolve([pending])
+    won = challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    won["track_spec_digest"] = "cd" * 32
+    with pytest.raises(ValueError, match="champion migration"):
+        resolve([won])
+
+
 def test_fifo_matches_replace_champion_only_after_required_gain() -> None:
     tournament = resolve(
         [

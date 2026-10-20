@@ -56,6 +56,7 @@ _EVALUATOR_WRITE_NAMESPACES = (
     CAPABILITY_PROBES_NAMESPACE,
     "disclosed",
     MODELS_NAMESPACE,
+    # Only the allocation authority, not plans or their hidden generation secrets.
     RETRY_STATE_NAMESPACE,
     STAGES_NAMESPACE,
 )
@@ -121,6 +122,11 @@ def evaluator_iam_policy(*, bucket: str, prefix: str) -> dict[str, object]:
                 "Effect": "Allow",
                 "Action": ["s3:PutObject"],
                 "Resource": [namespace_arn(name) for name in _EVALUATOR_WRITE_NAMESPACES],
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:PutObject"],
+                "Resource": [object_arn("plans/allocations.json")],
             },
             {
                 "Effect": "Allow",
