@@ -93,7 +93,7 @@ class ArtifactRepository(Protocol):
         deadline: float | None = None,
     ) -> None: ...
 
-    async def load(
+    async def recover(
         self, track: TrackSpec, *, runtime_manifest: bytes | None = None,
     ) -> PublicLedger: ...
 
@@ -249,8 +249,15 @@ async def _publish_due_batch(
     challenges: list[dict[str, object]],
 ) -> str | None:
     """At most one bulk job, owned by the existing evaluator, not its FIFO worker."""
-    protected = await asyncio.to_thread(source.protected_plan_digests, challenges, finalized_block)
-    await asyncio.to_thread(source.prune_disclosed, protected)
+    try:
+        protected = await asyncio.to_thread(
+            source.protected_plan_digests, challenges, finalized_block,
+        )
+        await asyncio.to_thread(source.prune_disclosed, protected)
+    except Exception:
+        # Retain bytes when safety cannot be established. Optional reclamation
+        # must not delay the independent, durable disclosure deadline.
+        _LOG.exception("optional disclosed-data cleanup failed; retaining files")
     now_ms = time.time_ns() // 1_000_000
     due = await asyncio.to_thread(source.due_plan_digests, now_ms)
     if not due:
@@ -354,8 +361,8 @@ async def run_evaluator(
         while True:
             try:
                 ledger = (
-                    await publisher.load(track) if runtime_manifest_payload is None
-                    else await publisher.load(track, runtime_manifest=runtime_manifest_payload)
+                    await publisher.recover(track) if runtime_manifest_payload is None
+                    else await publisher.recover(track, runtime_manifest=runtime_manifest_payload)
                 )
                 break
             except Exception as exc:
@@ -384,7 +391,6 @@ async def run_evaluator(
                 if once:
                     return
                 await asyncio.sleep(poll_seconds)
-    disclosed_plan_digests = set(getattr(ledger, "disclosed_plan_digests", ()))
     historical_matches = tuple(getattr(ledger, "historical_matches", ()))
     recovery_matches = (*historical_matches, *ledger.matches)
     cache_dir = Path(exact_cache)
@@ -553,9 +559,7 @@ async def run_evaluator(
                 next_inventory_refresh = now + 30.0
             if disclosure_task is not None and disclosure_task.done():
                 try:
-                    digest = disclosure_task.result()
-                    if digest is not None:
-                        disclosed_plan_digests.add(digest)
+                    disclosure_task.result()
                 except Exception as exc:
                     _LOG.error("DATA_DISCLOSURE_FAILURE: %s", exc)
                     if alert is not None:
@@ -711,10 +715,6 @@ async def run_evaluator(
                                         stage_error = str(exc) or type(exc).__name__
                                     else:
                                         staged_match_count = len(prepared.matches)
-                                        disclosed_plan_digests.update(
-                                            name.removeprefix("batch_groups/").removesuffix(".json")
-                                            for name, _ in prepared.batch_groups
-                                        )
                                         pending_artifacts = None
                                 if (
                                     publication is None

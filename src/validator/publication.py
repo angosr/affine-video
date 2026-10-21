@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -1034,6 +1034,12 @@ class S3Repository:
 
         return await asyncio.to_thread(self._load, track, runtime_manifest)
 
+    async def recover(
+        self, track: TrackSpec, *, runtime_manifest: bytes | None = None,
+    ) -> PublicLedger:
+        """Recover authoritative facts without auditing previously published bulk."""
+        return await asyncio.to_thread(self._recover, track, runtime_manifest)
+
     def _load_history(
         self, track: TrackSpec, runtime_manifest: bytes | None = None,
     ) -> tuple[MatchRecord, ...]:
@@ -1091,6 +1097,12 @@ class S3Repository:
         return result
 
     def _load(self, track: TrackSpec, runtime_manifest: bytes | None = None) -> PublicLedger:
+        ledger = self._recover(track, runtime_manifest)
+        self._verify_model_archives(ledger.matches)
+        disclosures = self._load_batch_disclosures(track, ledger.matches)
+        return replace(ledger, disclosed_plan_digests=disclosures)
+
+    def _recover(self, track: TrackSpec, runtime_manifest: bytes | None = None) -> PublicLedger:
         history = self._load_history(track, runtime_manifest)
         track_payload = self._get_optional("track.json")
         summary_payload = self._get_optional("summary.json")
@@ -1196,8 +1208,6 @@ class S3Repository:
         source_block: int | None, committed_count: int,
         history: tuple[MatchRecord, ...] = (),
     ) -> PublicLedger:
-        self._verify_model_archives(matches)
-        disclosures = self._load_batch_disclosures(track, matches)
         payload = self._get_optional("weights.json")
         if payload is not None and (
             _decode_canonical_object(payload, "weights").get("track_id") == track.track_id
@@ -1224,7 +1234,7 @@ class S3Repository:
             committed_count = max(committed_count, count)
             source_block = max(0 if source_block is None else source_block, weights.source_block)
         return PublicLedger(
-            source_block, matches, disclosures, committed_count, history,
+            source_block, matches, frozenset(), committed_count, history,
         )
 
     def _load_following_matches(

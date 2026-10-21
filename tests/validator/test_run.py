@@ -47,6 +47,52 @@ from .test_store import submission_at
 from .test_tournament import challenge as scored_challenge
 
 
+@pytest.mark.parametrize("failure", ["protection", "pruning"])
+def test_optional_cleanup_failure_does_not_block_durable_disclosure(failure, caplog):
+    from tests.validator.production.test_storage import MemoryS3 as PrivateMemoryS3
+    from validator.production.storage import PrivateObjectStore
+
+    track = parse_track_spec(valid_spec())
+    objects = PrivateObjectStore(PrivateMemoryS3(), bucket="test", prefix="test")
+    digest = "ab" * 32
+    calls = []
+
+    def protection(*_args):
+        calls.append("protection")
+        if failure == "protection":
+            raise OSError("chain Timestamp unavailable")
+        return frozenset({"cd" * 32})
+
+    def prune(protected):
+        assert protected == frozenset({"cd" * 32})
+        calls.append("prune")
+        raise OSError("optional filesystem reclamation unavailable")
+
+    source = SimpleNamespace(
+        track=track, objects=objects, protected_plan_digests=protection, prune_disclosed=prune,
+        due_plan_digests=lambda _now: (digest,),
+        public_disclosure=lambda *_a, **_k: "original-bound-disclosure",
+        record_disclosed=lambda key: calls.append(("record", key)),
+    )
+
+    class Publisher:
+        async def publish_disclosure(self, disclosure, **kwargs):
+            assert disclosure == "original-bound-disclosure" and kwargs["track"] == track
+            calls.append("publish")
+
+    assert asyncio.run(run_module._publish_due_batch(
+        source, Publisher(), finalized_block=120, challenges=[],
+    )) == digest
+    assert calls == (["protection"] if failure == "protection" else ["protection", "prune"]) + [
+        "publish", ("record", digest),
+    ]
+    assert "optional disclosed-data cleanup failed" in caplog.text
+    checkpoint = objects.get_optional(f"retry_state/disclosures/{digest}.json")
+    assert checkpoint is not None
+    row = json.loads(checkpoint.body)
+    assert row["attempt"] == 1 and row["retry_after_ms"] == 0 and row["error"] is None
+
+
 @pytest.mark.parametrize("already_scanned", [False, True])
 @pytest.mark.parametrize("same_hotkey", [False, True])
 def test_empty_new_track_recovers_verified_old_submission_before_fifo(
@@ -605,6 +651,12 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     client = Client(case.client._substrate.blocks)
     client._finalized = 102
 
+    def no_startup_bulk(*_args):
+        pytest.fail("startup bulk auditing blocked the owner heartbeat")
+
+    monkeypatch.setattr(case.publisher, "_verify_model_archives", no_startup_bulk)
+    monkeypatch.setattr(case.publisher, "_load_batch_disclosures", no_startup_bulk)
+
     if benchmark_refresh.startswith(("inventory_", "disclosure_")):
         from tests.validator.production.test_storage import MemoryS3 as PrivateMemoryS3
         from validator.production.storage import PrivateObjectStore
@@ -1155,11 +1207,11 @@ def test_ledger_outage_scanning_reserves_uid0_and_recovers_from_chain_failure(
     class Publisher(S3Repository):
         remaining_load_failures = 2 if chain_outage else 1
 
-        async def load(self, candidate):
+        async def recover(self, candidate):
             if self.remaining_load_failures:
                 self.remaining_load_failures -= 1
                 raise OSError("public ledger temporarily unavailable")
-            return await super().load(candidate)
+            return await super().recover(candidate)
 
     async def no_seed(*_args, **_kwargs):
         pass
@@ -1255,7 +1307,7 @@ def test_evaluator_reconnects_after_unexpected_cycle_failure(monkeypatch, tmp_pa
             return 100
 
     class Publisher:
-        async def load(self, _track):
+        async def recover(self, _track):
             return SimpleNamespace(
                 matches=(), required_finalized_block=0, committed_match_count=0,
             )
@@ -1772,7 +1824,7 @@ def test_publication_gate_survives_restarts_and_republishes_before_work(monkeypa
             pass
 
     class Publisher:
-        async def load(self, _track):
+        async def recover(self, _track):
             if load_fail:
                 raise RuntimeError("public ledger unavailable on restart")
             return SimpleNamespace(

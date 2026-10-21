@@ -372,7 +372,8 @@ def test_maintenance_cannot_drop_history_from_manifest(maintenance_history, unco
 
 
 @pytest.mark.parametrize("damage", ["missing", "sha", "identity", "subnet", "sequence", "link"])
-def test_maintenance_history_fails_closed(maintenance_history, damage):
+@pytest.mark.parametrize("operation", ["recover", "load"])
+def test_maintenance_history_fails_closed(maintenance_history, damage, operation):
     case = maintenance_history
     name = case.history[0].object_name
     body = case.body
@@ -403,7 +404,7 @@ def test_maintenance_history_fails_closed(maintenance_history, damage):
         case.client.objects[key] = body if damage != "sha" else body + b" "
     cold = S3Repository(case.client, bucket="test", prefix="isolated/maintenance")
     with pytest.raises(PublicArtifactError, match="historical"):
-        asyncio.run(cold.load(track, runtime_manifest=manifest.encode()))
+        asyncio.run(getattr(cold, operation)(track, runtime_manifest=manifest.encode()))
 
 
 def test_weight_artifact_has_one_strict_canonical_representation() -> None:
@@ -1067,21 +1068,67 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) ->
     assert len(ledger.matches) == 1
     assert ledger.matches[0].challenge_id == "challenge"
 
+    # Startup has the same immutable facts/fence, but must not read the model
+    # or disclosed payloads before scanning and refreshing current weights.
+    cold = S3Repository(client, bucket="public-data", prefix="veda/track")
+    def blocked_bulk(*_args):
+        pytest.fail("authoritative fact recovery attempted a bulk audit")
+    cold._verify_model_archives = blocked_bulk
+    cold._load_batch_disclosures = blocked_bulk
+    facts = asyncio.run(cold.recover(track))
+    assert facts.matches == ledger.matches
+    assert facts.source_block == ledger.source_block
+    assert facts.required_finalized_block == ledger.required_finalized_block
+    assert facts.disclosed_plan_digests == frozenset()
+
+    weights_key = "veda/track/weights.json"
+    original_weights = client.objects[weights_key]
+    wrong_fence = json.loads(original_weights)
+    wrong_fence["terminal_match_sha256"] = "fa" * 32
+    client.objects[weights_key] = canonical_json(wrong_fence)
+    for operation in ("recover", "load"):
+        with pytest.raises(PublicArtifactError, match="does not bind"):
+            asyncio.run(getattr(
+                S3Repository(client, bucket="public-data", prefix="veda/track"), operation,
+            )(track))
+    client.objects[weights_key] = original_weights
+
+    summary_key = "veda/track/summary.json"
+    original_summary = client.objects[summary_key]
+    wrong_summary = json.loads(original_summary)
+    wrong_summary["leaderboard_total"] += 1
+    client.objects[summary_key] = canonical_json(wrong_summary)
+    for operation in ("recover", "load"):
+        with pytest.raises(PublicArtifactError, match="summary does not match"):
+            asyncio.run(getattr(S3Repository(
+                client, bucket="public-data", prefix="veda/track",
+            ), operation)(track))
+    client.objects[summary_key] = original_summary
+
     model_prefix = f"veda/track/models/{track.track_id}/{model_sha256}/"
     model_part = next(key for key in client.objects if key.startswith(model_prefix + "part-"))
     model_bytes = client.objects.pop(model_part)
+    assert asyncio.run(S3Repository(
+        client, bucket="public-data", prefix="veda/track",
+    ).recover(track)).matches == ledger.matches
     with pytest.raises(PublicArtifactError, match="chunk is missing"):
         asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
     client.objects[model_part] = model_bytes
 
     original_match = client.objects.pop("veda/track/matches/veda-test-v1/000000000001.json")
-    with pytest.raises(PublicArtifactError, match="committed match is missing"):
-        asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
+    for operation in ("recover", "load"):
+        with pytest.raises(PublicArtifactError, match="committed match is missing"):
+            asyncio.run(getattr(S3Repository(
+                client, bucket="public-data", prefix="veda/track",
+            ), operation)(track))
     client.objects["veda/track/matches/veda-test-v1/000000000001.json"] = original_match
 
     client.objects["veda/track/matches/veda-test-v1/000000000001.json"] = b"{}"
-    with pytest.raises(PublicArtifactError, match="match is invalid"):
-        asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").load(track))
+    for operation in ("recover", "load"):
+        with pytest.raises(PublicArtifactError, match="match is invalid"):
+            asyncio.run(getattr(S3Repository(
+                client, bucket="public-data", prefix="veda/track",
+            ), operation)(track))
 
 
 @pytest.mark.parametrize(
