@@ -82,6 +82,7 @@ class CacheSpec:
     storage_dtype: str
     compute_dtype: str
     accumulation_dtype: str
+    disclosure_delay_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +382,7 @@ def _parse_cache(value: Any) -> CacheSpec:
             "inventory_target_batches",
             "generator",
             "inventory_max_bytes",
+            "disclosure_delay_seconds",
             "storage_dtype",
         },
         "cache",
@@ -395,6 +397,9 @@ def _parse_cache(value: Any) -> CacheSpec:
     if target > 8 or target % 2:
         raise TrackSpecError("inventory target batches must be even and between 2 and 8")
     maximum = _integer(raw["inventory_max_bytes"], "inventory max bytes", minimum=1)
+    disclosure_delay = _integer(
+            raw["disclosure_delay_seconds"], "data disclosure delay seconds", minimum=1,
+    )
     exact_maximum = _integer(raw["exact_max_bytes"], "exact cache max bytes", minimum=1)
     if maximum < 3 * target * exact_maximum:
         raise TrackSpecError(
@@ -409,6 +414,7 @@ def _parse_cache(value: Any) -> CacheSpec:
         _choice(raw["storage_dtype"], "storage_dtype", {"float16"}),
         _choice(raw["compute_dtype"], "compute_dtype", {"float32"}),
         _choice(raw["accumulation_dtype"], "accumulation_dtype", {"float32"}),
+        disclosure_delay,
     )
 
 

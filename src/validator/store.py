@@ -429,11 +429,16 @@ class ChallengeStore:
             """
             SELECT choice.hotkey, submission.block_height,
                    submission.extrinsic_index, submission.event_index,
-                   choice.submission_id, submission.repo_id, submission.revision,
+                   submission.submission_id, submission.repo_id, submission.revision,
                    exclusion.reason AS exclusion_reason
             FROM commitment_choices choice
             LEFT JOIN submissions submission
-              ON submission.submission_id = choice.submission_id
+              ON submission.submission_id = COALESCE((
+                  SELECT s.submission_id FROM submissions s
+                  JOIN challenges c ON c.submission_id=s.submission_id
+                  WHERE s.hotkey=choice.hotkey AND c.state != 'SYSTEM_NOT_ADMITTED'
+                  ORDER BY s.block_height, s.extrinsic_index, s.event_index LIMIT 1
+              ), choice.submission_id)
             LEFT JOIN competition_exclusions exclusion
               ON exclusion.hotkey = choice.hotkey
             ORDER BY choice.block_height, choice.extrinsic_index, choice.event_index
@@ -683,14 +688,22 @@ class ChallengeStore:
             excluded = exclusion is not None
             previous_hotkey_submission = self._connection.execute(
                 """
-                SELECT submission_id FROM submissions
-                WHERE hotkey = ?
+                SELECT s.submission_id, c.state, c.model_digest FROM submissions s
+                JOIN challenges c ON c.submission_id=s.submission_id
+                WHERE s.hotkey = ? AND c.state != 'SYSTEM_NOT_ADMITTED'
                 LIMIT 1
                 """,
                 (submission.hotkey,),
             ).fetchone()
             first_for_hotkey = previous_hotkey_submission is None
-            admitted = not excluded and not malformed and first_for_hotkey
+            prior_undecided = (
+                previous_hotkey_submission is not None
+                and previous_hotkey_submission["state"] not in TERMINAL_STATES
+                and previous_hotkey_submission["model_digest"] is None
+            )
+            # An earlier unadmitted FIFO item may be a system non-admission.
+            # Defer only that duplicate decision; never reverse a terminal row.
+            admitted = not excluded and not malformed and (first_for_hotkey or prior_undecided)
 
             self._connection.execute(
                 """
@@ -729,7 +742,7 @@ class ChallengeStore:
             )
             terminal = (
                 ChallengeState.REJECTED_DUPLICATE_HOTKEY
-                if not first_for_hotkey
+                if (not first_for_hotkey and not prior_undecided)
                 or (exclusion is not None and exclusion["reason"] == "RESERVED_UID0")
                 else ChallengeState.REJECTED_OTHER_COMPETITION
                 if excluded
@@ -932,6 +945,20 @@ class ChallengeStore:
                 identifier,
                 ChallengeState.PARTICIPANT_FAILED,
             ),
+        ).fetchone()
+        return None if row is None else row["challenge_id"]
+
+    def earlier_hotkey_owner(self, identifier: str) -> str | None:
+        row = self._connection.execute(
+            """SELECT earlier.challenge_id FROM challenges current
+               JOIN submissions current_s USING(submission_id)
+               JOIN submissions earlier_s ON earlier_s.hotkey=current_s.hotkey
+               JOIN challenges earlier ON earlier.submission_id=earlier_s.submission_id
+               WHERE current.challenge_id=? AND earlier.state != 'SYSTEM_NOT_ADMITTED'
+               AND (earlier_s.block_height, earlier_s.extrinsic_index, earlier_s.event_index)
+                 < (current_s.block_height, current_s.extrinsic_index, current_s.event_index)
+               ORDER BY earlier_s.block_height, earlier_s.extrinsic_index, earlier_s.event_index
+               LIMIT 1""", (identifier,),
         ).fetchone()
         return None if row is None else row["challenge_id"]
 
@@ -1620,6 +1647,7 @@ class ChallengeStore:
                              ChallengeState.REJECTED_DUPLICATE_HOTKEY,
                              ChallengeState.REJECTED_OTHER_COMPETITION,
                              ChallengeState.MALFORMED_SUBMISSION,
+                             ChallengeState.SYSTEM_NOT_ADMITTED,
                          })),
                     )
                     self._connection.execute(
@@ -1655,10 +1683,16 @@ class ChallengeStore:
                     later = self._connection.execute(
                         """SELECT c.challenge_id, c.state, c.created_at_ms
                            FROM submissions s JOIN challenges c USING(submission_id)
-                           WHERE s.hotkey=? AND (s.block_height, s.extrinsic_index,
+                           WHERE ? != 'SYSTEM_NOT_ADMITTED' AND s.hotkey=?
+                           AND (s.block_height, s.extrinsic_index,
                            s.event_index) > (?, ?, ?)""",
-                        (record.hotkey, record.position.block, record.position.extrinsic_index,
-                         record.position.event_index),
+                        (
+                            match.state,
+                            record.hotkey,
+                            record.position.block,
+                            record.position.extrinsic_index,
+                            record.position.event_index,
+                        ),
                     ).fetchall()
                     historical_ids = {item.challenge_id for item in matches}
                     for item in later:
@@ -1797,6 +1831,16 @@ class ChallengeStore:
                                 "cache_generated_block": batch["generated_block"],
                                 "cache_plan_digest": batch["plan_digest"],
                                 "cache_seed_block_hash": batch["seed_block_hash"],
+                                **{
+                                    f"cache_{key}": batch[key]
+                                    for key in (
+                                        "completed_block",
+                                        "completed_at_ms",
+                                        "ready_sha256",
+                                        "allocation",
+                                    )
+                                    if key in batch
+                                },
                             }
                         self._connection.execute(
                             """
@@ -1815,6 +1859,11 @@ class ChallengeStore:
                             ),
                         )
                 model_digest = evaluation["model_digest"]
+                if match.state is ChallengeState.SYSTEM_NOT_ADMITTED:
+                    self._connection.execute(
+                        "UPDATE submissions SET admitted=0 WHERE submission_id=?",
+                        (document["submission_id"],),
+                    )
                 if model_digest is not None and evaluation["error_code"] not in {
                     "EXACT_DUPLICATE",
                 }:
@@ -1939,6 +1988,16 @@ class ChallengeStore:
                     "generated_block": stage_metrics.get("cache_generated_block"),
                     "plan_digest": stage_metrics.get("cache_plan_digest"),
                     "seed_block_hash": stage_metrics.get("cache_seed_block_hash"),
+                    **{
+                        key: stage_metrics[f"cache_{key}"]
+                        for key in (
+                            "completed_block",
+                            "completed_at_ms",
+                            "ready_sha256",
+                            "allocation",
+                        )
+                        if f"cache_{key}" in stage_metrics
+                    },
                 }
                 document["incumbent_score"] = stage_metrics.get("incumbent_score")
                 document["paired_gain_lower_bound"] = stage_metrics.get("paired_gain_lower_bound")
@@ -1955,6 +2014,16 @@ class ChallengeStore:
                         "generated_block": metrics.get("cache_generated_block"),
                         "plan_digest": metrics.get("cache_plan_digest"),
                         "seed_block_hash": metrics.get("cache_seed_block_hash"),
+                        **{
+                            key: metrics[f"cache_{key}"]
+                            for key in (
+                                "completed_block",
+                                "completed_at_ms",
+                                "ready_sha256",
+                                "allocation",
+                            )
+                            if f"cache_{key}" in metrics
+                        },
                     }
                     if "cache_sha256" in metrics
                     else None
@@ -2048,6 +2117,18 @@ class ChallengeStore:
             """,
             (target, error_code, error_summary, timestamp, identifier),
         )
+        if target is ChallengeState.SYSTEM_NOT_ADMITTED:
+            if error_code != "NO_PRE_SUBMISSION_DATA":
+                raise ValueError("system non-admission requires the unavailable historical pool")
+            self._connection.execute(
+                "UPDATE submissions SET admitted=0 WHERE submission_id="
+                "(SELECT submission_id FROM challenges WHERE challenge_id=?)", (identifier,),
+            )
+        elif target is ChallengeState.REJECTED_DUPLICATE_HOTKEY:
+            self._connection.execute(
+                "UPDATE submissions SET admitted=0 WHERE submission_id="
+                "(SELECT submission_id FROM challenges WHERE challenge_id=?)", (identifier,),
+            )
 
     def _claim_next(
         self,

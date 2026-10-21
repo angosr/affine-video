@@ -129,6 +129,23 @@ def test_preproduced_confirmation_still_requires_two_independent_decisions():
         resolve([item])
 
 
+def test_system_non_admission_is_not_a_loss_or_lifetime_exclusion():
+    first = challenge(1, "alice", state=ChallengeState.SYSTEM_NOT_ADMITTED,
+                      error_code="NO_PRE_SUBMISSION_DATA")
+    second = challenge(2, "alice", score=0.8, incumbent_score=0.7)
+    result = resolve([first, second])
+    assert result.matches[0].outcome is MatchOutcome.SYSTEM_NOT_ADMITTED
+    assert result.matches[0].champion_after == genesis()
+    assert result.matches[1].outcome is MatchOutcome.CHALLENGER_WON
+    assert result.champion.hotkey == "alice"
+    history = resolve([first]).matches
+    next_release = resolve_tournament(
+        [second], track_id="next", track_spec_digest="ef" * 32, netuid=7,
+        minimum_gain=0.01, initial_champion=genesis(), historical_matches=history,
+    )
+    assert next_release.champion.hotkey == "alice"
+
+
 def test_previous_completed_loss_keeps_lifetime_uniqueness_without_relabelling():
     old = challenge(1, "alice", score=0.7, incumbent_score=0.7)
     old["track_spec_digest"] = "cd" * 32

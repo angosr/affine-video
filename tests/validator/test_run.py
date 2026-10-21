@@ -576,6 +576,7 @@ def test_worker_setup_failure_alerts_and_does_not_poison_next_task(pending_evalu
 
 @pytest.mark.parametrize("benchmark_refresh", [
     "normal", "slow", "error", "inventory_slow", "inventory_error",
+    "disclosure_slow", "disclosure_error",
 ])
 def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     pending_evaluation, monkeypatch, tmp_path, benchmark_refresh,
@@ -604,7 +605,10 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     client = Client(case.client._substrate.blocks)
     client._finalized = 102
 
-    if benchmark_refresh.startswith("inventory_"):
+    if benchmark_refresh.startswith(("inventory_", "disclosure_")):
+        from tests.validator.production.test_storage import MemoryS3 as PrivateMemoryS3
+        from validator.production.storage import PrivateObjectStore
+
         original_evaluator = run_module.PairedTrackEvaluator
 
         def inventory_plans():
@@ -619,11 +623,30 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
         def evaluator_factory(**kwargs):
             evaluator = original_evaluator(**kwargs)
             evaluator.batch_source = SimpleNamespace(
-                _plans=inventory_plans, inventory_status=lambda _plans: {},
+                _plans=inventory_plans, inventory_status=lambda _plans: {"allocated_stages": []},
+                protected_plan_digests=lambda *_a: frozenset(), prune_disclosed=lambda _p: 0,
+                due_plan_digests=lambda _now: (),
             )
+            if benchmark_refresh.startswith("disclosure_"):
+                source = evaluator.batch_source
+                source._plans = lambda: ()
+                source.track = case.track
+                source.objects = PrivateObjectStore(PrivateMemoryS3(), bucket="test", prefix="test")
+                source.due_plan_digests = lambda _now: ("ab" * 32,)
+                source.public_disclosure = lambda *_a, **_k: object()
+                source.record_disclosed = lambda _digest: None
             return evaluator
 
         monkeypatch.setattr(run_module, "PairedTrackEvaluator", evaluator_factory)
+        if benchmark_refresh.startswith("disclosure_"):
+            async def disclose(*_args, **_kwargs):
+                benchmark_calls.append(benchmark_refresh)
+                if benchmark_refresh == "disclosure_error":
+                    raise OSError("public bulk upload unavailable")
+                if not await asyncio.to_thread(inventory_gate.wait, 5):
+                    raise OSError("test did not release disclosure upload")
+
+            monkeypatch.setattr(case.publisher, "publish_disclosure", disclose)
     elif benchmark_refresh != "normal":
         async def load_benchmarks(_track, _manifest):
             benchmark_calls.append(benchmark_refresh)
@@ -747,10 +770,10 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
 
 
 @pytest.mark.parametrize("mode", [
-    "success", "prepare_retry", "retry", "retry_exhaustion", "restart", "group_restart",
+    "success", "prepare_retry", "retry", "retry_exhaustion", "restart", "stage_restart",
     "success_lost_response",
 ])
-def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
+def test_slow_model_archive_keeps_weights_fresh_until_immutable_match_commit(
     pending_evaluation, monkeypatch, tmp_path, mode,
 ):
     """CPU orchestration/real byte uploads; fixture scores are not quality evidence."""
@@ -819,7 +842,13 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
                                content(f"latent-{index}.safetensors"))
                 for index, rollout in enumerate(plan.rollouts)
             )
-            ready = plan.ready(exact=exact, dense_references=references, sample_cache=inputs)
+            ready = plan.ready(
+                completed_at_ms=(plan.generation_block + 1) * 1000,
+                completed_block=plan.generation_block + 1,
+                exact=exact,
+                dense_references=references,
+                sample_cache=inputs,
+            )
             plans[generation] = ready
             exact_paths[ready.plan_digest] = paths[exact.object_key]
             input_roots[ready.plan_digest] = directory
@@ -838,13 +867,6 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         if not plans:
             build_groups(task.challenge_id)
         exact = task.state is ChallengeState.SCORING
-        with ChallengeStore(case.work.database, track_spec_digest=case.track.digest) as observer:
-            admitted = observer.public_challenge(task.challenge_id)
-        source.inventory.claim(
-            challenge_id=task.challenge_id, stage=task.state.value,
-            file_sha256=admitted["file_sha256"], model_digest=admitted["model_digest"],
-            plans=tuple(plans.values()),
-        )
         plan = plans[200 if exact else 400]
         return StageOutcome(0.9, {
             "stage": "scoring" if exact else "confirming",
@@ -872,10 +894,10 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     retry_observed = []
     upload_failures = 0
     prepare_failed = False
-    group_failure_enabled = mode == "group_restart"
+    stage_failure_enabled = mode == "stage_restart"
     height = 401
     owner_thread = threading.get_ident()
-    original_resolve = run_module.resolve_public_disclosures
+    original_stage = run_module._stage_publication
 
     class StopLoop(BaseException):
         pass
@@ -890,29 +912,30 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         async def finalized_block(self):
             return height
 
-    def slow_resolve(artifacts, **kwargs):
+    def slow_prepare():
         nonlocal prepare_failed
         assert threading.get_ident() != owner_thread
         prepare_entered.set()
         if not prepare_release.wait(5):
-            raise OSError("test did not release disclosure preparation")
+            raise OSError("test did not release immutable metadata preparation")
         if mode == "prepare_retry" and not prepare_failed:
             prepare_failed = True
-            raise OSError("injected disclosure preparation failure")
-        kwargs["resolver"] = source.public_disclosure
-        return original_resolve(artifacts, **kwargs)
+            raise OSError("injected immutable metadata preparation failure")
+
+    async def slow_stage(artifacts, **kwargs):
+        await asyncio.to_thread(slow_prepare)
+        prepared = await original_stage(artifacts, **kwargs)
+        if stage_failure_enabled:
+            raise OSError("injected crash after immutable match staging")
+        return prepared
 
     def slow_upload(arguments):
         nonlocal upload_failures
-        if "/batch_groups/" in arguments["Key"] and group_failure_enabled:
-            raise OSError("injected crash after match and before group")
         if arguments["Key"].endswith("/weights.json"):
             weights = decode_weight_artifact(arguments["Body"])
             if weights.match_sequence:
-                assert all(
-                    f"isolated/slow-disclosure/batch_groups/{plan.plan_digest}.json"
-                    in transport.objects for plan in plans.values()
-                )
+                assert not any("/batch_groups/" in key for key in transport.objects)
+                assert any("/matches/" in key for key in transport.objects)
         if "/models/" in arguments["Key"] and arguments["Key"].endswith("/part-00000"):
             upload_entered.set()
             if not upload_release.wait(5):
@@ -975,7 +998,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
             assert upload_release.is_set()
             raise StopLoop
         assert weights.match_sequence == 0 and weights.plan.uids == (0,)
-        if mode == "group_restart" and result.publication_error:
+        if mode == "stage_restart" and result.publication_error:
             assert "/matches/" in next(
                 key for key in transport.objects if key.endswith("000000000001.json")
             )
@@ -1003,7 +1026,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     monkeypatch.setattr(run_module.bt, "Client", lambda *_args, **_kwargs: Client(blocks))
     monkeypatch.setattr(run_module, "seed_legacy_exclusions", no_seed)
     monkeypatch.setattr(run_module, "read_weight_chain_state", chain_state)
-    monkeypatch.setattr(run_module, "resolve_public_disclosures", slow_resolve)
+    monkeypatch.setattr(run_module, "_stage_publication", slow_stage)
     monkeypatch.setattr(run_module, "process_next_admission", no_work)
     monkeypatch.setattr(run_module, "evaluate_next_scoring", no_work)
     monkeypatch.setattr(run_module, "webhook_alerter", lambda *_args, **_kwargs: None)
@@ -1037,7 +1060,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
     if mode == "retry_exhaustion":
         assert upload_failures == run_module.MAX_PUBLICATION_FAILURES + 1
         assert max(retry_observed) == run_module.MAX_PUBLICATION_FAILURES
-    if mode in {"restart", "group_restart"}:
+    if mode in {"restart", "stage_restart"}:
         # Keep all remote immutable bytes, but discard the complete local database.
         # Reconcile the recovered public prefix without HF/model inference.
         database = tmp_path / "recovered.db"
@@ -1045,9 +1068,9 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         recovered_ledger = asyncio.run(publisher.load(case.track))
         assert len(recovered_ledger.matches) == 1
         assert recovered_ledger.committed_match_count == 0
-        if mode == "group_restart":
+        if mode == "stage_restart":
             assert recovered_ledger.disclosed_plan_digests == frozenset()
-            group_failure_enabled = False
+            stage_failure_enabled = False
         asyncio.run(execute(once=True))
         with ChallengeStore(database, track_spec_digest=case.track.digest) as recovered:
             assert recovered.public_snapshot()["challenges"][0]["state"] == ChallengeState.SUCCEEDED
@@ -1057,7 +1080,7 @@ def test_slow_disclosure_keeps_old_weights_fresh_until_fenced_commit(
         assert recovered.publication_failures() == 0
     ledger = asyncio.run(publisher.load(case.track))
     assert len(ledger.matches) == 1
-    assert ledger.disclosed_plan_digests == frozenset(plan.plan_digest for plan in plans.values())
+    assert ledger.disclosed_plan_digests == frozenset()
 
 
 def test_release_defaults_target_sn120_initial_state() -> None:

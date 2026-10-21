@@ -17,6 +17,7 @@ class MatchOutcome(StrEnum):
     CHALLENGER_WON = "CHALLENGER_WON"
     CHAMPION_RETAINED = "CHAMPION_RETAINED"
     CHALLENGE_FAILED = "CHALLENGE_FAILED"
+    SYSTEM_NOT_ADMITTED = "SYSTEM_NOT_ADMITTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +214,8 @@ def resolve_tournament(
         # The release manifest pins the original public records. Their decisions
         # are facts, not comparisons against this release's possibly new gates.
         champion = historical_champion(historical_matches, initial_champion)
-        seen_hotkeys.update(record.hotkey for record in historical_matches)
+        seen_hotkeys.update(record.hotkey for record in historical_matches
+                            if record.state is not ChallengeState.SYSTEM_NOT_ADMITTED)
         historical_by_id = {record.challenge_id: record for record in historical_matches}
         if champion.challenge_id == "genesis":
             leaderboard_candidates = [champion]
@@ -243,7 +245,8 @@ def resolve_tournament(
                     raise ValueError("previous-track challenge conflicts with its immutable match")
             # Preserve completed facts and lifetime uniqueness, never re-label a
             # previous source/cache measurement as this track's match evidence.
-            seen_hotkeys.add(_required_string(challenge, "hotkey"))
+            if state is not ChallengeState.SYSTEM_NOT_ADMITTED:
+                seen_hotkeys.add(_required_string(challenge, "hotkey"))
             continue
         if state not in TERMINAL_STATES:
             break
@@ -253,7 +256,8 @@ def resolve_tournament(
         rejected_as_duplicate = state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
         if repeated != rejected_as_duplicate:
             raise ValueError("exactly a hotkey's later submissions must be rejected")
-        seen_hotkeys.add(hotkey)
+        if state is not ChallengeState.SYSTEM_NOT_ADMITTED:
+            seen_hotkeys.add(hotkey)
         record, champion = _resolve_match(
             challenge,
             sequence=sequence,
@@ -354,6 +358,13 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
             raise ValueError("historical retained champion is inconsistent")
     elif state is ChallengeState.SUCCEEDED or after != before:
         raise ValueError("historical failure changes its champion")
+    if (outcome is MatchOutcome.SYSTEM_NOT_ADMITTED) != (
+        state is ChallengeState.SYSTEM_NOT_ADMITTED
+    ) or (state is ChallengeState.SYSTEM_NOT_ADMITTED and (
+        challenge["error_code"] != "NO_PRE_SUBMISSION_DATA" or score is not None
+        or challenge.get("stages")
+    )):
+        raise ValueError("historical non-admission is not a participant result")
     return MatchRecord(sequence, challenge["challenge_id"], challenge["hotkey"], state,
                        score, gain, outcome, after, document)
 
@@ -416,6 +427,18 @@ def _resolve_match(
     )
     if any(stage["score_block"] < position.block for stage in stages):
         raise ValueError("stage decision block cannot precede its submission")
+    for stage in stages:
+        batch = stage.get("evaluation_batch") or {}
+        allocation = batch.get("allocation")
+        if allocation is not None and (
+            allocation["challenge_id"] != identifier
+            or allocation["stage"] != stage["stage"]
+            or allocation["file_sha256"] != file_sha256
+            or allocation["model_digest"] != model_digest
+            or allocation["submission_block"] != position.block
+            or not batch["generated_block"] < batch["completed_block"] < position.block
+        ):
+            raise ValueError("evaluation allocation differs from its submitted model")
 
     if state is ChallengeState.SUCCEEDED:
         if repo_id is None or revision is None:
@@ -488,7 +511,12 @@ def _resolve_match(
         score = None
         incumbent_score = None
         batch = None
-        outcome = MatchOutcome.CHALLENGE_FAILED
+        if state is ChallengeState.SYSTEM_NOT_ADMITTED:
+            if error_code != "NO_PRE_SUBMISSION_DATA" or stages or file_sha256 is not None:
+                raise ValueError("system non-admission contains participant evaluation facts")
+            outcome = MatchOutcome.SYSTEM_NOT_ADMITTED
+        else:
+            outcome = MatchOutcome.CHALLENGE_FAILED
 
     decided_block = (
         _integer(challenge["score_block"], "score_block")
@@ -636,7 +664,10 @@ def _evaluation_batch(
         "plan_digest",
         "seed_block_hash",
     }
-    if not isinstance(value, Mapping) or set(value) not in (expected, expected | {"object"}):
+    completed = {"completed_block", "completed_at_ms", "ready_sha256", "allocation"}
+    if not isinstance(value, Mapping) or set(value) not in (
+        expected, expected | {"object"}, expected | completed, expected | completed | {"object"},
+    ):
         raise ValueError("evaluation_batch fields are invalid")
     sha256 = _optional_digest(value["sha256"], "evaluation batch sha256")
     plan_digest = _optional_digest(value["plan_digest"], "evaluation batch plan_digest")
@@ -646,13 +677,40 @@ def _evaluation_batch(
     object_name = f"batches/{sha256}/manifest.json"
     if "object" in value and value["object"] != object_name:
         raise ValueError("evaluation batch object name is invalid")
-    return {
+    result = {
         "sha256": sha256,
         "generated_block": generated_block,
         "plan_digest": plan_digest,
         "seed_block_hash": seed_block_hash,
         "object": object_name,
     }
+    # Old immutable history retains its original body. New completed-pool
+    # records additionally commit the READY seal and exact admitted identity.
+    if "completed_block" in value:
+        allocation = value["allocation"]
+        if not isinstance(allocation, Mapping) or set(allocation) != {
+            "ordinal", "challenge_id", "stage", "plan_digest", "ready_sha256",
+            "file_sha256", "model_digest", "submission_block", "submission_timestamp_ms",
+        }:
+            raise ValueError("evaluation allocation fields are invalid")
+        if (
+            _integer(allocation["ordinal"], "allocation ordinal") == 0
+            or allocation["stage"] not in {"SCORING", "CONFIRMING"}
+            or allocation["plan_digest"] != plan_digest
+            or allocation["ready_sha256"] != value["ready_sha256"]
+        ):
+            raise ValueError("evaluation allocation binding is invalid")
+        for key in ("challenge_id", "file_sha256", "model_digest", "ready_sha256"):
+            if _optional_digest(allocation[key], key) is None:
+                raise ValueError("evaluation allocation identity is missing")
+        _integer(allocation["submission_block"], "allocation submission block")
+        _integer(allocation["submission_timestamp_ms"], "allocation submission time")
+        result.update(
+            completed_block=_integer(value["completed_block"], "batch completion block"),
+            completed_at_ms=_integer(value["completed_at_ms"], "batch completion time"),
+            ready_sha256=value["ready_sha256"], allocation=dict(allocation),
+        )
+    return result
 
 
 def _evaluation_stages(

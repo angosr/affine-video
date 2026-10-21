@@ -35,6 +35,7 @@ class AdmissionStatus(StrEnum):
     FAILED = "FAILED"
     DEFERRED = "DEFERRED"
     BLOCKED = "BLOCKED"
+    NOT_ADMITTED = "NOT_ADMITTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +63,7 @@ class AdmissionSettings:
     restore: Callable[[object], DownloadedModel | RejectedAdmission | None] | None = None
     restore_retry: RetryRestore | None = None
     record_retry: RetryRecorder | None = None
+    eligible: Callable[[object], bool] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -150,6 +152,42 @@ def process_next_admission(
             store, task, settings, downloaded,
             current_finalized_block=current_finalized_block, clock=clock,
         )
+    prior = store.earlier_hotkey_owner(task.challenge_id)
+    if prior is not None:
+        return _reject_participant(
+            store,
+            task,
+            settings,
+            RejectedAdmission(
+                "DUPLICATE_HOTKEY",
+                "the earlier submission consumed this opportunity",
+                current_finalized_block,
+                duplicate_of=prior,
+            ),
+            current_finalized_block=current_finalized_block,
+            clock=clock,
+        )
+    if (downloaded is None and task.state is ChallengeState.FETCHING
+            and settings.eligible is not None):
+        try:
+            eligible = settings.eligible(task)
+        except Exception:
+            error = ModelDownloadError(
+                "INVENTORY_AUTHORITY_UNAVAILABLE", "submission-time pool cannot be verified",
+                temporary=True,
+            )
+            status = _defer_or_fail(store, task, settings, clock(), error)
+            return AdmissionOutcome(task.challenge_id, status, error.code)
+        if not eligible:
+            return _reject_participant(
+                store, task, settings,
+                RejectedAdmission(
+                    "NO_PRE_SUBMISSION_DATA", "system did not admit this submission; "
+                    "no eligible pre-submission data; opportunity retained, resubmission allowed",
+                    current_finalized_block,
+                ),
+                current_finalized_block=current_finalized_block, clock=clock,
+            )
     reference_owner = store.earlier_reference_owner(task.challenge_id)
     if reference_owner is not None:
         return _reject_participant(
@@ -358,8 +396,15 @@ def _reject_participant(
                 temporary=True,
             )
         else:
+            not_admitted = rejection.code == "NO_PRE_SUBMISSION_DATA"
+            target = (
+                ChallengeState.SYSTEM_NOT_ADMITTED if not_admitted
+                else ChallengeState.REJECTED_DUPLICATE_HOTKEY
+                if rejection.code == "DUPLICATE_HOTKEY"
+                else ChallengeState.PARTICIPANT_FAILED
+            )
             store.complete_challenge(
-                task.challenge_id, ChallengeState.PARTICIPANT_FAILED,
+                task.challenge_id, target,
                 error_code=rejection.code, error_summary=rejection.summary,
                 occurred_at_ms=clock(), lease_token=task.lease_token,
                 score_block=rejection.score_block,
@@ -367,7 +412,9 @@ def _reject_participant(
                 model_size_bytes=rejection.model_size_bytes,
             )
             return AdmissionOutcome(
-                task.challenge_id, AdmissionStatus.FAILED, rejection.code, rejection.duplicate_of,
+                task.challenge_id,
+                AdmissionStatus.NOT_ADMITTED if not_admitted else AdmissionStatus.FAILED,
+                rejection.code, rejection.duplicate_of,
             )
     status = _defer_or_fail(store, task, settings, clock(), error)
     return AdmissionOutcome(task.challenge_id, status, error.code)

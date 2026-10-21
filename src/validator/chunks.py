@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,13 +85,19 @@ class ChunkManifest:
         return result
 
 
-def build_chunk_manifest(path: str | Path) -> ChunkManifest:
+def check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("bulk publication exceeded its attempt deadline")
+
+
+def build_chunk_manifest(path: str | Path, *, deadline: float | None = None) -> ChunkManifest:
     source = Path(path)
     complete = hashlib.sha256()
     parts = []
     size = 0
     with source.open("rb") as stream:
         for index, content in enumerate(iter(lambda: stream.read(CHUNK_BYTES), b"")):
+            check_deadline(deadline)
             complete.update(content)
             size += len(content)
             parts.append(
@@ -123,11 +130,13 @@ def verify_chunked_content(
     open_part: Callable[[str], Any],
     *,
     write: Callable[[bytes], Any] | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Stream and verify actual part and complete bytes, optionally copying them."""
 
     complete = hashlib.sha256()
     for part in manifest.parts:
+        check_deadline(deadline)
         body = open_part(part.name)
         received = 0
         digest = hashlib.sha256()
@@ -135,6 +144,7 @@ def verify_chunked_content(
             if not callable(getattr(body, "read", None)):
                 raise ValueError("chunk response has no readable body")
             while True:
+                check_deadline(deadline)
                 content = body.read(min(64 * 1024, part.size - received + 1))
                 if not isinstance(content, bytes):
                     raise ValueError("chunk response contains non-byte content")

@@ -40,7 +40,6 @@ from validator.publication import (
     encode_weight_artifact,
     fetch_track_identity,
     fetch_weight_artifact,
-    resolve_public_disclosures,
     validate_public_weights_url,
 )
 from validator.queue import ChainPosition
@@ -887,8 +886,11 @@ def test_public_file_verification_reads_actual_bytes(tmp_path, monkeypatch, oper
         if corruption == "complete_digest":
             # Preserve individually valid chunks under a false complete digest.
             monkeypatch.setattr(
-                publication_module, "build_chunk_manifest",
-                lambda _path: chunks.ChunkManifest(digest, manifest.size, manifest.parts),
+                publication_module,
+                "build_chunk_manifest",
+                lambda _path, **_kwargs: chunks.ChunkManifest(
+                    digest, manifest.size, manifest.parts
+                ),
             )
         del client.objects[manifest_key]
     with pytest.raises(PublicArtifactError):
@@ -1499,6 +1501,8 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
             )
         )
     ready = plan.ready(
+        completed_at_ms=(plan.generation_block + 1) * 1000,
+        completed_block=plan.generation_block + 1,
         exact=exact,
         dense_references=tuple(references),
         sample_cache=sample_cache,
@@ -1507,7 +1511,8 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         "ordinal": 1, "challenge_id": "a1" * 32, "stage": "SCORING",
         "plan_digest": ready.plan_digest,
         "ready_sha256": hashlib.sha256(ready.encode()).hexdigest(),
-        "file_sha256": "b2" * 32, "model_digest": "c3" * 32,
+        "file_sha256": "b2" * 32, "model_digest": "c3" * 32, "submission_block": 300,
+        "submission_timestamp_ms": 300_000,
     }
     public_references = []
     for reference in ready.dense_references:
@@ -1521,8 +1526,7 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         public_references.append(public)
     record = canonical_json(
         {
-            "format": "veda-batch-disclosure-v2",
-            "allocation": allocation,
+            "format": "veda-batch-disclosure-v3",
             "plan": ready.document(),
             "public_exact_object": f"batches/{exact.sha256}/manifest.json",
             "public_dense_references": public_references,
@@ -1547,10 +1551,15 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         "plan_digest": ready.plan_digest,
         "seed_block_hash": ready.block_hash,
         "object": f"batches/{exact.sha256}/manifest.json",
+        "ready_sha256": hashlib.sha256(ready.encode()).hexdigest(),
+        "completed_block": ready.completed_block,
+        "completed_at_ms": ready.completed_at_ms,
+        "allocation": allocation,
     }
     match = SimpleNamespace(
         challenge_id="a1" * 32,
         document={
+            "challenge_id": "a1" * 32,
             "submission": {"block_height": 300},
             "evaluation": {
                 "file_sha256": "b2" * 32, "model_digest": "c3" * 32,
@@ -1566,16 +1575,54 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
         },
     )
 
+    publication_module._require_inventory_bindings(track, match.document)
+    for field in ("ready_sha256", "completed_block", "completed_at_ms", "allocation"):
+        incomplete = json.loads(json.dumps(match.document))
+        del incomplete["evaluation"]["stages"][0]["evaluation_batch"][field]
+        with pytest.raises(PublicArtifactError):
+            publication_module._require_inventory_bindings(track, incomplete)
+    for field, value in (("completed_block", 300), ("completed_at_ms", 300_000)):
+        post_submission = json.loads(json.dumps(match.document))
+        post_submission["evaluation"]["stages"][0]["evaluation_batch"][field] = value
+        with pytest.raises(PublicArtifactError):
+            publication_module._require_inventory_bindings(track, post_submission)
+
     client = MemoryS3()
     publisher = S3Repository(client, bucket="public-data", prefix="tracks/test")
-    for object_name, path, item in local_files:
-        publisher._put_file_immutable(PublicFile(object_name, path, item.sha256))
-    publisher._put_immutable(f"batch_groups/{ready.plan_digest}.json", record)
+    disclosure = BatchDisclosure(f"batch_groups/{ready.plan_digest}.json", record, tuple(
+        DisclosureFile(name, path, item.sha256) for name, path, item in local_files
+    ))
+    reveal_at = ready.completed_at_ms + track.cache.disclosure_delay_seconds * 1000
+    with pytest.raises(PublicArtifactError, match="premature"):
+        asyncio.run(publisher.publish_disclosure(disclosure, track=track, now_ms=reveal_at - 1))
+    assert client.objects == {}
+    asyncio.run(publisher.publish_disclosure(disclosure, track=track, now_ms=reveal_at))
+    assert not any(key.endswith(("weights.json", "track.json", "summary.json", "status.json"))
+                   for key in client.objects)
 
     restarted = S3Repository(client, bucket="public-data", prefix="tracks/test")
     assert restarted._load_batch_disclosures(track, (match,)) == frozenset(
         {ready.plan_digest}
     )
+    another_allocation = {
+        **allocation, "ordinal": 2, "challenge_id": "d4" * 32,
+        "file_sha256": "e5" * 32, "model_digest": "f6" * 32, "submission_block": 301,
+        "submission_timestamp_ms": 301_000,
+    }
+    another_batch = {**batch, "allocation": another_allocation}
+    another_match = SimpleNamespace(challenge_id="d4" * 32, document={
+        "submission": {"block_height": 301}, "evaluation": {
+            "file_sha256": "e5" * 32, "model_digest": "f6" * 32,
+            "evaluation_batch": another_batch,
+            "stages": [{"stage": "SCORING", "score_block": 302,
+                        "evaluation_batch": another_batch}],
+        },
+    })
+    before_record = client.objects[f"tracks/test/batch_groups/{ready.plan_digest}.json"]
+    assert restarted._load_batch_disclosures(track, (match, another_match)) == frozenset({
+        ready.plan_digest,
+    })
+    assert client.objects[f"tracks/test/batch_groups/{ready.plan_digest}.json"] == before_record
 
     tampered = json.loads(record)
     tampered["public_selected_inputs"]["index"]["sha256"] = "ff" * 32
@@ -1591,15 +1638,15 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
             prefix="tracks/test",
         )._load_batch_disclosures(track, (match,))
 
-    # Inventory may be generated before submission. Changing that historical
-    # submission height alone does not change the fixed READY/claim binding.
+    # The original submission boundary is part of the immutable allocation.
     later_submission = SimpleNamespace(
         challenge_id="a1" * 32,
         document={**match.document, "submission": {"block_height": 301}},
     )
-    assert S3Repository(
-        client, bucket="public-data", prefix="tracks/test",
-    )._load_batch_disclosures(track, (later_submission,)) == frozenset({ready.plan_digest})
+    with pytest.raises(PublicArtifactError, match="claimant"):
+        S3Repository(client, bucket="public-data", prefix="tracks/test")._load_batch_disclosures(
+            track, (later_submission,),
+        )
 
     wrong_assignment = SimpleNamespace(
         challenge_id="a1" * 32,
@@ -1633,7 +1680,7 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
     )
     assert S3Repository(
         client, bucket="public-data", prefix="tracks/test",
-    )._load_batch_disclosures(track, (earlier_missing, match)) == frozenset()
+    )._load_batch_disclosures(track, (earlier_missing, match)) == frozenset({ready.plan_digest})
 
     client.objects.pop(f"tracks/test/batches/{exact.sha256}/part-00000")
     with pytest.raises(PublicArtifactError, match="chunk is missing"):
@@ -1765,90 +1812,13 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     )
     assert json.loads(fallback.summary)["champion"]["hotkey"] == "alice"
 
-    def disclosure(plan_digest, challenge_ids):
-        batch = next(
-            stage["evaluation_batch"]
-            for stage in snapshot["challenges"][0]["stages"]
-            if stage["evaluation_batch"]["plan_digest"] == plan_digest
-        )
-        return BatchDisclosure(
-            challenge_ids,
-            f"batch_groups/{plan_digest}.json",
-            b"{}",
-            (
-                DisclosureFile(
-                    f"batches/{batch['sha256']}/manifest.json",
-                    tmp_path / "batch.npz",
-                    batch["sha256"],
-                ),
-                DisclosureFile(
-                    f"batch_assets/{plan_digest}/manifest.json",
-                    tmp_path / "asset",
-                    plan_digest,
-                ),
-            ),
-        )
-
     metadata = build_public_artifacts(store, track, chain, version_key=9)
     assert metadata is not None
-    withheld = resolve_public_disclosures(
-        metadata,
-        terminal_challenge_ids=frozenset({"challenge"}),
-        resolver=lambda digest, _terminal: disclosure(
-            digest, ("challenge", "pending")
-        ),
-    )
-    assert withheld is not None
-    assert not any(item.object_name.startswith("batches/") for item in withheld.files)
-    unresolved = []
-
-    def no_terminal_group(digest, terminal_ids):
-        assert terminal_ids == frozenset({"challenge"})
-        unresolved.append(digest)
-        return None
-
-    still_pending = resolve_public_disclosures(
-        metadata, terminal_challenge_ids=frozenset({"challenge"}), resolver=no_terminal_group,
-    )
-    assert still_pending is not None
-    assert len(unresolved) == 2 and len(set(unresolved)) == 2
-    assert still_pending.batch_groups == ()
-    assert not any(item.object_name.startswith("batches/") for item in still_pending.files)
-    # A shared batch can stay hidden without delaying an already-decided win.
-    for pending_data in (withheld, still_pending):
-        assert pending_data.weights == metadata.weights
-        assert decode_weight_artifact(pending_data.weights).plan.hotkeys == ("alice",)
-        assert pending_data.matches == metadata.matches
-        assert pending_data.summary == metadata.summary
-        assert pending_data.status == metadata.status
-    disclosed = resolve_public_disclosures(
-        metadata, terminal_challenge_ids=frozenset({"challenge"}),
-        resolver=lambda digest, _terminal: disclosure(digest, ("challenge",)),
-    )
-    assert disclosed is not None
-    assert sum(item.object_name.startswith("batches/") for item in disclosed.files) == 2
-    assert sum(item.object_name.startswith("batch_assets/") for item in disclosed.files) == 2
-    assert len(disclosed.batch_groups) == 2
-
-    resolved_digests = frozenset(
-        name.removeprefix("batch_groups/").removesuffix(".json")
-        for name, _ in disclosed.batch_groups
-    )
-
-    def unexpected_disclosure(_digest, _terminal):
-        raise AssertionError("an already public batch was restored from private storage")
-
-    repeated = resolve_public_disclosures(
-        metadata, terminal_challenge_ids=frozenset({"challenge"}),
-        resolver=unexpected_disclosure,
-        disclosed_plan_digests=resolved_digests,
-    )
-    assert repeated is not None
-    assert not any(
-        item.object_name.startswith(("batches/", "batch_assets/"))
-        for item in repeated.files
-    )
-    assert repeated.batch_groups == ()
+    # A decision publishes its commitments immediately, without restoring any
+    # raw evaluation inputs. Production-age disclosure is a separate task.
+    assert not any(item.object_name.startswith(("batches/", "batch_assets/"))
+                   for item in metadata.files)
+    assert metadata.batch_groups == ()
 
     store.chain_cursor = lambda: (119, "0x" + "11" * 32)
     assert build_public_artifacts(store, track, chain, version_key=9) is None

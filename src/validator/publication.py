@@ -9,9 +9,10 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
 from validator.chunks import (
     ChunkManifest,
     build_chunk_manifest,
+    check_deadline,
     chunk_object_name,
     read_part,
     verify_chunked_content,
@@ -130,6 +132,36 @@ class PublicTrackIdentity:
     track_spec_digest: str
     netuid: int
     mechid: int
+
+
+def _require_inventory_bindings(track: TrackSpec, document: Mapping[str, Any]) -> None:
+    """Formal current matches need pre-submission seals, even before raw reveal.
+
+    Historical records are authenticated separately against their original
+    runtime manifest. This guard does not relabel them as this pool protocol.
+    """
+    submission = document["submission"]["block_height"]
+    evaluation = document["evaluation"]
+    for stage in evaluation["stages"]:
+        batch = stage.get("evaluation_batch") or {}
+        allocation = batch.get("allocation") or {}
+        completion = _integer(batch.get("completed_block"), "batch completion block")
+        completed_at = _integer(batch.get("completed_at_ms"), "batch completion time")
+        submitted_at = _integer(allocation.get("submission_timestamp_ms"), "submission time")
+        if (
+            not batch["generated_block"] < completion < submission
+            or not completed_at < submitted_at
+            < completed_at + track.cache.disclosure_delay_seconds * 1000
+            or not _HEX_32.fullmatch(str(batch.get("ready_sha256", "")))
+            or allocation.get("ready_sha256") != batch["ready_sha256"]
+            or allocation.get("plan_digest") != batch["plan_digest"]
+            or allocation.get("challenge_id") != document["challenge_id"]
+            or allocation.get("submission_block") != submission
+            or allocation.get("stage") != stage["stage"]
+            or allocation.get("file_sha256") != evaluation["file_sha256"]
+            or allocation.get("model_digest") != evaluation["model_digest"]
+        ):
+            raise PublicArtifactError("current match lacks its original pre-submission allocation")
 
 
 def build_public_artifacts(
@@ -282,54 +314,6 @@ def build_public_artifacts(
         system_matches=system_matches,
         files=tuple(files.values()),
         runtime_manifest=_runtime_manifest(track, runtime_manifest),
-    )
-
-
-def resolve_public_disclosures(
-    artifacts: PublicArtifacts,
-    *,
-    terminal_challenge_ids: frozenset[str],
-    resolver: Callable[[str, frozenset[str]], BatchDisclosure | None] | None,
-    disclosed_plan_digests: frozenset[str] = frozenset(),
-) -> PublicArtifacts:
-    """Restore terminal groups off the scan loop; retain the exact immutable prefix."""
-
-    if resolver is None:
-        return artifacts
-    files = {item.object_name: item for item in artifacts.files}
-    batch_groups = dict(artifacts.batch_groups)
-    disclosure: dict[str, bool] = {}
-    for _name, payload in artifacts.matches:
-        evaluation = _decode_canonical_object(payload, "match")["evaluation"]
-        stage_batches = [
-            stage["evaluation_batch"] for stage in evaluation["stages"]
-            if "evaluation_batch" in stage
-        ]
-        if evaluation["evaluation_batch"] is not None:
-            stage_batches.append(evaluation["evaluation_batch"])
-        for used_batch in stage_batches:
-            plan_digest = used_batch["plan_digest"]
-            if plan_digest not in disclosure:
-                if plan_digest in disclosed_plan_digests:
-                    disclosure[plan_digest] = True
-                else:
-                    resolved = resolver(plan_digest, terminal_challenge_ids)
-                    disclosure[plan_digest] = bool(resolved) and set(
-                        resolved.challenge_ids
-                    ).issubset(terminal_challenge_ids)
-                    if disclosure[plan_digest]:
-                        batch_groups[resolved.record_name] = resolved.record_payload
-                        for item in resolved.files:
-                            files[item.object_name] = PublicFile(
-                                item.object_name, item.path, item.sha256,
-                            )
-            if (
-                disclosure[plan_digest] and plan_digest not in disclosed_plan_digests
-                and used_batch["object"] not in files
-            ):
-                raise PublicArtifactError("batch disclosure omitted its exact evaluation object")
-    return replace(
-        artifacts, files=tuple(files.values()), batch_groups=tuple(sorted(batch_groups.items())),
     )
 
 
@@ -772,6 +756,8 @@ class S3Repository:
                 ]:
                     raise ValueError("public track digest is invalid")
                 track = parse_track_spec(document["spec"])
+                for name, payload in artifacts.matches:
+                    _require_inventory_bindings(track, _decode_canonical_object(payload, name))
                 require_release_approval(
                     track,
                     (
@@ -818,6 +804,39 @@ class S3Repository:
                     _summary_document(track, artifacts.source_block, tournament)
                 ):
                     raise PublicArtifactError("public snapshot would reset its historical champion")
+
+    async def publish_disclosure(
+        self, disclosure: BatchDisclosure, *, track: TrackSpec, now_ms: int,
+        deadline: float | None = None,
+    ) -> None:
+        """One age-triggered bulk job; never write match or mutable pointer keys."""
+        document = _decode_canonical_object(disclosure.record_payload, disclosure.record_name)
+        try:
+            plan = BatchPlan.decode(_json_bytes(document["plan"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublicArtifactError("public disclosure READY is invalid") from exc
+        if (
+            document.get("format") != "veda-batch-disclosure-v3"
+            or plan.track_spec_digest != track.digest or plan.state != "READY"
+            or plan.completed_block is None
+            or plan.completed_at_ms + track.cache.disclosure_delay_seconds * 1000 > now_ms
+            or disclosure.record_name != f"batch_groups/{plan.plan_digest}.json"
+        ):
+            raise PublicArtifactError("public disclosure is premature or belongs to another track")
+        for artifact in disclosure.files:
+            check_deadline(deadline)
+            if artifact.object_name not in {
+                f"{namespace}/{artifact.sha256}/manifest.json"
+                for namespace in ("batches", "batch_assets", "batch_inputs")
+            }:
+                raise PublicArtifactError("disclosure cannot write models or mutable pointers")
+            await asyncio.to_thread(
+                self._put_file_immutable,
+                PublicFile(artifact.object_name, artifact.path, artifact.sha256), deadline=deadline,
+            )
+        check_deadline(deadline)
+        await asyncio.to_thread(self._put_immutable,
+                                disclosure.record_name, disclosure.record_payload)
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
         await self.stage(artifacts)
@@ -918,7 +937,8 @@ class S3Repository:
             except Exception as exc:
                 _LOG.warning("system benchmark publication skipped: %s (%s)", name, exc)
 
-    def _put_file_immutable(self, artifact: PublicFile) -> None:
+    def _put_file_immutable(self, artifact: PublicFile, *, deadline: float | None = None) -> None:
+        check_deadline(deadline)
         if self._confirmed_immutable.get(artifact.object_name) == artifact.sha256:
             return
         existing = self._get_optional(artifact.object_name)
@@ -929,13 +949,15 @@ class S3Repository:
                 raise PublicArtifactError("immutable public file manifest is invalid") from exc
             if manifest.sha256 != artifact.sha256:
                 raise PublicArtifactError("immutable public file conflicts with committed digest")
-            self._verify_public_chunks(artifact.object_name, manifest)
+            self._verify_public_chunks(artifact.object_name, manifest, deadline=deadline)
             self._confirmed_immutable[artifact.object_name] = artifact.sha256
             return
 
         path = artifact.path
         try:
-            manifest = None if path is None else build_chunk_manifest(path)
+            manifest = None if path is None else build_chunk_manifest(path, deadline=deadline)
+        except TimeoutError:
+            raise
         except (OSError, ValueError):
             manifest = None
         if manifest is None or manifest.sha256 != artifact.sha256:
@@ -952,6 +974,7 @@ class S3Repository:
                     f"restored public file digest changed: {artifact.object_name}"
                 )
         for index, part in enumerate(manifest.parts):
+            check_deadline(deadline)
             name = chunk_object_name(artifact.object_name, part.name)
             key = f"{self._prefix}/{name}"
             try:
@@ -977,11 +1000,13 @@ class S3Repository:
                 Metadata={"sha256": part.sha256},
                 IfNoneMatch="*",
             )
-        self._verify_public_chunks(artifact.object_name, manifest)
+        self._verify_public_chunks(artifact.object_name, manifest, deadline=deadline)
         self._put(artifact.object_name, manifest.encode(), True, if_none_match="*")
         self._confirmed_immutable[artifact.object_name] = artifact.sha256
 
-    def _verify_public_chunks(self, manifest_name: str, manifest: ChunkManifest) -> None:
+    def _verify_public_chunks(
+        self, manifest_name: str, manifest: ChunkManifest, *, deadline: float | None = None,
+    ) -> None:
         def open_part(part_name: str):
             name = chunk_object_name(manifest_name, part_name)
             try:
@@ -998,7 +1023,7 @@ class S3Repository:
             return response.get("Body")
 
         try:
-            verify_chunked_content(manifest, open_part)
+            verify_chunked_content(manifest, open_part, deadline=deadline)
         except ValueError as exc:
             raise PublicArtifactError(f"immutable public {exc}") from exc
 
@@ -1129,6 +1154,8 @@ class S3Repository:
                 raise PublicArtifactError(f"public match is invalid: {name}") from exc
             matches.append(record)
             committed_challenges.append(challenge_from_match(document))
+            if self._prefix == "tracks/main":
+                _require_inventory_bindings(track, document)
             if document["decided_block"] > source_block:
                 raise PublicArtifactError(f"public match is newer than its summary: {name}")
             incumbent = record.champion_after
@@ -1228,6 +1255,8 @@ class S3Repository:
                 raise PublicArtifactError(f"public match is invalid: {name}") from exc
             matches.append(record)
             incumbent = record.champion_after
+            if self._prefix == "tracks/main":
+                _require_inventory_bindings(track, document)
             self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
             sequence += 1
         return matches
@@ -1239,7 +1268,6 @@ class S3Repository:
     ) -> frozenset[str]:
         """Verify complete public batch groups once when recovering the ledger."""
 
-        terminal_ids = {match.challenge_id for match in matches}
         batches: dict[str, list[Mapping[str, Any]]] = {}
         stage_uses: dict[str, list[tuple[MatchRecord, Mapping[str, Any]]]] = {}
         for match in matches:
@@ -1261,6 +1289,11 @@ class S3Repository:
             blocks = {batch["generated_block"] for batch in used_batches}
             if len(blocks) != 1:
                 raise PublicArtifactError("public matches disagree on a batch generation block")
+            seals = {tuple(batch.get(key) for key in (
+                "completed_block", "completed_at_ms", "ready_sha256",
+            )) for batch in used_batches}
+            if len(seals) != 1:
+                raise PublicArtifactError("public matches disagree on a READY seal")
             generation_blocks[plan_digest] = blocks.pop()
         if len(set(generation_blocks.values())) != len(generation_blocks):
             raise PublicArtifactError("public matches identify multiple plans for one block")
@@ -1271,42 +1304,58 @@ class S3Repository:
             record_name = f"batch_groups/{plan_digest}.json"
             payload = self._get_optional(record_name)
             if payload is None:
+                completed_at = used_batches[0].get("completed_at_ms")
+                if completed_at is not None and time.time_ns() // 1_000_000 >= (
+                    completed_at + track.cache.disclosure_delay_seconds * 1000
+                ):
+                    _LOG.error(
+                        "DATA_DISCLOSURE_OVERDUE plan_digest=%s completed_at_ms=%d",
+                        plan_digest, completed_at,
+                    )
                 continue
             document = _decode_canonical_object(payload, record_name)
             if set(document) != {
                 "format",
-                "allocation",
                 "plan",
                 "public_dense_references",
                 "public_exact_object",
                 "public_selected_inputs",
-            } or document["format"] != "veda-batch-disclosure-v2":
+            } or document["format"] != "veda-batch-disclosure-v3":
                 raise PublicArtifactError("public batch disclosure fields are invalid")
             try:
                 plan = BatchPlan.decode(_json_bytes(document["plan"]))
             except (TypeError, ValueError) as exc:
                 raise PublicArtifactError("public batch disclosure plan is invalid") from exc
-            allocation = document["allocation"]
             uses = stage_uses.get(plan_digest, [])
-            try:
-                Inventory.validate_claim(allocation, plan)
-            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
-                raise PublicArtifactError("public inventory allocation is invalid") from exc
             if (
                 plan.plan_digest != plan_digest
                 or plan.track_spec_digest != track.digest
-                or allocation["challenge_id"] not in terminal_ids
-                or len(uses) != 1
+                or not uses
             ):
                 raise PublicArtifactError("public inventory conflicts with the ledger")
-            match, stage = uses[0]
-            if (
-                allocation["challenge_id"] != match.challenge_id
-                or allocation["stage"] != stage["stage"]
-                or allocation["file_sha256"] != match.document["evaluation"]["file_sha256"]
-                or allocation["model_digest"] != match.document["evaluation"]["model_digest"]
-            ):
-                raise PublicArtifactError("public inventory claimant differs from its match")
+            for match, stage in uses:
+                allocation = stage["evaluation_batch"].get("allocation")
+                try:
+                    Inventory.validate_claim(
+                        allocation, plan,
+                        disclosure_delay_seconds=track.cache.disclosure_delay_seconds,
+                    )
+                except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                    raise PublicArtifactError("public inventory allocation is invalid") from exc
+                if (
+                    allocation["challenge_id"] != match.challenge_id
+                    or allocation["stage"] != stage["stage"]
+                    or allocation["file_sha256"] != match.document["evaluation"]["file_sha256"]
+                    or allocation["model_digest"] != match.document["evaluation"]["model_digest"]
+                    or allocation["submission_block"]
+                    != match.document["submission"]["block_height"]
+                ):
+                    raise PublicArtifactError("public inventory claimant differs from its match")
+                identity = (match.challenge_id, stage["stage"])
+                if any(row["ordinal"] == allocation["ordinal"] and key != identity
+                       for key, row in allocations.items()):
+                    raise PublicArtifactError("public inventory allocation ordinal is reused")
+                allocations[identity] = allocation
             commitment_digests = tuple(item.sha256 for item in track.source_commitments)
             if any(
                 not verify_source_proof(
@@ -1338,6 +1387,9 @@ class S3Repository:
                 or batch["object"] != exact_name
                 or batch["generated_block"] != plan.generation_block
                 or batch["seed_block_hash"] != plan.block_hash
+                or batch.get("completed_block") != plan.completed_block
+                or batch.get("completed_at_ms") != plan.completed_at_ms
+                or batch.get("ready_sha256") != hashlib.sha256(plan.encode()).hexdigest()
                 for batch in used_batches
             ):
                 raise PublicArtifactError("public match conflicts with its batch disclosure")
@@ -1374,8 +1426,7 @@ class S3Repository:
                 assert isinstance(object_name, str)
                 files.append((object_name, item.sha256, item.size_bytes))
             expected = {
-                "format": "veda-batch-disclosure-v2",
-                "allocation": allocation,
+                "format": "veda-batch-disclosure-v3",
                 "plan": plan.document(),
                 "public_exact_object": exact_name,
                 "public_dense_references": public_references,
@@ -1386,9 +1437,6 @@ class S3Repository:
             for object_name, sha256, size_bytes in files:
                 self._verify_public_file(object_name, sha256, size_bytes)
             verified[plan_digest] = (plan, record_name, payload)
-            if any(row["ordinal"] == allocation["ordinal"] for row in allocations.values()):
-                raise PublicArtifactError("public inventory allocation ordinal is reused")
-            allocations[plan_digest] = allocation
 
         # The stage ledger identifies both allocations even when confirmation was
         # generated before the exact decision. Prove independent source families.
@@ -1406,16 +1454,15 @@ class S3Repository:
             ):
                 raise PublicArtifactError("confirmation disclosure reuses exact sources")
             if len(plans) == 2 and (
-                allocations[plans[0].plan_digest]["ordinal"]
-                >= allocations[plans[1].plan_digest]["ordinal"]
+                allocations[(match.challenge_id, "SCORING")]["ordinal"]
+                >= allocations[(match.challenge_id, "CONFIRMING")]["ordinal"]
             ):
                 raise PublicArtifactError("confirmation allocation predates exact allocation")
         prefix = []
         for plan_digest in sorted(generation_blocks, key=generation_blocks.__getitem__):
             row = verified.get(plan_digest)
-            if row is None:
-                break
-            prefix.append((plan_digest, *row))
+            if row is not None:
+                prefix.append((plan_digest, *row))
         try:
             validate_source_selection_sequence(
                 tuple(plan for _digest, plan, _name, _payload in prefix),

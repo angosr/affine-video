@@ -64,14 +64,21 @@ def make_plan(case, block, slot=0, *, ready=True):
     if ready:
         item = ReadyObject("exact/file.npz", "23" * 32, 100)
         plan = plan.ready(
-            exact=item, sample_cache=ReadySampleCache(
+            completed_at_ms=(plan.generation_block + 1) * 1000,
+            completed_block=plan.generation_block + 1,
+            exact=item,
+            sample_cache=ReadySampleCache(
                 replace(item, object_key="inputs/index.json"),
                 replace(item, object_key="inputs/text.safetensors"),
             ),
-            dense_references=tuple(DenseReference(
-                rollout.rollout_id, replace(item, object_key="videos/file.mp4"),
-                replace(item, object_key="latents/file.safetensors"))
-                                   for rollout in plan.rollouts),
+            dense_references=tuple(
+                DenseReference(
+                    rollout.rollout_id,
+                    replace(item, object_key="videos/file.mp4"),
+                    replace(item, object_key="latents/file.safetensors"),
+                )
+                for rollout in plan.rollouts
+            ),
         )
     return plan
 
@@ -80,6 +87,11 @@ def claim(inventory, plans, identifier="a1" * 32, stage="SCORING", **kwargs):
     return inventory.claim(
         plans=plans, challenge_id=identifier, stage=stage,
         file_sha256=kwargs.get("file_sha256", "b2" * 32), model_digest="c3" * 32,
+        submission_block=kwargs.get("submission_block", 200),
+        submission_timestamp_ms=kwargs.get(
+            "submission_timestamp_ms", kwargs.get("submission_block", 200) * 1000,
+        ),
+        disclosure_delay_seconds=kwargs.get("disclosure_delay_seconds", 1800),
     )
 
 
@@ -119,15 +131,18 @@ def test_preproduced_archive_survives_cold_db_without_bulk(inventory_case, tmp_p
     with ChallengeStore(tmp_path / "original.db", track_spec_digest=case.track.digest) as store:
         task = prepare(store)
         identity = {"format": "veda-admission-model-v1", **source._admission_identity(task),
-                    "file_sha256": "b2" * 32, "model_digest": "c3" * 32, "size_bytes": 100}
+                    "file_sha256": "b2" * 32, "model_digest": "c3" * 32, "size_bytes": 100,
+                    "submission_timestamp_ms": 200_000}
         case.objects.create_plan(
             source._admission_name(task.challenge_id), canonical_json(identity),
         )
         claim(source.inventory, plans, task.challenge_id)
         if stage is ChallengeState.CONFIRMING:
             claim(source.inventory, plans, task.challenge_id, "CONFIRMING")
-        plan = plans[stage is ChallengeState.CONFIRMING]
+        plan = plans[stage is ChallengeState.SCORING]
         metrics = {
+            **source.stage_binding(task.challenge_id,
+                                   confirmation=stage is ChallengeState.CONFIRMING),
             "cache_generated_block": plan.generation_block, "cache_plan_digest": plan.plan_digest,
             "cache_seed_block_hash": plan.block_hash, "cache_sha256": plan.exact.sha256,
             "incumbent_score": 0.8, "paired_gain_lower_bound": -0.1,
@@ -173,14 +188,99 @@ def test_claim_is_fifo_idempotent_model_bound_and_cold_recoverable(inventory_cas
     plans = (make_plan(case, 101), make_plan(case, 102, 1))
     inventory = Inventory(case.objects, case.track.digest)
     first = claim(inventory, tuple(reversed(plans)))
-    assert first["plan_digest"] == plans[0].plan_digest
+    assert first["plan_digest"] == plans[1].plan_digest
     assert claim(Inventory(case.objects, case.track.digest), plans) == first
     assert len(inventory.read()[1]["claims"]) == 1
     with pytest.raises(RuntimeError, match="original admission"):
         claim(inventory, plans, file_sha256="dd" * 32)
     second = claim(inventory, plans, identifier="a2" * 32)
     assert second["plan_digest"] == plans[1].plan_digest
-    assert claim(inventory, plans, identifier="a3" * 32) is None
+    assert claim(inventory, plans, identifier="a3" * 32)["plan_digest"] == plans[1].plan_digest
+    assert {row["plan_digest"] for row in inventory.read()[1]["claims"]} == {
+        plans[1].plan_digest,
+    }
+    with pytest.raises(RuntimeError, match="original admission"):
+        claim(inventory, plans, submission_block=201)
+
+
+@pytest.mark.parametrize("submission,selected", [
+    (102, None), (103, 101), (104, 102), (1902, 102), (1903, None),
+])
+def test_eligibility_uses_real_completion_and_original_submission(
+    inventory_case, submission, selected,
+):
+    case = inventory_case
+    plans = (make_plan(case, 101), make_plan(case, 102, 1))
+    result = claim(Inventory(case.objects, case.track.digest), plans,
+                   submission_block=submission)
+    assert (None if result is None else result["plan_digest"]) == (
+        None if selected is None else plans[selected - 101].plan_digest
+    )
+
+
+def test_plan_start_is_not_completion_and_newer_data_cannot_fill_old_submission(inventory_case):
+    case = inventory_case
+    plan = replace(make_plan(case, 101), completed_block=210)
+    inventory = Inventory(case.objects, case.track.digest)
+    assert claim(inventory, (plan,), submission_block=200) is None
+    # An arbitrarily late admission is still compared to S, never to wall-clock A.
+    assert claim(inventory, (plan,), submission_block=211)["plan_digest"] == plan.plan_digest
+    changed = replace(plan, completed_block=211)
+    with pytest.raises(RuntimeError, match="immutable READY"):
+        claim(inventory, (changed,), submission_block=211)
+
+
+def test_local_byte_loss_cannot_resample_the_original_pool(inventory_case, tmp_path):
+    case = inventory_case
+    plans = (make_plan(case, 101), make_plan(case, 102, 1))
+    inventory = Inventory(case.objects, case.track.digest)
+    original = claim(inventory, plans, submission_block=200)
+    assert original["plan_digest"] == plans[1].plan_digest
+    reader = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        reader.content.get(sha256=plans[1].exact.sha256, size_bytes=plans[1].exact.size_bytes)
+    assert claim(inventory, plans, submission_block=200) == original
+    later = claim(inventory, plans, identifier="a2" * 32, submission_block=251)
+    assert later["plan_digest"] == plans[1].plan_digest
+    assert set(inventory.read()[1]) == {"format", "track_spec_digest", "claims"}
+
+
+def test_prune_protects_original_eligible_submissions_not_all_past_data(
+    inventory_case, tmp_path, monkeypatch,
+):
+    case = inventory_case
+    source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
+    old = make_plan(case, 101)
+    new = make_plan(case, 1903, 1)
+    monkeypatch.setattr(source, "_plans", lambda: (("old", old), ("new", new)))
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms", lambda b: b * 1000)
+    pending = [{"state": "QUEUED", "block_height": 200,
+                "track_spec_digest": case.track.digest}]
+    # At a late scan, an original pre-expiry submission still protects its data.
+    assert source.protected_plan_digests(pending, 2000) == frozenset({
+        old.plan_digest, new.plan_digest,
+    })
+    # A model submitted after old expiry must not pin all historical datasets.
+    pending[0]["block_height"] = 1904
+    assert source.protected_plan_digests(pending, 2000) == frozenset({new.plan_digest})
+    # A lagged scan must first discover pre-expiry submissions before pruning.
+    assert old.plan_digest in source.protected_plan_digests([], 1901)
+
+
+def test_time_rpc_failure_cannot_prune_or_invent_non_admission(
+    inventory_case, tmp_path, monkeypatch
+):
+    source = ReadyBatchSource(track=inventory_case.track, objects=inventory_case.objects,
+                              cache_dir=tmp_path)
+
+    def unavailable(_block):
+        raise OSError("time RPC unavailable")
+
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms", unavailable)
+    with pytest.raises(OSError, match="time RPC"):
+        source.protected_plan_digests([], 2000)
+    with pytest.raises(OSError, match="time RPC"):
+        source.eligible_submission(SimpleNamespace(position=SimpleNamespace(block=200)))
 
 
 def test_confirmation_uses_independent_half_even_when_already_generated(inventory_case):
@@ -191,24 +291,20 @@ def test_confirmation_uses_independent_half_even_when_already_generated(inventor
         claim(inventory, plans, stage="CONFIRMING")
     exact = claim(inventory, plans)
     confirmation = claim(inventory, plans, stage="CONFIRMING")
-    assert exact["plan_digest"] == plans[0].plan_digest
-    assert confirmation["plan_digest"] == plans[2].plan_digest
-    assert not {p.leaf.source_family_id for p in plans[0].source_proofs} & {
-        p.leaf.source_family_id for p in plans[2].source_proofs
+    assert exact["plan_digest"] == plans[2].plan_digest
+    assert confirmation["plan_digest"] == plans[1].plan_digest
+    assert not {p.leaf.source_family_id for p in plans[2].source_proofs} & {
+        p.leaf.source_family_id for p in plans[1].source_proofs
     }
     assert claim(inventory, plans, stage="CONFIRMING") == confirmation
 
 
-def test_lost_unassigned_is_invalidated_but_claimed_bytes_are_never_relabelled(inventory_case):
+def test_claimed_bytes_are_never_relabelled(inventory_case):
     case = inventory_case
     plans = (make_plan(case, 101), make_plan(case, 102, 1))
     inventory = Inventory(case.objects, case.track.digest)
-    assert inventory.invalidate_unassigned(plans[0].plan_digest)
-    assert inventory.invalidate_unassigned(plans[0].plan_digest)
     row = claim(inventory, plans)
     assert row["plan_digest"] == plans[1].plan_digest
-    assert not inventory.invalidate_unassigned(plans[1].plan_digest)
-    assert len(inventory.read()[1]["invalidations"]) == 1
     changed = replace(plans[1], exact=replace(plans[1].exact, sha256="dd" * 32))
     with pytest.raises(RuntimeError, match="immutable READY"):
         claim(inventory, (plans[0], changed))
@@ -232,7 +328,6 @@ def test_cas_race_cannot_double_claim_or_discard_a_winning_claim(inventory_case,
     row = claim(inventory, plans)
     assert row["plan_digest"] == plans[1].plan_digest
     assert [r["ordinal"] for r in inventory.read()[1]["claims"]] == [1, 2]
-    assert not inventory.invalidate_unassigned(plans[0].plan_digest)
 
 
 def test_zero_miners_preproduce_and_full_inventory_pauses_then_refills(inventory_case):
@@ -248,24 +343,49 @@ def test_zero_miners_preproduce_and_full_inventory_pauses_then_refills(inventory
     store.height = 101
     coordinator = PlanCoordinator(track=case.track, store=store, objects=case.objects,
                                   source_pool=case.pool)
-    first = coordinator.create_next()
+    first = coordinator.create_next(now_ms=101_000, finalized_head=store.chain_cursor())
     assert first.inventory_slot == 0
-    assert coordinator.create_next() is None
+    assert coordinator.create_next(now_ms=101_000, finalized_head=store.chain_cursor()) is None
     ready = make_plan(case, 101)
     # Keep the actual reservation's secret/selection, not a newly generated plan.
-    ready = first.ready(exact=ready.exact, dense_references=tuple(
-        DenseReference(rollout.rollout_id, ready.exact, ready.exact) for rollout in first.rollouts
-    ), sample_cache=ready.sample_cache)
+    ready = first.ready(
+        completed_at_ms=(first.generation_block + 1) * 1000,
+        completed_block=first.generation_block + 1,
+        exact=ready.exact,
+        dense_references=tuple(
+            DenseReference(rollout.rollout_id, ready.exact, ready.exact)
+            for rollout in first.rollouts
+        ),
+        sample_cache=ready.sample_cache,
+    )
     stored = case.objects.get("plans/101.json")
     case.objects.replace_plan("plans/101.json", ready.encode(), etag=stored.etag)
     store.height = 102
-    second = coordinator.create_next()
+    second = coordinator.create_next(now_ms=102_000, finalized_head=store.chain_cursor())
     assert second.inventory_slot == 1
-    assert coordinator.create_next() is None
-    assert Inventory(case.objects, case.track.digest).invalidate_unassigned(second.plan_digest)
+    assert coordinator.create_next(now_ms=102_000, finalized_head=store.chain_cursor()) is None
+    ready_second = second.ready(
+        exact=ready.exact, sample_cache=ready.sample_cache,
+        completed_block=103, completed_at_ms=103_000,
+        dense_references=tuple(DenseReference(r.rollout_id, ready.exact, ready.exact)
+                               for r in second.rollouts),
+    )
+    stored = case.objects.get("plans/102.json")
+    case.objects.replace_plan("plans/102.json", ready_second.encode(), etag=stored.etag)
+    claim(Inventory(case.objects, case.track.digest), (ready, ready_second))
     store.height = 103
-    assert coordinator.create_next(disk_bytes=case.track.cache.inventory_max_bytes) is None
-    assert coordinator.create_next().inventory_slot == 1
+    assert (
+        coordinator.create_next(
+            disk_bytes=case.track.cache.inventory_max_bytes, finalized_head=store.chain_cursor()
+        )
+        is None
+    )
+    assert coordinator.create_next(now_ms=103_000, finalized_head=store.chain_cursor()) is None
+    # A claim does not refill the pool. Age starts renewal while old data is hidden.
+    store.height = 1003
+    assert coordinator.create_next(
+        now_ms=1_003_000, finalized_head=store.chain_cursor(),
+    ).inventory_slot == 0
 
 
 def test_authority_rejects_corrupt_or_cross_track_facts(inventory_case):
@@ -302,13 +422,13 @@ def test_claim_lost_response_keeps_original_allocation(inventory_case, monkeypat
         claim(inventory, plans)
     before = case.objects.get(ALLOCATION_OBJECT)
     assert claim(Inventory(case.objects, case.track.digest), plans)["plan_digest"] == (
-        plans[0].plan_digest
+        plans[1].plan_digest
     )
     assert case.objects.get(ALLOCATION_OBJECT) == before
     assert len(inventory.read()[1]["claims"]) == 1
 
 
-def test_invalidation_winning_cas_cannot_be_claimed(inventory_case, monkeypatch):
+def test_same_stage_cas_race_reuses_only_the_original_claim(inventory_case, monkeypatch):
     case = inventory_case
     inventory = Inventory(case.objects, case.track.digest)
     plans = (make_plan(case, 101), make_plan(case, 102, 1))
@@ -319,16 +439,15 @@ def test_invalidation_winning_cas_cannot_be_claimed(inventory_case, monkeypatch)
         nonlocal raced
         if name == ALLOCATION_OBJECT and not raced:
             raced = True
-            Inventory(case.objects, case.track.digest).invalidate_unassigned(plans[0].plan_digest)
+            claim(Inventory(case.objects, case.track.digest), plans)
         return create(name, payload)
 
     monkeypatch.setattr(case.objects, "create_plan", race)
     assert claim(inventory, plans)["plan_digest"] == plans[1].plan_digest
-    authority = inventory.read()[1]
-    assert len(authority["invalidations"]) == len(authority["claims"]) == 1
+    assert len(inventory.read()[1]["claims"]) == 1
 
 
-def test_terminal_disclosure_never_returns_a_batch_to_inventory(inventory_case):
+def test_expiry_blocks_new_submissions_but_not_late_original_claims(inventory_case):
     case = inventory_case
     plan = make_plan(case, 101)
     inventory = Inventory(case.objects, case.track.digest)
@@ -336,14 +455,16 @@ def test_terminal_disclosure_never_returns_a_batch_to_inventory(inventory_case):
     case.objects.create_plan(f"disclosed/{plan.plan_digest}.json", canonical_json({
         "plan_digest": plan.plan_digest, "exact_sha256": plan.exact.sha256,
     }))
-    assert claim(inventory, (plan,), identifier="a2" * 32) is None
+    assert claim(inventory, (plan,), identifier="a2" * 32,
+                 submission_block=1902) is None
+    assert claim(inventory, (plan,), identifier="a3" * 32)["plan_digest"] == plan.plan_digest
     assert claim(inventory, (plan,)) == original
-    assert not inventory.invalidate_unassigned(plan.plan_digest)
 
 
 def test_public_inventory_contains_no_seed_secret_proofs_or_inputs(inventory_case, tmp_path):
     case = inventory_case
-    plans = (make_plan(case, 101), make_plan(case, 102, 1, ready=False))
+    plans = (replace(make_plan(case, 101), completed_at_ms=10**15),
+             make_plan(case, 102, 1, ready=False))
     source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
     status = source.inventory_status(plans)
     assert status["ready_batches"] == status["producing_batches"] == 1
@@ -384,41 +505,38 @@ def test_reader_claim_requires_both_registered_model_fingerprints(
     source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
     with pytest.raises(RuntimeError, match="admission identity"):
         source.claim_ready("a1" * 32, confirmation=False,
+                           submission_block=200,
                            file_sha256="b2" * 32, model_digest="c3" * 32)
     assert source.inventory.read()[1]["claims"] == []
 
 
-def test_reader_fences_missing_unclaimed_payload_before_allocation(
+def test_reader_binds_original_metadata_even_when_payload_needs_recovery(
     inventory_case, tmp_path, monkeypatch,
 ):
     case = inventory_case
     case.objects.create_plan("admissions/" + "a1" * 32 + ".json", canonical_json({
         "format": "veda-admission-model-v1", "track_spec_digest": case.track.digest,
         "challenge_id": "a1" * 32, "file_sha256": "b2" * 32, "model_digest": "c3" * 32,
+        "submission_block": 200,
+        "submission_timestamp_ms": 200_000,
     }))
     plan = make_plan(case, 101)
     source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
     monkeypatch.setattr(source, "_plans", lambda: (("plans/101.json", plan),))
-    assert not source.claim_ready("a1" * 32, confirmation=False,
+    assert source.claim_ready("a1" * 32, confirmation=False, submission_block=200,
                                   file_sha256="b2" * 32, model_digest="c3" * 32)
     authority = source.inventory.read()[1]
-    assert authority["claims"] == []
-    assert authority["invalidations"] == [{
-        "plan_digest": plan.plan_digest, "reason": "UNASSIGNED_DATA_LOST",
-    }]
+    assert len(authority["claims"]) == 1
+    assert authority["claims"][0]["plan_digest"] == plan.plan_digest
 
 
-@pytest.mark.parametrize("terminal_ids", [frozenset(), frozenset({"b2" * 32})])
-def test_disclosure_does_not_restore_files_until_the_allocated_challenge_is_terminal(
-    tmp_path, monkeypatch, terminal_ids, inventory_case,
+@pytest.mark.parametrize("height", [102, 1901])
+def test_disclosure_does_not_restore_files_before_production_age(
+    tmp_path, monkeypatch, height, inventory_case,
 ) -> None:
     plan = make_plan(inventory_case, 101)
     source = ReadyBatchSource(
         track=inventory_case.track, objects=inventory_case.objects, cache_dir=tmp_path,
-    )
-    source.inventory.claim(
-        challenge_id="a1" * 32, stage="SCORING", file_sha256="b2" * 32,
-        model_digest="c3" * 32, plans=(plan,),
     )
     monkeypatch.setattr(source, "_plan_by_digest", lambda _digest: plan)
 
@@ -427,5 +545,5 @@ def test_disclosure_does_not_restore_files_until_the_allocated_challenge_is_term
 
     monkeypatch.setattr(source, "_restore_exact", unexpected_restore)
     monkeypatch.setattr(source, "_restore_sample_cache", unexpected_restore)
-    assert source.public_disclosure(plan.plan_digest, terminal_ids) is None
+    assert source.public_disclosure(plan.plan_digest, now_ms=height * 1000) is None
     assert list(tmp_path.iterdir()) == []

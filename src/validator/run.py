@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AsyncExitStack
@@ -30,7 +31,7 @@ from validator.chain import (
     seed_legacy_exclusions,
 )
 from validator.download import DownloadedModel, download_chunked_asset, download_public_model
-from validator.production.batches import ReadyBatchSource
+from validator.production.batches import BatchDisclosure, ReadyBatchSource
 from validator.production.commitment import ArtifactManifest
 from validator.production.config import load_producer_config
 from validator.production.confirmation import ConfirmationWorkerPool
@@ -43,7 +44,6 @@ from validator.publication import (
     build_public_artifacts,
     fetch_track_identity,
     fetch_weight_artifact,
-    resolve_public_disclosures,
     validate_public_weights_url,
 )
 from validator.queue import TERMINAL_STATES
@@ -87,6 +87,11 @@ class ArtifactRepository(Protocol):
     async def stage(self, artifacts: PublicArtifacts) -> None: ...
 
     async def publish(self, artifacts: PublicArtifacts) -> None: ...
+
+    async def publish_disclosure(
+        self, disclosure: BatchDisclosure, *, track: TrackSpec, now_ms: int,
+        deadline: float | None = None,
+    ) -> None: ...
 
     async def load(
         self, track: TrackSpec, *, runtime_manifest: bytes | None = None,
@@ -232,23 +237,58 @@ class _EvaluationWorker:
 async def _stage_publication(
     artifacts: PublicArtifacts,
     *,
-    terminal_ids: frozenset[str],
-    disclosed_plan_digests: frozenset[str],
-    batch_source: ReadyBatchSource | None,
     publisher: ArtifactRepository,
-    work: _EvaluationWorker,
 ) -> PublicArtifacts:
-    # Never overlap CUDA restore validation with the one in-flight evaluator.
-    # Its completed result may stay leased while the old public champion refreshes.
-    while work.busy and not work.done:
-        await asyncio.sleep(0.05)
-    prepared = await asyncio.to_thread(
-        resolve_public_disclosures, artifacts, terminal_challenge_ids=terminal_ids,
-        resolver=None if batch_source is None else batch_source.public_disclosure,
-        disclosed_plan_digests=disclosed_plan_digests,
-    )
-    await publisher.stage(prepared)
-    return prepared
+    # A decision depends on its admitted model, not publication of hidden input.
+    await publisher.stage(artifacts)
+    return artifacts
+
+
+async def _publish_due_batch(
+    source: ReadyBatchSource, publisher: ArtifactRepository, *, finalized_block: int,
+    challenges: list[dict[str, object]],
+) -> str | None:
+    """At most one bulk job, owned by the existing evaluator, not its FIFO worker."""
+    protected = await asyncio.to_thread(source.protected_plan_digests, challenges, finalized_block)
+    await asyncio.to_thread(source.prune_disclosed, protected)
+    now_ms = time.time_ns() // 1_000_000
+    due = await asyncio.to_thread(source.due_plan_digests, now_ms)
+    if not due:
+        return None
+    retries = PrivateRetryStore(source.objects, track_spec_digest=source.track.digest)
+    for digest in due:
+        attempt = await asyncio.to_thread(
+            retries.disclosure_attempt, digest, now_ms=now_ms, lease_ms=3 * 60 * 60 * 1000,
+        )
+        if attempt is None:
+            continue
+        error = None
+        try:
+            deadline = time.monotonic() + 3 * 60 * 60
+            disclosure = await asyncio.to_thread(
+                source.public_disclosure, digest, now_ms=now_ms, deadline=deadline,
+            )
+            if disclosure is None:
+                raise RuntimeError("disclosure became unavailable after reserving its attempt")
+            await publisher.publish_disclosure(
+                disclosure, track=source.track, now_ms=now_ms, deadline=deadline,
+            )
+            await asyncio.to_thread(source.record_disclosed, digest)
+        except BaseException as exc:
+            error = str(exc) or type(exc).__name__
+            raise
+        finally:
+            try:
+                await asyncio.to_thread(
+                    retries.disclosure_attempt, digest, now_ms=time.time_ns() // 1_000_000,
+                    lease_ms=3 * 60 * 60 * 1000, completed_attempt=attempt, error=error,
+                )
+            except Exception:
+                if error is None:
+                    raise
+                _LOG.exception("disclosure retry completion failed; original error retained")
+        return digest
+    return None
 
 
 async def run_evaluator(
@@ -399,6 +439,7 @@ async def run_evaluator(
             cache_dir=cache_dir,
             batch_dir=data_config.work_dir / "content",
             validation_device=scoring_device,
+            public_base_url=PUBLIC_STORAGE_URL,
         )
         retry_store = PrivateRetryStore(objects, track_spec_digest=track.digest)
         confirmation_pool = ConfirmationWorkerPool(
@@ -422,6 +463,7 @@ async def run_evaluator(
         archive=None if batch_source is None else batch_source.archive_model,
         archive_rejection=None if batch_source is None else batch_source.archive_rejection,
         restore=None if batch_source is None else batch_source.restore_admission,
+        eligible=None if batch_source is None else batch_source.eligible_submission,
         restore_retry=None if retry_store is None else retry_store.restore,
         record_retry=None if retry_store is None else retry_store.record_failure,
     )
@@ -471,10 +513,13 @@ async def run_evaluator(
         system_match_loader = getattr(publisher, "load_system_matches", None)
         inventory_task: asyncio.Task[dict[str, object]] | None = None
         next_inventory_refresh = 0.0
+        disclosure_task: asyncio.Task[str | None] | None = None
+        next_disclosure_refresh = 0.0
 
         def refresh_metadata() -> None:
             nonlocal system_match_task, system_matches, next_system_match_refresh
             nonlocal inventory_task, next_inventory_refresh
+            nonlocal disclosure_task, next_disclosure_refresh
             if system_match_task is not None and system_match_task.done():
                 try:
                     system_matches = system_match_task.result()
@@ -506,24 +551,43 @@ async def run_evaluator(
                     ))
                 inventory_task = asyncio.create_task(asyncio.to_thread(load_inventory))
                 next_inventory_refresh = now + 30.0
+            if disclosure_task is not None and disclosure_task.done():
+                try:
+                    digest = disclosure_task.result()
+                    if digest is not None:
+                        disclosed_plan_digests.add(digest)
+                except Exception as exc:
+                    _LOG.error("DATA_DISCLOSURE_FAILURE: %s", exc)
+                    if alert is not None:
+                        alert("DATA_DISCLOSURE_FAILURE", {"error": str(exc)[:500]})
+                disclosure_task = None
+            cursor = store.chain_cursor()
+            if (source is not None and cursor is not None and disclosure_task is None
+                    and now >= next_disclosure_refresh):
+                # A caught-up cursor fences late scans: do not prune any data
+                # that an already-submitted, not-yet-discovered model could use.
+                disclosure_task = asyncio.create_task(_publish_due_batch(
+                    source, publisher, finalized_block=cursor[0],
+                    challenges=store.public_snapshot()["challenges"],
+                ))
+                next_disclosure_refresh = now + 30.0
 
         async def close_system_match_refresh() -> None:
             tasks = [task for task in (system_match_task, inventory_task) if task is not None]
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if disclosure_task is not None:
+                # Joining preserves a single writer. Cancelling to_thread would
+                # leave its S3 request alive and permit an overlapping restart.
+                await asyncio.gather(asyncio.shield(disclosure_task), return_exceptions=True)
 
         def start_publication() -> asyncio.Task[PublicArtifacts]:
             assert pending_artifacts is not None
             artifacts = pending_artifacts
             return asyncio.create_task(_stage_publication(
                 artifacts,
-                terminal_ids=frozenset(
-                    item["challenge_id"] for item in store.public_snapshot()["challenges"]
-                    if item["state"] in TERMINAL_STATES
-                ),
-                disclosed_plan_digests=frozenset(disclosed_plan_digests),
-                batch_source=batch_source, publisher=publisher, work=work,
+                publisher=publisher,
             ))
 
         async def finish_publication() -> None:
@@ -709,24 +773,13 @@ async def run_evaluator(
                                 artifacts = publication
                                 if artifacts is not None:
                                     await publisher.publish(artifacts)
-                                    # publish() completes the full continuous match prefix,
-                                    # disclosures and fenced pointers before clearing this gate.
+                                    # Commit the small match prefix and fenced pointers.
+                                    # Dataset publication has its own production-age clock.
                                     published_match_count = staged_match_count
                                     if pending_artifacts is None:
                                         store.publication_succeeded()
                                     if pending_artifacts is not None and publication_task is None:
                                         publication_task = start_publication()
-                                    if (
-                                        batch_source is not None and pending_artifacts is None
-                                        and publication_task is None
-                                    ):
-                                        terminal_ids = {
-                                            challenge["challenge_id"]
-                                            for challenge in store.public_snapshot()["challenges"]
-                                            if challenge["state"]
-                                            in {state.value for state in TERMINAL_STATES}
-                                        }
-                                        batch_source.prune_disclosed(terminal_ids)
                                     result = replace(
                                         result,
                                         published_block=artifacts.source_block,

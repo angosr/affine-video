@@ -31,6 +31,12 @@ from .production.test_storage import MemoryS3
 SCHEMA = {"selector.weight": TensorSpec((2, 2), "float32")}
 
 
+@pytest.fixture(autouse=True)
+def submission_clock(monkeypatch):
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms",
+                        lambda block: block * 1000)
+
+
 def submission_at(block: int, hotkey: str, repo_id: str = "owner/model") -> SubmissionRecord:
     position = ChainPosition(block, 0, 0)
     block_hash = "0x" + f"{block:064x}"
@@ -79,6 +85,120 @@ def settings(tmp_path) -> AdmissionSettings:
         retry_base_ms=30_000,
         retry_max_ms=120_000,
     )
+
+
+@pytest.mark.parametrize("crash", [False, True])
+def test_no_pre_submission_pool_preserves_opportunity_and_cold_decision(tmp_path, crash):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private-data", prefix="test")
+    source = ReadyBatchSource(track=SimpleNamespace(digest="ab" * 32), objects=objects,
+                              cache_dir=tmp_path / "archive")
+    config = replace(settings(tmp_path), eligible=lambda _task: False,
+                     archive_rejection=source.archive_rejection, restore=source.restore_admission)
+    record = submission_at(100, "hk1")
+
+    def no_download(*_args, **_kwargs):
+        pytest.fail("system non-admission must not download or consume a model")
+
+    def archive_then_crash(task, rejection):
+        source.archive_rejection(task, rejection)
+        raise SystemExit("host lost after durable non-admission")
+
+    with ChallengeStore(tmp_path / "original.db") as store:
+        identifier, _ = store.add_submission(record)
+        if crash:
+            with pytest.raises(SystemExit, match="host lost"):
+                process_next_admission(
+                    store, worker_id="first", settings=replace(
+                        config, archive_rejection=archive_then_crash,
+                    ), current_finalized_block=110, now_ms=10, downloader=no_download,
+                )
+        else:
+            result = process_next_admission(
+                store, worker_id="first", settings=config,
+                current_finalized_block=110, now_ms=10, downloader=no_download,
+            )
+            assert result.status is AdmissionStatus.NOT_ADMITTED
+
+    with ChallengeStore(tmp_path / "cold.db") as store:
+        store.add_submission(record)
+        # New stock cannot retroactively accept the old submission on recovery.
+        result = process_next_admission(
+            store, worker_id="recover", settings=replace(config, eligible=lambda _t: True),
+            current_finalized_block=120, now_ms=20, downloader=no_download,
+        )
+        assert result.status is AdmissionStatus.NOT_ADMITTED
+        row = store.public_challenge(identifier)
+        assert row["state"] == ChallengeState.SYSTEM_NOT_ADMITTED
+        assert row["score_block"] == 110
+        assert row["model_digest"] is row["file_sha256"] is None
+        later, _ = store.add_submission(submission_at(121, "hk1"))
+        assert store.get_challenge(later).state is ChallengeState.QUEUED
+        # A real failure still consumes its original opportunity, as before.
+        store.transition(later, ChallengeState.FETCHING)
+        store.complete_challenge(later, ChallengeState.PARTICIPANT_FAILED,
+                                 error_code="REPOSITORY_NOT_PUBLIC", score_block=122)
+        third, _ = store.add_submission(submission_at(123, "hk1"))
+        assert store.get_challenge(third).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+
+
+def test_unavailable_pool_authority_defers_instead_of_releasing_opportunity(tmp_path):
+    def unavailable(_task):
+        raise OSError("authority unavailable")
+
+    with ChallengeStore(tmp_path / "retry.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"))
+        result = process_next_admission(
+            store, worker_id="first", settings=replace(settings(tmp_path), eligible=unavailable),
+            current_finalized_block=110, now_ms=10,
+            downloader=lambda *_a, **_k: pytest.fail("unexpected download"),
+        )
+        assert result.status is AdmissionStatus.DEFERRED
+        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_DEFERRED
+        later, _ = store.add_submission(submission_at(111, "hk1"))
+        assert store.get_challenge(later).state is ChallengeState.QUEUED
+        assert store.claim_next_admission(
+            "must-not-bypass", lease_ms=100, ready_through_block=111, now_ms=100,
+        ) is None
+
+
+def test_late_scan_does_not_turn_system_non_admission_into_a_spent_opportunity(tmp_path):
+    model = tmp_path / "selector.safetensors"
+    write_model(model, "hk1")
+    records = [submission_at(block, "hk1") for block in (100, 121, 122)]
+    config = replace(settings(tmp_path), eligible=lambda task: task.position.block >= 121)
+    with ChallengeStore(tmp_path / "late-scan.db") as store:
+        identifiers = []
+        # All blocks are discovered before admission, as after a long outage.
+        for record in records:
+            identifiers.append(store.add_submission(record)[0])
+            store.observe_commitment(
+                hotkey=record.hotkey, netuid=record.netuid, block_hash=record.block_hash,
+                position=record.position, payload=record.payload,
+                submission_id=record.submission_id, legacy_excluded=False,
+            )
+        first = process_next_admission(
+            store, worker_id="fifo", settings=config, current_finalized_block=123,
+            now_ms=10, downloader=model_downloader(model),
+        )
+        assert first.status is AdmissionStatus.NOT_ADMITTED
+        second = process_next_admission(
+            store, worker_id="fifo", settings=config, current_finalized_block=123,
+            now_ms=20, downloader=model_downloader(model),
+        )
+        assert second.challenge_id == identifiers[1]
+        assert second.status is AdmissionStatus.ACCEPTED
+        assert store.active_competitors({"hk1": 4})[0]["submission_id"] == records[1].submission_id
+        third = process_next_admission(
+            store,
+            worker_id="fifo",
+            settings=config,
+            current_finalized_block=123,
+            now_ms=30,
+            downloader=lambda *_a, **_k: pytest.fail("spent opportunity downloaded twice"),
+        )
+        assert third.challenge_id == identifiers[2] and third.code == "DUPLICATE_HOTKEY"
+        assert store.get_challenge(identifiers[1]).state is ChallengeState.SCORING
+        assert store.get_challenge(identifiers[2]).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
 
 
 @pytest.mark.parametrize("validation_failure", [False, True])

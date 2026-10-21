@@ -73,6 +73,7 @@ class ChallengeState(StrEnum):
     MALFORMED_SUBMISSION = "MALFORMED_SUBMISSION"
     REJECTED_DUPLICATE_HOTKEY = "REJECTED_DUPLICATE_HOTKEY"
     REJECTED_OTHER_COMPETITION = "REJECTED_OTHER_COMPETITION"
+    SYSTEM_NOT_ADMITTED = "SYSTEM_NOT_ADMITTED"
 
 
 TERMINAL_STATES = frozenset(
@@ -82,6 +83,7 @@ TERMINAL_STATES = frozenset(
         ChallengeState.MALFORMED_SUBMISSION,
         ChallengeState.REJECTED_DUPLICATE_HOTKEY,
         ChallengeState.REJECTED_OTHER_COMPETITION,
+        ChallengeState.SYSTEM_NOT_ADMITTED,
     }
 )
 
@@ -109,6 +111,8 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
             ChallengeState.SYSTEM_BLOCKED,
+            ChallengeState.SYSTEM_NOT_ADMITTED,
+            ChallengeState.REJECTED_DUPLICATE_HOTKEY,
         }
     ),
     ChallengeState.VALIDATING: frozenset(
@@ -117,6 +121,7 @@ _TRANSITIONS: dict[ChallengeState, frozenset[ChallengeState]] = {
             ChallengeState.PARTICIPANT_FAILED,
             ChallengeState.SYSTEM_DEFERRED,
             ChallengeState.SYSTEM_BLOCKED,
+            ChallengeState.REJECTED_DUPLICATE_HOTKEY,
         }
     ),
     ChallengeState.SCORING: frozenset(

@@ -51,6 +51,11 @@ from .production.test_storage import MemoryS3
 from .test_store import submission_at
 
 
+@pytest.fixture(autouse=True)
+def submission_clock(monkeypatch):
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms",
+                        lambda block: block * 1000)
+
 def scoring_spec(*, routes: int, rollouts: int = 1) -> ScoringSpec:
     return ScoringSpec(
         budgets=(
@@ -88,6 +93,7 @@ def cache_spec() -> CacheSpec:
         "float16",
         "float32",
         "float32",
+        1800,
     )
 
 
@@ -278,6 +284,7 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
         elif cache_loss == "corrupt":
             challenger_path.write_bytes(b"broken")
         evaluator.batch_source = source
+        monkeypatch.setattr(source, "stage_binding", lambda *_a, **_k: {})
         monkeypatch.setattr(source, "claim_ready", lambda *_args, **_kwargs: True)
         monkeypatch.setattr(source, "exact_batch", lambda _identifier: batch)
         if stage == "confirmation":
@@ -476,6 +483,7 @@ def test_both_stages_require_the_finalized_generation_hash(
     batch = SimpleNamespace(plan=plan, exact=exact)
     source = SimpleNamespace(
         exact_batch=lambda _id: exact, confirmation_batch=lambda _id: batch,
+        stage_binding=lambda *_a, **_k: {},
         _allocated_plan=lambda *_a, **_k: SimpleNamespace(
             plan_digest="99" * 32,
             source_proofs=(SimpleNamespace(leaf=SimpleNamespace(source_family_id="exact")),),
@@ -1209,7 +1217,7 @@ def test_future_generation_boundary_is_not_claimed_as_a_scoring_attempt(tmp_path
         assert challenge.attempts == 0
 
 
-def test_normal_producer_lag_waits_without_attempt_or_alert(tmp_path) -> None:
+def test_original_bound_batch_recovers_after_visible_infrastructure_retry(tmp_path) -> None:
     alerts = []
 
     class ProducerBatch:
@@ -1241,10 +1249,10 @@ def test_normal_producer_lag_waits_without_attempt_or_alert(tmp_path) -> None:
             now_ms=20,
         )
         assert waiting is not None
-        assert waiting.code == "EVALUATION_BATCH_PENDING"
-        assert store.get_challenge(identifier).attempts == 0
-        assert store.public_challenge(identifier)["attempts"] == 0
-        assert alerts == []
+        assert waiting.code == "EVALUATION_BATCH_UNAVAILABLE"
+        assert store.get_challenge(identifier).attempts == 1
+        assert store.public_challenge(identifier)["attempts"] == 1
+        assert [event for event, _ in alerts] == ["SCORING_RETRY_STARTED"]
 
         evaluator.ready = True
         completed = process_next_scoring(
@@ -1258,7 +1266,7 @@ def test_normal_producer_lag_waits_without_attempt_or_alert(tmp_path) -> None:
         assert completed is not None and completed.state is ChallengeState.SUCCEEDED
 
 
-def test_overdue_batch_uses_bounded_retries_and_push_alerts(tmp_path) -> None:
+def test_missing_bound_batch_uses_bounded_retries_and_alerts(tmp_path) -> None:
     alerts = []
 
     class MissingBatch:
@@ -1267,9 +1275,6 @@ def test_overdue_batch_uses_bounded_retries_and_push_alerts(tmp_path) -> None:
 
         def batch_ready(self, _task):
             return False
-
-        def inventory_deadline_block(self, _task):
-            return 100
 
         def __call__(self, _task):
             raise AssertionError("an unavailable batch must not be evaluated")
@@ -1291,7 +1296,7 @@ def test_overdue_batch_uses_bounded_retries_and_push_alerts(tmp_path) -> None:
             now_ms=20,
         )
         assert first is not None and first.state is ChallengeState.SYSTEM_DEFERRED
-        assert first.code == "EVALUATION_BATCH_TIMEOUT"
+        assert first.code == "EVALUATION_BATCH_UNAVAILABLE"
         assert store.get_challenge(identifier).attempts == 1
 
         final = process_next_scoring(
@@ -1303,7 +1308,7 @@ def test_overdue_batch_uses_bounded_retries_and_push_alerts(tmp_path) -> None:
             now_ms=30,
         )
         assert final is not None and final.state is ChallengeState.SYSTEM_BLOCKED
-        assert final.code == "EVALUATION_BATCH_TIMEOUT"
+        assert final.code == "EVALUATION_BATCH_UNAVAILABLE"
         assert [event for event, _details in alerts] == [
             "SCORING_RETRY_STARTED",
             "SCORING_RETRY_EXHAUSTED",
@@ -1346,7 +1351,7 @@ def test_real_inventory_supply_watchdog_survives_cold_databases_and_retains_fifo
                 current_finalized_block=100 + 12 * 24 * 300, evaluator=evaluator, now_ms=now,
             )
             assert result.challenge_id == identifier
-            assert result.code == "EVALUATION_BATCH_TIMEOUT"
+            assert result.code == "EVALUATION_BATCH_UNAVAILABLE"
             assert result.state is (
                 ChallengeState.SYSTEM_DEFERRED if attempt == 0 else ChallengeState.SYSTEM_BLOCKED
             )
@@ -1528,7 +1533,7 @@ def test_long_scoring_failure_starts_cooldown_at_failure_not_task_start(
         assert recovered.state is stage
 
 
-def test_slow_ready_probe_waits_from_completion_without_consuming_an_attempt(tmp_path, monkeypatch):
+def test_slow_failed_binding_probe_cools_down_from_completion(tmp_path, monkeypatch):
     clock = {"ms": 1_000}
     monkeypatch.setattr(time, "time_ns", lambda: clock["ms"] * 1_000_000)
 
@@ -1547,10 +1552,10 @@ def test_slow_ready_probe_waits_from_completion_without_consuming_an_attempt(tmp
             store, worker_id="worker", settings=configured,
             current_finalized_block=100, evaluator=WaitingBatch(),
         )
-        assert outcome is not None and outcome.code == "EVALUATION_BATCH_PENDING"
-        assert store.get_challenge(identifier).attempts == 0
+        assert outcome is not None and outcome.code == "EVALUATION_BATCH_UNAVAILABLE"
+        assert store.get_challenge(identifier).attempts == 1
         assert store.claim_next_scoring(
-            "early", lease_ms=1_000, now_ms=clock["ms"] + configured.retry_base_ms - 1,
+            "early", lease_ms=1_000, now_ms=clock["ms"] + configured.retry_max_ms - 1,
         ) is None
 
 

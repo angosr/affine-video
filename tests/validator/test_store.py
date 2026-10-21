@@ -236,18 +236,20 @@ def test_chain_cursor_is_contiguous_and_persistent(tmp_path) -> None:
         assert reopened.advance_chain_cursor(101, second_hash) is True
 
 
-def test_only_first_submission_per_hotkey_is_admitted(tmp_path) -> None:
+def test_undecided_hotkey_submissions_wait_for_the_original_fifo_admission(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         first, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
         rejected, _ = store.add_submission(submission_at(119), occurred_at_ms=20)
         rejected_much_later, _ = store.add_submission(submission_at(10_000), occurred_at_ms=30)
 
         assert store.get_challenge(first).state is ChallengeState.QUEUED
-        assert store.get_challenge(rejected).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
-        assert (
-            store.get_challenge(rejected_much_later).state
-            is ChallengeState.REJECTED_DUPLICATE_HOTKEY
-        )
+        assert store.get_challenge(rejected).state is ChallengeState.QUEUED
+        assert store.get_challenge(rejected_much_later).state is ChallengeState.QUEUED
+        assert store.earlier_hotkey_owner(rejected) == first
+        assert store.earlier_hotkey_owner(rejected_much_later) == first
+        assert store.claim_next_admission(
+            "fifo", lease_ms=100, ready_through_block=10_000, now_ms=40,
+        ).challenge_id == first
 
 
 def test_model_owner_lookup_validates_and_returns_the_registered_challenge(tmp_path) -> None:
@@ -398,7 +400,7 @@ def test_current_vda_choice_always_points_to_hotkeys_first_submission(tmp_path) 
         )
 
         assert (
-            store.get_challenge(later_challenge).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+            store.get_challenge(later_challenge).state is ChallengeState.QUEUED
         )
 
     with ChallengeStore(database) as store:

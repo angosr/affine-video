@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import save_file
 
+import validator.production.batches as batches_module
 import validator.production.service as production_service
 from scoring.cache import CacheLoadError, write_exact_cache_batch
 from scoring.exact import ExactCase
@@ -49,6 +50,7 @@ from validator.production.service import (
     ProducerService,
     UnitResult,
     WorkerPool,
+    _completion_boundary,
     _find_valid_shard,
     _plan_attempt_count,
     _prune_local_work,
@@ -67,6 +69,17 @@ from validator.queue import ChainPosition, ChallengeState
 from validator.store import ChallengeStore
 
 from .test_storage import MemoryS3
+
+
+@pytest.fixture(autouse=True)
+def local_completion_head(monkeypatch):
+    # All synthetic plans use an explicit, post-production completion boundary.
+    # The real RPC boundary is covered separately without network or GPU I/O.
+    monkeypatch.setattr(
+        production_service, "_completion_boundary", lambda plan: plan.generation_block + 1,
+    )
+    monkeypatch.setattr(production_service, "_utc_ms", lambda: 121_000)
+    monkeypatch.setattr(batches_module, "_submission_timestamp_ms", lambda block: block * 1000)
 
 
 def scoring() -> ScoringSpec:
@@ -109,6 +122,56 @@ def test_runtime_rejects_a_rounded_trajectory_commitment() -> None:
     runtime.verify_trajectory_schedule((1.0, 0.972972972972973, 0.0))
     with pytest.raises(RuntimeError, match="trajectory schedule"):
         runtime.verify_trajectory_schedule((1.0, 0.973, 0.0))
+
+
+@pytest.mark.parametrize("namespace", ["batches", "batch_assets", "batch_inputs"])
+def test_disclosed_payload_cold_restore_preserves_original_hash(tmp_path, monkeypatch, namespace):
+    from validator.production.storage import StorageError
+
+    payload = b"original completed data"
+    item = ReadyObject("original/data.bin", hashlib.sha256(payload).hexdigest(), len(payload))
+    plan = SimpleNamespace(
+        exact=item if namespace == "batches" else None,
+        sample_cache=SimpleNamespace(index=item, text=None, condition=None)
+        if namespace == "batch_inputs" else None,
+        completed_at_ms=1000,
+    )
+    track = SimpleNamespace(cache=SimpleNamespace(disclosure_delay_seconds=10))
+    source = ReadyBatchSource(
+        track=SimpleNamespace(**track.__dict__, digest="ab" * 32), objects=object(),
+        cache_dir=tmp_path / "fresh", public_base_url="https://public.example/tracks/main",
+    )
+    downloaded = tmp_path / "downloaded.bin"
+    calls = []
+
+    def download(url, **kwargs):
+        calls.append((url, kwargs))
+        return downloaded
+
+    monkeypatch.setattr(batches_module, "download_chunked_file", download)
+    monkeypatch.setattr(batches_module.time, "time_ns", lambda: 10_999_000_000)
+    destination = tmp_path / "materialized.bin"
+    with pytest.raises(StorageError):
+        source._materialize(plan, item, destination)
+    assert calls == []  # The same public URL must never expose pre-expiry recovery.
+
+    monkeypatch.setattr(batches_module.time, "time_ns", lambda: 11_000_000_000)
+    downloaded.write_bytes(b"corrupted download")
+    with pytest.raises(StorageError):
+        source._materialize(plan, item, destination)
+    assert not destination.exists()
+    downloaded.write_bytes(payload)
+    assert source._materialize(plan, item, destination).read_bytes() == payload
+    assert all(url == f"https://public.example/tracks/main/{namespace}/{item.sha256}/manifest.json"
+               and kwargs["expected_sha256"] == item.sha256
+               and kwargs["max_bytes"] == item.size_bytes for url, kwargs in calls)
+    # A fresh source uses the sealed local object without downloading a second time.
+    restarted = ReadyBatchSource(
+        track=source.track, objects=object(), cache_dir=source.cache_dir,
+        public_base_url=source.public_base_url,
+    )
+    assert restarted._materialize(plan, item, tmp_path / "again.bin").read_bytes() == payload
+    assert len(calls) == 2
 
 
 def proof(index: int = 0):
@@ -157,6 +220,8 @@ def test_plan_is_deterministic_and_only_transitions_to_ready_once() -> None:
     assert len(first.rollouts) == 2
     assert first.state == "PLANNED"
     ready = first.ready(
+        completed_at_ms=(first.generation_block + 1) * 1000,
+        completed_block=first.generation_block + 1,
         exact=ReadyObject("exact/120-data.npz", "12" * 32, 100),
         dense_references=tuple(
             DenseReference(
@@ -169,6 +234,11 @@ def test_plan_is_deterministic_and_only_transitions_to_ready_once() -> None:
         sample_cache=ready_sample_cache(),
     )
     assert ready.state == "READY"
+    assert ready.completed_block == first.generation_block + 1
+    for invalid in (None, True, first.generation_block, first.generation_block - 1):
+        with pytest.raises(ValueError, match="completion"):
+            replace(ready, completed_block=invalid)
+    assert replace(ready, completed_block=ready.completed_block + 1).encode() != ready.encode()
     assert ready.plan_digest == first.plan_digest
     assert BatchPlan.decode(first.encode()) == first
     assert BatchPlan.decode(ready.encode()) == ready
@@ -176,10 +246,37 @@ def test_plan_is_deterministic_and_only_transitions_to_ready_once() -> None:
         BatchPlan.decode(first.encode() + b"\n")
     with pytest.raises(ValueError, match="only a PLANNED"):
         ready.ready(
+            completed_at_ms=(ready.generation_block + 1) * 1000,
+            completed_block=ready.generation_block + 1,
             exact=ReadyObject("exact/other.npz", "56" * 32, 100),
             dense_references=ready.dense_references,
             sample_cache=ready_sample_cache(),
         )
+
+
+@pytest.mark.parametrize("head", [150, 119, True])
+def test_completion_boundary_uses_post_capture_best_head(monkeypatch, head):
+    calls = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def block(self):
+            calls.append("best-head")
+            return head
+
+    monkeypatch.setattr(production_service.bt, "Client", lambda network: Client())
+    plan = SimpleNamespace(generation_block=120)
+    if type(head) is int and head >= 120:
+        assert _completion_boundary(plan) == 151
+    else:
+        with pytest.raises(RuntimeError, match="completion head"):
+            _completion_boundary(plan)
+    assert calls == ["best-head"]
 
 
 def test_query_selection_excludes_global_rows_and_reserves_reference_quota() -> None:
@@ -655,7 +752,9 @@ def local_producer(tmp_path, monkeypatch):
     return service, plan, objects, Workers(), payload
 
 
-@pytest.mark.parametrize("winner_change", ["identical", "exact", "inputs", "dense", "plan"])
+@pytest.mark.parametrize(
+    "winner_change", ["identical", "completion", "exact", "inputs", "dense", "plan"]
+)
 def test_producer_cas_loser_requires_identical_ready(local_producer, winner_change):
     service, plan, objects, workers, _payload = local_producer
     objects.create_plan("stages/challenge/SCORING.json", b"immutable scored result")
@@ -664,7 +763,10 @@ def test_producer_cas_loser_requires_identical_ready(local_producer, winner_chan
     def lose_replace(name, payload, *, etag):
         assert objects.get(name).etag == etag
         candidate = BatchPlan.decode(payload)
-        if winner_change == "exact":
+        if winner_change == "completion":
+            candidate = replace(candidate, completed_at_ms=candidate.completed_at_ms + 5,
+                                completed_block=candidate.completed_block + 1)
+        elif winner_change == "exact":
             candidate = replace(candidate, exact=replace(candidate.exact, sha256="11" * 32))
         elif winner_change == "inputs":
             candidate = replace(candidate, sample_cache=replace(
@@ -687,7 +789,7 @@ def test_producer_cas_loser_requires_identical_ready(local_producer, winner_chan
         raise PreconditionFailed("another producer won the same PLANNED ETag")
 
     objects.replace_plan = lose_replace
-    if winner_change == "identical":
+    if winner_change in {"identical", "completion"}:
         ready = service._execute(
             "plans/120.json", objects.get("plans/120.json"), plan, workers,
             deadline=time.monotonic() + 30,
@@ -712,6 +814,7 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
     """Storage/orchestration regression, not GPU determinism or score evidence."""
 
     service, plan, objects, workers, payload = local_producer
+    service.track.cache.disclosure_delay_seconds = 1800
     ready = service._execute(
         "plans/120.json", objects.get("plans/120.json"), plan, workers,
         deadline=time.monotonic() + 30,
@@ -721,6 +824,7 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
     Inventory(objects, plan.track_spec_digest).claim(
         challenge_id="a1" * 32, stage="SCORING", file_sha256="b2" * 32,
         model_digest="c3" * 32, plans=(ready,),
+        submission_block=200, submission_timestamp_ms=200_000, disclosure_delay_seconds=1800,
     )
     immutable_ready = objects.get("plans/120.json")
     objects.create_plan("stages/challenge/SCORING.json", b"immutable scored result")
@@ -750,14 +854,17 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
         batch_dir=service.content.root,
     )
     monkeypatch.setattr(source, "_plans", lambda: (("plans/120.json", ready),))
+    assert source._allocated_plan("a1" * 32, confirmation=False) == ready
     with pytest.raises(production_service.StorageError):
-        source._plan_for("a1" * 32, confirmation=False)
+        source.content.get(sha256=ready.exact.sha256, size_bytes=ready.exact.size_bytes)
     payload[0] = b"deterministic exact fixture"
     recovered = service._execute(
         "plans/120.json", immutable_ready, ready, workers, deadline=time.monotonic() + 30,
     )
     assert recovered.encode() == immutable_ready.body
-    assert source._plan_for("a1" * 32, confirmation=False) == ready
+    assert source._allocated_plan("a1" * 32, confirmation=False) == ready
+    assert source.content.get(sha256=ready.exact.sha256,
+                              size_bytes=ready.exact.size_bytes).read_bytes() == payload[0]
     assert not service._needs_regeneration(ready)
     assert objects.get(f"interruptions/{plan.plan_digest}.json") == interruption
     assert objects.get("plans/120.json") == immutable_ready
@@ -778,6 +885,8 @@ def test_producer_continues_at_arbitrary_heights_and_releases_workers(
     )
     if state == "READY":
         plan = plan.ready(
+            completed_at_ms=(plan.generation_block + 1) * 1000,
+            completed_block=plan.generation_block + 1,
             exact=ReadyObject("exact/batch.npz", "12" * 32, 100),
             dense_references=tuple(
                 DenseReference(
@@ -803,18 +912,22 @@ def test_producer_continues_at_arbitrary_heights_and_releases_workers(
             source_proofs=(proof(0), proof(1)), scoring=scoring(),
             available_routes=("route-0", "route-1", "route-2"),
         )
-        newer.append(item.ready(
-            exact=ReadyObject(f"exact/{block}.npz", "12" * 32, 100),
-            dense_references=tuple(
-                DenseReference(
-                    rollout.rollout_id,
-                    ReadyObject(f"videos/{block}-{index}.mp4", "34" * 32, 100),
-                    ReadyObject(f"latents/{block}-{index}.safetensors", "56" * 32, 100),
-                )
-                for index, rollout in enumerate(item.rollouts)
-            ),
-            sample_cache=ready_sample_cache(),
-        ))
+        newer.append(
+            item.ready(
+                completed_at_ms=(item.generation_block + 1) * 1000,
+                completed_block=item.generation_block + 1,
+                exact=ReadyObject(f"exact/{block}.npz", "12" * 32, 100),
+                dense_references=tuple(
+                    DenseReference(
+                        rollout.rollout_id,
+                        ReadyObject(f"videos/{block}-{index}.mp4", "34" * 32, 100),
+                        ReadyObject(f"latents/{block}-{index}.safetensors", "56" * 32, 100),
+                    )
+                    for index, rollout in enumerate(item.rollouts)
+                ),
+                sample_cache=ready_sample_cache(),
+            )
+        )
     database = tmp_path / "validator.db"
     with ChallengeStore(database, track_spec_digest=plan.track_spec_digest) as store:
         store.advance_chain_cursor(cursor_block, "0x" + "cd" * 32)
@@ -1657,6 +1770,8 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
     )
     batch = write(tmp_path / "valid", cases)
     ready = planned.ready(
+        completed_at_ms=(planned.generation_block + 1) * 1000,
+        completed_block=planned.generation_block + 1,
         exact=ReadyObject("exact/valid.npz", batch.sha256, batch.path.stat().st_size),
         dense_references=references,
         sample_cache=ready_sample_cache(),
@@ -1685,6 +1800,8 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
     changed = (replace(cases[0], source_id="wrong-source"), *cases[1:])
     invalid = write(tmp_path / "invalid", changed)
     invalid_ready = planned.ready(
+        completed_at_ms=(planned.generation_block + 1) * 1000,
+        completed_block=planned.generation_block + 1,
         exact=ReadyObject("exact/invalid.npz", invalid.sha256, invalid.path.stat().st_size),
         dense_references=references,
         sample_cache=ready_sample_cache(),
@@ -1704,6 +1821,8 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
         (replace(cases[0], dense=corrupted_dense), *cases[1:]),
     )
     inconsistent_ready = planned.ready(
+        completed_at_ms=(planned.generation_block + 1) * 1000,
+        completed_block=planned.generation_block + 1,
         exact=ReadyObject(
             "exact/inconsistent.npz",
             inconsistent.sha256,
@@ -1730,6 +1849,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     pool = SourcePool(tuple(proof(index).leaf for index in range(8)))
     track = SimpleNamespace(
         digest="ab" * 32,
+        cache=SimpleNamespace(disclosure_delay_seconds=1800),
         source_pool_merkle_root=pool.root,
         source_commitments=source_commitments(pool),
         track_start_block=100,
@@ -1778,6 +1898,8 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     text_object = ReadyObject("inputs/text.safetensors", text_digest, len(text_content))
     payloads[text_object.object_key] = text_content
     ready_plan = planned.ready(
+        completed_at_ms=(planned.generation_block + 1) * 1000,
+        completed_block=planned.generation_block + 1,
         exact=ReadyObject("exact/data.npz", "12" * 32, 10),
         dense_references=tuple(references),
         sample_cache=ReadySampleCache(index_object, text_object),
@@ -1796,7 +1918,10 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
             ), scoring=track.scoring, available_routes=track.model.selector.routes,
         )
         earlier = earlier.ready(
-            exact=plan.exact, sample_cache=plan.sample_cache,
+            completed_at_ms=(earlier.generation_block + 3) * 1000,
+            completed_block=earlier.generation_block + 3,
+            exact=plan.exact,
+            sample_cache=plan.sample_cache,
             dense_references=tuple(
                 replace(ref, rollout_id=rollout.rollout_id)
                 for ref, rollout in zip(plan.dense_references, earlier.rollouts, strict=True)
@@ -1807,8 +1932,14 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         inventory = Inventory(objects, track.digest)
         for stage in ("SCORING", "CONFIRMING"):
             inventory.claim(
-                challenge_id="a1" * 32, stage=stage, file_sha256="b2" * 32,
-                model_digest="c3" * 32, plans=(earlier, plan),
+                challenge_id="a1" * 32,
+                stage=stage,
+                file_sha256="b2" * 32,
+                model_digest="c3" * 32,
+                plans=(earlier, plan),
+                submission_block=200,
+                submission_timestamp_ms=200_000,
+                disclosure_delay_seconds=1800,
             )
         return objects
 
@@ -1828,17 +1959,17 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
     )
     exact_path = tmp_path / "exact-source.npz"
     exact_path.write_bytes(b"exact")
-    source._restore_exact = lambda _plan: SimpleNamespace(sha256="12" * 32, path=exact_path)
+    source._restore_exact = lambda _plan, **_kw: SimpleNamespace(sha256="12" * 32, path=exact_path)
 
     restored = source.confirmation_batch("a1" * 32)
 
     assert restored.plan == ready_plan
     assert restored.exact.sha256 == "12" * 32
     assert len(restored.latent_paths) == 2
-    terminal_ids = frozenset({"a1" * 32})
-    disclosure = source.public_disclosure(ready_plan.plan_digest, terminal_ids)
+    disclosure_time = ready_plan.completed_at_ms + track.cache.disclosure_delay_seconds * 1000
+    assert source.public_disclosure(ready_plan.plan_digest, now_ms=disclosure_time - 1) is None
+    disclosure = source.public_disclosure(ready_plan.plan_digest, now_ms=disclosure_time)
     assert disclosure is not None
-    assert disclosure.challenge_ids == ("a1" * 32,)
     assert disclosure.record_name == f"batch_groups/{ready_plan.plan_digest}.json"
     assert len(disclosure.files) == 7
     with pytest.raises(RuntimeError, match="no allocated"):
@@ -1855,7 +1986,7 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
             track=mismatched_track,
             objects=objects,
             cache_dir=tmp_path,
-        ).public_disclosure(ready_plan.plan_digest, terminal_ids)
+        ).public_disclosure(ready_plan.plan_digest, now_ms=disclosure_time)
 
     wrong_namespace = replace(
         ready_plan,
@@ -1866,13 +1997,15 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
             track=track,
             objects=make_objects(wrong_namespace),
             cache_dir=tmp_path,
-        ).public_disclosure(ready_plan.plan_digest, terminal_ids)
+        ).public_disclosure(ready_plan.plan_digest, now_ms=disclosure_time)
 
     exact = tmp_path / f"{ready_plan.generation_block}-{ready_plan.exact.sha256}.npz"
     exact.write_bytes(b"temporary")
     assert (tmp_path / "dense" / ready_plan.plan_digest).is_dir()
-    assert source.prune_disclosed({"b2" * 32}) == 0
-    assert source.prune_disclosed({"a1" * 32}) == 4
+    assert source.prune_disclosed(frozenset()) == 0
+    source.record_disclosed(ready_plan.plan_digest)
+    assert source.prune_disclosed(frozenset({ready_plan.plan_digest})) == 0
+    assert source.prune_disclosed(frozenset()) == 4
     assert not exact.exists()
     assert not (tmp_path / "dense" / ready_plan.plan_digest).exists()
 
@@ -1931,6 +2064,7 @@ def test_admission_archive_restores_model_by_challenge_identity(tmp_path) -> Non
     validated = ValidatedModel(file_sha256, "cd" * 32, path.stat().st_size, 1)
     task = SimpleNamespace(
         challenge_id="challenge-a",
+        position=ChainPosition(100, 0, 0),
         submission_id="submission-a",
         hotkey="hotkey-a",
         repo_id="owner/model",

@@ -1,11 +1,30 @@
 from dataclasses import replace
 
+import pytest
+
 from validator.production.retries import PrivateRetryStore
 from validator.production.storage import RETRY_STATE_NAMESPACE, PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState
 from validator.store import LeasedChallenge
 
 from .test_storage import MemoryS3
+
+
+def test_disclosure_retry_survives_cold_host_without_touching_miner_attempts():
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retry = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    digest = "ab" * 32
+    assert retry.disclosure_attempt(digest, now_ms=100, lease_ms=1000) == 1
+    cold = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    assert cold.disclosure_attempt(digest, now_ms=1099, lease_ms=1000) is None
+    cold.disclosure_attempt(digest, now_ms=1100, lease_ms=1000,
+                            completed_attempt=1, error="network unavailable")
+    assert retry.disclosure_attempt(digest, now_ms=61_099, lease_ms=1000) is None
+    assert retry.disclosure_attempt(digest, now_ms=61_100, lease_ms=1000) == 2
+    with pytest.raises(RuntimeError, match="attempt fence"):
+        cold.disclosure_attempt(digest, now_ms=61_101, lease_ms=1000,
+                                completed_attempt=1, error=None)
+    assert retry.restore(task(lease_token="miner", attempts=1), "SCORING") is None
 
 
 def task(*, lease_token: str, attempts: int) -> LeasedChallenge:

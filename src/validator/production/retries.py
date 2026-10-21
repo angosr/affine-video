@@ -161,6 +161,60 @@ class PrivateRetryStore:
             return
         raise RuntimeError("durable retry state changed repeatedly")
 
+    def disclosure_attempt(
+        self, plan_digest: str, *, now_ms: int, lease_ms: int,
+        completed_attempt: int | None = None, error: str | None = None,
+    ) -> int | None:
+        """One durable, bounded bulk attempt; never change a miner's retry state.
+
+        The next-attempt fence is written before I/O and survives a killed host
+        or a lost PUT response. Finishing updates this same fact, not a second
+        queue. A successful public receipt remains the completion authority.
+        """
+        if not _digest(plan_digest) or now_ms < 0 or lease_ms <= 0:
+            raise ValueError("disclosure retry identity or limits are invalid")
+        name = f"{RETRY_STATE_NAMESPACE}/disclosures/{plan_digest}.json"
+        for _ in range(8):
+            stored = self.objects.get_optional(name)
+            row = None if stored is None else decode_canonical_json(stored.body)
+            if row is not None and (
+                not isinstance(row, dict) or set(row) != {
+                    "format", "track_spec_digest", "plan_digest", "attempt", "retry_after_ms",
+                    "error",
+                } or row["format"] != "veda-disclosure-retry-v1"
+                or row["track_spec_digest"] != self.track_spec_digest
+                or row["plan_digest"] != plan_digest
+                or type(row["attempt"]) is not int or row["attempt"] <= 0
+                or type(row["retry_after_ms"]) is not int or row["retry_after_ms"] < 0
+                or (row["error"] is not None and not isinstance(row["error"], str))
+            ):
+                raise RuntimeError("disclosure retry authority is invalid")
+            if completed_attempt is None:
+                if row is not None and row["retry_after_ms"] > now_ms:
+                    return None
+                attempt = 1 if row is None else row["attempt"] + 1
+                retry_after = now_ms + lease_ms
+            else:
+                if row is None or row["attempt"] != completed_attempt:
+                    raise RuntimeError("disclosure completion lost its attempt fence")
+                attempt = completed_attempt
+                retry_after = (0 if error is None else
+                               now_ms + min(3_600_000, 60_000 * 2 ** min(attempt - 1, 6)))
+            payload = canonical_json({
+                "format": "veda-disclosure-retry-v1", "track_spec_digest": self.track_spec_digest,
+                "plan_digest": plan_digest, "attempt": attempt, "retry_after_ms": retry_after,
+                "error": None if error is None else error[:1000],
+            })
+            try:
+                if stored is None:
+                    self.objects.create_plan(name, payload)
+                else:
+                    self.objects.replace_plan(name, payload, etag=stored.etag)
+            except PreconditionFailed:
+                continue
+            return attempt
+        raise RuntimeError("disclosure retry authority changed repeatedly")
+
     def _decode(
         self,
         payload: bytes,

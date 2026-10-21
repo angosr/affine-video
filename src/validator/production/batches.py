@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import shutil
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from math import isclose
 from pathlib import Path
 
+import bittensor as bt
 import numpy as np
 
 from scoring.cache import (
@@ -23,7 +27,8 @@ from scoring.exact import GLOBAL_SEGMENT, REFERENCE_SEGMENT, TARGET_SEGMENT
 from scoring.model import ValidatedModel
 from scoring.spec import TrackSpec
 from validator.admission import RejectedAdmission
-from validator.download import DownloadedModel
+from validator.chunks import check_deadline
+from validator.download import DownloadedModel, download_chunked_file
 from validator.production.commitment import canonical_json, verify_source_proof
 from validator.production.inventory import ALLOCATION_OBJECT, Inventory
 from validator.production.plan import (
@@ -46,7 +51,27 @@ from validator.production.storage import (
     VIDEOS_NAMESPACE,
     LocalBatchStore,
     PrivateObjectStore,
+    StorageError,
 )
+from validator.queue import TERMINAL_STATES
+
+
+def _submission_timestamp_ms(block: int) -> int:
+    """Use the original finalized block's Timestamp, never admission wall-clock."""
+    async def read() -> int:
+        async with bt.Client("finney") as client:
+            info = await client.block_info(block=block)
+            if info is None or info.number != block:
+                raise RuntimeError("original submission block is unavailable")
+            stamp = info.timestamp
+            if stamp.tzinfo is None or stamp.utcoffset() is None:
+                raise RuntimeError("submission Timestamp must be timezone-aware")
+            return (stamp - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
+
+    async def bounded() -> int:
+        return await asyncio.wait_for(read(), timeout=30)
+
+    return asyncio.run(bounded())
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +98,6 @@ class DisclosureFile:
 
 @dataclass(frozen=True, slots=True)
 class BatchDisclosure:
-    challenge_ids: tuple[str, ...]
     record_name: str
     record_payload: bytes
     files: tuple[DisclosureFile, ...]
@@ -112,6 +136,7 @@ class ReadyBatchSource:
         cache_dir: str | Path,
         batch_dir: str | Path | None = None,
         validation_device: str | None = None,
+        public_base_url: str | None = None,
     ) -> None:
         self.track = track
         self.objects = objects
@@ -120,8 +145,34 @@ class ReadyBatchSource:
             self.cache_dir / "content" if batch_dir is None else batch_dir
         )
         self.validation_device = validation_device
+        self.public_base_url = public_base_url
         self._validated_exact: set[str] = set()
         self.inventory = Inventory(objects, track.digest)
+
+    def _materialize(self, plan: BatchPlan, item: ReadyObject, destination: Path) -> Path:
+        try:
+            return self.content.materialize(
+                destination, sha256=item.sha256, size_bytes=item.size_bytes,
+            )
+        except StorageError:
+            if (self.public_base_url is None or time.time_ns() // 1_000_000
+                    < plan.completed_at_ms + self.track.cache.disclosure_delay_seconds * 1000):
+                raise
+        namespace = (
+            "batches" if item == plan.exact else
+            "batch_inputs" if plan.sample_cache is not None and item in (
+                plan.sample_cache.index, plan.sample_cache.text, plan.sample_cache.condition,
+            ) else "batch_assets"
+        )
+        path = download_chunked_file(
+            f"{self.public_base_url}/{namespace}/{item.sha256}/manifest.json",
+            cache_dir=self.cache_dir / "public-restored", expected_sha256=item.sha256,
+            max_bytes=item.size_bytes, suffix=destination.suffix or ".bin",
+        )
+        self.content.put(path, sha256=item.sha256, size_bytes=item.size_bytes)
+        return self.content.materialize(
+            destination, sha256=item.sha256, size_bytes=item.size_bytes,
+        )
 
     def _admission_identity(self, task: object) -> dict[str, object]:
         return {
@@ -131,7 +182,21 @@ class ReadyBatchSource:
             "hotkey": task.hotkey,
             "repo_id": task.repo_id,
             "revision": task.revision,
+            "submission_block": task.position.block,
         }
+
+    def finalized_seed_hash(self, block: int) -> str:
+        """Verify pre-opening production blocks not present in the miner scan DB."""
+        async def read() -> str:
+            async with bt.Client("finney") as client:
+                if block > await client.finalized_block():
+                    raise RuntimeError("production seed is not finalized")
+                return await client._substrate.block_hash(block)
+
+        async def bounded() -> str:
+            return await asyncio.wait_for(read(), timeout=30)
+
+        return asyncio.run(bounded())
 
     def archive_model(
         self,
@@ -154,6 +219,7 @@ class ReadyBatchSource:
             "file_sha256": validated.file_sha256,
             "model_digest": validated.model_digest,
             "size_bytes": validated.size_bytes,
+            "submission_timestamp_ms": _submission_timestamp_ms(task.position.block),
         }
         self.objects.create_plan(
             self._admission_name(task.challenge_id),
@@ -208,7 +274,9 @@ class ReadyBatchSource:
                     and not _digest(document["duplicate_of"])
                 )
                 or (
-                    (document["error_code"] in {"REFERENCE_DUPLICATE", "EXACT_DUPLICATE"})
+                    (document["error_code"] in {
+                        "REFERENCE_DUPLICATE", "EXACT_DUPLICATE", "DUPLICATE_HOTKEY",
+                    })
                     != (document.get("duplicate_of") is not None)
                 )
                 or (
@@ -237,7 +305,11 @@ class ReadyBatchSource:
             not isinstance(document, dict)
             or _json(document) != stored.body
             or any(document.get(key) != value for key, value in identity.items())
-            or set(document) != set(identity) | {"file_sha256", "model_digest", "size_bytes"}
+            or set(document) != set(identity) | {
+                "file_sha256", "model_digest", "size_bytes", "submission_timestamp_ms",
+            }
+            or type(document.get("submission_timestamp_ms")) is not int
+            or document["submission_timestamp_ms"] <= 0
             or not _digest(file_sha256)
             or not _digest(model_digest)
             or type(size_bytes) is not int
@@ -328,6 +400,8 @@ class ReadyBatchSource:
                 task.challenge_id, confirmation=task.state.value == "CONFIRMING",
             )
             expected_batch = {
+                **self.stage_binding(task.challenge_id,
+                                     confirmation=task.state.value == "CONFIRMING"),
                 "cache_generated_block": plan.generation_block,
                 "cache_plan_digest": plan.plan_digest,
                 "cache_seed_block_hash": plan.block_hash,
@@ -338,10 +412,12 @@ class ReadyBatchSource:
                 raise RuntimeError("archived stage conflicts with its allocated READY batch")
             _, authority = self.inventory.read()
             claim = next(row for row in authority["claims"]
-                         if row["plan_digest"] == plan.plan_digest)
+                         if row["challenge_id"] == task.challenge_id
+                         and row["stage"] == task.state.value)
             admission = self.objects.get(self._admission_name(task.challenge_id))
             identity = json.loads(admission.body)
             if (claim["file_sha256"] != task.file_sha256
+                    or claim["submission_block"] != task.position.block
                     or identity.get("model_digest") != claim["model_digest"]
                     or identity.get("file_sha256") != task.file_sha256
                     or identity.get("track_spec_digest") != self.track.digest
@@ -363,21 +439,17 @@ class ReadyBatchSource:
         return f"{ADMISSIONS_NAMESPACE}/{challenge_id}.json"
 
     def exact_batch(self, challenge_id: str) -> ExactCacheBatch:
-        plan = self._plan_for(challenge_id, confirmation=False)
+        plan = self._allocated_plan(challenge_id, confirmation=False)
         return self._restore_exact(plan)
 
-    def _restore_exact(self, plan: BatchPlan) -> ExactCacheBatch:
+    def _restore_exact(self, plan: BatchPlan, *, validate_dense: bool = True) -> ExactCacheBatch:
         if plan.exact is None:
             raise RuntimeError("READY plan omitted its exact object")
         destination = self.cache_dir / f"{plan.generation_block}-{plan.exact.sha256}.npz"
-        path = self.content.materialize(
-            destination,
-            sha256=plan.exact.sha256,
-            size_bytes=plan.exact.size_bytes,
-        )
+        path = self._materialize(plan, plan.exact, destination)
         try:
             batch = inspect_exact_cache_batch(path, max_bytes=self.track.cache.exact_max_bytes)
-            if batch.sha256 not in self._validated_exact:
+            if validate_dense and batch.sha256 not in self._validated_exact:
                 validate_exact_cache(
                     path,
                     expected_sha256=batch.sha256,
@@ -411,20 +483,17 @@ class ReadyBatchSource:
             or batch.sample_cache != plan.sample_cache.document()
         ):
             raise RuntimeError("restored exact batch conflicts with its READY plan")
-        self._validated_exact.add(batch.sha256)
+        if validate_dense:
+            self._validated_exact.add(batch.sha256)
         return batch
 
     def confirmation_batch(self, challenge_id: str) -> ConfirmationBatch:
-        plan = self._plan_for(challenge_id, confirmation=True)
+        plan = self._allocated_plan(challenge_id, confirmation=True)
         destination = self.cache_dir / "dense" / plan.plan_digest
         references = []
         for reference in plan.dense_references:
             latent = reference.latent
-            path = self.content.materialize(
-                destination / f"{latent.sha256}.safetensors",
-                sha256=latent.sha256,
-                size_bytes=latent.size_bytes,
-            )
+            path = self._materialize(plan, latent, destination / f"{latent.sha256}.safetensors")
             references.append((reference, path))
         return ConfirmationBatch(
             plan,
@@ -441,26 +510,19 @@ class ReadyBatchSource:
         destination.mkdir(parents=True, exist_ok=True)
         objects = (("index.json", selected.index), ("text.safetensors", selected.text))
         for name, item in objects:
-            self.content.materialize(
-                destination / name,
-                sha256=item.sha256,
-                size_bytes=item.size_bytes,
-            )
+            self._materialize(plan, item, destination / name)
         condition_path = destination / "cond.safetensors"
         if selected.condition is None:
             if condition_path.exists():
                 condition_path.unlink()
         else:
-            self.content.materialize(
-                condition_path,
-                sha256=selected.condition.sha256,
-                size_bytes=selected.condition.size_bytes,
-            )
+            self._materialize(plan, selected.condition, condition_path)
         validate_selected_sample_cache(destination, plan)
         return destination
 
     def claim_ready(
         self, challenge_id: str, *, confirmation: bool, file_sha256: str, model_digest: str,
+        submission_block: int,
     ) -> bool:
         """CAS-claim available inventory for the current leased, admitted FIFO stage."""
 
@@ -473,46 +535,83 @@ class ReadyBatchSource:
                 or document.get("track_spec_digest") != self.track.digest
                 or document.get("challenge_id") != challenge_id
                 or document.get("file_sha256") != file_sha256
+                or document.get("submission_block") != submission_block
                 or document.get("model_digest") != model_digest
                 or _json(document) != admission.body):
             raise RuntimeError("inventory claim admission identity is invalid")
         plans = tuple(plan for _, plan in self._plans())
-        # Availability is checked before CAS. A producer invalidating lost data
-        # races on this same authority, so it cannot discard a winning claim.
-        _, authority = self.inventory.read()
-        claimed = {row["plan_digest"] for row in authority["claims"]}
-        for plan in plans:
-            if plan.state != "READY" or plan.plan_digest in claimed:
-                continue
-            try:
-                for item in ready_objects(plan):
-                    self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)
-            except RuntimeError:
-                self.inventory.invalidate_unassigned(plan.plan_digest)
+        # Selection is a metadata decision at S, not a scan of whatever bytes
+        # happen to survive at admission time. Missing bytes recover the bound
+        # READY; they must not silently select a different historical batch.
         claim = self.inventory.claim(
             challenge_id=challenge_id, stage=stage,
             file_sha256=file_sha256, model_digest=model_digest,
             plans=plans,
+            submission_block=submission_block,
+            submission_timestamp_ms=document["submission_timestamp_ms"],
+            disclosure_delay_seconds=self.track.cache.disclosure_delay_seconds,
         )
         return claim is not None
+
+    def eligible_submission(self, task: object) -> bool:
+        """Admission needs both independent stages before the original submission.
+
+        This reads only authoritative metadata, never GPU availability or payload
+        bytes. A temporarily lost original cache is not a new non-admission.
+        """
+        stamp = _submission_timestamp_ms(task.position.block)
+        eligible = [plan for _, plan in self._plans()
+                    if Inventory.eligible(plan, task.position.block, stamp,
+                                           self.track.cache.disclosure_delay_seconds)]
+        return any(
+            first.inventory_slot != second.inventory_slot and not {
+                proof.leaf.source_family_id for proof in first.source_proofs
+            }.intersection(proof.leaf.source_family_id for proof in second.source_proofs)
+            for first in eligible for second in eligible
+        )
+
+    def stage_binding(self, challenge_id: str, *, confirmation: bool) -> dict[str, object]:
+        plan = self._allocated_plan(challenge_id, confirmation=confirmation)
+        _, authority = self.inventory.read()
+        stage = "CONFIRMING" if confirmation else "SCORING"
+        claim = next(row for row in authority["claims"]
+                     if row["challenge_id"] == challenge_id and row["stage"] == stage)
+        return {
+            "cache_ready_sha256": hashlib.sha256(plan.encode()).hexdigest(),
+            "cache_completed_block": plan.completed_block,
+            "cache_completed_at_ms": plan.completed_at_ms,
+            "cache_allocation": claim,
+        }
 
     def inventory_status(self, plans: tuple[BatchPlan, ...]) -> dict[str, object]:
         """Expose commitments/counts only; seeds, proofs and inputs stay private."""
 
         _, authority = self.inventory.read()
-        unavailable = {
-            row["plan_digest"] for row in authority["claims"] + authority["invalidations"]
-        }
-        available = [plan for plan in plans if plan.plan_digest not in unavailable]
+        now = time.time_ns() // 1_000_000
+        available = [plan for plan in plans
+                     if (plan.state == "PLANNED" or plan.completed_at_ms
+                          + self.track.cache.disclosure_delay_seconds * 1000 > now)]
         return {
-            "observed_at_ns": time.time_ns(),
+            "observed_at_ns": now * 1_000_000,
             "ready_batches": sum(plan.state == "READY" for plan in available),
             "producing_batches": sum(plan.state == "PLANNED" for plan in available),
             "target_batches": self.track.cache.inventory_target_batches,
             "max_bytes": self.track.cache.inventory_max_bytes,
+            "disclosure_pending_batches": sum(
+                plan.state == "READY" and plan.completed_at_ms
+                + self.track.cache.disclosure_delay_seconds * 1000 <= now
+                and self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is None
+                for plan in plans
+            ),
             "commitments": [{
                 "plan_digest": plan.plan_digest, "secret_commitment": plan.secret_commitment,
                 "generation_block": plan.generation_block, "state": plan.state,
+                "completed_at_ms": plan.completed_at_ms,
+                "disclose_at_ms": (None if plan.completed_at_ms is None else
+                                   plan.completed_at_ms
+                                   + self.track.cache.disclosure_delay_seconds * 1000),
+                "ready_sha256": (hashlib.sha256(plan.encode()).hexdigest()
+                                 if plan.state == "READY" else None),
             } for plan in available],
             "allocated_stages": [(row["challenge_id"], row["stage"])
                                  for row in authority["claims"]],
@@ -521,22 +620,22 @@ class ReadyBatchSource:
     def public_disclosure(
         self,
         plan_digest: str,
-        terminal_challenge_ids: frozenset[str],
+        *, now_ms: int, deadline: float | None = None,
     ) -> BatchDisclosure | None:
-        """Restore replay bytes only after every challenge sharing the batch is terminal."""
+        """Reveal at production age, including unused and still-in-flight data.
+
+        The dataset object never includes a mutable list of its users. Each
+        match carries its own immutable allocation; a late scan can bind the
+        original pre-expiry submission without rewriting this public record.
+        """
 
         plan = self._plan_by_digest(plan_digest)
-        _, authority = self.inventory.read()
-        claims = [row for row in authority["claims"] if row["plan_digest"] == plan_digest]
-        if len(claims) != 1:
-            raise RuntimeError("disclosure requires one immutable inventory claim")
-        allocation = claims[0]
-        self.inventory.validate_claim(allocation, plan)
-        challenge_ids = (allocation["challenge_id"],)
-        if not set(challenge_ids).issubset(terminal_challenge_ids):
+        check_deadline(deadline)
+        assert plan.completed_block is not None
+        if now_ms < plan.completed_at_ms + self.track.cache.disclosure_delay_seconds * 1000:
             return None
         assert plan.exact is not None
-        exact = self._restore_exact(plan)
+        exact = self._restore_exact(plan, validate_dense=False)
         files = [
             DisclosureFile(
                 f"batches/{plan.exact.sha256}/manifest.json",
@@ -547,16 +646,13 @@ class ReadyBatchSource:
         references = []
         directory = self.cache_dir / "disclosures" / plan.plan_digest
         for reference in plan.dense_references:
+            check_deadline(deadline)
             public = {"rollout_id": reference.rollout_id}
             for kind, item, suffix in (
                 ("video", reference.video, ".mp4"),
                 ("latent", reference.latent, ".safetensors"),
             ):
-                path = self.content.materialize(
-                    directory / f"{item.sha256}{suffix}",
-                    sha256=item.sha256,
-                    size_bytes=item.size_bytes,
-                )
+                path = self._materialize(plan, item, directory / f"{item.sha256}{suffix}")
                 object_name = f"batch_assets/{item.sha256}/manifest.json"
                 files.append(DisclosureFile(object_name, path, item.sha256))
                 public[kind] = {
@@ -583,19 +679,59 @@ class ReadyBatchSource:
             files.append(DisclosureFile(object_name, path, item.sha256))
         record = canonical_json(
             {
-                "format": "veda-batch-disclosure-v2",
-                "allocation": allocation,
+                "format": "veda-batch-disclosure-v3",
                 "plan": plan.document(),
                 "public_exact_object": f"batches/{plan.exact.sha256}/manifest.json",
                 "public_dense_references": references,
                 "public_selected_inputs": public_inputs,
             }
         )
+        check_deadline(deadline)
         return BatchDisclosure(
-            challenge_ids,
             f"batch_groups/{plan.plan_digest}.json",
             record,
             tuple(files),
+        )
+
+    def due_plan_digests(self, now_ms: int) -> tuple[str, ...]:
+        return tuple(
+            plan.plan_digest for _, plan in self._plans()
+            if plan.state == "READY" and plan.completed_block is not None
+            and plan.completed_at_ms + self.track.cache.disclosure_delay_seconds * 1000 <= now_ms
+            and self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is None
+        )
+
+    def record_disclosed(self, plan_digest: str) -> None:
+        """Persist only after the public immutable record and all bytes verified."""
+        plan = self._plan_by_digest(plan_digest)
+        self.objects.create_plan(
+            f"disclosed/{plan_digest}.json", canonical_json({
+                "plan_digest": plan_digest, "exact_sha256": plan.exact.sha256,
+            }),
+        )
+
+    def protected_plan_digests(
+        self, challenges: list[dict[str, object]], scanned_block: int,
+    ) -> frozenset[str]:
+        pending = [row for row in challenges
+                   if row["state"] not in TERMINAL_STATES
+                   and row.get("track_spec_digest", self.track.digest) == self.track.digest]
+        scanned_time = _submission_timestamp_ms(scanned_block)
+        # An RPC failure aborts pruning conservatively; it is not evidence that
+        # the model lacked eligible data. Reuse immutable chain times per S.
+        submission_times = {
+            block: _submission_timestamp_ms(block)
+            for block in {row["block_height"] for row in pending}
+        }
+        return frozenset(
+            plan.plan_digest for _, plan in self._plans()
+            if plan.state == "PLANNED"
+            or plan.completed_at_ms + self.track.cache.disclosure_delay_seconds * 1000
+            > scanned_time
+            or any(Inventory.eligible(
+                plan, row["block_height"], submission_times[row["block_height"]],
+                self.track.cache.disclosure_delay_seconds,
+            ) for row in pending)
         )
 
     def _plan_by_digest(self, plan_digest: str) -> BatchPlan:
@@ -616,33 +752,26 @@ class ReadyBatchSource:
             raise RuntimeError("evaluation batch plan is not READY")
         return plan
 
-    def prune_disclosed(self, terminal_challenge_ids: set[str]) -> int:
-        """Called only after publication; retain a small durable disclosure fence."""
+    def prune_disclosed(self, protected_plan_digests: frozenset[str]) -> int:
+        """Reclaim only verified public bytes not needed by replay or in-flight work."""
 
         removed = 0
         plans = self._plans()
-        _, authority = self.inventory.read()
-        claims = {row["plan_digest"]: row for row in authority["claims"]}
+        published = {
+            plan.plan_digest for _name, plan in plans
+            if self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is not None
+        }
         retained = {
             item.sha256
             for _name, plan in plans
-            if plan.plan_digest not in claims
-            or claims[plan.plan_digest]["challenge_id"] not in terminal_challenge_ids
+            if plan.plan_digest not in published or plan.plan_digest in protected_plan_digests
             for item in ready_objects(plan)
         }
         for _name, plan in plans:
-            references = (
-                {claims[plan.plan_digest]["challenge_id"]} if plan.plan_digest in claims else set()
-            )
-            if plan.state != "READY" or not references or not references <= terminal_challenge_ids:
+            if (plan.state != "READY" or plan.plan_digest not in published
+                    or plan.plan_digest in protected_plan_digests):
                 continue
             assert plan.exact is not None
-            self.objects.create_plan(
-                f"disclosed/{plan.plan_digest}.json",
-                canonical_json({
-                    "plan_digest": plan.plan_digest, "exact_sha256": plan.exact.sha256,
-                }),
-            )
             exact = self.cache_dir / f"{plan.generation_block}-{plan.exact.sha256}.npz"
             if exact.is_file():
                 exact.unlink()
@@ -662,6 +791,10 @@ class ReadyBatchSource:
             for item in ready_objects(plan):
                 if item.sha256 not in retained:
                     self.content.path(item.sha256).unlink(missing_ok=True)
+                    for suffix in (".npz", ".mp4", ".safetensors", ".json", ".bin"):
+                        (self.cache_dir / "public-restored" / f"{item.sha256}{suffix}").unlink(
+                            missing_ok=True,
+                        )
         return removed
 
     def _allocated_plan(self, challenge_id: str, *, confirmation: bool) -> BatchPlan:
@@ -675,17 +808,11 @@ class ReadyBatchSource:
                       if row["challenge_id"] == challenge_id and row["stage"] == stage), None)
         if claim is not None:
             plan = self._plan_by_digest(claim["plan_digest"])
-            self.inventory.validate_claim(claim, plan)
+            self.inventory.validate_claim(
+                claim, plan, disclosure_delay_seconds=self.track.cache.disclosure_delay_seconds,
+            )
             return plan
         raise RuntimeError("challenge has no allocated hidden inventory")
-
-    def _plan_for(self, challenge_id: str, *, confirmation: bool) -> BatchPlan:
-        plan = self._allocated_plan(challenge_id, confirmation=confirmation)
-        if self.objects.get_optional(f"interruptions/{plan.plan_digest}.json") is not None:
-            # A past failure stays immutable; matching restored bytes clear its live fence.
-            for item in ready_objects(plan):
-                self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)
-        return plan
 
     def _plans(self) -> tuple[tuple[str, BatchPlan], ...]:
         rows = []

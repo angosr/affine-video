@@ -116,43 +116,35 @@ archiving, confirmed by the `SCORING` state.
    still has one submission opportunity.
 2. Admission checks registration, competition eligibility, model format, hotkey binding and
    duplicate tensors. Re-signing an earlier model or copying the baseline is not a new model.
-3. Challenger and champion run on the same hidden inventory batch: 16 videos across four strata,
-   eight sampled layer/head routes and three denoising steps, giving 384 paired cases. The FIFO
-   scorer claims the oldest available batch once; retries retain that allocation. Confidence
-   bounds group correlated cases by video rather than treating all 384 cases as independent.
+3. Challenger and champion are evaluated on the same data: 16 videos across four strata,
+   eight sampled layer/head routes and three denoising steps, giving 384 paired cases. Retries
+   retain the already-bound evaluation data. Confidence bounds group correlated cases by video
+   rather than treating all 384 cases as independent.
    Confidence is specified per comparison, not as a lifetime false-promotion guarantee.
-4. Passing the attention-quality/cost gate claims a source-independent hidden batch for complete
-   eight-step video inference at all three budgets. Only a challenger exceeding the frozen
+4. Passing the attention-quality/cost gate leads to complete eight-step video inference on
+   source-independent data at all three budgets. Only a challenger exceeding the frozen
    paired improvement thresholds in both stages becomes champion. Ties retain the champion.
 5. Results are published in queue order. The champion receives this mechanism's full weight
    until replaced or no longer eligible; the registered UID0 baseline is the fallback.
 
-Maintenance releases retain confirmed champions and spent submission opportunities. The existing
-runtime manifest pins every prior immutable `matches/<track_id>/<sequence>.json` by its original
-key, SHA and size under `evidence/system-panel/history/`. Those original outcomes are carried
-forward without applying new thresholds or relabelling old scores. New matches restart sequence
-numbering only within the new track namespace. A cold evaluator verifies the original finalized
-chain submissions before rebuilding their local projections; it does not admit new work until
-recovery completes. Existing chain eligibility and UID0 fallback still apply.
+Maintenance releases must retain confirmed champions and spent submission opportunities. A release
+introducing a new track must preserve prior immutable matches by their original keys, hashes and
+identities, without applying new thresholds or relabelling old scores. New match sequence numbers
+belong to the new track namespace. Recovery must verify original finalized chain submissions and
+restore their confirmed outcomes and eligibility before admitting new work. Existing chain
+eligibility and UID0 fallback still apply.
 
 Infrastructure failures defer and retry the original challenge; they do not count as miner
-losses. Normal inventory waiting is not a failed attempt.
-After 600 finalized blocks from submission (or the exact decision for confirmation), continued
-inventory shortage raises a durable infrastructure retry/alert instead of waiting silently;
-it still preserves the original opportunity and FIFO, and ready stock is claimed immediately.
-Each batch belongs to one challenge/stage
-and cannot be reused by a later model. Its data, committed secret and replay references are
-disclosed only after that challenge finishes. Quality metrics, budgets and thresholds are
-defined by the live track, not adjustable per submission. Scores from different batches are not
-directly comparable; promotion uses the paired comparison with the incumbent.
+losses. Retries preserve already-bound evaluation data and archived stage results rather than
+selecting replacement data. Quality metrics, budgets and thresholds are defined by the live track,
+not adjustable per submission. Scores from different batches are not directly comparable;
+promotion uses the paired comparison with the incumbent.
 
-The existing producer fills a small hidden inventory even without miners, pausing at the track's
-batch-count and disk-byte limits. Generation combines a finalized block hash with a committed
-private 256-bit secret; public block hashes alone cannot reconstruct unused inventory. Production
-commitments have two fixed, family-disjoint halves; each challenge uses opposite halves for its
-two stages. Confirmation may already exist before the exact decision. Lost unclaimed data is
-CAS-invalidated and replenished; assigned hashes and archived results never change. Prompts may
-recur with new secret-seeded rollouts; this is not an unlimited supply of new prompts.
+Public immutable match records bind the submitted model, stage scores and evaluation data by
+their recorded hashes. When replay data is available, reproduce a match using its original
+frozen specification, runtime and bound inputs, not the latest working tree or a different
+hardware execution path. Archived outcomes and data bindings are not rewritten by a retry or
+maintenance release.
 
 ## Watch the competition
 
@@ -162,7 +154,7 @@ uv run veda monitor --watch 30
 ```
 
 The read-only CLI shows UIDs, hotkey prefixes, champion, queue positions, match numbers, scores,
-outcomes, inventory counts, waiting/computing activity and retry alerts. It needs no wallet, GPU
+outcomes, waiting/computing activity and retry alerts. It needs no wallet, GPU
 or storage key. `status.json` is the current
 view; `summary.json` includes the committed match count and latest match. Immutable match records
 use `matches/<track_id>/<12-digit-sequence>.json` under the same public `tracks/main/` prefix.

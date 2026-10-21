@@ -200,7 +200,7 @@ def verify_initial_champion(
 
 @dataclass(slots=True)
 class PairedTrackEvaluator:
-    """Score the FIFO challenger on its once-only hidden inventory allocation."""
+    """Score the FIFO challenger on data fixed at its original submission."""
 
     track: TrackSpec
     store: ChallengeStore
@@ -234,22 +234,8 @@ class PairedTrackEvaluator:
             confirmation=task.state is ChallengeState.CONFIRMING,
             file_sha256=task.file_sha256,
             model_digest=record["model_digest"],
+            submission_block=task.position.block,
         )
-
-    def inventory_deadline_block(self, task: LeasedChallenge) -> int:
-        """Supply watchdog, not a generation schedule or an eligibility delay.
-
-        The original submission/exact-decision block survives cold replay; a
-        missing producer cannot restart this budget with each new local DB.
-        Available stock is always claimed immediately, even after this bound.
-        """
-        start = task.position.block
-        if task.state is ChallengeState.CONFIRMING:
-            exact = self.store.stage_score(task.challenge_id, ChallengeState.SCORING)
-            if exact is None:
-                raise TemporaryScoringError("SCORING_RECORD_MISSING", "exact decision is missing")
-            start = exact.score_block
-        return start + 600  # About two hours at the chain's 12-second block time.
 
     def __call__(self, task: LeasedChallenge) -> StageOutcome:
         snapshot = self.store.public_snapshot()
@@ -287,6 +273,7 @@ class PairedTrackEvaluator:
             paired.score,
             {
                 **paired.metrics,
+                **self.batch_source.stage_binding(task.challenge_id, confirmation=False),
                 "cache_sha256": batch.sha256,
                 "cache_generated_block": batch.generated_block,
                 "cache_plan_digest": batch.plan_digest,
@@ -372,6 +359,7 @@ class PairedTrackEvaluator:
         return StageOutcome(
             result.challenger_score,
             {
+                **self.batch_source.stage_binding(challenger.challenge_id, confirmation=True),
                 "cache_generated_block": batch.plan.generation_block,
                 "cache_plan_digest": batch.plan.plan_digest,
                 "cache_seed_block_hash": batch.plan.block_hash,
@@ -402,6 +390,10 @@ class PairedTrackEvaluator:
             self.store.finalized_block_hash(generated_block)
             if self.seed_block_hashes is None else self.seed_block_hashes.get(generated_block)
         )
+        if (expected_hash is None and self.seed_block_hashes is None
+                and generated_block < self.track.track_start_block
+                and self.batch_source is not None):
+            expected_hash = self.batch_source.finalized_seed_hash(generated_block)
         if not isinstance(expected_hash, str) or seed_block_hash.lower() != expected_hash.lower():
             raise CacheLoadError("cache seed hash does not match its finalized generation block")
 
@@ -723,37 +715,10 @@ def evaluate_next_scoring(
             archived = None if settings.restore_stage is None else settings.restore_stage(task)
             batch_ready = getattr(evaluator, "batch_ready", None)
             if archived is None and batch_ready is not None and not batch_ready(task):
-                deadline = getattr(evaluator, "inventory_deadline_block", None)
-                deadline_block = None if deadline is None else deadline(task)
-                if deadline_block is not None and current_finalized_block > deadline_block:
-                    state = _defer_or_fail(
-                        store,
-                        task,
-                        settings,
-                        clock(),
-                        code="EVALUATION_BATCH_TIMEOUT",
-                        summary=(
-                            "evaluation batch remained unavailable after finalized "
-                            f"block {deadline_block}"
-                        ),
-                    )
-                    return ScoringOutcome(
-                        task.challenge_id,
-                        state,
-                        "EVALUATION_BATCH_TIMEOUT",
-                    )
-                wait_at = clock()
-                store.wait_leased(
-                    task.challenge_id,
-                    task.lease_token,
-                    retry_after_ms=wait_at + settings.retry_base_ms,
-                    reason="EVALUATION_BATCH_PENDING",
-                    occurred_at_ms=wait_at,
-                )
-                return ScoringOutcome(
-                    task.challenge_id,
-                    ChallengeState.SYSTEM_DEFERRED,
-                    "EVALUATION_BATCH_PENDING",
+                raise TemporaryScoringError(
+                    "EVALUATION_BATCH_UNAVAILABLE",
+                    "the original pre-submission data binding is unavailable; "
+                    "later production cannot replace it",
                 )
             if archived is None:
                 result = evaluator(task)

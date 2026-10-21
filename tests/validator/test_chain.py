@@ -381,8 +381,13 @@ def test_scanner_binds_multiple_timelock_fields_in_event_order(tmp_path, same_pa
             "owner/first", "owner/first" if same_payload else "owner/second",
         ]
         assert [row["state"] for row in challenges] == [
-            ChallengeState.QUEUED, ChallengeState.REJECTED_DUPLICATE_HOTKEY,
+            ChallengeState.QUEUED, ChallengeState.QUEUED,
         ]
+        # The earlier FIFO submission might be a system non-admission; defer
+        # only this duplicate decision until its opportunity is established.
+        assert store.earlier_hotkey_owner(challenges[1]["challenge_id"]) == (
+            challenges[0]["challenge_id"]
+        )
         assert len(store.active_competitors({HOTKEY: 1})) == 1
 
 

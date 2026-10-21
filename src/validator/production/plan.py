@@ -151,6 +151,8 @@ class BatchPlan:
     exact: ReadyObject | None = None
     dense_references: tuple[DenseReference, ...] = ()
     sample_cache: ReadySampleCache | None = None
+    completed_block: int | None = None
+    completed_at_ms: int | None = None
 
     def __post_init__(self) -> None:
         _digest_bytes(self.track_spec_digest, "track specification digest")
@@ -182,13 +184,21 @@ class BatchPlan:
             if len(set(values)) != len(values) or any(not value for value in values):
                 raise ValueError(f"{name} identifiers must be non-empty and unique")
         if self.state == "PLANNED":
-            if self.exact is not None or self.dense_references or self.sample_cache is not None:
+            if (self.exact is not None or self.dense_references or self.sample_cache is not None
+                    or self.completed_block is not None or self.completed_at_ms is not None):
                 raise ValueError("a PLANNED batch cannot reference completed objects")
         elif self.state == "READY":
             if self.exact is None or not self.dense_references or self.sample_cache is None:
                 raise ValueError(
                     "a READY batch requires exact data, dense references, and selected inputs"
                 )
+            if (
+                type(self.completed_block) is not int
+                or self.completed_block <= self.generation_block
+            ):
+                raise ValueError("READY completion must follow the generation plan")
+            if type(self.completed_at_ms) is not int or self.completed_at_ms <= 0:
+                raise ValueError("READY completion time must be a positive UTC millisecond")
         else:
             raise ValueError("batch plan state must be PLANNED or READY")
         if self.plan_digest != hashlib.sha256(canonical_json(self.planned_document())).hexdigest():
@@ -230,6 +240,8 @@ class BatchPlan:
             "state": self.state,
         }
         if self.state == "READY":
+            result["completed_block"] = self.completed_block
+            result["completed_at_ms"] = self.completed_at_ms
             result["exact"] = self.exact.document() if self.exact is not None else None
             result["dense_references"] = [
                 reference.document() for reference in self.dense_references
@@ -248,6 +260,8 @@ class BatchPlan:
         exact: ReadyObject,
         dense_references: tuple[DenseReference, ...],
         sample_cache: ReadySampleCache,
+        completed_block: int,
+        completed_at_ms: int,
     ) -> BatchPlan:
         if self.state != "PLANNED":
             raise ValueError("only a PLANNED batch can become READY")
@@ -257,6 +271,8 @@ class BatchPlan:
             exact=exact,
             dense_references=dense_references,
             sample_cache=sample_cache,
+            completed_block=completed_block,
+            completed_at_ms=completed_at_ms,
         )
 
     @classmethod
@@ -285,7 +301,8 @@ class BatchPlan:
         }
         state = value.get("state")
         expected = common | (
-            {"dense_references", "exact", "sample_cache"} if state == "READY" else set()
+            {"dense_references", "exact", "sample_cache", "completed_block", "completed_at_ms"}
+            if state == "READY" else set()
         )
         if set(value) != expected or value.get("format") != "veda-inventory-plan-v1":
             raise ValueError("batch plan fields or format are invalid")
@@ -330,6 +347,8 @@ class BatchPlan:
             exact=exact,
             dense_references=tuple(_parse_reference(row) for row in references_value),
             sample_cache=sample_cache,
+            completed_block=value.get("completed_block"),
+            completed_at_ms=value.get("completed_at_ms"),
         )
 
 

@@ -61,6 +61,7 @@ def valid_spec() -> dict:
             "exact_max_bytes": 1_000_000,
             "inventory_target_batches": 2,
             "inventory_max_bytes": 10_000_000,
+            "disclosure_delay_seconds": 1800,
             "generator": "veda-private-rollout-v1",
             "format": "veda-exact-cache-v2",
             "storage_dtype": "float16",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import json
@@ -21,6 +22,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any
 
+import bittensor as bt
 from safetensors import SafetensorError, safe_open
 
 from scoring.cache import (
@@ -41,7 +43,7 @@ from validator.production.commitment import (
     verify_source_proof,
 )
 from validator.production.config import ProducerConfig, load_producer_config
-from validator.production.inventory import ALLOCATION_OBJECT, Inventory
+from validator.production.inventory import ALLOCATION_OBJECT
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
@@ -76,6 +78,25 @@ _PLAN_PROBE_INTERVAL_MS = 60 * 60 * 1000
 _PRODUCER_ATTEMPT_TIMEOUT_SECONDS = 4 * 60 * 60
 
 
+def _completion_boundary(plan: BatchPlan) -> int:
+    """Conservatively order a sealed batch before later chain submissions.
+
+    Read the current best head only after all bytes have been produced and
+    validated. The next block is the availability boundary, never the stale
+    finalized scan cursor used to seed generation. Recovery retains this first
+    seal instead of moving the completion/disclosure clock.
+    """
+
+    async def head() -> int:
+        async with bt.Client("finney") as client:
+            block = await client.block()
+            if type(block) is not int or block < plan.generation_block:
+                raise RuntimeError("completion head is older than its generation plan")
+            return block + 1
+
+    return asyncio.run(head())
+
+
 class _DeadlineInterrupt(BaseException):
     """Escape SDK retry loops before translating to a producer failure."""
 
@@ -97,8 +118,25 @@ class ProducerCycle:
     inventory_idle: bool
 
 
+def _utc_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def _finalized_head() -> tuple[int, str]:
+    async def read() -> tuple[int, str]:
+        async with bt.Client("finney") as client:
+            block = await client.finalized_block()
+            block_hash = await client._substrate.block_hash(block)
+            return block, block_hash
+
+    async def bounded() -> tuple[int, str]:
+        return await asyncio.wait_for(read(), timeout=30)
+
+    return asyncio.run(bounded())
+
+
 class PlanCoordinator:
-    """Create immutable plans only from a fully scanned finalized SQLite snapshot."""
+    """Create immutable plans from finalized chain state, independently of miners."""
 
     def __init__(
         self,
@@ -150,13 +188,21 @@ class PlanCoordinator:
             raise RuntimeError("private plan source selection is invalid") from exc
         return tuple(rows)
 
-    def create_next(self, *, disk_bytes: int = 0) -> BatchPlan | None:
+    def create_next(
+        self, *, disk_bytes: int = 0, now_ms: int | None = None,
+        finalized_head: tuple[int, str] | None = None,
+    ) -> BatchPlan | None:
+        now_ms = _utc_ms() if now_ms is None else now_ms
         existing = self.plans()
-        _, authority = Inventory(self.objects, self.track.digest).read()
-        unavailable = {
-            row["plan_digest"] for row in authority["claims"] + authority["invalidations"]
-        }
-        available = [plan for _, _, plan in existing if plan.plan_digest not in unavailable]
+        # The producer follows finalized chain state itself; miner scan/admission
+        # lag must not stop supply. This also permits prewarming before opening.
+        block, block_hash = _finalized_head() if finalized_head is None else finalized_head
+        # Reuse every unexpired batch. Start replacing at half its lifetime,
+        # while the older half remains hidden and eligible for new submissions.
+        # Claims do not consume a whole cache or trigger per-model generation.
+        available = [plan for _, _, plan in existing
+                     if (plan.state == "PLANNED" or plan.completed_at_ms
+                          + max(1, self.track.cache.disclosure_delay_seconds * 500) > now_ms)]
         counts = [sum(plan.inventory_slot == slot for plan in available) for slot in (0, 1)]
         slot = min((0, 1), key=lambda value: (counts[value], value))
         if counts[slot] >= self.track.cache.inventory_target_batches // 2:
@@ -165,12 +211,8 @@ class PlanCoordinator:
         if disk_bytes + 3 * self.track.cache.exact_max_bytes > self.track.cache.inventory_max_bytes:
             return None
         # An in-flight item is completed before another reservation is made.
-        if any(plan.state == "PLANNED" for plan in available):
+        if any(plan.state == "PLANNED" for _, _, plan in existing):
             return None
-        cursor = self.store.chain_cursor()
-        if cursor is None or cursor[0] < self.track.track_start_block:
-            return None
-        block, block_hash = cursor
         if any(plan.generation_block == block for _, _, plan in existing):
             return None
         secret = secrets.token_hex(32)
@@ -367,36 +409,28 @@ class ProducerService:
                             objects=self.objects,
                             source_pool=self.pool,
                         )
-                        plans = coordinator.plans()
-                        inventory = Inventory(self.objects, self.track.digest)
-                        # A missing unclaimed READY is fenced before anybody can claim it.
-                        for _, _, item in plans:
-                            if item.state == "READY":
-                                self._needs_regeneration(item)
-                        _, authority = inventory.read()
-                        invalid = {row["plan_digest"] for row in authority["invalidations"]}
-                        retained_objects = {
-                            item.sha256 for _, _, plan in plans
-                            if plan.plan_digest not in invalid for item in ready_objects(plan)
-                        }
-                        for _, _, plan in plans:
-                            if plan.plan_digest in invalid:
-                                for item in ready_objects(plan):
-                                    if item.sha256 not in retained_objects:
-                                        self.content.path(item.sha256).unlink(missing_ok=True)
                         created = coordinator.create_next(
-                            disk_bytes=_work_bytes(self.config.work_dir),
+                            disk_bytes=_disk_bytes(self.config.work_dir),
                         )
                         plans = coordinator.plans()
                         pending = next(
-                            (row for row in plans if row[2].plan_digest not in invalid
-                             and (row[2].state == "PLANNED"
-                                  or self._needs_regeneration(row[2]))), None,
+                            (
+                                row
+                                for row in sorted(
+                                    plans,
+                                    key=lambda row: (
+                                        row[2].state != "PLANNED",
+                                        row[2].generation_block,
+                                    ),
+                                )
+                                if row[2].state == "PLANNED"
+                                or (row[2].state == "READY" and self._needs_regeneration(row[2]))
+                            ),
+                            None,
                         )
                         retained = frozenset(
                             plan.plan_digest for _, _, plan in plans
-                            if plan.plan_digest not in invalid
-                            and self.objects.get_optional(
+                            if self.objects.get_optional(
                                 f"disclosed/{plan.plan_digest}.json"
                             ) is None
                         )
@@ -562,11 +596,21 @@ class ProducerService:
         )
         self._retain_content(batch.path, exact)
         _require_before_deadline(deadline)
-        planned = replace(plan, state="PLANNED", exact=None, dense_references=(), sample_cache=None)
+        planned = replace(
+            plan, state="PLANNED", exact=None, dense_references=(), sample_cache=None,
+            completed_block=None,
+            completed_at_ms=None,
+        )
         ready = planned.ready(
             exact=exact,
             dense_references=tuple(references),
             sample_cache=selected_cache,
+            completed_block=(
+                plan.completed_block if plan.state == "READY" else _completion_boundary(plan)
+            ),
+            completed_at_ms=(
+                plan.completed_at_ms if plan.state == "READY" else _utc_ms()
+            ),
         )
         if plan.state == "READY":
             if ready.encode() != plan.encode():
@@ -584,7 +628,14 @@ class ProducerService:
             _require_before_deadline(deadline)
             if winner.state != "READY":
                 raise RuntimeError("plan changed without reaching READY") from None
-            if winner.encode() != ready.encode():
+            if (
+                winner.encode()
+                != replace(
+                    ready,
+                    completed_block=winner.completed_block,
+                    completed_at_ms=winner.completed_at_ms,
+                ).encode()
+            ):
                 raise RuntimeError("concurrent READY differs from the local batch") from None
             return winner
         _require_before_deadline(deadline)
@@ -614,9 +665,7 @@ class ProducerService:
             for item in ready_objects(plan):
                 self.content.get(sha256=item.sha256, size_bytes=item.size_bytes)
         except StorageError:
-            return not Inventory(self.objects, self.track.digest).invalidate_unassigned(
-                plan.plan_digest,
-            )
+            return True
         return False
 
 
@@ -638,6 +687,17 @@ def _work_bytes(root: Path) -> int:
             seen.add(identity)
             total += stat.st_blocks * 512
     return total
+
+
+def _disk_bytes(root: Path) -> int:
+    """Global occupancy includes expired/failed uploads and scratch, not just the pool.
+
+    Reserving generation space against the entire backing volume also counts
+    images, static models and unrelated files. Expiry never pretends to release
+    allocated blocks; only actual pruning can make room for the next plan.
+    """
+    volume = os.statvfs(root)
+    return max(_work_bytes(root), (volume.f_blocks - volume.f_bfree) * volume.f_frsize)
 
 
 def run_producer(config_path: str | Path, *, once: bool = False) -> None:
