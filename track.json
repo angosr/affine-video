@@ -1,4 +1,5 @@
 {
+  "artifact_manifest_sha256": "3fddfcdf70d9151ca0af16ca157d1b5669be2dd9d2e89177266877f341cf3169",
   "base_model": {
     "repo_id": "MiniMaxAI/MiniMax-H3",
     "revision": "42ed227ee7df40d41602854ae760620d6eb651fe"
@@ -6,15 +7,24 @@
   "cache": {
     "accumulation_dtype": "float32",
     "compute_dtype": "float32",
+    "disclosure_delay_seconds": 86400,
     "exact_max_bytes": 17179869184,
     "format": "veda-exact-cache-v2",
-    "generation_interval_blocks": 1200,
     "generator": "veda-private-rollout-v1",
-    "minimum_generation_delay_blocks": 301,
+    "inventory_max_bytes": 549755813888,
+    "inventory_target_batches": 2,
     "storage_dtype": "float16"
   },
-  "artifact_manifest_sha256": "4d3eb36eadf259a1d0ce0627275aa88d3d62d096de04c887b58708f946d9395e",
-  "source_pool_merkle_root": "11844a47d2e1ee5192a8b4b170fd396941313b4de9abdbbd5d0493f2b9026477",
+  "full_video": {
+    "black_frame_threshold": 0.01,
+    "feature_model_sha256": "1f542c569f5e8912e30a156da860faff22a4ec08b4c432fb3cbbabded40dc016",
+    "flicker_threshold": 2.0,
+    "frame_weight": 0.3,
+    "latent_weight": 0.4,
+    "metric_version": "veda-video-fidelity-v2",
+    "minimum_gain": 0.005,
+    "temporal_weight": 0.3
+  },
   "initial_champion": {
     "evaluation_file_sha256": "64addb5da430059e37e405d28ca0f2887132905f077ae92fba86982c8b0e9d3f",
     "file_sha256": "2a8d8845c5342756a2781e8e69563940e4bb573c9a40ebb534915ff8fd76573a",
@@ -38,16 +48,6 @@
     }
   },
   "netuid": 120,
-  "full_video": {
-    "black_frame_threshold": 0.01,
-    "feature_model_sha256": "1f542c569f5e8912e30a156da860faff22a4ec08b4c432fb3cbbabded40dc016",
-    "flicker_threshold": 2.0,
-    "frame_weight": 0.3,
-    "latent_weight": 0.4,
-    "metric_version": "veda-video-fidelity-v2",
-    "minimum_gain": 0.005,
-    "temporal_weight": 0.3
-  },
   "scoring": {
     "bootstrap_resamples": 10000,
     "bootstrap_seed": 12020261017,
@@ -68,19 +68,19 @@
         "target_blocks": 64
       }
     ],
+    "match_confidence": 0.9975,
     "minimum_frontier_gain": 0.005,
     "query_tile_selection_algorithm": "sha256-segment-quota-v1",
     "query_tiles_per_case": 4,
     "rollouts_per_stratum": 4,
     "sampled_route_count": 8,
     "sampled_step_count": 3,
-    "match_confidence": 0.9975,
     "step_selection_algorithm": "sha256-window-without-replacement-v1",
     "stratum_weights": {
+      "16:9@37": 0.25,
       "1:1@72": 0.25,
       "4:3@102": 0.25,
-      "9:16@37": 0.25,
-      "16:9@37": 0.25
+      "9:16@37": 0.25
     },
     "tail_mean_weight": 0.8,
     "trajectory_schedule": {
@@ -126,8 +126,6 @@
       ]
     }
   },
-  "track_id": "veda-sn120-v2-r4",
-  "track_start_block": 9323901,
   "source_commitments": {
     "audit": {
       "16:9@37": [
@@ -1269,5 +1267,8 @@
         "ff9977c2798188559735921c00a1d049c02a74fc238dec59da1c31c9e96f19a5"
       ]
     }
-  }
+  },
+  "source_pool_merkle_root": "11844a47d2e1ee5192a8b4b170fd396941313b4de9abdbbd5d0493f2b9026477",
+  "track_id": "veda-sn120-v2-r6",
+  "track_start_block": 9332100
 }

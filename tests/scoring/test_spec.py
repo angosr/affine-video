@@ -1,5 +1,6 @@
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -337,3 +338,8 @@ def test_loader_accepts_canonical_json_file(tmp_path) -> None:
     path.write_text(json.dumps(valid_spec()), encoding="utf-8")
 
     assert load_track_spec(path).track_id == "veda-test-v1"
+
+
+def test_repository_track_matches_the_current_parser() -> None:
+    track = load_track_spec(Path(__file__).resolve().parents[2] / "track.json")
+    assert parse_track_spec(track_spec_dict(track)).digest == track.digest
