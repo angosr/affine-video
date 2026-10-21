@@ -428,6 +428,41 @@ def test_weight_artifact_has_one_strict_canonical_representation() -> None:
         )
 
 
+def test_confirmation_status_exposes_exact_aggregate_without_raw_inputs():
+    from validator.tournament import Tournament
+
+    track = parse_track_spec(valid_spec())
+    baseline = genesis_champion(track)
+    allocation = {"plan_digest": "ab" * 32, "ready_sha256": "cd" * 32}
+    stage = {
+        "stage": "SCORING", "score": 0.8, "score_block": 210,
+        "incumbent_score": 0.7, "paired_gain_lower_bound": 0.06,
+        "evaluation_batch": allocation, "prompt": "must stay private",
+        "secret": "must stay private", "cases": ["not a safe aggregate"],
+    }
+    challenge = {
+        "submission_id": "submission", "challenge_id": "model", "state": "CONFIRMING",
+        "final_score": None, "incumbent_score": 0.7, "paired_gain_lower_bound": 0.06,
+        "evaluation_batch": {"generated_block": 100}, "created_at_ms": 1,
+        "attempts": 1, "error_code": None, "file_sha256": "e5" * 32,
+        "model_digest": "f6" * 32, "stages": [stage],
+    }
+    status = publication_module._status_document(
+        track, 211, Tournament((), baseline, ()),
+        [{"submission_id": "submission", "uid": 7, "hotkey": "miner", "block_height": 200}],
+        [challenge], system_matches=[],
+    )
+    miner = next(row for row in status["participants"] if row["challenge_id"] == "model")
+    assert miner["score"] == 0.8 and miner["score_gain"] == 0.06
+    assert miner["file_sha256"] == "e5" * 32 and miner["model_digest"] == "f6" * 32
+    assert miner["stages"] == [{k: v for k, v in stage.items()
+                                if k not in {"prompt", "secret", "cases"}}]
+    assert miner["match_sequence"] is miner["outcome"] is None
+    assert miner["champion"] is False
+    assert status["champion"] == baseline.public()
+    assert "must stay private" not in json.dumps(status)
+
+
 def test_public_repository_rejects_active_track_pointer_rollback() -> None:
     def encoded(value):
         return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()

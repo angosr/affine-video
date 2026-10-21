@@ -1809,6 +1809,13 @@ def _status_document(
             and challenge["track_spec_digest"] != track.digest
         )
         is_champion = tournament.champion.challenge_id == challenge["challenge_id"]
+        # Stage aggregates are safe before raw reveal. Project only these
+        # commitments, never arbitrary metric payloads (prompts/seeds/cases).
+        stages = [{key: stage[key] for key in (
+            "stage", "score", "score_block", "incumbent_score", "paired_gain_lower_bound",
+            "evaluation_batch",
+        ) if key in stage} for stage in challenge.get("stages", [])]
+        latest_score = stages[-1]["score"] if stages else None
         active_rows.append(
             {
                 "uid": competitor["uid"],
@@ -1819,10 +1826,15 @@ def _status_document(
                 "state": challenge["state"],
                 "queue_position": None,
                 "match_sequence": None if match is None else match.sequence,
-                "score": (tournament.champion.score if is_champion else challenge["final_score"]),
+                "score": (tournament.champion.score if is_champion else
+                          challenge["final_score"] if challenge["final_score"] is not None
+                          else latest_score),
+                "file_sha256": challenge.get("file_sha256"),
+                "model_digest": challenge.get("model_digest"),
+                "stages": stages,
                 "incumbent_score": challenge["incumbent_score"],
                 "score_gain": (
-                    challenge.get("paired_gain_lower_bound") if historical
+                    challenge.get("paired_gain_lower_bound") if historical or match is None
                     else None if match is None else match.score_gain
                 ),
                 "batch_generated_block": (
