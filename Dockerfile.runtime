@@ -10,7 +10,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --no-cache-dir --no-build-isolation \
-    "flash-attn-4 @ git+https://github.com/Dao-AILab/flash-attention@d15f1531a460ba456f41b01a774f33ab2db8febf#subdirectory=flash_attn/cute"
+    "flash-attn-4 @ https://files.pythonhosted.org/packages/40/d0/b1e9ab8eefc9e67179a372c3e1a8e9f83d963c3a8e5bd4c738e55dd134c0/flash_attn_4-4.0.0b32-py3-none-any.whl#sha256=9299da3524d579d84eb92954d3243aa095d55ebdafcf80d6a9766fd96fe8a562"
 
 RUN git init /tmp/Miowtion \
     && git -C /tmp/Miowtion remote add origin https://github.com/veda-sparse/Miowtion.git \
