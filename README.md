@@ -87,8 +87,10 @@ file after choosing the revision.
 
 ### 4. Commit on-chain
 
-**Only your hotkey's first VEDA submission on this track is eligible.** A malformed submission,
-invalid model or lost challenge consumes that opportunity; later submissions cannot replace it.
+**Each hotkey has one VEDA evaluation opportunity; maintenance does not reset it.** A malformed
+submission, invalid model or lost challenge consumes that opportunity. Only an explicit
+`SYSTEM_NOT_ADMITTED` outcome for missing eligible pre-submission data preserves it for a later
+submission. Ordinary infrastructure retries are not permission to submit a replacement.
 
 ```bash
 uv run veda miner commit \
@@ -113,18 +115,24 @@ archiving, confirmed by the `SCORING` state.
 
 1. Submissions enter a continuously open queue ordered by finalized block, extrinsic and event
    position. There is no submission deadline or competition-wide challenge limit. Each hotkey
-   still has one submission opportunity.
+   still has one evaluation opportunity, subject to the explicit system-non-admission exception above.
 2. Admission checks registration, competition eligibility, model format, hotkey binding and
    duplicate tensors. Re-signing an earlier model or copying the baseline is not a new model.
 3. Challenger and champion are evaluated on the same data: 16 videos across four strata,
    eight sampled layer/head routes and three denoising steps, giving 384 paired cases. Retries
-   retain the already-bound evaluation data. Confidence bounds group correlated cases by video
+   retain the already-bound evaluation data. Data must have completed before the original
+   finalized submission and still have been secret and not yet due for disclosure then.
+   The same hidden data can serve multiple models; it is not produced separately for each model.
+   Confidence bounds group correlated cases by video
    rather than treating all 384 cases as independent.
    Confidence is specified per comparison, not as a lifetime false-promotion guarantee.
 4. Passing the attention-quality/cost gate leads to complete eight-step video inference on
    source-independent data at all three budgets. Only a challenger exceeding the frozen
    paired improvement thresholds in both stages becomes champion. Ties retain the champion.
-5. Results are published in queue order. The champion receives this mechanism's full weight
+5. Results are published in queue order without waiting for raw evaluation data publication.
+   Raw inputs follow the live track's fixed delay from actual data completion; immediate results
+   contain scores and non-revealing commitments, not prompts or reconstruction seeds.
+   The champion receives this mechanism's full weight
    until replaced or no longer eligible; the registered UID0 baseline is the fallback.
 
 Maintenance releases must retain confirmed champions and spent submission opportunities. A release
