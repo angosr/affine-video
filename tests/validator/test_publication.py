@@ -429,6 +429,49 @@ def test_weight_artifact_has_one_strict_canonical_representation() -> None:
         )
 
 
+@pytest.mark.parametrize("positions", [
+    ((200, 1, 9), (200, 2, 1)),
+    ((200, 1, 1), (200, 1, 2)),
+])
+@pytest.mark.parametrize("reverse_input", [False, True])
+def test_status_queue_positions_follow_chain_order_not_challenge_id(positions, reverse_input):
+    track = parse_track_spec(valid_spec())
+    baseline = genesis_champion(track)
+    challenges, competitors = [], []
+    for index, (position, identifier) in enumerate(
+        zip(positions, ("ff" * 32, "00" * 32), strict=True), 1,
+    ):
+        item = scored_challenge(index, f"miner-{index}", state="QUEUED")
+        item.update(challenge_id=identifier, block_height=position[0],
+                    extrinsic_index=position[1], event_index=position[2],
+                    created_at_ms=1, attempts=0)
+        challenges.append(item)
+        competitors.append({**item, "uid": 3 - index})
+    if reverse_input:
+        challenges.reverse()
+        competitors.reverse()
+    store = SimpleNamespace(
+        chain_cursor=lambda: (211, "0x" + "12" * 32),
+        public_snapshot=lambda: {"challenges": challenges},
+        active_competitors=lambda _mapping: competitors,
+        legacy_excluded_hotkeys=lambda: frozenset(),
+    )
+    chain = WeightChainState(211, {baseline.hotkey: 0}, 1, 1.0, 10, {baseline.hotkey: 0})
+
+    artifacts = build_public_artifacts(store, track, chain, version_key=0)
+
+    status = json.loads(artifacts.status)
+    rows = {row["challenge_id"]: row for row in status["participants"]}
+    assert rows["ff" * 32]["queue_position"] == 1
+    assert rows["00" * 32]["queue_position"] == 2
+    assert all("extrinsic_index" not in row and "event_index" not in row for row in rows.values())
+    assert status["champion"] == baseline.public()
+    assert decode_weight_artifact(artifacts.weights).plan == WeightPlan(
+        211, (baseline.hotkey,), (0,), (1.0,),
+    )
+    assert all(item["state"] == "QUEUED" and item["attempts"] == 0 for item in challenges)
+
+
 def test_confirmation_status_exposes_exact_aggregate_without_raw_inputs():
     from validator.tournament import Tournament
 
@@ -450,7 +493,8 @@ def test_confirmation_status_exposes_exact_aggregate_without_raw_inputs():
     }
     status = publication_module._status_document(
         track, 211, Tournament((), baseline, ()),
-        [{"submission_id": "submission", "uid": 7, "hotkey": "miner", "block_height": 200}],
+        [{"submission_id": "submission", "uid": 7, "hotkey": "miner", "block_height": 200,
+          "extrinsic_index": 0, "event_index": 0}],
         [challenge], system_matches=[],
     )
     miner = next(row for row in status["participants"] if row["challenge_id"] == "model")

@@ -1809,10 +1809,14 @@ def _status_document(
             "alert": False,
         }
     ]
+    chain_positions: dict[str, tuple[int, int, int]] = {}
     for competitor in competitors:
         challenge = challenge_by_id.get(competitor["submission_id"])
         if challenge is None:
             raise PublicArtifactError("active commitment has no local challenge")
+        chain_positions[challenge["challenge_id"]] = (
+            competitor["block_height"], competitor["extrinsic_index"], competitor["event_index"],
+        )
         match = match_by_id.get(challenge["challenge_id"])
         historical = (
             challenge.get("track_spec_digest") is not None
@@ -1884,7 +1888,7 @@ def _status_document(
         if row["match_sequence"] is None
         and row["state"] not in {str(state) for state in TERMINAL_STATES} | {"CHAMPION"}
     ]
-    waiting.sort(key=lambda row: (row["submission_block"], row["challenge_id"]))
+    waiting.sort(key=lambda row: chain_positions[row["challenge_id"]])
     queue_positions = {
         row["challenge_id"]: position for position, row in enumerate(waiting, start=1)
     }
