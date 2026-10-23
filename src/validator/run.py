@@ -249,7 +249,10 @@ async def _publish_due_batch(
     source: ReadyBatchSource, publisher: ArtifactRepository, *, finalized_block: int,
     challenges: list[dict[str, object]],
 ) -> str | None | Literal[False]:
-    """Run one bulk job; False means due data is fenced, None means nothing is due."""
+    """Run one bulk job; report any remaining durable failure before declaring success.
+
+    False means due data is fenced without a known failure; None means nothing is due.
+    """
     try:
         protected = await asyncio.to_thread(
             source.protected_plan_digests, challenges, finalized_block,
@@ -264,6 +267,7 @@ async def _publish_due_batch(
     if not due:
         return None
     retries = PrivateRetryStore(source.objects, track_spec_digest=source.track.digest)
+    published = None
     for digest in due:
         attempt = await asyncio.to_thread(
             retries.disclosure_attempt, digest, now_ms=now_ms, lease_ms=3 * 60 * 60 * 1000,
@@ -295,8 +299,13 @@ async def _publish_due_batch(
                 if error is None:
                     raise
                 _LOG.exception("disclosure retry completion failed; original error retained")
-        return digest
-    return False  # Due data exists, but durable retry fences skipped every attempt.
+        published = digest
+        break
+    if await asyncio.to_thread(lambda: any(
+        retries.disclosure_failed(digest) for digest in due if digest != published
+    )):
+        raise RuntimeError("unresolved disclosure failure remains in durable retry state")
+    return published if published is not None else False
 
 
 async def run_evaluator(
@@ -566,9 +575,10 @@ async def run_evaluator(
                 try:
                     outcome = disclosure_task.result()
                 except Exception as exc:
+                    newly_failed = inventory.get("disclosure_error") != "DATA_DISCLOSURE_FAILURE"
                     inventory["disclosure_error"] = "DATA_DISCLOSURE_FAILURE"
                     _LOG.error("DATA_DISCLOSURE_FAILURE: %s", exc)
-                    if alert is not None:
+                    if alert is not None and newly_failed:
                         alert("DATA_DISCLOSURE_FAILURE", {"error": str(exc)[:500]})
                 else:
                     if outcome is not False:

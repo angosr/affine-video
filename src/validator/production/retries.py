@@ -176,19 +176,7 @@ class PrivateRetryStore:
         name = f"{RETRY_STATE_NAMESPACE}/disclosures/{plan_digest}.json"
         for _ in range(8):
             stored = self.objects.get_optional(name)
-            row = None if stored is None else decode_canonical_json(stored.body)
-            if row is not None and (
-                not isinstance(row, dict) or set(row) != {
-                    "format", "track_spec_digest", "plan_digest", "attempt", "retry_after_ms",
-                    "error",
-                } or row["format"] != "veda-disclosure-retry-v1"
-                or row["track_spec_digest"] != self.track_spec_digest
-                or row["plan_digest"] != plan_digest
-                or type(row["attempt"]) is not int or row["attempt"] <= 0
-                or type(row["retry_after_ms"]) is not int or row["retry_after_ms"] < 0
-                or (row["error"] is not None and not isinstance(row["error"], str))
-            ):
-                raise RuntimeError("disclosure retry authority is invalid")
+            row = None if stored is None else self._decode_disclosure(stored.body, plan_digest)
             if completed_attempt is None:
                 if row is not None and row["retry_after_ms"] > now_ms:
                     return None
@@ -203,7 +191,8 @@ class PrivateRetryStore:
             payload = canonical_json({
                 "format": "veda-disclosure-retry-v1", "track_spec_digest": self.track_spec_digest,
                 "plan_digest": plan_digest, "attempt": attempt, "retry_after_ms": retry_after,
-                "error": None if error is None else error[:1000],
+                "error": (row["error"] if completed_attempt is None and row is not None
+                          else None if error is None else error[:1000]),
             })
             try:
                 if stored is None:
@@ -214,6 +203,31 @@ class PrivateRetryStore:
                 continue
             return attempt
         raise RuntimeError("disclosure retry authority changed repeatedly")
+
+    def disclosure_failed(self, plan_digest: str) -> bool:
+        """Read unresolved failure from the original checkpoint, including in-flight retries."""
+        if not _digest(plan_digest):
+            raise ValueError("disclosure retry identity is invalid")
+        stored = self.objects.get_optional(
+            f"{RETRY_STATE_NAMESPACE}/disclosures/{plan_digest}.json",
+        )
+        return (stored is not None
+                and self._decode_disclosure(stored.body, plan_digest)["error"] is not None)
+
+    def _decode_disclosure(self, payload: bytes, plan_digest: str) -> dict[str, Any]:
+        row = decode_canonical_json(payload)
+        if (
+            not isinstance(row, dict) or set(row) != {
+                "format", "track_spec_digest", "plan_digest", "attempt", "retry_after_ms", "error",
+            } or row["format"] != "veda-disclosure-retry-v1"
+            or row["track_spec_digest"] != self.track_spec_digest
+            or row["plan_digest"] != plan_digest
+            or type(row["attempt"]) is not int or row["attempt"] <= 0
+            or type(row["retry_after_ms"]) is not int or row["retry_after_ms"] < 0
+            or (row["error"] is not None and not isinstance(row["error"], str))
+        ):
+            raise RuntimeError("disclosure retry authority is invalid")
+        return row
 
     def _decode(
         self,

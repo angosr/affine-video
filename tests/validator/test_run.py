@@ -93,6 +93,69 @@ def test_optional_cleanup_failure_does_not_block_durable_disclosure(failure, cap
     assert row["attempt"] == 1 and row["retry_after_ms"] == 0 and row["error"] is None
 
 
+@pytest.mark.parametrize("cold", [False, True])
+def test_disclosure_success_cannot_hide_another_batch_failure(monkeypatch, cold):
+    from tests.validator.production.test_storage import MemoryS3 as PrivateMemoryS3
+    from validator.production.storage import PrivateObjectStore
+
+    track = parse_track_spec(valid_spec())
+    client = PrivateMemoryS3()
+    clock = [1_000_000_000]
+    monkeypatch.setattr(run_module.time, "time_ns", lambda: clock[0])
+    first, second = "ab" * 32, "cd" * 32
+    uploads = []
+
+    def new_source():
+        objects = PrivateObjectStore(client, bucket="test", prefix="test")
+        source = SimpleNamespace(
+            track=track, objects=objects, protected_plan_digests=lambda *_a: frozenset(),
+            prune_disclosed=lambda _p: 0, public_disclosure=lambda digest, **_kw: digest,
+            _plan_by_digest=lambda digest: SimpleNamespace(
+                plan_digest=digest, exact=SimpleNamespace(sha256="ef" * 32),
+            ),
+        )
+        source.due_plan_digests = lambda _now: tuple(
+            digest for digest in (first, second)
+            if objects.get_optional(f"disclosed/{digest}.json") is None
+        )
+        source.record_disclosed = lambda digest: run_module.ReadyBatchSource.record_disclosed(
+            source, digest,
+        )
+        return source
+
+    class Publisher:
+        async def publish_disclosure(self, digest, **_kwargs):
+            uploads.append(digest)
+            if digest == first and uploads.count(first) == 1:
+                raise OSError("private upload failure")
+
+    source = new_source()
+    publisher = Publisher()
+
+    def execute():
+        return asyncio.run(run_module._publish_due_batch(
+            source, publisher, finalized_block=120, challenges=[],
+        ))
+
+    with pytest.raises(OSError, match="private upload failure"):
+        execute()
+    failed = source.objects.get(f"retry_state/disclosures/{first}.json")
+    if cold:
+        source = new_source()  # Only the existing S3 facts survive.
+    with pytest.raises(RuntimeError, match="unresolved disclosure"):
+        execute()  # B is published, but A is still failed and cooling down.
+    assert source.objects.get_optional(f"disclosed/{second}.json") is not None
+    assert source.objects.get(f"retry_state/disclosures/{first}.json") == failed
+    with pytest.raises(RuntimeError, match="unresolved disclosure"):
+        execute()
+    assert uploads == [first, second]
+    clock[0] += 61_000_000_000
+    assert execute() == first
+    assert source.due_plan_digests(0) == ()
+    assert execute() is None
+    assert uploads == [first, second, first]
+
+
 def test_disclosure_cooldown_is_not_a_successful_observation():
     from tests.validator.production.test_storage import MemoryS3 as PrivateMemoryS3
     from validator.production.retries import PrivateRetryStore
@@ -648,6 +711,7 @@ def test_worker_setup_failure_alerts_and_does_not_poison_next_task(pending_evalu
 @pytest.mark.parametrize("benchmark_refresh", [
     "normal", "slow", "error", "inventory_slow", "inventory_error",
     "disclosure_slow", "disclosure_error", "inventory_recovery", "disclosure_recovery",
+    "disclosure_multibatch_recovery", "disclosure_cold_recovery",
 ])
 def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     pending_evaluation, monkeypatch, tmp_path, benchmark_refresh,
@@ -662,6 +726,11 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     metadata_snapshots = []
     metadata_error_seen = threading.Event()
     recovering = benchmark_refresh.endswith("_recovery")
+    multibatch = benchmark_refresh in {"disclosure_multibatch_recovery", "disclosure_cold_recovery"}
+    published_disclosures, disclosure_completions, uploads = [], [], []
+    disclosure_clock = [run_module.time.time_ns()]
+    if multibatch:
+        monkeypatch.setattr(run_module.time, "time_ns", lambda: disclosure_clock[0])
     original_admission = run_module.process_next_admission
     original_scoring = run_module.evaluate_next_scoring
     owner = threading.get_ident()
@@ -730,11 +799,48 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
                 source.due_plan_digests = lambda _now: ("ab" * 32,)
                 source.public_disclosure = lambda *_a, **_k: object()
                 source.record_disclosed = lambda _digest: None
+                if multibatch:
+                    from validator.production.retries import PrivateRetryStore
+
+                    source.due_plan_digests = lambda _now: tuple(
+                        digest for digest in ("ab" * 32, "cd" * 32)
+                        if source.objects.get_optional(f"disclosed/{digest}.json") is None
+                    )
+                    source.public_disclosure = lambda digest, **_kw: digest
+                    source._plan_by_digest = lambda digest: SimpleNamespace(
+                        plan_digest=digest, exact=SimpleNamespace(sha256="ef" * 32),
+                    )
+
+                    def record_disclosed(digest):
+                        run_module.ReadyBatchSource.record_disclosed(source, digest)
+                        published_disclosures.append(digest)
+
+                    source.record_disclosed = record_disclosed
+                    if benchmark_refresh == "disclosure_cold_recovery":
+                        retry = PrivateRetryStore(
+                            source.objects, track_spec_digest=case.track.digest,
+                        )
+                        now_ms = disclosure_clock[0] // 1_000_000
+                        retry.disclosure_attempt("ab" * 32, now_ms=now_ms, lease_ms=1000)
+                        retry.disclosure_attempt("ab" * 32, now_ms=now_ms, lease_ms=1000,
+                                                 completed_attempt=1, error="prior host failure")
             return evaluator
 
         monkeypatch.setattr(run_module, "PairedTrackEvaluator", evaluator_factory)
         if benchmark_refresh.startswith("disclosure_"):
-            if recovering:
+            if multibatch:
+                original_disclose = run_module._publish_due_batch
+
+                async def observe_disclosure(*args, **kwargs):
+                    try:
+                        return await original_disclose(*args, **kwargs)
+                    finally:
+                        disclosure_completions.append((
+                            client._finalized, tuple(published_disclosures),
+                        ))
+
+                monkeypatch.setattr(run_module, "_publish_due_batch", observe_disclosure)
+            elif recovering:
                 async def recover_disclosure(*_args, **_kwargs):
                     benchmark_calls.append(benchmark_refresh)
                     if len(benchmark_calls) == 1:
@@ -746,8 +852,14 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
 
                 monkeypatch.setattr(run_module, "_publish_due_batch", recover_disclosure)
 
-            async def disclose(*_args, **_kwargs):
+            async def disclose(disclosure, *_args, **_kwargs):
                 benchmark_calls.append(benchmark_refresh)
+                if multibatch:
+                    uploads.append(disclosure)
+                    if (benchmark_refresh != "disclosure_cold_recovery"
+                            and disclosure == "ab" * 32 and uploads.count(disclosure) == 1):
+                        raise OSError("public bulk upload unavailable")
+                    return
                 if benchmark_refresh == "disclosure_error":
                     raise OSError("public bulk upload unavailable")
                 if not await asyncio.to_thread(inventory_gate.wait, 5):
@@ -837,6 +949,22 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
                     status.get("inventory", {}).get("observed_at_ns") == 200
                     and status["inventory"].get("refresh_error") is None
                 )
+        elif multibatch:
+            after_second = any(
+                block < published_block and published == ("cd" * 32,)
+                for block, published in disclosure_completions
+            )
+            if after_second and "ab" * 32 not in published_disclosures:
+                assert status["inventory"].get("disclosure_error") == "DATA_DISCLOSURE_FAILURE"
+                assert status["inventory"]["disclosure_observed_at_ns"] == 50
+                if not metadata_error_seen.is_set():
+                    metadata_error_seen.set()
+                    disclosure_clock[0] += 61_000_000_000
+            metadata_ready = (
+                metadata_error_seen.is_set() and "ab" * 32 in published_disclosures
+                and status["inventory"].get("disclosure_error") is None
+                and status["inventory"].get("disclosure_observed_at_ns", 0) > 50
+            )
         elif benchmark_refresh in {"disclosure_error", "disclosure_recovery"}:
             errors = [row for row in metadata_snapshots if row.get("disclosure_error")]
             metadata_ready = bool(errors)
@@ -874,7 +1002,7 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
                 model_cache=tmp_path / "models", exact_cache=tmp_path / "batches",
                 initial_model=tmp_path / "selector.safetensors", network="finney",
                 archive_endpoints=None, worker_id="single-worker", publisher=case.publisher,
-                report=report, poll_seconds=0.001,
+                report=report, poll_seconds=0.005 if multibatch else 0.001,
                 alert_webhook_url="https://alerts.example/veda",
             )
 
@@ -901,6 +1029,10 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
         failed = next(row for row in metadata_snapshots if row.get("disclosure_error"))
         assert failed["disclosure_error"] == "DATA_DISCLOSURE_FAILURE"
         assert failed["disclosure_observed_at_ns"] == 50
+    if multibatch:
+        assert published_disclosures == ["cd" * 32, "ab" * 32]
+        assert sum(bool(row.get("disclosure_error")) for row in metadata_snapshots) >= 1
+        assert sum(code == "DATA_DISCLOSURE_FAILURE" for code, _detail in case.alerts) == 1
     assert "private inventory read unavailable" not in json.dumps(metadata_snapshots)
     assert "public bulk upload unavailable" not in json.dumps(metadata_snapshots)
     first_height = [payload for height, payload in snapshots if height == 102]
