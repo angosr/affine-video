@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -12,6 +14,7 @@ import httpx
 from validator.publication import PublicArtifactError, validate_public_weights_url
 
 _MAX_STATUS_BYTES = 1024 * 1024
+_INVENTORY_STALE_NS = 120 * 1_000_000_000
 
 
 async def fetch_status(url: str, *, client: httpx.AsyncClient) -> dict[str, Any]:
@@ -111,9 +114,28 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
     lines = [title, "", _format_row(headers, widths), separator]
     inventory = status.get("inventory")
     if isinstance(inventory, Mapping):
-        lines.insert(1, f"Hidden inventory: {inventory.get('ready_batches', 0)} ready / "
-                     f"{inventory.get('producing_batches', 0)} producing / "
+        lines.insert(1, f"Hidden inventory: {inventory.get('ready_batches', '?')} ready / "
+                     f"{inventory.get('producing_batches', '?')} producing / "
                      f"{inventory.get('target_batches', '?')} target")
+        observed = time.time_ns()
+        details = []
+        for label, key in (
+            ("Inventory last success", "observed_at_ns"),
+            ("Disclosure last successful check", "disclosure_observed_at_ns"),
+        ):
+            stamp = inventory.get(key)
+            valid = type(stamp) is int and 0 < stamp < 2**63
+            age = max(0, observed - stamp) if valid else None
+            stale = key == "observed_at_ns" and (age is None or age > _INVENTORY_STALE_NS)
+            value = (
+                f"{datetime.fromtimestamp(stamp / 1_000_000_000, UTC).isoformat()} "
+                f"({age / 1_000_000_000:.0f}s ago)" if valid else "unknown"
+            )
+            details.append(f"{label}: {value}" + (f" {yellow}STALE{reset}" if stale else ""))
+        for key in ("refresh_error", "disclosure_error"):
+            if inventory.get(key):
+                details.append(f"{yellow}{key}: {inventory[key]}{reset}")
+        lines[2:2] = details
     if rows:
         lines.extend(
             _format_colored_row(row, plain, widths)

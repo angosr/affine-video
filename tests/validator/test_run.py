@@ -93,6 +93,31 @@ def test_optional_cleanup_failure_does_not_block_durable_disclosure(failure, cap
     assert row["attempt"] == 1 and row["retry_after_ms"] == 0 and row["error"] is None
 
 
+def test_disclosure_cooldown_is_not_a_successful_observation():
+    from tests.validator.production.test_storage import MemoryS3 as PrivateMemoryS3
+    from validator.production.retries import PrivateRetryStore
+    from validator.production.storage import PrivateObjectStore
+
+    track = parse_track_spec(valid_spec())
+    objects = PrivateObjectStore(PrivateMemoryS3(), bucket="test", prefix="test")
+    digest = "ab" * 32
+    retry = PrivateRetryStore(objects, track_spec_digest=track.digest)
+    retry.disclosure_attempt(digest, now_ms=run_module.time.time_ns() // 1_000_000, lease_ms=60_000)
+    before = objects.get(f"retry_state/disclosures/{digest}.json")
+    source = SimpleNamespace(
+        track=track, objects=objects, protected_plan_digests=lambda *_a: frozenset(),
+        prune_disclosed=lambda _p: 0, due_plan_digests=lambda _now: (digest,),
+    )
+    assert asyncio.run(run_module._publish_due_batch(
+        source, SimpleNamespace(), finalized_block=120, challenges=[],
+    )) is False
+    assert objects.get(f"retry_state/disclosures/{digest}.json") == before
+    source.due_plan_digests = lambda _now: ()
+    assert asyncio.run(run_module._publish_due_batch(
+        source, SimpleNamespace(), finalized_block=120, challenges=[],
+    )) is None
+
+
 @pytest.mark.parametrize("already_scanned", [False, True])
 @pytest.mark.parametrize("same_hotkey", [False, True])
 def test_empty_new_track_recovers_verified_old_submission_before_fifo(
@@ -622,7 +647,7 @@ def test_worker_setup_failure_alerts_and_does_not_poison_next_task(pending_evalu
 
 @pytest.mark.parametrize("benchmark_refresh", [
     "normal", "slow", "error", "inventory_slow", "inventory_error",
-    "disclosure_slow", "disclosure_error",
+    "disclosure_slow", "disclosure_error", "inventory_recovery", "disclosure_recovery",
 ])
 def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     pending_evaluation, monkeypatch, tmp_path, benchmark_refresh,
@@ -634,6 +659,9 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     calls, reports, failures = [], [], []
     snapshots = []
     benchmark_calls = []
+    metadata_snapshots = []
+    metadata_error_seen = threading.Event()
+    recovering = benchmark_refresh.endswith("_recovery")
     original_admission = run_module.process_next_admission
     original_scoring = run_module.evaluate_next_scoring
     owner = threading.get_ident()
@@ -662,20 +690,35 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
         from validator.production.storage import PrivateObjectStore
 
         original_evaluator = run_module.PairedTrackEvaluator
+        if recovering:
+            monkeypatch.setattr(run_module, "_DATA_REFRESH_SECONDS", 0.001)
 
         def inventory_plans():
             assert threading.get_ident() != owner
             benchmark_calls.append(benchmark_refresh)
-            if benchmark_refresh == "inventory_error":
+            if benchmark_refresh == "inventory_error" or (
+                benchmark_refresh == "inventory_recovery" and len(benchmark_calls) == 1
+            ):
                 raise OSError("private inventory read unavailable")
+            if recovering:
+                assert metadata_error_seen.wait(5)
+                return ()
             if not inventory_gate.wait(5):
                 raise OSError("test did not release inventory read")
             return ()
 
         def evaluator_factory(**kwargs):
             evaluator = original_evaluator(**kwargs)
+            evaluator.inventory_status = {
+                "allocated_stages": [], "observed_at_ns": 100,
+                "ready_batches": 4, "producing_batches": 0, "target_batches": 2,
+                "disclosure_pending_batches": 1, "disclosure_observed_at_ns": 50,
+            }
             evaluator.batch_source = SimpleNamespace(
-                _plans=inventory_plans, inventory_status=lambda _plans: {"allocated_stages": []},
+                _plans=inventory_plans, inventory_status=lambda _plans: {
+                    "allocated_stages": [], "observed_at_ns": 200, "ready_batches": 5,
+                    "producing_batches": 0, "target_batches": 2, "disclosure_pending_batches": 1,
+                },
                 protected_plan_digests=lambda *_a: frozenset(), prune_disclosed=lambda _p: 0,
                 due_plan_digests=lambda _now: (),
             )
@@ -691,6 +734,18 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
 
         monkeypatch.setattr(run_module, "PairedTrackEvaluator", evaluator_factory)
         if benchmark_refresh.startswith("disclosure_"):
+            if recovering:
+                async def recover_disclosure(*_args, **_kwargs):
+                    benchmark_calls.append(benchmark_refresh)
+                    if len(benchmark_calls) == 1:
+                        raise OSError("public bulk upload unavailable")
+                    if len(benchmark_calls) == 2:
+                        return False  # Durable cooldown is not a successful retry.
+                    assert await asyncio.to_thread(metadata_error_seen.wait, 5)
+                    return "ab" * 32
+
+                monkeypatch.setattr(run_module, "_publish_due_batch", recover_disclosure)
+
             async def disclose(*_args, **_kwargs):
                 benchmark_calls.append(benchmark_refresh)
                 if benchmark_refresh == "disclosure_error":
@@ -765,12 +820,35 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
             client._finalized += 1
             return
         reports.append(result)
+        metadata_snapshots.append(status.get("inventory", {}))
         weights = decode_weight_artifact(
             case.transport.objects["isolated/heartbeat/weights.json"],
         )
         assert weights.source_block == published_block
         assert weights.plan.uids == (0,)
-        if len(reports) == 3:
+        metadata_ready = True
+        if benchmark_refresh in {"inventory_error", "inventory_recovery"}:
+            errors = [row for row in metadata_snapshots if row.get("refresh_error")]
+            metadata_ready = bool(errors)
+            if status.get("inventory", {}).get("refresh_error"):
+                metadata_error_seen.set()
+            if recovering:
+                metadata_ready = metadata_ready and (
+                    status.get("inventory", {}).get("observed_at_ns") == 200
+                    and status["inventory"].get("refresh_error") is None
+                )
+        elif benchmark_refresh in {"disclosure_error", "disclosure_recovery"}:
+            errors = [row for row in metadata_snapshots if row.get("disclosure_error")]
+            metadata_ready = bool(errors)
+            if len(benchmark_calls) >= 2 and status.get("inventory", {}).get("disclosure_error"):
+                assert status["inventory"]["disclosure_observed_at_ns"] == 50
+                metadata_error_seen.set()
+            if recovering:
+                metadata_ready = metadata_ready and (
+                    status.get("inventory", {}).get("disclosure_observed_at_ns", 0) > 50
+                    and status["inventory"].get("disclosure_error") is None
+                )
+        if len(reports) >= 3 and metadata_ready:
             inventory_gate.set()
             release.set()
             raise StopLoop
@@ -804,14 +882,27 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
         with pytest.raises(StopLoop):
             asyncio.run(execute())
     finally:
+        metadata_error_seen.set()
         inventory_gate.set()
         admission_gate.set()
         release.set()
     assert not failures
     assert len(calls) == 1
-    assert len(reports) == 3
-    if benchmark_refresh != "normal":
+    assert len(reports) >= 3
+    if recovering:
+        assert len(benchmark_calls) >= 2
+    elif benchmark_refresh != "normal":
         assert benchmark_calls == [benchmark_refresh]
+    if benchmark_refresh in {"inventory_error", "inventory_recovery"}:
+        failed = next(row for row in metadata_snapshots if row.get("refresh_error"))
+        assert failed["refresh_error"] == "INVENTORY_REFRESH_FAILED"
+        assert failed["observed_at_ns"] == 100 and failed["ready_batches"] == 4
+    if benchmark_refresh in {"disclosure_error", "disclosure_recovery"}:
+        failed = next(row for row in metadata_snapshots if row.get("disclosure_error"))
+        assert failed["disclosure_error"] == "DATA_DISCLOSURE_FAILURE"
+        assert failed["disclosure_observed_at_ns"] == 50
+    assert "private inventory read unavailable" not in json.dumps(metadata_snapshots)
+    assert "public bulk upload unavailable" not in json.dumps(metadata_snapshots)
     first_height = [payload for height, payload in snapshots if height == 102]
     assert len(first_height) >= 2 and len(set(first_height)) == 1
     assert next(

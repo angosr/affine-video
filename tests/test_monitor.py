@@ -3,6 +3,38 @@ import pytest
 from monitor import render_status
 
 
+@pytest.mark.parametrize("observed_at_ns", [None, 1_000_000_000])
+def test_monitor_flags_missing_or_stale_inventory(monkeypatch, observed_at_ns):
+    monkeypatch.setattr("monitor.time.time_ns", lambda: 200_000_000_000)
+    status = {"participants": [], "inventory": {
+        "observed_at_ns": observed_at_ns, "ready_batches": 4,
+        "producing_batches": 0, "target_batches": 2,
+    }}
+    rendered = render_status(status, color=False)
+    assert "4 ready / 0 producing / 2 target" in rendered
+    assert "STALE" in rendered
+    assert ("unknown" if observed_at_ns is None else "199s ago") in rendered
+
+
+def test_monitor_inventory_and_disclosure_error_recovery(monkeypatch):
+    monkeypatch.setattr("monitor.time.time_ns", lambda: 200_000_000_000)
+    inventory = {
+        "observed_at_ns": 199_000_000_000, "disclosure_observed_at_ns": 198_000_000_000,
+        "ready_batches": 4, "producing_batches": 0, "target_batches": 2,
+        "refresh_error": "INVENTORY_REFRESH_FAILED", "disclosure_error": "DATA_DISCLOSURE_FAILURE",
+    }
+    status = {"participants": [], "inventory": inventory}
+    failed = render_status(status, color=False)
+    assert "INVENTORY_REFRESH_FAILED" in failed and "DATA_DISCLOSURE_FAILURE" in failed
+    assert "1970-01-01T00:03:19+00:00" in failed
+    assert "1970-01-01T00:03:18+00:00" in failed
+    inventory.update(refresh_error=None, disclosure_error=None)
+    recovered = render_status(status, color=False)
+    assert "INVENTORY_REFRESH_FAILED" not in recovered
+    assert "DATA_DISCLOSURE_FAILURE" not in recovered and "STALE" not in recovered
+    assert "4 ready / 0 producing / 2 target" in recovered
+
+
 def test_monitor_renders_all_active_competitors_in_uid_order() -> None:
     status = {
         "netuid": 120,

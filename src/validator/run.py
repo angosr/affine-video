@@ -11,7 +11,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from math import ceil
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import bittensor as bt
 import httpx
@@ -81,6 +81,7 @@ DEFAULT_BASELINE_MANIFEST_URL = f"{PUBLIC_STORAGE_URL}/assets/veda_baseline_f16/
 DEFAULT_NETUID = PRODUCTION_NETUID
 DEFAULT_MECHID = 1
 _LOG = logging.getLogger(__name__)
+_DATA_REFRESH_SECONDS = 30.0
 
 
 class ArtifactRepository(Protocol):
@@ -247,8 +248,8 @@ async def _stage_publication(
 async def _publish_due_batch(
     source: ReadyBatchSource, publisher: ArtifactRepository, *, finalized_block: int,
     challenges: list[dict[str, object]],
-) -> str | None:
-    """At most one bulk job, owned by the existing evaluator, not its FIFO worker."""
+) -> str | None | Literal[False]:
+    """Run one bulk job; False means due data is fenced, None means nothing is due."""
     try:
         protected = await asyncio.to_thread(
             source.protected_plan_digests, challenges, finalized_block,
@@ -295,7 +296,7 @@ async def _publish_due_batch(
                     raise
                 _LOG.exception("disclosure retry completion failed; original error retained")
         return digest
-    return None
+    return False  # Due data exists, but durable retry fences skipped every attempt.
 
 
 async def run_evaluator(
@@ -519,7 +520,7 @@ async def run_evaluator(
         system_match_loader = getattr(publisher, "load_system_matches", None)
         inventory_task: asyncio.Task[dict[str, object]] | None = None
         next_inventory_refresh = 0.0
-        disclosure_task: asyncio.Task[str | None] | None = None
+        disclosure_task: asyncio.Task[str | None | Literal[False]] | None = None
         next_disclosure_refresh = 0.0
 
         def refresh_metadata() -> None:
@@ -544,10 +545,13 @@ async def run_evaluator(
                 )
                 next_system_match_refresh = now + 300.0
             if inventory_task is not None and inventory_task.done():
+                inventory = dict(evaluator.inventory_status or {"allocated_stages": []})
                 try:
-                    evaluator.inventory_status = inventory_task.result()
+                    inventory.update(inventory_task.result(), refresh_error=None)
                 except Exception as exc:
+                    inventory["refresh_error"] = "INVENTORY_REFRESH_FAILED"
                     _LOG.warning("inventory refresh failed; retaining last observation: %s", exc)
+                evaluator.inventory_status = inventory
                 inventory_task = None
             source = evaluator.batch_source
             if source is not None and inventory_task is None and now >= next_inventory_refresh:
@@ -556,14 +560,22 @@ async def run_evaluator(
                         plan for _, plan in source._plans()
                     ))
                 inventory_task = asyncio.create_task(asyncio.to_thread(load_inventory))
-                next_inventory_refresh = now + 30.0
+                next_inventory_refresh = now + _DATA_REFRESH_SECONDS
             if disclosure_task is not None and disclosure_task.done():
+                inventory = dict(evaluator.inventory_status or {"allocated_stages": []})
                 try:
-                    disclosure_task.result()
+                    outcome = disclosure_task.result()
                 except Exception as exc:
+                    inventory["disclosure_error"] = "DATA_DISCLOSURE_FAILURE"
                     _LOG.error("DATA_DISCLOSURE_FAILURE: %s", exc)
                     if alert is not None:
                         alert("DATA_DISCLOSURE_FAILURE", {"error": str(exc)[:500]})
+                else:
+                    if outcome is not False:
+                        inventory.update(
+                            disclosure_error=None, disclosure_observed_at_ns=time.time_ns(),
+                        )
+                evaluator.inventory_status = inventory
                 disclosure_task = None
             cursor = store.chain_cursor()
             if (source is not None and cursor is not None and disclosure_task is None
@@ -574,7 +586,7 @@ async def run_evaluator(
                     source, publisher, finalized_block=cursor[0],
                     challenges=store.public_snapshot()["challenges"],
                 ))
-                next_disclosure_refresh = now + 30.0
+                next_disclosure_refresh = now + _DATA_REFRESH_SECONDS
 
         async def close_system_match_refresh() -> None:
             tasks = [task for task in (system_match_task, inventory_task) if task is not None]
