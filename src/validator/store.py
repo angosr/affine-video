@@ -473,6 +473,32 @@ class ChallengeStore:
             )
         )
 
+    def require_upload_eligible(
+        self, hotkey: str, *, uid: int | None, finalized_block: int,
+    ) -> None:
+        """Read the original participation facts; an upload never spends an opportunity.
+
+        The caller must resolve UID at this finalized snapshot, not from a
+        client claim. Refuse stale scans rather than miss a concurrent HF
+        submission or signed old-contest activation. Admission remains the
+        final arbiter if a new commitment arrives after this permission.
+        """
+        cursor = self.chain_cursor()
+        if (type(finalized_block) is not int or finalized_block < 0
+                or cursor is None or cursor[0] < finalized_block):
+            raise RuntimeError("upload eligibility scan is behind the finalized snapshot")
+        if type(uid) is not int or not 0 < uid <= 0xFFFF:
+            raise ValueError("upload requires a registered non-genesis UID")
+        if self._connection.execute(
+            "SELECT 1 FROM competition_exclusions WHERE hotkey=?", (hotkey,),
+        ).fetchone() is not None:
+            raise ValueError("hotkey is excluded from this competition")
+        if self._connection.execute(
+            "SELECT 1 FROM submissions s JOIN challenges c USING(submission_id) "
+            "WHERE s.hotkey=? AND c.state != 'SYSTEM_NOT_ADMITTED' LIMIT 1", (hotkey,),
+        ).fetchone() is not None:
+            raise ValueError("hotkey already has a formal submission")
+
     def bind_track_spec(self, digest: str) -> None:
         """Bind all future challenges in this database to one frozen spec."""
 

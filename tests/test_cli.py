@@ -215,6 +215,36 @@ def test_removed_miner_submit_command_is_rejected(capsys) -> None:
     assert "invalid choice: 'submit'" in capsys.readouterr().err
 
 
+def test_private_commit_preview_is_explicit_and_does_not_open_chain(monkeypatch, capsys):
+    async def unexpected(*_args, **_kwargs):
+        pytest.fail("preparatory private source opened a chain connection")
+
+    monkeypatch.setattr(cli_module, "submit_model", unexpected)
+    command = ["miner", "commit", "--upload-id", "ab" * 32, "--file-sha256", "cd" * 32]
+    main([*command, "--dry-run"])
+    document = json.loads(capsys.readouterr().out)
+    assert document["source"] == "PRIVATE_S3"
+    assert document["file_sha256"] == "cd" * 32
+    assert document["payload_bytes"] == 68
+    assert "repo_id" not in document and "revision" not in document
+    with pytest.raises(SystemExit) as stopped:
+        main(command)
+    assert stopped.value.code == 1
+    assert "not enabled" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("arguments", [
+    ["--repo-id", "owner/model", "--revision", "12" * 20, "--file-sha256", "ab" * 32],
+    ["--upload-id", "ab" * 32, "--revision", "12" * 20, "--file-sha256", "cd" * 32],
+    ["--upload-id", "ab" * 32],
+    ["--upload-id", "ab" * 32, "--file-sha256", "cd" * 32, "--netuid", "7"],
+])
+def test_commit_rejects_mixed_or_incomplete_sources(arguments, capsys):
+    with pytest.raises(SystemExit) as stopped:
+        main(["miner", "commit", *arguments, "--dry-run"])
+    assert stopped.value.code == 1
+
+
 def test_formal_evaluator_defaults_to_cuda_zero() -> None:
     arguments = cli_module._parser().parse_args(
         [

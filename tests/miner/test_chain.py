@@ -6,7 +6,20 @@ import pytest
 
 from miner import chain
 from miner.chain import ChainSubmissionError, commitment_info, submit_model
-from miner.submit import ModelSubmission
+from miner.submit import ModelSubmission, PrivateModelSubmission
+
+
+def test_preparatory_private_reference_cannot_spend_a_chain_opportunity(monkeypatch):
+    def unexpected(**_kwargs):
+        pytest.fail("unwired private source opened a wallet or chain")
+
+    monkeypatch.setattr(chain.bt, "Wallet", unexpected)
+    monkeypatch.setattr(chain.bt, "Client", unexpected)
+    with pytest.raises(ChainSubmissionError, match="not enabled"):
+        asyncio.run(submit_model(
+            PrivateModelSubmission("ab" * 32, "cd" * 32), netuid=120,
+            network="finney", wallet_name="default", hotkey_name="default",
+        ))
 
 
 def test_commitment_info_uses_runtime_raw_length_variant() -> None:

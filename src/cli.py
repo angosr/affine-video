@@ -13,7 +13,7 @@ from pathlib import Path
 
 from miner.chain import ChainSubmissionError, submit_model
 from miner.prepare import prepare_model
-from miner.submit import ModelSubmission, SubmissionFormatError
+from miner.submit import ModelSubmission, PrivateModelSubmission, SubmissionFormatError
 from monitor import fetch_status, render_status
 from scoring.spec import load_track_spec
 from validator.publication import S3Repository
@@ -53,8 +53,13 @@ def _parser() -> argparse.ArgumentParser:
         "commit",
         help="sign and finalize the hotkey's one allowed model commitment",
     )
-    commit.add_argument("--repo-id", required=True)
-    commit.add_argument("--revision", required=True)
+    source = commit.add_mutually_exclusive_group(required=True)
+    source.add_argument("--repo-id")
+    source.add_argument(
+        "--upload-id", help="sealed private upload ID (preview only until deployed)",
+    )
+    commit.add_argument("--revision")
+    commit.add_argument("--file-sha256", help="complete SHA-256 of the sealed private model")
     commit.add_argument("--netuid", default=DEFAULT_NETUID, type=int)
     commit.add_argument("--network", default="finney")
     commit.add_argument("--wallet-name", default="default")
@@ -190,6 +195,23 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
             raise ValueError("netuid must fit in an unsigned 16-bit integer")
         if not arguments.network:
             raise ValueError("network cannot be empty")
+        if arguments.upload_id is not None:
+            if arguments.netuid != DEFAULT_NETUID:
+                raise ValueError("private submission is restricted to SN120")
+            if arguments.revision is not None or arguments.file_sha256 is None:
+                raise ValueError("private source requires --file-sha256 and forbids --revision")
+            private = PrivateModelSubmission(arguments.upload_id, arguments.file_sha256)
+            if not arguments.dry_run:
+                raise ValueError("private submission is not enabled; only --dry-run is available")
+            print(json.dumps({
+                "source": "PRIVATE_S3", "upload_id": private.upload_id,
+                "file_sha256": private.file_sha256, "netuid": arguments.netuid,
+                "network": arguments.network, "hotkey": arguments.hotkey,
+                "payload_bytes": len(private.encode()), "payload_hex": private.encode().hex(),
+            }, sort_keys=True))
+            return
+        if arguments.revision is None or arguments.file_sha256 is not None:
+            raise ValueError("HF source requires --revision and forbids --file-sha256")
         submission = ModelSubmission(arguments.repo_id, arguments.revision)
         payload = submission.encode()
         if arguments.dry_run:

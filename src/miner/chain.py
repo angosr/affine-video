@@ -51,6 +51,8 @@ async def submit_model(
         raise ValueError("netuid must fit in an unsigned 16-bit integer")
     if not network:
         raise ValueError("network cannot be empty")
+    if not isinstance(submission, ModelSubmission):
+        raise ChainSubmissionError("private submission is not enabled for chain submission")
 
     wallet_arguments = {"name": wallet_name, "hotkey": hotkey_name}
     if wallet_path is not None:

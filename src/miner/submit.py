@@ -7,10 +7,12 @@ bytes can be tested independently of a network connection.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
 MAGIC = b"VDA1"
+PRIVATE_MAGIC = b"VDS1"
 REVISION_BYTES = 20
 REVISION_HEX_LENGTH = REVISION_BYTES * 2
 MAX_REPO_ID_BYTES = 96
@@ -89,3 +91,70 @@ class ModelSubmission:
 
         revision = payload[repo_end:].hex()
         return cls(repo_id=repo_id, revision=revision)
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateModelSubmission:
+    """A sealed private upload, never a URL, credential, or HF revision."""
+
+    upload_id: str
+    file_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in ("upload_id", "file_sha256"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise SubmissionFormatError(f"{name} must be a full lowercase SHA-256 value")
+
+    def encode(self) -> bytes:
+        return PRIVATE_MAGIC + bytes.fromhex(self.upload_id) + bytes.fromhex(self.file_sha256)
+
+    @classmethod
+    def decode(cls, payload: bytes) -> PrivateModelSubmission:
+        if len(payload) != 68 or not payload.startswith(PRIVATE_MAGIC):
+            raise SubmissionFormatError("private submission must be exactly 68 VDS1 bytes")
+        return cls(payload[4:36].hex(), payload[36:].hex())
+
+
+@dataclass(frozen=True, slots=True)
+class UploadIntent:
+    """Short-lived hotkey-signed intent, shared by CLI and upload admission.
+
+    Retrying the exact intent is idempotent, not another competition attempt.
+    The audience is a configured HTTPS authority; genesis separates forks.
+    """
+
+    audience: str
+    genesis_hash: str
+    hotkey: str
+    netuid: int
+    action: str
+    upload_id: str
+    file_sha256: str
+    size_bytes: int
+    manifest_sha256: str
+    expires_at: int
+
+    def __post_init__(self) -> None:
+        from urllib.parse import urlparse
+
+        PrivateModelSubmission(self.upload_id, self.file_sha256)
+        PrivateModelSubmission(self.upload_id, self.manifest_sha256)
+        if re.fullmatch(r"[0-9a-f]{64}", self.genesis_hash) is None:
+            raise ValueError("upload genesis hash must be a full lowercase SHA-256 value")
+        url = urlparse(self.audience)
+        if (url.scheme != "https" or not url.netloc or url.username is not None
+                or url.password is not None or url.query or url.fragment):
+            raise ValueError("upload audience must be a credential-free HTTPS endpoint")
+        if (not self.hotkey or len(self.hotkey) > 64 or type(self.netuid) is not int
+                or self.netuid != 120 or self.action not in {"upload", "seal"}
+                or type(self.size_bytes) is not int or self.size_bytes <= 0
+                or type(self.expires_at) is not int or self.expires_at <= 0):
+            raise ValueError("upload intent fields are invalid")
+
+    def signing_message(self) -> bytes:
+        from dataclasses import asdict
+
+        return b"veda-private-upload-v1\0" + json.dumps(
+            asdict(self), sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("ascii")
