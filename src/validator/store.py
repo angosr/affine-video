@@ -146,6 +146,23 @@ class ChallengeStore:
             self._connection.close()
             raise
 
+    @classmethod
+    def readonly(cls, path: str | Path) -> ChallengeStore:
+        """Open existing authority facts without DDL, WAL setup or track binding."""
+        instance = cls.__new__(cls)
+        connection = sqlite3.connect(
+            Path(path).resolve().as_uri() + "?mode=ro", uri=True,
+            timeout=_SQLITE_BUSY_TIMEOUT_MS / 1_000,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+        except Exception:
+            connection.close()
+            raise
+        instance._connection = connection
+        return instance
+
     def close(self) -> None:
         self._connection.close()
 
@@ -483,21 +500,25 @@ class ChallengeStore:
         submission or signed old-contest activation. Admission remains the
         final arbiter if a new commitment arrives after this permission.
         """
-        cursor = self.chain_cursor()
-        if (type(finalized_block) is not int or finalized_block < 0
-                or cursor is None or cursor[0] < finalized_block):
-            raise RuntimeError("upload eligibility scan is behind the finalized snapshot")
-        if type(uid) is not int or not 0 < uid <= 0xFFFF:
-            raise ValueError("upload requires a registered non-genesis UID")
-        if self._connection.execute(
-            "SELECT 1 FROM competition_exclusions WHERE hotkey=?", (hotkey,),
-        ).fetchone() is not None:
-            raise ValueError("hotkey is excluded from this competition")
-        if self._connection.execute(
-            "SELECT 1 FROM submissions s JOIN challenges c USING(submission_id) "
-            "WHERE s.hotkey=? AND c.state != 'SYSTEM_NOT_ADMITTED' LIMIT 1", (hotkey,),
-        ).fetchone() is not None:
-            raise ValueError("hotkey already has a formal submission")
+        self._connection.execute("BEGIN")
+        try:
+            cursor = self.chain_cursor()
+            if (type(finalized_block) is not int or finalized_block < 0
+                    or cursor is None or cursor[0] < finalized_block):
+                raise RuntimeError("upload eligibility scan is behind the finalized snapshot")
+            if type(uid) is not int or not 0 < uid <= 0xFFFF:
+                raise ValueError("upload requires a registered non-genesis UID")
+            if self._connection.execute(
+                "SELECT 1 FROM competition_exclusions WHERE hotkey=?", (hotkey,),
+            ).fetchone() is not None:
+                raise ValueError("hotkey is excluded from this competition")
+            if self._connection.execute(
+                "SELECT 1 FROM submissions s JOIN challenges c USING(submission_id) "
+                "WHERE s.hotkey=? AND c.state != 'SYSTEM_NOT_ADMITTED' LIMIT 1", (hotkey,),
+            ).fetchone() is not None:
+                raise ValueError("hotkey already has a formal submission")
+        finally:
+            self._connection.rollback()
 
     def bind_track_spec(self, digest: str) -> None:
         """Bind all future challenges in this database to one frozen spec."""

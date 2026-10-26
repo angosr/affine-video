@@ -1,14 +1,15 @@
-"""Private upload admission primitives, without an HTTP server or a second queue.
+"""Private upload metadata admission and the original ADMISSION source adapter.
 
-The hosting adapter supplies a fresh finalized registration lookup and the
-existing scanned ChallengeStore. Temporary S3 writes are separated from the
-existing immutable model archive. Only the latter can be used after sealing.
+The thin HTTP adapter uses only authorize/seal. It never handles model bodies
+or writes the models archive. Real byte verification happens in download,
+called by the existing admission worker before its ordinary schema/owner gate.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -17,8 +18,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 from miner.submit import PrivateModelSubmission, UploadIntent
+from scoring.model import model_file_sha256
 from validator.chunks import ChunkManifest, verify_chunked_content
-from validator.download import DownloadedModel
+from validator.download import DownloadedModel, ModelDownloadError
 from validator.production.commitment import canonical_json
 from validator.production.storage import PrivateObjectStore, StoredObject
 from validator.store import ChallengeStore
@@ -43,17 +45,18 @@ class UploadGrant:
 
 
 class PrivateUploads:
-    """CAS upload quota and immutable sealing; NOT a participation ledger.
+    """One CAS upload record plus a hotkey quota pointer, NOT an opportunity ledger.
 
-    This preparatory API is not wired into the live evaluator or exposed as a
-    listener. Deployment must supply restricted staging and authority clients.
+    This preparatory API is not exposed as a listener or wired into the live
+    evaluator. The host must supply restricted staging/authority clients and
+    a finalized SN120 registration lookup, never a client-provided UID.
     """
 
     def __init__(
         self, *, objects: PrivateObjectStore, staging_client: Any,
         staging_bucket: str, staging_prefix: str, audience: str, genesis_hash: str,
         store: ChallengeStore, registration: Callable[[str], tuple[int | None, int]],
-        max_bytes: int, cache_dir: str | Path,
+        max_bytes: int,
     ) -> None:
         if (not staging_bucket or "/" in staging_bucket or staging_bucket == "affine_video"
                 or not staging_prefix or any(
@@ -69,7 +72,6 @@ class PrivateUploads:
         self.store = store
         self.registration = registration
         self.max_bytes = max_bytes
-        self.cache_dir = Path(cache_dir)
 
     def _authenticate(self, intent: UploadIntent, signature: bytes, *, now: int) -> None:
         if (intent.audience != self.audience or intent.genesis_hash != self.genesis_hash
@@ -88,7 +90,6 @@ class PrivateUploads:
             raise ValueError("upload hotkey signature is invalid")
 
     def _eligible(self, intent: UploadIntent) -> None:
-        # A lookup error propagates: no capability is issued on unknown state.
         uid, finalized_block = self.registration(intent.hotkey)
         self.store.require_upload_eligible(
             intent.hotkey, uid=uid, finalized_block=finalized_block,
@@ -103,70 +104,93 @@ class PrivateUploads:
         }
 
     @staticmethod
-    def _lease_name(hotkey: str) -> str:
-        return f"uploads/leases/{hashlib.sha256(hotkey.encode()).hexdigest()}.json"
+    def _record_name(upload_id: str) -> str:
+        return f"uploads/{upload_id}.json"
+
+    @staticmethod
+    def _quota_name(hotkey: str) -> str:
+        return f"uploads/hotkeys/{hashlib.sha256(hotkey.encode()).hexdigest()}.json"
 
     def _key(self, intent: UploadIntent) -> str:
         owner = hashlib.sha256(intent.hotkey.encode()).hexdigest()
         return f"{self.prefix}/{owner}/{intent.upload_id}"
 
-    def _read(self, hotkey: str) -> tuple[StoredObject | None, dict[str, Any] | None]:
-        stored = self.objects.get_optional(self._lease_name(hotkey))
+    def _read(self, upload_id: str) -> tuple[StoredObject | None, dict[str, Any] | None]:
+        stored = self.objects.get_optional(self._record_name(upload_id))
         if stored is None:
             return None, None
         value = json.loads(stored.body)
         if (not isinstance(value, dict) or set(value) != {
             "format", "hotkey", "upload_id", "file_sha256", "size_bytes", "expires_at", "state",
             "manifest", "manifest_sha256",
-        } or value["format"] != "veda-upload-lease-v1" or value["hotkey"] != hotkey
+        } or value["format"] != "veda-upload-v1" or value["upload_id"] != upload_id
+                or not isinstance(value["hotkey"], str) or not value["hotkey"]
                 or value["state"] not in {"UPLOADING", "SEALED"}
                 or type(value["expires_at"]) is not int
                 or type(value["size_bytes"]) is not int
                 or not 0 < value["size_bytes"] <= self.max_bytes):
-            raise ValueError("private upload quota record is invalid")
+            raise ValueError("private upload record is invalid")
         PrivateModelSubmission(value["upload_id"], value["file_sha256"])
         manifest = ChunkManifest.decode(canonical_json(value["manifest"]))
         if (manifest.sha256 != value["file_sha256"] or manifest.size != value["size_bytes"]
                 or hashlib.sha256(manifest.encode()).hexdigest() != value["manifest_sha256"]):
-            raise ValueError("private upload quota manifest conflicts with its identity")
+            raise ValueError("private upload manifest conflicts with its identity")
         return stored, value
+
+    def _claim_quota(self, intent: UploadIntent, *, now: int) -> None:
+        name = self._quota_name(intent.hotkey)
+        stored = self.objects.get_optional(name)
+        expires = intent.expires_at
+        if stored is not None:
+            value = json.loads(stored.body)
+            if (not isinstance(value, dict) or set(value) != {
+                "hotkey", "upload_id", "expires_at",
+            } or value["hotkey"] != intent.hotkey or type(value["expires_at"]) is not int):
+                raise ValueError("private upload quota pointer is invalid")
+            PrivateModelSubmission(value["upload_id"], intent.file_sha256)
+            if value["upload_id"] != intent.upload_id and value["expires_at"] > now:
+                raise ValueError("another upload is active")
+            if value["upload_id"] == intent.upload_id and value["expires_at"] >= expires:
+                return
+        document = canonical_json({
+            "hotkey": intent.hotkey, "upload_id": intent.upload_id, "expires_at": expires,
+        })
+        if stored is None:
+            self.objects.create_plan(name, document)
+        else:
+            self.objects.replace_plan(name, document, etag=stored.etag)
 
     def authorize(
         self, intent: UploadIntent, signature: bytes, *, manifest: ChunkManifest, now: int,
     ) -> UploadGrant:
-        """Authorize only fixed original-format chunks, checking original eligibility."""
         if intent.action != "upload":
             raise ValueError("expected an upload intent")
         self._authenticate(intent, signature, now=now)
-        # The hosting adapter must bound the small JSON body before decoding it.
         manifest = ChunkManifest.decode(manifest.encode())
         if (manifest.sha256 != intent.file_sha256 or manifest.size != intent.size_bytes
                 or hashlib.sha256(manifest.encode()).hexdigest() != intent.manifest_sha256):
             raise ValueError("upload manifest differs from signed intent")
         self._eligible(intent)
-        stored, previous = self._read(intent.hotkey)
+        stored, previous = self._read(intent.upload_id)
         identity = self._identity(intent)
         if previous is not None:
-            same = all(previous[key] == value for key, value in identity.items())
-            if (same and previous["state"] == "SEALED") or (
-                not same and previous["expires_at"] > now
-            ):
-                raise ValueError("another upload is active or already sealed")
-            if same and previous["expires_at"] >= intent.expires_at:
-                # Exact replay may recover a lost response, never extend its lifetime.
-                return self._grant(intent, manifest, now=now)
-        document = canonical_json({
-            "format": "veda-upload-lease-v1", **identity,
-            "state": "UPLOADING", "expires_at": intent.expires_at,
-            "manifest": json.loads(manifest.encode()),
-        })
-        if stored is None:
-            self.objects.create_plan(self._lease_name(intent.hotkey), document)
-        else:
-            self.objects.replace_plan(self._lease_name(intent.hotkey), document, etag=stored.etag)
-        return self._grant(intent, manifest, now=now)
-
-    def _grant(self, intent: UploadIntent, manifest: ChunkManifest, *, now: int) -> UploadGrant:
+            if any(previous[key] != value for key, value in identity.items()):
+                raise ValueError("upload identity is already fixed")
+            if previous["state"] == "SEALED":
+                raise ValueError("upload is already sealed")
+        self._claim_quota(intent, now=now)
+        if previous is None or previous["expires_at"] < intent.expires_at:
+            document = canonical_json({
+                "format": "veda-upload-v1", **identity,
+                "state": "UPLOADING", "expires_at": intent.expires_at,
+                "manifest": json.loads(manifest.encode()),
+            })
+            if stored is None:
+                self.objects.create_plan(self._record_name(intent.upload_id), document)
+            else:
+                self.objects.replace_plan(
+                    self._record_name(intent.upload_id), document, etag=stored.etag,
+                )
         parts = []
         for part in manifest.parts:
             url = self.staging.generate_presigned_url(
@@ -185,62 +209,29 @@ class PrivateUploads:
     def seal(
         self, intent: UploadIntent, signature: bytes, *, now: int,
     ) -> PrivateModelSubmission:
-        """Hash real bytes, archive once, then CAS seal. Do not trust S3 metadata.
-
-        An old presigned URL can still overwrite staging, but can never write
-        the content-addressed archive or change the sealed reference.
-        """
+        """Freeze metadata, not acceptance. HEAD confirms only transport completion."""
         if intent.action != "seal":
             raise ValueError("expected a seal intent")
         self._authenticate(intent, signature, now=now)
-        stored, record = self._read(intent.hotkey)
+        stored, record = self._read(intent.upload_id)
         if (stored is None or record is None or any(
             record[key] != value for key, value in self._identity(intent).items()
         )):
             raise ValueError("upload has no matching authorization")
+        reference = PrivateModelSubmission(intent.upload_id, intent.file_sha256)
         if record["state"] == "SEALED":
-            return self._receipt(record)
+            return reference
         self._eligible(intent)
         manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
-
-        def open_part(name: str):
-            response = self.staging.get_object(
-                Bucket=self.bucket, Key=f"{self._key(intent)}/{name}",
+        for part in manifest.parts:
+            observed = self.staging.head_object(
+                Bucket=self.bucket, Key=f"{self._key(intent)}/{part.name}",
             )
-            body = response["Body"]
-            expected_size = next(part.size for part in manifest.parts if part.name == name)
-            if response.get("ContentLength") != expected_size:
-                body.close()
-                raise ValueError("private upload part length differs from signed manifest")
-            return body
-
-        # Run this verifier on the existing owner, not as a body-proxying HTTPS
-        # function. Upload bytes go directly from the miner into staging S3.
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=self.cache_dir, suffix=".upload") as output:
-            verify_chunked_content(manifest, open_part, write=output.write)
-            output.flush()
-            self._eligible(intent)
-            self.objects.put_content(
-                output.name, sha256=intent.file_sha256,
-                object_name=f"models/{intent.file_sha256}.safetensors",
-            )
-        sealed = {**record, "state": "SEALED"}
+            if observed.get("ContentLength") != part.size:
+                raise ValueError("upload part is not complete")
         self.objects.replace_plan(
-            self._lease_name(intent.hotkey), canonical_json(sealed), etag=stored.etag,
-        )
-        return self._receipt(sealed)
-
-    def _receipt(self, record: dict[str, Any]) -> PrivateModelSubmission:
-        reference = PrivateModelSubmission(record["upload_id"], record["file_sha256"])
-        # Recover this exact immutable receipt if the previous response was lost.
-        self.objects.create_plan(
-            f"uploads/sealed/{reference.upload_id}.json", canonical_json({
-                "format": "veda-sealed-upload-v1",
-                **{key: record[key] for key in (
-                    "hotkey", "upload_id", "file_sha256", "size_bytes",
-                )},
-            }),
+            self._record_name(intent.upload_id), canonical_json({**record, "state": "SEALED"}),
+            etag=stored.etag,
         )
         return reference
 
@@ -248,20 +239,62 @@ class PrivateUploads:
         self, reference: PrivateModelSubmission, *, hotkey: str, cache_dir: str | Path,
         max_bytes: int,
     ) -> DownloadedModel:
-        """Source adapter to the original model cache/archive; no HF impersonation."""
-        stored = self.objects.get(f"uploads/sealed/{reference.upload_id}.json")
-        value = json.loads(stored.body)
-        if (not isinstance(value, dict) or set(value) != {
-            "format", "hotkey", "upload_id", "file_sha256", "size_bytes",
-        } or value["format"] != "veda-sealed-upload-v1"
-                or value["hotkey"] != hotkey or value["upload_id"] != reference.upload_id
-                or value["file_sha256"] != reference.file_sha256
-                or type(value["size_bytes"]) is not int
-                or not 0 < value["size_bytes"] <= min(max_bytes, self.max_bytes)):
-            raise ValueError("sealed upload does not match the submitting identity")
-        path = self.objects.download_content(
-            f"models/{reference.file_sha256}.safetensors",
-            Path(cache_dir) / f"{reference.file_sha256}.safetensors",
-            sha256=reference.file_sha256, size_bytes=value["size_bytes"],
+        """ADMISSION source adapter: verify actual bytes once, then normal validation."""
+        try:
+            _, record = self._read(reference.upload_id)
+        except Exception as exc:
+            raise ModelDownloadError(
+                "PRIVATE_UPLOAD_AUTHORITY_UNAVAILABLE", "private source cannot be verified",
+                temporary=True,
+            ) from exc
+        if record is None or record["state"] != "SEALED":
+            raise ModelDownloadError(
+                "PRIVATE_UPLOAD_UNAVAILABLE", "private source is not available",
+                temporary=True,
+            )
+        if record["hotkey"] != hotkey or record["file_sha256"] != reference.file_sha256:
+            raise ModelDownloadError(
+                "PRIVATE_UPLOAD_BINDING_MISMATCH", "private source is not sealed for this hotkey",
+            )
+        if record["size_bytes"] > max_bytes:
+            raise ModelDownloadError("MODEL_TOO_LARGE", "private source exceeds the byte limit")
+        manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
+        target = Path(cache_dir) / f"{reference.file_sha256}.safetensors"
+        if (target.is_file() and target.stat().st_size == manifest.size
+                and model_file_sha256(target) == reference.file_sha256):
+            return DownloadedModel(target, reference.file_sha256, manifest.size, None, None)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        intent_key = (
+            f"{self.prefix}/{hashlib.sha256(hotkey.encode()).hexdigest()}/{reference.upload_id}"
         )
-        return DownloadedModel(path, reference.file_sha256, value["size_bytes"], None, None)
+
+        def open_part(name: str):
+            response = self.staging.get_object(
+                Bucket=self.bucket, Key=f"{intent_key}/{name}",
+            )
+            return response["Body"]
+
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=target.parent, suffix=".part", delete=False,
+            ) as out:
+                temporary = Path(out.name)
+                verify_chunked_content(manifest, open_part, write=out.write)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, target)
+            temporary = None
+        except ValueError as exc:
+            raise ModelDownloadError(
+                "PRIVATE_UPLOAD_HASH_MISMATCH", "private source failed byte verification",
+            ) from exc
+        except Exception as exc:
+            raise ModelDownloadError(
+                "PRIVATE_UPLOAD_UNAVAILABLE", "private source is temporarily unavailable",
+                temporary=True,
+            ) from exc
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return DownloadedModel(target, reference.file_sha256, manifest.size, None, None)

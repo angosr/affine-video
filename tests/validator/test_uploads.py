@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Barrier, Lock
@@ -13,6 +14,7 @@ from safetensors.numpy import save
 from miner.submit import ModelSubmission, PrivateModelSubmission, UploadIntent
 from scoring.model import TensorSpec, validate_model
 from validator.chunks import CHUNK_BYTES, ChunkManifest, ChunkPart, build_chunk_manifest, read_part
+from validator.download import ModelDownloadError
 from validator.production.storage import PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
@@ -29,6 +31,7 @@ class StagingS3(MemoryS3):
     def __init__(self):
         super().__init__()
         self.grants = []
+        self.reads = []
 
     def generate_presigned_url(self, operation, **kwargs):
         assert operation == "put_object"
@@ -36,6 +39,7 @@ class StagingS3(MemoryS3):
         return "https://private.example/staging?secret=bearer"
 
     def get_object(self, **kwargs):
+        self.reads.append(kwargs["Key"])
         result = super().get_object(**kwargs)
         result["ContentLength"] = len(self.objects[(kwargs["Bucket"], kwargs["Key"])][0])
         return result
@@ -62,7 +66,7 @@ def setup(tmp_path):
             objects=PrivateObjectStore(authority, bucket="private", prefix="test"),
             staging_client=staging, staging_bucket="uploads-private", staging_prefix="temporary",
             audience=intent.audience, genesis_hash=intent.genesis_hash, store=store,
-            registration=lambda _hotkey: (9, 100), max_bytes=10_000, cache_dir=tmp_path / "seal",
+            registration=lambda _hotkey: (9, 100), max_bytes=10_000,
         )
         yield uploads, intent, payload, store
 
@@ -101,7 +105,7 @@ def formal_submission(store, hotkey=KEY.ss58_address, block=100):
     return identifier
 
 
-def test_real_hotkey_signature_retry_seal_and_original_archive_adapter(setup, tmp_path):
+def test_seal_freezes_metadata_and_admission_verifies_the_real_source_once(setup, tmp_path):
     uploads, intent, payload, store = setup
     grant, params = upload(uploads, intent, payload)
     before = dict(uploads.objects._client.objects)
@@ -118,8 +122,14 @@ def test_real_hotkey_signature_retry_seal_and_original_archive_adapter(setup, tm
 
     seal = replace(intent, action="seal")
     reference = uploads.seal(seal, sign(seal), now=NOW + 1)
-    # An unexpired presigned URL is reusable; post-seal overwrites never affect source bytes.
+    assert uploads.staging.reads == []  # HTTP seal never proxies a model body
+    # Seal success is NOT file acceptance. An unexpired URL can still overwrite staging.
     uploads.staging.put_object(Bucket=params["Bucket"], Key=params["Key"], Body=b"replaced")
+    with pytest.raises(ModelDownloadError) as invalid:
+        uploads.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cold",
+                         max_bytes=10_000)
+    assert invalid.value.code == "PRIVATE_UPLOAD_HASH_MISMATCH"
+    uploads.staging.put_object(Bucket=params["Bucket"], Key=params["Key"], Body=payload)
     restored = uploads.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cold",
                                 max_bytes=10_000)
     assert restored.path.read_bytes() == payload
@@ -127,6 +137,8 @@ def test_real_hotkey_signature_retry_seal_and_original_archive_adapter(setup, tm
     assert validate_model(restored.path, schema=SCHEMA, max_bytes=10_000,
                           expected_hotkey=intent.hotkey).file_sha256 == reference.file_sha256
     assert uploads.seal(seal, sign(seal), now=NOW + 2) == reference
+    assert not any("/models/" in key for _, key in uploads.objects._client.objects)
+    assert all("/uploads/" in key for _, key in uploads.objects._client.objects)
     with pytest.raises(ValueError, match="already sealed"):
         authorize(uploads, intent, now=NOW + 2)
     assert store.public_snapshot()["challenges"] == []
@@ -205,16 +217,19 @@ def test_registration_loss_after_upload_prevents_seal(setup):
         uploads.seal(seal, sign(seal), now=NOW + 1)
 
 
-def test_client_metadata_cannot_replace_real_full_sha_verification(setup):
+def test_seal_checks_transport_only_metadata_cannot_replace_admission_full_sha(setup, tmp_path):
     uploads, intent, payload, _ = setup
     upload(uploads, intent, b"!" * len(payload))
     seal = replace(intent, action="seal")
-    with pytest.raises(ValueError, match="chunk conflicts"):
-        uploads.seal(seal, sign(seal), now=NOW + 1)
+    reference = uploads.seal(seal, sign(seal), now=NOW + 1)
+    with pytest.raises(ModelDownloadError) as invalid:
+        uploads.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cache",
+                         max_bytes=10_000)
+    assert invalid.value.code == "PRIVATE_UPLOAD_HASH_MISMATCH"
     assert not any("/models/" in key for _, key in uploads.objects._client.objects)
 
 
-def test_s3_stream_is_bounded_even_with_forged_content_length(setup, monkeypatch):
+def test_s3_stream_is_bounded_even_with_forged_content_length(setup, monkeypatch, tmp_path):
     uploads, intent, payload, _ = setup
     upload(uploads, intent, payload)
     seal = replace(intent, action="seal")
@@ -222,12 +237,15 @@ def test_s3_stream_is_bounded_even_with_forged_content_length(setup, monkeypatch
     monkeypatch.setattr(uploads.staging, "get_object", lambda **_kwargs: {
         "ContentLength": len(payload), "Body": body,
     })
-    with pytest.raises(ValueError, match="exceeds manifest size"):
-        uploads.seal(seal, sign(seal), now=NOW + 1)
+    reference = uploads.seal(seal, sign(seal), now=NOW + 1)
+    with pytest.raises(ModelDownloadError) as invalid:
+        uploads.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cache",
+                         max_bytes=10_000)
+    assert invalid.value.code == "PRIVATE_UPLOAD_HASH_MISMATCH"
     assert body.closed
 
 
-@pytest.mark.parametrize("lost_on", ["lease", "seal", "receipt"])
+@pytest.mark.parametrize("lost_on", ["quota", "upload", "seal"])
 def test_committed_response_loss_recovers_exact_original_bytes_without_new_chance(setup, lost_on):
     uploads, intent, payload, store = setup
     client = uploads.objects._client
@@ -240,9 +258,9 @@ def test_committed_response_loss_recovers_exact_original_bytes_without_new_chanc
         key = kwargs["Key"]
         document = json.loads(kwargs["Body"]) if key.endswith(".json") else {}
         matches = (
-            lost_on == "lease" and document.get("state") == "UPLOADING"
+            lost_on == "quota" and "/hotkeys/" in key
+            or lost_on == "upload" and document.get("state") == "UPLOADING"
             or lost_on == "seal" and document.get("state") == "SEALED"
-            or lost_on == "receipt" and "/sealed/" in key
         )
         if matches and not lost:
             lost = True
@@ -250,18 +268,18 @@ def test_committed_response_loss_recovers_exact_original_bytes_without_new_chanc
         return response
 
     client.put_object = put
-    if lost_on == "lease":
+    if lost_on != "seal":
         with pytest.raises(RuntimeError, match="response lost"):
             authorize(uploads, intent, now=NOW)
     upload(uploads, intent, payload)
     seal = replace(intent, action="seal")
-    if lost_on != "lease":
+    if lost_on == "seal":
         with pytest.raises(RuntimeError, match="response lost"):
             uploads.seal(seal, sign(seal), now=NOW + 1)
     reference = uploads.seal(seal, sign(seal), now=NOW + 2)
-    receipt = uploads.objects.get(f"uploads/sealed/{reference.upload_id}.json")
+    receipt = uploads.objects.get(uploads._record_name(reference.upload_id))
     assert uploads.seal(seal, sign(seal), now=NOW + 3) == reference
-    assert uploads.objects.get(f"uploads/sealed/{reference.upload_id}.json") == receipt
+    assert uploads.objects.get(uploads._record_name(reference.upload_id)) == receipt
     assert store.public_snapshot()["challenges"] == []
 
 
@@ -275,7 +293,7 @@ def test_source_adapter_rejects_wrong_owner_digest_and_oversize(setup, tmp_path)
         (replace(reference, file_sha256="bb" * 32), intent.hotkey, 10_000),
         (reference, intent.hotkey, len(payload) - 1),
     ):
-        with pytest.raises(ValueError, match="submitting identity"):
+        with pytest.raises(ModelDownloadError):
             uploads.download(wrong_ref, hotkey=owner, cache_dir=tmp_path / "wrong",
                              max_bytes=max_bytes)
     assert not (tmp_path / "wrong").exists()
@@ -301,7 +319,7 @@ def test_concurrent_different_uploads_for_one_hotkey_only_issue_one_capability(s
     database = store._connection.execute("PRAGMA database_list").fetchone()[2]
 
     def get(**kwargs):
-        if "/leases/" not in kwargs["Key"]:
+        if "/hotkeys/" not in kwargs["Key"]:
             return original_get(**kwargs)
         try:
             result = original_get(**kwargs)
@@ -317,13 +335,13 @@ def test_concurrent_different_uploads_for_one_hotkey_only_issue_one_capability(s
     client.get_object, client.put_object = get, put
 
     def issue(candidate):
-        with ChallengeStore(database) as connection:
+        with ChallengeStore.readonly(database) as connection:
             worker = PrivateUploads(
                 objects=uploads.objects, staging_client=uploads.staging,
                 staging_bucket=uploads.bucket, staging_prefix=uploads.prefix,
                 audience=uploads.audience, genesis_hash=uploads.genesis_hash,
                 store=connection, registration=uploads.registration,
-                max_bytes=uploads.max_bytes, cache_dir=uploads.cache_dir,
+                max_bytes=uploads.max_bytes,
             )
             try:
                 return authorize(worker, candidate, now=NOW)
@@ -337,18 +355,17 @@ def test_concurrent_different_uploads_for_one_hotkey_only_issue_one_capability(s
     assert store.public_snapshot()["challenges"] == []
 
 
-def test_sealed_response_and_bytes_recover_with_fresh_adapter_without_staging(setup, tmp_path):
+def test_fresh_adapter_recovers_the_same_sealed_record_and_verifies_staging(setup, tmp_path):
     uploads, intent, payload, _ = setup
-    _, params = upload(uploads, intent, payload)
+    upload(uploads, intent, payload)
     seal = replace(intent, action="seal")
     reference = uploads.seal(seal, sign(seal), now=NOW + 1)
-    uploads.staging.delete_object(Bucket=params["Bucket"], Key=params["Key"])
     fresh = PrivateUploads(
         objects=uploads.objects, staging_client=uploads.staging,
         staging_bucket=uploads.bucket, staging_prefix=uploads.prefix,
         audience=uploads.audience, genesis_hash=uploads.genesis_hash,
         store=uploads.store, registration=uploads.registration,
-        max_bytes=uploads.max_bytes, cache_dir=tmp_path / "fresh-seal",
+        max_bytes=uploads.max_bytes,
     )
     assert fresh.seal(seal, sign(seal), now=NOW + 2) == reference
     restored = fresh.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "fresh-model",
@@ -383,9 +400,8 @@ def test_original_40mib_chunks_resume_without_reupload_and_verify_complete_file(
                                Body=read_part(source, 0, CHUNK_BYTES))
     original_etag = uploads.staging.objects[(first["Bucket"], first["Key"])][1]
     seal = replace(intent, action="seal")
-    with pytest.raises(KeyError):
+    with pytest.raises(RuntimeError, match="missing"):
         uploads.seal(seal, sign(seal), now=NOW + 1)
-    assert list(uploads.cache_dir.iterdir()) == []
     assert not any("/models/" in key for _, key in uploads.objects._client.objects)
     # Resume the missing original part, not another upload or competition opportunity.
     uploads.staging.put_object(Bucket=second["Bucket"], Key=second["Key"],
@@ -398,7 +414,7 @@ def test_original_40mib_chunks_resume_without_reupload_and_verify_complete_file(
     assert store.public_snapshot()["challenges"] == []
 
 
-def test_valid_part_sha_cannot_substitute_for_signed_complete_file_sha(setup):
+def test_valid_part_sha_cannot_substitute_for_signed_complete_file_sha(setup, tmp_path):
     uploads, original, payload, _ = setup
     manifest = ChunkManifest("bb" * 32, len(payload), (
         ChunkPart("part-00000", hashlib.sha256(payload).hexdigest(), len(payload)),
@@ -409,6 +425,53 @@ def test_valid_part_sha_cannot_substitute_for_signed_complete_file_sha(setup):
     params = uploads.staging.grants[-1]["Params"]
     uploads.staging.put_object(Bucket=params["Bucket"], Key=params["Key"], Body=payload)
     seal = replace(intent, action="seal")
-    with pytest.raises(ValueError, match="complete digest"):
-        uploads.seal(seal, sign(seal), now=NOW + 1)
+    reference = uploads.seal(seal, sign(seal), now=NOW + 1)
+    with pytest.raises(ModelDownloadError) as invalid:
+        uploads.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cache",
+                         max_bytes=10_000)
+    assert invalid.value.code == "PRIVATE_UPLOAD_HASH_MISMATCH"
     assert not any("/models/" in key for _, key in uploads.objects._client.objects)
+
+
+def test_readonly_eligibility_uses_existing_schema_and_cannot_write(setup, monkeypatch, tmp_path):
+    _, intent, _, writer = setup
+    path = writer._connection.execute("PRAGMA database_list").fetchone()[2]
+
+    def no_initialize(_self):
+        pytest.fail("read-only upload admission attempted DDL/WAL initialization")
+
+    monkeypatch.setattr(ChallengeStore, "_initialize", no_initialize)
+    with ChallengeStore.readonly(path) as reader:
+        reader.require_upload_eligible(intent.hotkey, uid=9, finalized_block=100)
+        assert reader._connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader._connection.execute("DELETE FROM submissions")
+    missing = tmp_path / "must-not-create.db"
+    with pytest.raises(sqlite3.OperationalError):
+        ChallengeStore.readonly(missing)
+    assert not missing.exists()
+    assert writer.public_snapshot()["challenges"] == []
+
+
+def test_eligibility_cursor_exclusions_and_opportunity_share_one_read_snapshot(setup):
+    _, intent, _, writer = setup
+    path = writer._connection.execute("PRAGMA database_list").fetchone()[2]
+    with ChallengeStore.readonly(path) as reader:
+        queries = []
+        inserted = False
+
+        def trace(query):
+            nonlocal inserted
+            queries.append(query)
+            if "FROM competition_exclusions" in query and not inserted:
+                inserted = True
+                formal_submission(writer, block=101)
+
+        reader._connection.set_trace_callback(trace)
+        # This snapshot precedes the new commitment; mixing snapshots would
+        # observe a half-old/half-new qualification. ADMISSION still arbitrates.
+        reader.require_upload_eligible(intent.hotkey, uid=9, finalized_block=100)
+        assert queries[0] == "BEGIN" and queries[-1] == "ROLLBACK"
+        reader._connection.set_trace_callback(None)
+        with pytest.raises(ValueError, match="formal submission"):
+            reader.require_upload_eligible(intent.hotkey, uid=9, finalized_block=100)
