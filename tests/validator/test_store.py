@@ -1,12 +1,18 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Barrier
 
 import pytest
 
-from validator.queue import ChainPosition, ChallengeState, submission_id
+from miner.submit import ModelSubmission, PrivateModelSubmission, model_source_fields
+from validator.production.commitment import canonical_json
+from validator.queue import ChainPosition, ChallengeState, challenge_id, submission_id
+from validator.scan import ChainCommitment, submission_from_commitment
 from validator.store import ChallengeStore, SubmissionRecord
 from validator.tournament import Champion, resolve_tournament
 from validator.weights import plan_champion_weight
+
+from .test_tournament import challenge as scored_challenge
 
 
 def make_submission(*, hotkey: str = "hk1") -> SubmissionRecord:
@@ -504,6 +510,60 @@ def test_failed_admission_public_match_restores_without_model_ownership(tmp_path
             == 1
         )
         assert store.model_owner("ef" * 32) is None
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("damage", [None, "upload_id", "file_sha256", "hf"])
+def test_private_public_history_binds_original_chain_payload_and_spent_opportunity(
+    tmp_path, existing, damage,
+):
+    reference = PrivateModelSubmission("ef" * 32, "ab" * 32)
+    record = submission_from_commitment(ChainCommitment(
+        "alice", 120, "ab" * 32, ChainPosition(101, 0, 0), reference.encode(),
+    ))
+    item = scored_challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    item.update(challenge_id=challenge_id(record.submission_id), submission_id=record.submission_id,
+        **model_source_fields(None, None, reference))
+    ledger = resolve_tournament(
+        [item], track_id="private-track", track_spec_digest="ab" * 32, netuid=120,
+        minimum_gain=0.003, minimum_exact_gain=0.003, initial_champion=genesis_champion(),
+    )
+    original = canonical_json(ledger.matches[0].document)
+    chain_record = record
+    if damage == "hf":
+        hf = ModelSubmission("owner/model", "12" * 20)
+        chain_record = replace(record, payload=hf.encode(), repo_id=hf.repo_id,
+                               revision=hf.revision)
+    elif damage is not None:
+        chain_record = replace(record, payload=replace(reference, **{damage: "ff" * 32}).encode())
+    with ChallengeStore(tmp_path / "cold.db", track_spec_digest="ab" * 32) as store:
+        if existing:
+            store.add_submission(chain_record)
+        if damage is not None:
+            with pytest.raises(RuntimeError, match="(chain input|on-chain submission)"):
+                store.restore_public_matches(ledger.matches,
+                                             submissions={record.submission_id: chain_record})
+            if existing:
+                assert (store.get_challenge(ledger.matches[0].challenge_id).state
+                        is ChallengeState.QUEUED)
+            else:
+                assert store.public_snapshot()["challenges"] == []
+            return
+        assert store.restore_public_matches(ledger.matches,
+                                            submissions={record.submission_id: record}) == 1
+        replayed = resolve_tournament(
+            store.public_snapshot()["challenges"], track_id="private-track",
+            track_spec_digest="ab" * 32, netuid=120, minimum_gain=0.003,
+            minimum_exact_gain=0.003, initial_champion=genesis_champion(),
+        )
+        assert canonical_json(replayed.matches[0].document) == original
+        assert replayed.champion.private_submission == reference
+        hf = ModelSubmission("owner/model", "12" * 20)
+        position = ChainPosition(102, 0, 0)
+        later = SubmissionRecord(submission_id(120, "cd" * 32, position), "alice", 120,
+                                 "cd" * 32, position, hf.encode(), hf.repo_id, hf.revision)
+        later_id, _ = store.add_submission(later)
+        assert store.get_challenge(later_id).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
 
 
 def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None:

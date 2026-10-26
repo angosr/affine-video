@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 MAGIC = b"VDA1"
@@ -129,6 +130,17 @@ def model_source_fields(
             "upload_id": private.upload_id, "file_sha256": private.file_sha256,
         }
     return result
+
+
+def private_model_source(value: Mapping[str, object]) -> PrivateModelSubmission | None:
+    """Decode the same optional private identity in existing public/archive documents."""
+    if "private_upload" not in value:
+        return None
+    private = value["private_upload"]
+    if (not isinstance(private, Mapping) or set(private) != {"upload_id", "file_sha256"}
+            or value.get("repo_id") is not None or value.get("revision") is not None):
+        raise SubmissionFormatError("private source identity conflicts with HF fields")
+    return PrivateModelSubmission(private["upload_id"], private["file_sha256"])
 
 
 @dataclass(frozen=True, slots=True)

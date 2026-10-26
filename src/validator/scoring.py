@@ -17,6 +17,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
+from miner.submit import private_model_source
 from scoring.cache import (
     CacheLoadError,
     ExactCacheBatch,
@@ -402,6 +403,7 @@ class PairedTrackEvaluator:
         incumbent: Any,
         challenges: Sequence[Mapping[str, Any]],
     ) -> LeasedChallenge:
+        private = getattr(incumbent, "private_submission", None)
         if incumbent.challenge_id == "genesis":
             path = self.initial_model_path
             expected_digest = self.track.initial_champion.model_digest
@@ -430,6 +432,13 @@ class PairedTrackEvaluator:
             expected_hotkey = incumbent.hotkey
             expected_sha256 = record["file_sha256"]
             expected_size = record["model_size_bytes"]
+            if private is not None and (
+                private_model_source(record) != private or expected_sha256 != private.file_sha256
+            ):
+                raise TemporaryScoringError(
+                    "INCUMBENT_MODEL_UNAVAILABLE",
+                    "confirmed champion source conflicts with its file",
+                )
             try:
                 local_path = self.store.model_path(incumbent.challenge_id)
             except KeyError:
@@ -486,6 +495,10 @@ class PairedTrackEvaluator:
                     expected_hotkey=expected_hotkey,
                 )
             if validated is None:
+                if private is not None:
+                    raise TemporaryScoringError(
+                        "INCUMBENT_MODEL_UNAVAILABLE", "confirmed champion archive is unavailable",
+                    )
                 try:
                     downloaded = self.downloader(
                         incumbent.repo_id,
@@ -522,6 +535,7 @@ class PairedTrackEvaluator:
             attempts=1,
             model_path=str(path),
             file_sha256=validated.file_sha256,
+            private_submission=private,
         )
 
     def _validate_incumbent_candidate(

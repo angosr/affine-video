@@ -17,6 +17,7 @@ from miner.submit import (
     PrivateModelSubmission,
     SubmissionFormatError,
     model_source_fields,
+    private_model_source,
 )
 from validator.queue import (
     TERMINAL_STATES,
@@ -1687,7 +1688,7 @@ class ChallengeStore:
                     SELECT c.state, c.error_code, c.final_score, c.score_block,
                            c.file_sha256, c.model_digest,
                            c.model_size_bytes, c.created_at_ms, c.track_spec_digest,
-                           s.submission_id, s.hotkey, s.repo_id, s.revision,
+                           s.submission_id, s.hotkey, s.repo_id, s.revision, s.payload,
                            s.block_height, s.extrinsic_index, s.event_index
                     FROM challenges c
                     JOIN submissions s ON s.submission_id = c.submission_id
@@ -1703,6 +1704,7 @@ class ChallengeStore:
                         break
                     if (record.netuid != document["netuid"]
                             or challenge_id(record.submission_id) != match.challenge_id
+                            or record.private_submission != private_model_source(submission)
                             or (record.hotkey, record.repo_id, record.revision,
                                 record.position.block, record.position.extrinsic_index,
                                 record.position.event_index) != (
@@ -1792,7 +1794,7 @@ class ChallengeStore:
                             (item["challenge_id"],),
                         )
                     row = self._connection.execute(
-                        "SELECT c.*, s.hotkey, s.repo_id, s.revision, s.block_height, "
+                        "SELECT c.*, s.hotkey, s.repo_id, s.revision, s.payload, s.block_height, "
                         "s.extrinsic_index, s.event_index FROM challenges c "
                         "JOIN submissions s ON s.submission_id=c.submission_id "
                         "WHERE c.challenge_id=?", (match.challenge_id,),
@@ -1818,7 +1820,9 @@ class ChallengeStore:
                     row["extrinsic_index"],
                     row["event_index"],
                 )
-                if actual_submission != expected_submission:
+                if (actual_submission != expected_submission
+                        or _private_submission(bytes(row["payload"]))
+                        != private_model_source(submission)):
                     raise RuntimeError("public match conflicts with its on-chain submission")
 
                 target = ChallengeState(evaluation["state"])

@@ -9,6 +9,7 @@ from enum import StrEnum
 from math import isfinite
 from typing import Any
 
+from miner.submit import PrivateModelSubmission, model_source_fields, private_model_source
 from scoring.spec import TrackSpec
 from validator.queue import TERMINAL_STATES, ChainPosition, ChallengeState
 
@@ -24,19 +25,19 @@ class MatchOutcome(StrEnum):
 class Champion:
     challenge_id: str
     hotkey: str
-    repo_id: str
-    revision: str
+    repo_id: str | None
+    revision: str | None
     score: float
     position: ChainPosition
     uid: int | None = None
     source: str = "MINER"
+    private_submission: PrivateModelSubmission | None = None
 
     def public(self) -> dict[str, Any]:
         return {
             "challenge_id": self.challenge_id,
             "hotkey": self.hotkey,
-            "repo_id": self.repo_id,
-            "revision": self.revision,
+            **model_source_fields(self.repo_id, self.revision, self.private_submission),
             "score": self.score,
             "uid": self.uid,
             "source": self.source,
@@ -48,19 +49,25 @@ class Champion:
     @classmethod
     def from_public(cls, value: Mapping[str, Any]) -> Champion:
         """Read an immutable recorded champion, never reselect one by its score."""
-        if not isinstance(value, Mapping) or set(value) != {
+        fields = {
             "challenge_id", "hotkey", "repo_id", "revision", "score", "uid", "source",
             "block_height", "extrinsic_index", "event_index",
-        }:
+        }
+        if (not isinstance(value, Mapping)
+                or set(value) not in (fields, fields | {"private_upload"})):
             raise ValueError("recorded champion fields are invalid")
+        private = private_model_source(value)
         result = cls(
             _required_string(value, "challenge_id"), _required_string(value, "hotkey"),
-            _required_string(value, "repo_id"), _required_string(value, "revision"),
+            _required_string(value, "repo_id") if private is None else None,
+            _required_string(value, "revision") if private is None else None,
             _score(value["score"], "champion score"), _position(value),
             _optional_integer(value["uid"], "champion uid"), _required_string(value, "source"),
+            private,
         )
         if ((result.challenge_id == "genesis") != (result.source == "VEDA_BASELINE")
                 or (result.source == "VEDA_BASELINE" and result.uid != 0)
+                or (result.source == "VEDA_BASELINE" and private is not None)
                 or (result.source == "MINER" and result.uid is not None)
                 or result.source not in {"VEDA_BASELINE", "MINER"}):
             raise ValueError("recorded champion source is invalid")
@@ -126,8 +133,8 @@ def challenge_from_match(document: Mapping[str, Any]) -> dict[str, Any]:
         "challenge_id": document.get("challenge_id"),
         "submission_id": document.get("submission_id"),
         "hotkey": submission.get("hotkey"),
-        "repo_id": submission.get("repo_id"),
-        "revision": submission.get("revision"),
+        **model_source_fields(submission.get("repo_id"), submission.get("revision"),
+                              private_model_source(submission)),
         "block_height": submission.get("block_height"),
         "extrinsic_index": submission.get("extrinsic_index"),
         "event_index": submission.get("event_index"),
@@ -225,6 +232,7 @@ def resolve_tournament(
                 leaderboard_candidates.append(Champion(
                     record.challenge_id, record.hotkey, fact["repo_id"], fact["revision"],
                     _score(fact["final_score"], "historical score"), _position(fact),
+                    private_submission=private_model_source(fact),
                 ))
 
     for challenge in challenges:
@@ -240,8 +248,9 @@ def resolve_tournament(
             expected = challenge_from_match(recorded.document)
             for key in ("submission_id", "hotkey", "repo_id", "revision", "state",
                         "file_sha256", "model_digest", "model_size_bytes", "final_score",
-                        "score_block", "block_height", "extrinsic_index", "event_index"):
-                if challenge.get(key) != expected[key]:
+                        "score_block", "block_height", "extrinsic_index", "event_index",
+                        "private_upload"):
+                if challenge.get(key) != expected.get(key):
                     raise ValueError("previous-track challenge conflicts with its immutable match")
             # Preserve completed facts and lifetime uniqueness, never re-label a
             # previous source/cache measurement as this track's match evidence.
@@ -273,8 +282,9 @@ def resolve_tournament(
             position = _position(challenge)
             score = _score(challenge["final_score"], "final_score")
             _integer(challenge["score_block"], "score_block")
-            repo_id = _required_string(challenge, "repo_id")
-            revision = _required_string(challenge, "revision")
+            private = private_model_source(challenge)
+            repo_id = _required_string(challenge, "repo_id") if private is None else None
+            revision = _required_string(challenge, "revision") if private is None else None
             candidate = Champion(
                 record.challenge_id,
                 record.hotkey,
@@ -282,6 +292,7 @@ def resolve_tournament(
                 revision,
                 score,
                 position,
+                private_submission=private,
             )
             leaderboard_candidates.append(candidate)
 
@@ -339,6 +350,10 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
     gain = None if document["score_gain"] is None else _gain(
         document["score_gain"], "historical gain",
     )
+    private = private_model_source(challenge)
+    if (private is not None and challenge["file_sha256"] is not None
+            and challenge["file_sha256"] != private.file_sha256):
+        raise ValueError("historical private source differs from its recorded file")
     if state is ChallengeState.SUCCEEDED:
         if any(_optional_digest(challenge[key], key) is None
                for key in ("file_sha256", "model_digest")):
@@ -349,7 +364,8 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
         if (state is not ChallengeState.SUCCEEDED or score is None
                 or len(_evaluation_stages(challenge["stages"])) != 2
                 or after != Champion(challenge["challenge_id"], challenge["hotkey"],
-                                     challenge["repo_id"], challenge["revision"], score, position)):
+                                     challenge["repo_id"], challenge["revision"], score, position,
+                                     private_submission=private)):
             raise ValueError("historical winner conflicts with its recorded model")
     elif outcome is MatchOutcome.CHAMPION_RETAINED:
         if (state is not ChallengeState.SUCCEEDED
@@ -416,10 +432,13 @@ def _resolve_match(
         raise ValueError("a match must contain a terminal challenge")
     repo_id = _optional_string(challenge.get("repo_id"), "repo_id")
     revision = _optional_string(challenge.get("revision"), "revision")
+    private = private_model_source(challenge)
     error_code = _optional_string(challenge.get("error_code"), "error_code")
     file_sha256 = _optional_digest(challenge.get("file_sha256"), "file_sha256")
     model_digest = _optional_digest(challenge.get("model_digest"), "model_digest")
     model_size_bytes = _optional_integer(challenge.get("model_size_bytes"), "model_size_bytes")
+    if private is not None and file_sha256 is not None and private.file_sha256 != file_sha256:
+        raise ValueError("private source differs from its evaluated file")
     before = incumbent
     score_gain: float | None = None
     stages = _evaluation_stages(
@@ -441,7 +460,7 @@ def _resolve_match(
             raise ValueError("evaluation allocation differs from its submitted model")
 
     if state is ChallengeState.SUCCEEDED:
-        if repo_id is None or revision is None:
+        if private is None and (repo_id is None or revision is None):
             raise ValueError("successful challenge is missing its model reference")
         if error_code is not None:
             raise ValueError("successful challenge cannot contain an error code")
@@ -450,7 +469,8 @@ def _resolve_match(
         if file_sha256 is None or model_digest is None or model_size_bytes is None:
             raise ValueError("successful challenge is missing its model facts")
         score = _score(challenge.get("final_score"), "final_score")
-        candidate = Champion(identifier, hotkey, repo_id, revision, score, position)
+        candidate = Champion(identifier, hotkey, repo_id, revision, score, position,
+                             private_submission=private)
         incumbent_score = _score(challenge.get("incumbent_score"), "incumbent_score")
         score_block = _integer(challenge["score_block"], "score_block")
         if score_block < position.block:
@@ -556,8 +576,7 @@ def _resolve_match(
         "submission_id": submission_id,
         "submission": {
             "hotkey": hotkey,
-            "repo_id": repo_id,
-            "revision": revision,
+            **model_source_fields(repo_id, revision, private),
             "block_height": position.block,
             "extrinsic_index": position.extrinsic_index,
             "event_index": position.event_index,

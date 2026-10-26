@@ -1,11 +1,16 @@
+import hashlib
+
 import pytest
 
+from miner.submit import PrivateModelSubmission, model_source_fields
 from validator.production.commitment import canonical_json
 from validator.queue import ChainPosition, ChallengeState
 from validator.tournament import (
     Champion,
     MatchOutcome,
     canonical_score_gain,
+    historical_champion,
+    recorded_match,
     resolve_tournament,
     validate_match_document,
 )
@@ -117,6 +122,53 @@ def resolve(items: list[dict], *, history=(), minimum_gain=0.01):
     )
 
 
+def test_hf_match_bytes_are_unchanged_when_private_sources_are_supported():
+    result = resolve([challenge(1, "alice", score=0.8, incumbent_score=0.7)])
+    body = canonical_json(result.matches[0].document)
+    assert len(body) == 2783
+    assert hashlib.sha256(body).hexdigest() == (
+        "9b35e5dae1548be9e2406a83f2e8b606510785d524310289439bef0d170bae92"
+    )
+    assert b"private_upload" not in body
+
+
+def test_private_champion_and_history_keep_one_source_without_rejudging():
+    private = PrivateModelSubmission("ef" * 32, "ab" * 32)
+    winner = challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    winner.update(model_source_fields(None, None, private))
+    result = resolve([winner])
+    assert result.champion.private_submission == private
+    assert Champion.from_public(result.champion.public()) == result.champion
+    original = canonical_json(result.matches[0].document)
+    historical = recorded_match(result.matches[0].document, netuid=7)
+    assert historical_champion((historical,), genesis()) == result.champion
+    later = challenge(2, "bob", score=0.7, incumbent_score=0.7)
+    carried = resolve([later], history=(historical,), minimum_gain=0.5)
+    assert carried.champion.private_submission == private
+    assert carried.champion.hotkey == "alice"
+    assert canonical_json(historical.document) == original
+    validate_match_document(result.matches[0].document, sequence=1, track_id="track",
+                            track_spec_digest="ab" * 32, netuid=7, minimum_gain=0.01,
+                            incumbent=genesis())
+
+
+@pytest.mark.parametrize("damage", ["mixed_hf", "file_sha", "null", "extra_key"])
+def test_private_match_rejects_conflicting_or_incomplete_source_identity(damage):
+    private = PrivateModelSubmission("ef" * 32, "ab" * 32)
+    item = challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    item.update(model_source_fields(None, None, private))
+    if damage == "mixed_hf":
+        item["repo_id"] = "owner/model"
+    elif damage == "file_sha":
+        item["private_upload"]["file_sha256"] = "cd" * 32
+    elif damage == "null":
+        item["private_upload"] = None
+    else:
+        item["private_upload"]["url"] = "https://must-not-be-a-source.example/"
+    with pytest.raises(ValueError):
+        resolve([item])
+
+
 def test_preproduced_confirmation_still_requires_two_independent_decisions():
     item = challenge(1, "alice", score=0.8, incumbent_score=0.7)
     for stage in item["stages"]:
@@ -204,8 +256,11 @@ def test_historical_two_stage_outcome_requires_proof_not_current_thresholds(
 
 @pytest.mark.parametrize("exact_gain", [0.002999999999, 0.003, 0.003000000001])
 @pytest.mark.parametrize("full_gain", [0.002999999999, 0.003, 0.003000000001])
-def test_candidate_three_milli_gate_remains_strict_for_both_stages(exact_gain, full_gain):
+@pytest.mark.parametrize("private", [False, True])
+def test_candidate_three_milli_gate_remains_strict_for_both_stages(exact_gain, full_gain, private):
     item = challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    if private:
+        item.update(model_source_fields(None, None, PrivateModelSubmission("ef" * 32, "ab" * 32)))
     item["stages"][0]["paired_gain_lower_bound"] = exact_gain
     item["stages"][1]["paired_gain_lower_bound"] = full_gain
     if exact_gain <= 0.003:

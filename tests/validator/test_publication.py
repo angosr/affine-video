@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from miner.submit import PrivateModelSubmission, model_source_fields
 from scoring.spec import parse_track_spec
 from tests.scoring.test_spec import valid_spec
 from validator import chunks
@@ -215,8 +216,8 @@ def two_stage_challenge(value: dict) -> dict:
     return result
 
 
-@pytest.fixture
-def maintenance_history():
+@pytest.fixture(params=[False, True], ids=["hf", "private-s3"])
+def maintenance_history(request):
     """Canonical outcome facts, not GPU measurements or a second champion source."""
     runtime = Artifact("runtime/source.zip", "ab" * 32, 1, "source")
     previous_manifest = ArtifactManifest((runtime,))
@@ -224,6 +225,9 @@ def maintenance_history():
     raw["artifact_manifest_sha256"] = previous_manifest.digest
     previous = parse_track_spec(raw)
     winner = scored_challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    if request.param:
+        winner.update(model_source_fields(None, None,
+                                          PrivateModelSubmission("ef" * 32, "ab" * 32)))
     history = resolve_tournament(
         [winner], track_id=previous.track_id, track_spec_digest=previous.digest, netuid=7,
         minimum_gain=previous.full_video.minimum_gain,
@@ -1054,7 +1058,8 @@ def test_invalid_model_restore_cannot_publish_an_archive(tmp_path):
     assert name not in repository._confirmed_immutable
 
 
-def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) -> None:
+@pytest.mark.parametrize("private", [False, True])
+def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path, private) -> None:
     track = parse_track_spec(valid_spec())
     model = tmp_path / "model.safetensors"
     model.write_bytes(b"model")
@@ -1091,6 +1096,9 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) ->
             )
         ]
     }
+    reference = PrivateModelSubmission("ef" * 32, model_sha256) if private else None
+    if reference is not None:
+        snapshot["challenges"][0].update(model_source_fields(None, None, reference))
     store = SimpleNamespace(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
@@ -1111,6 +1119,7 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path) ->
     assert ledger.required_finalized_block == 120
     assert len(ledger.matches) == 1
     assert ledger.matches[0].challenge_id == "challenge"
+    assert ledger.matches[0].champion_after.private_submission == reference
 
     # Startup has the same immutable facts/fence, but must not read the model
     # or disclosed payloads before scanning and refreshing current weights.

@@ -351,8 +351,9 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
 
 
 @pytest.mark.parametrize("historical_public", [False, True])
+@pytest.mark.parametrize("private_source", [False, True])
 def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
-    tmp_path, monkeypatch, historical_public,
+    tmp_path, monkeypatch, historical_public, private_source,
 ) -> None:
     architecture = SelectorArchitecture(1, 1, 2, "float32")
     tensors = {
@@ -368,6 +369,8 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
         max_bytes=10_000,
         expected_hotkey="champion-hotkey",
     )
+    from miner.submit import PrivateModelSubmission, model_source_fields
+    private = PrivateModelSubmission("ef" * 32, validated.file_sha256) if private_source else None
     local_path.write_bytes(b"broken")
     track = SimpleNamespace(
         digest="ab" * 32,
@@ -399,9 +402,10 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
     incumbent = SimpleNamespace(
         challenge_id="12" * 32,
         hotkey="champion-hotkey",
-        repo_id="owner/model",
-        revision="34" * 20,
+        repo_id=None if private_source else "owner/model",
+        revision=None if private_source else "34" * 20,
         position=ChainPosition(100, 0, 0),
+        private_submission=private,
     )
     challenges = (
         {
@@ -409,6 +413,7 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
             "file_sha256": validated.file_sha256,
             "model_digest": validated.model_digest,
             "model_size_bytes": validated.size_bytes,
+            **model_source_fields(incumbent.repo_id, incumbent.revision, private),
         },
     )
     if historical_public:
@@ -422,8 +427,9 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
             0.8, 0.1, MatchOutcome.CHALLENGER_WON, incumbent,
             {"track_id": "old-track", "submission_id": "old-submission",
              "challenge_id": incumbent.challenge_id,
-             "submission": {"hotkey": incumbent.hotkey, "repo_id": incumbent.repo_id,
-                            "revision": incumbent.revision, "block_height": 100,
+             "submission": {"hotkey": incumbent.hotkey,
+                            **model_source_fields(incumbent.repo_id, incumbent.revision, private),
+                            "block_height": 100,
                             "extrinsic_index": 0, "event_index": 0},
              "evaluation": {"state": "SUCCEEDED", "error_code": None,
                             "file_sha256": validated.file_sha256,
@@ -454,12 +460,24 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
     assert exact_incumbent.model_path == confirmation_incumbent.model_path
     assert exact_incumbent.model_path != str(local_path)
     assert exact_incumbent.file_sha256 == validated.file_sha256
+    assert (exact_incumbent.private_submission == confirmation_incumbent.private_submission
+            == private)
     assert validate_model(
         exact_incumbent.model_path,
         schema=architecture.tensor_schema,
         max_bytes=10_000,
         expected_hotkey="champion-hotkey",
     ) == validated
+    if private_source:
+        evaluator.store = SimpleNamespace(model_path=lambda _identifier: None)
+        evaluator.batch_source = None
+        def unavailable_archive(*_args, **_kwargs):
+            raise RuntimeError("confirmed archive unavailable")
+        monkeypatch.setattr(scoring_module, "download_chunked_file", unavailable_archive)
+        with pytest.raises(
+            TemporaryScoringError, match="confirmed champion archive is unavailable",
+        ):
+            evaluator._incumbent_task(incumbent, challenges)
 
 
 @pytest.mark.parametrize("stage", ["exact", "confirmation"])
