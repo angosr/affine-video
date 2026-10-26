@@ -3,8 +3,10 @@ import io
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from threading import Barrier, Lock
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pytest
@@ -18,7 +20,7 @@ from validator.download import ModelDownloadError
 from validator.production.storage import PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
-from validator.uploads import PrivateUploads
+from validator.uploads import PrivateUploads, upload_http_server
 
 from .production.test_storage import MemoryS3
 
@@ -112,7 +114,7 @@ def test_seal_freezes_metadata_and_admission_verifies_the_real_source_once(setup
     retried = authorize(uploads, intent, now=NOW + 1)
     assert before == uploads.objects._client.objects
     assert retried.expires_at == intent.expires_at
-    assert uploads.staging.grants[-1]["ExpiresIn"] == 299
+    assert 0 < uploads.staging.grants[-1]["ExpiresIn"] <= 299
     assert "bearer" not in repr(grant)
     assert params == {
         "Bucket": "uploads-private", "Key": f"{uploads._key(intent)}/part-00000",
@@ -129,6 +131,7 @@ def test_seal_freezes_metadata_and_admission_verifies_the_real_source_once(setup
         uploads.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cold",
                          max_bytes=10_000)
     assert invalid.value.code == "PRIVATE_UPLOAD_HASH_MISMATCH"
+    assert invalid.value.temporary  # unknown backend corruption must not become a miner loss
     uploads.staging.put_object(Bucket=params["Bucket"], Key=params["Key"], Body=payload)
     restored = uploads.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cold",
                                 max_bytes=10_000)
@@ -475,3 +478,103 @@ def test_eligibility_cursor_exclusions_and_opportunity_share_one_read_snapshot(s
         reader._connection.set_trace_callback(None)
         with pytest.raises(ValueError, match="formal submission"):
             reader.require_upload_eligible(intent.hotkey, uid=9, finalized_block=100)
+
+
+def test_private_source_cache_io_failure_is_temporary_not_a_participant_loss(
+    setup, monkeypatch, tmp_path,
+):
+    uploads, intent, payload, _ = setup
+    upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW + 1)
+
+    def denied(_path):
+        raise PermissionError("cache access denied")
+
+    monkeypatch.setattr("validator.uploads.model_file_sha256", denied)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / f"{reference.file_sha256}.safetensors").write_bytes(payload)
+    with pytest.raises(ModelDownloadError) as unavailable:
+        uploads.download(reference, hotkey=intent.hotkey, cache_dir=cache, max_bytes=10_000)
+    assert unavailable.value.temporary
+    assert unavailable.value.code == "PRIVATE_UPLOAD_UNAVAILABLE"
+
+
+def test_authority_delay_cannot_extend_a_signed_upload_capability(setup, monkeypatch):
+    uploads, intent, _, _ = setup
+    instants = iter((0.0, 301.0))
+    monkeypatch.setattr("validator.uploads.time.monotonic", lambda: next(instants))
+    with pytest.raises(ValueError, match="expired before"):
+        authorize(uploads, intent, now=NOW)
+    assert uploads.staging.grants == []
+
+
+def http_request(server, payload, *, content_length=None):
+    encoded = json.dumps(payload).encode() if isinstance(payload, dict) else payload
+    request = Request(
+        f"http://127.0.0.1:{server.server_port}/veda", data=encoded,
+        headers={"Content-Type": "application/json", "Content-Length": str(
+            len(encoded) if content_length is None else content_length,
+        )}, method="POST",
+    )
+
+    def client():
+        try:
+            response = urlopen(request, timeout=5)
+        except HTTPError as error:
+            response = error
+        with response:
+            return response.status, dict(response.headers), json.loads(response.read())
+
+    # SQLite stays in its owning main thread; only the client runs elsewhere.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(client)
+        server.handle_request()
+        return result.result(timeout=5)
+
+
+def test_single_loopback_http_adapter_handles_only_small_signed_metadata(setup, capsys):
+    uploads, intent, payload, store = setup
+    manifest = ChunkManifest(intent.file_sha256, intent.size_bytes, (
+        ChunkPart("part-00000", intent.file_sha256, intent.size_bytes),
+    ))
+    with upload_http_server(uploads, port=0, clock=lambda: NOW) as server:
+        assert server.server_address[0] == "127.0.0.1"
+        status, headers, grant = http_request(server, {
+            "intent": asdict(intent), "signature": sign(intent).hex(),
+            "manifest": json.loads(manifest.encode()),
+        })
+        assert status == 200 and headers["Cache-Control"] == "no-store"
+        assert len(grant["parts"]) == 1 and grant["upload_id"] == intent.upload_id
+        params = uploads.staging.grants[-1]["Params"]
+        uploads.staging.put_object(Bucket=params["Bucket"], Key=params["Key"], Body=payload)
+        seal = replace(intent, action="seal")
+        status, _, sealed = http_request(server, {
+            "intent": asdict(seal), "signature": sign(seal).hex(),
+        })
+        assert status == 200 and sealed["sealed"] is True and sealed["accepted"] is False
+        assert uploads.staging.reads == []  # no model-body proxy or redundant model admission
+        assert store.public_snapshot()["challenges"] == []
+    assert "bearer" not in capsys.readouterr().err
+
+
+def test_http_rejects_body_over_limit_and_does_not_expose_private_errors(setup, monkeypatch):
+    uploads, intent, _, _ = setup
+    with upload_http_server(uploads, port=0, clock=lambda: NOW) as server:
+        status, _, response = http_request(server, b"{}", content_length=64 * 1024 + 1)
+        assert status == 400 and response == {"error": "INVALID_UPLOAD_REQUEST"}
+        assert uploads.staging.grants == []
+
+        def unavailable(*_args, **_kwargs):
+            raise RuntimeError("PRIVATE_ENDPOINT_AND_CREDENTIALS")
+
+        monkeypatch.setattr(uploads, "authorize", unavailable)
+        manifest = ChunkManifest(intent.file_sha256, intent.size_bytes, (
+            ChunkPart("part-00000", intent.file_sha256, intent.size_bytes),
+        ))
+        status, _, response = http_request(server, {
+            "intent": asdict(intent), "signature": sign(intent).hex(),
+            "manifest": json.loads(manifest.encode()),
+        })
+        assert status == 503 and response == {"error": "UPLOAD_UNAVAILABLE"}
