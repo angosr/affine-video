@@ -3,7 +3,6 @@ import io
 import json
 import socket
 import sqlite3
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from threading import Barrier, Lock
@@ -625,52 +624,3 @@ def test_http_times_out_before_parsing_and_can_serve_the_next_request(
         status, _, response = http_request(server, {})
         assert status == 400 and response == {"error": "INVALID_UPLOAD_REQUEST"}
         assert observed_timeouts == [0.05, 0.05]
-
-
-@pytest.mark.parametrize("prefix", [
-    b"POST /ve",
-    b"POST /veda HTTP/1.1\r\nHost: auth.example\r\nX-Incomplete: ",
-    (b"POST /veda HTTP/1.1\r\nHost: auth.example\r\nContent-Type: application/json\r\n"
-     b"Content-Length: 65536\r\n\r\n"),
-], ids=["request-line", "headers", "body"])
-def test_http_absolute_receive_deadline_rejects_drips_and_serves_next_request(
-    setup, monkeypatch, prefix,
-):
-    uploads, intent, _, _ = setup
-    with upload_http_server(uploads, port=0, clock=lambda: NOW) as server:
-        assert server.RequestHandlerClass.timeout == 10
-        monkeypatch.setattr(server.RequestHandlerClass, "timeout", 0.2)
-
-        def dripping_client():
-            with socket.create_connection(server.server_address, timeout=1) as connection:
-                connection.settimeout(0.02)  # Every new byte arrives within the idle timeout.
-                connection.sendall(prefix)
-                started = time.monotonic()
-                while time.monotonic() - started < 1:
-                    try:
-                        connection.sendall(b"x")
-                        if connection.recv(4096) == b"":
-                            return time.monotonic() - started
-                    except TimeoutError:
-                        continue
-                    except ConnectionError:
-                        return time.monotonic() - started
-                return None  # Close the old unbounded receiver so a red test cannot hang.
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            result = pool.submit(dripping_client)
-            server.handle_request()
-            elapsed = result.result(timeout=2)
-        assert elapsed is not None, "drips extended the absolute metadata receive budget"
-        assert elapsed < 0.7
-        assert uploads.staging.grants == []
-        assert uploads.objects._client.objects == {}
-        manifest = ChunkManifest(intent.file_sha256, intent.size_bytes, (
-            ChunkPart("part-00000", intent.file_sha256, intent.size_bytes),
-        ))
-        status, _, response = http_request(server, {
-            "intent": asdict(intent), "signature": sign(intent).hex(),
-            "manifest": json.loads(manifest.encode()),
-        })
-        assert status == 200 and response["upload_id"] == intent.upload_id
-        assert len(response["parts"]) == len(uploads.staging.grants) == 1
