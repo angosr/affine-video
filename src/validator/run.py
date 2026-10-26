@@ -62,6 +62,7 @@ from validator.scoring import (
 )
 from validator.store import MAX_PUBLICATION_FAILURES, ChallengeStore, LeasedChallenge
 from validator.tournament import MatchRecord
+from validator.uploads import PrivateUploads
 from validator.weights import (
     WeightReceipt,
     read_weight_chain_state,
@@ -308,6 +309,30 @@ async def _publish_due_batch(
     return published if published is not None else False
 
 
+async def _reclaim_private_uploads(
+    uploads: PrivateUploads, *, database: str | Path, network: str,
+    archive_endpoints: list[str] | None,
+) -> int:
+    """Bounded staging cleanup inside the existing evaluator, not another service."""
+    async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
+        genesis = (await client.block_info(0)).hash
+        if not isinstance(genesis, str) or genesis.removeprefix("0x") != uploads.genesis_hash:
+            raise RuntimeError("upload cleanup network differs from its signature domain")
+        finalized = await client.finalized_block()
+        snapshot = await client.at(finalized)
+        timestamp = int((await snapshot.timestamp()).timestamp())
+
+    def reclaim() -> int:
+        # Created and used in this thread; never share the main SQLite connection.
+        with ChallengeStore.readonly(database) as store:
+            return uploads.reclaim_expired(
+                store=store, finalized_block=finalized, finalized_timestamp=timestamp,
+                now=int(time.time()),
+            )
+
+    return await asyncio.to_thread(reclaim)
+
+
 async def run_evaluator(
     *,
     track_spec: str | Path,
@@ -488,6 +513,11 @@ async def run_evaluator(
         store = resources.enter_context(ChallengeStore(database, track_spec_digest=track.digest))
         if confirmation_pool is not None:
             resources.callback(confirmation_pool.close)
+        uploads = PrivateUploads.from_environment(store=store, max_bytes=track.model.max_bytes)
+        if uploads is not None:
+            if track.netuid != DEFAULT_NETUID or batch_source is None:
+                raise ValueError("private upload admission requires SN120 and its models archive")
+            admission_settings = replace(admission_settings, private_download=uploads.download)
         store.reserve_uid_zero(
             track.initial_champion.hotkey,
             track_start_block=track.track_start_block,
@@ -531,11 +561,14 @@ async def run_evaluator(
         next_inventory_refresh = 0.0
         disclosure_task: asyncio.Task[str | None | Literal[False]] | None = None
         next_disclosure_refresh = 0.0
+        upload_cleanup_task: asyncio.Task[int] | None = None
+        next_upload_cleanup = 0.0
 
         def refresh_metadata() -> None:
             nonlocal system_match_task, system_matches, next_system_match_refresh
             nonlocal inventory_task, next_inventory_refresh
             nonlocal disclosure_task, next_disclosure_refresh
+            nonlocal upload_cleanup_task, next_upload_cleanup
             if system_match_task is not None and system_match_task.done():
                 try:
                     system_matches = system_match_task.result()
@@ -545,6 +578,19 @@ async def run_evaluator(
                     )
                 system_match_task = None
             now = asyncio.get_running_loop().time()
+            if upload_cleanup_task is not None and upload_cleanup_task.done():
+                try:
+                    upload_cleanup_task.result()
+                except Exception:
+                    # Fixed code only: backend exceptions can contain credentials/URLs.
+                    _LOG.warning("PRIVATE_UPLOAD_CLEANUP_FAILED; original references retained")
+                upload_cleanup_task = None
+            if uploads is not None and upload_cleanup_task is None and now >= next_upload_cleanup:
+                upload_cleanup_task = asyncio.create_task(_reclaim_private_uploads(
+                    uploads, database=database, network=network,
+                    archive_endpoints=archive_endpoints,
+                ))
+                next_upload_cleanup = now + 300.0
             if (
                 system_match_loader is not None
                 and system_match_task is None and now >= next_system_match_refresh
@@ -607,6 +653,9 @@ async def run_evaluator(
                 # Joining preserves a single writer. Cancelling to_thread would
                 # leave its S3 request alive and permit an overlapping restart.
                 await asyncio.gather(asyncio.shield(disclosure_task), return_exceptions=True)
+            if upload_cleanup_task is not None:
+                # A live exact-key DELETE must end before the owner can be restarted.
+                await asyncio.gather(asyncio.shield(upload_cleanup_task), return_exceptions=True)
 
         def start_publication() -> asyncio.Task[PublicArtifacts]:
             assert pending_artifacts is not None

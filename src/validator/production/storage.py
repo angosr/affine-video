@@ -547,17 +547,28 @@ class PrivateObjectStore:
         if not manifest_exists:
             self.create_plan(object_name, manifest.encode())
 
-    def list_names(self, prefix: str) -> tuple[str, ...]:
+    def list_names(
+        self, prefix: str, *, limit: int | None = None, after: str | None = None,
+    ) -> tuple[str, ...]:
         """List a small private index with strong-consistency assumptions."""
 
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("private listing limit must be positive")
         relative = prefix.strip("/")
         query = self._key(relative)
+        after_key = None if after is None else self._key(after)
+        if after_key is not None and not after_key.startswith(query + "/"):
+            raise ValueError("private listing cursor is outside its prefix")
         token: str | None = None
         names: list[str] = []
         while True:
             arguments: dict[str, Any] = {"Bucket": self._bucket, "Prefix": query}
+            if limit is not None:
+                arguments["MaxKeys"] = min(1000, limit - len(names))
             if token is not None:
                 arguments["ContinuationToken"] = token
+            elif after_key is not None:
+                arguments["StartAfter"] = after_key
             response = self._client.list_objects_v2(**arguments)
             for item in response.get("Contents", []):
                 key = item.get("Key")
@@ -565,6 +576,8 @@ class PrivateObjectStore:
                 if not isinstance(key, str) or not key.startswith(root):
                     raise StorageError("object store returned a key outside the private prefix")
                 names.append(key[len(root) :])
+            if limit is not None and len(names) >= limit:
+                break
             if not response.get("IsTruncated", False):
                 break
             token = response.get("NextContinuationToken")

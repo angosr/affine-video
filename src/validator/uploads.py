@@ -7,6 +7,7 @@ called by the existing admission worker before its ordinary schema/owner gate.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -26,7 +27,12 @@ from scoring.model import model_file_sha256
 from validator.chunks import ChunkManifest, verify_chunked_content
 from validator.download import DownloadedModel, ModelDownloadError
 from validator.production.commitment import canonical_json
-from validator.production.storage import PrivateObjectStore, StoredObject
+from validator.production.storage import (
+    PrivateObjectStore,
+    StoredObject,
+    _environment_client,
+    _validated_endpoint,
+)
 from validator.store import ChallengeStore
 
 
@@ -51,15 +57,14 @@ class UploadGrant:
 class PrivateUploads:
     """One CAS upload record plus a hotkey quota pointer, NOT an opportunity ledger.
 
-    This preparatory API is not exposed as a listener or wired into the live
-    evaluator. The host must supply restricted staging/authority clients and
+    The host must supply restricted staging/authority clients and
     a finalized SN120 registration lookup, never a client-provided UID.
     """
 
     def __init__(
         self, *, objects: PrivateObjectStore, staging_client: Any,
         staging_bucket: str, staging_prefix: str, audience: str, genesis_hash: str,
-        store: ChallengeStore, registration: Callable[[str], tuple[int | None, int]],
+        store: ChallengeStore, registration: Callable[[str], tuple[int | None, int]] | None,
         max_bytes: int,
     ) -> None:
         if (not staging_bucket or "/" in staging_bucket or staging_bucket == "affine_video"
@@ -76,6 +81,49 @@ class PrivateUploads:
         self.store = store
         self.registration = registration
         self.max_bytes = max_bytes
+        self._gc_after = ""
+
+    @classmethod
+    def from_environment(
+        cls, *, store: ChallengeStore, max_bytes: int,
+        registration: Callable[[str], tuple[int | None, int]] | None = None,
+        required: bool = False,
+    ) -> PrivateUploads | None:
+        """Use explicit restricted credentials, never publisher/admin fallbacks.
+
+        Each process receives its own role values under these same names.
+        HTTP needs staging PUT/HEAD; evaluator needs GET/exact DELETE. Neither
+        changes the original models writer or per-track private backend.
+        """
+        names = (
+            "AUDIENCE", "GENESIS_HASH", "AUTHORITY_BUCKET",
+            "AUTHORITY_STORAGE_URL", "AUTHORITY_ACCESS_KEY", "AUTHORITY_SECRET_ACCESS_KEY",
+            "STAGING_STORAGE_URL", "STAGING_ACCESS_KEY", "STAGING_SECRET_ACCESS_KEY",
+        )
+        values = tuple(os.environ.get(f"VEDA_UPLOAD_{name}") for name in names)
+        if not any(values) and not required:
+            return None
+        if not all(values):
+            raise ValueError("all VEDA_UPLOAD domain and restricted storage settings are required")
+        (audience, genesis, bucket, authority_url, authority_key, authority_secret,
+         staging_url, staging_key, staging_secret) = values
+        if bucket == "affine_video":
+            raise ValueError("upload authority cannot use the public bucket")
+        # Validate before constructing any clients; do not log settings/credentials.
+        UploadIntent(audience, genesis, "configuration", 120, "upload", "00" * 32,
+                     "00" * 32, 1, "00" * 32, 1)
+        authority_url = _validated_endpoint(authority_url)
+        staging_url = _validated_endpoint(staging_url)
+        return cls(
+            objects=PrivateObjectStore(
+                _environment_client(authority_url, authority_key, authority_secret),
+                bucket=bucket, prefix="evaluation",
+            ),
+            staging_client=_environment_client(staging_url, staging_key, staging_secret),
+            staging_bucket="affine_video_private", staging_prefix="uploads/v1",
+            audience=audience, genesis_hash=genesis, store=store,
+            registration=registration, max_bytes=max_bytes,
+        )
 
     def _authenticate(self, intent: UploadIntent, signature: bytes, *, now: int) -> None:
         if (intent.audience != self.audience or intent.genesis_hash != self.genesis_hash
@@ -96,6 +144,8 @@ class PrivateUploads:
     def _eligible(
         self, intent: UploadIntent, *, reference: PrivateModelSubmission | None = None,
     ) -> None:
+        if self.registration is None:
+            raise RuntimeError("upload authorization requires a finalized registration lookup")
         uid, finalized_block = self.registration(intent.hotkey)
         self.store.require_upload_eligible(
             intent.hotkey, uid=uid, finalized_block=finalized_block, reference=reference,
@@ -126,10 +176,13 @@ class PrivateUploads:
         if stored is None:
             return None, None
         value = json.loads(stored.body)
-        if (not isinstance(value, dict) or set(value) != {
+        fields = {
             "format", "hotkey", "upload_id", "file_sha256", "size_bytes", "expires_at", "state",
             "manifest", "manifest_sha256",
-        } or value["format"] != "veda-upload-v1" or value["upload_id"] != upload_id
+        }
+        if (not isinstance(value, dict) or set(value) not in (fields, fields | {"cleanup"})
+                or ("cleanup" in value and value["cleanup"] not in {"pending", "done"})
+                or value["format"] != "veda-upload-v1" or value["upload_id"] != upload_id
                 or not isinstance(value["hotkey"], str) or not value["hotkey"]
                 or value["state"] not in {"UPLOADING", "SEALED"}
                 or type(value["expires_at"]) is not int
@@ -178,6 +231,8 @@ class PrivateUploads:
                 or hashlib.sha256(manifest.encode()).hexdigest() != intent.manifest_sha256):
             raise ValueError("upload manifest differs from signed intent")
         stored, previous = self._read(intent.upload_id)
+        if previous is not None and previous.get("cleanup") == "pending":
+            raise RuntimeError("original upload cleanup must finish before issuing permissions")
         identity = self._identity(intent)
         if previous is not None and any(
             previous[key] != value for key, value in identity.items()
@@ -232,6 +287,8 @@ class PrivateUploads:
             record[key] != value for key, value in self._identity(intent).items()
         )):
             raise ValueError("upload has no matching authorization")
+        if record.get("cleanup") == "pending":
+            raise RuntimeError("original upload cleanup is still pending")
         reference = PrivateModelSubmission(intent.upload_id, intent.file_sha256)
         if record["state"] == "SEALED":
             return reference
@@ -261,7 +318,8 @@ class PrivateUploads:
                 "PRIVATE_UPLOAD_AUTHORITY_UNAVAILABLE", "private source cannot be verified",
                 temporary=True,
             ) from exc
-        if record is None or record["state"] != "SEALED":
+        if (record is None or record["state"] != "SEALED"
+                or record.get("cleanup") == "pending"):
             raise ModelDownloadError(
                 "PRIVATE_UPLOAD_UNAVAILABLE", "private source is not available",
                 temporary=True,
@@ -321,6 +379,92 @@ class PrivateUploads:
                             temporary=True,
                         ) from exc
         return DownloadedModel(target, reference.file_sha256, manifest.size, None, None)
+
+    def reclaim_expired(
+        self, *, store: ChallengeStore, finalized_block: int,
+        finalized_timestamp: int, now: int,
+    ) -> int:
+        """One upload per call; original facts and cap expiry protect live references.
+
+        Only evaluator calls this, after a real finalized timestamp/scan fence.
+        The pending marker in the SAME CAS record excludes permission issuance
+        during DELETE, and resumes exact-key cleanup after a crash. Metadata,
+        SEALED identity and original chain/opportunity facts are never deleted.
+        """
+        def page(after: str | None) -> tuple[str, ...]:
+            return tuple(name for name in self.objects.list_names("uploads/", limit=16, after=after)
+                         if name.startswith("uploads/") and name.count("/") == 1
+                         and name.endswith(".json"))
+
+        names = page(self._gc_after or None)
+        if not names and self._gc_after:
+            self._gc_after = ""
+            names = page(None)
+        for name in names:
+            self._gc_after = name
+            upload_id = name.removeprefix("uploads/").removesuffix(".json")
+            stored, record = self._read(upload_id)
+            if (record is None or stored is None or record.get("cleanup") == "done"
+                    or record["expires_at"] >= min(now, finalized_timestamp)):
+                continue
+            reference = PrivateModelSubmission(upload_id, record["file_sha256"])
+            if store.upload_is_referenced(
+                record["hotkey"], reference=reference, finalized_block=finalized_block,
+            ):
+                if record.get("cleanup") == "pending":
+                    original = {key: value for key, value in record.items() if key != "cleanup"}
+                    self.objects.replace_plan(name, canonical_json(original), etag=stored.etag)
+                continue
+            if record.get("cleanup") != "pending":
+                record = {**record, "cleanup": "pending"}
+                stored = self.objects.replace_plan(name, canonical_json(record), etag=stored.etag)
+            # Recheck after the CAS fence; a newly observed in-flight S keeps its bytes.
+            if store.upload_is_referenced(
+                record["hotkey"], reference=reference, finalized_block=finalized_block,
+            ):
+                original = {key: value for key, value in record.items() if key != "cleanup"}
+                self.objects.replace_plan(name, canonical_json(original), etag=stored.etag)
+                return 0
+            root = (f"{self.prefix}/{hashlib.sha256(record['hotkey'].encode()).hexdigest()}"
+                    f"/{upload_id}")
+            manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
+            for part in manifest.parts:
+                self.staging.delete_object(Bucket=self.bucket, Key=f"{root}/{part.name}")
+            self.objects.replace_plan(
+                name, canonical_json({**record, "cleanup": "done"}), etag=stored.etag,
+            )
+            return len(manifest.parts)
+        return 0
+
+
+def serve_uploads(*, database: str | Path, track_spec: str | Path, network: str, port: int) -> None:
+    """Sole CPU metadata entry, same-host read-only DB; TLS remains the managed proxy."""
+    import bittensor as bt
+
+    from scoring.spec import load_track_spec
+
+    track = load_track_spec(track_spec)
+    if track.netuid != 120:
+        raise ValueError("private upload service is restricted to SN120")
+
+    async def registration(hotkey: str) -> tuple[int | None, int]:
+        async with asyncio.timeout(10), bt.Client(network) as client:
+            genesis = (await client.block_info(0)).hash
+            if not isinstance(genesis, str) or genesis.removeprefix("0x") != uploads.genesis_hash:
+                raise RuntimeError("upload registration network differs from its signature domain")
+            finalized = await client.finalized_block()
+            snapshot = await client.at(finalized)
+            uid = await snapshot.read("uid", hotkey_ss58=hotkey, netuid=120)
+            return uid, finalized
+
+    with ChallengeStore.readonly(database) as store:
+        uploads = PrivateUploads.from_environment(
+            store=store, max_bytes=track.model.max_bytes, required=True,
+            registration=lambda hotkey: asyncio.run(registration(hotkey)),
+        )
+        assert uploads is not None
+        with upload_http_server(uploads, port=port) as server:
+            server.serve_forever()
 
 
 def upload_http_server(

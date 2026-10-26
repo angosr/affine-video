@@ -1,8 +1,10 @@
+import asyncio
 import hashlib
 import io
 import json
 import socket
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from threading import Barrier, Lock
@@ -10,12 +12,14 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import httpx
 import numpy as np
 import pytest
 from bittensor.wallet import Keypair
 from safetensors.numpy import save
 
 from miner.submit import ModelSubmission, PrivateModelSubmission, UploadIntent
+from miner.upload import upload_file
 from scoring.model import TensorSpec, validate_model
 from validator.admission import AdmissionSettings, AdmissionStatus, process_next_admission
 from validator.chunks import CHUNK_BYTES, ChunkManifest, ChunkPart, build_chunk_manifest, read_part
@@ -26,7 +30,7 @@ from validator.production.storage import PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.scan import ChainCommitment, submission_from_commitment
 from validator.store import ChallengeStore, SubmissionRecord
-from validator.uploads import PrivateUploads, upload_http_server
+from validator.uploads import PrivateUploads, serve_uploads, upload_http_server
 
 from .production.test_storage import MemoryS3
 
@@ -81,6 +85,606 @@ def setup(tmp_path):
 
 def sign(intent):
     return KEY.sign(intent.signing_message())
+
+
+def test_miner_upload_uses_real_signed_loopback_metadata_and_original_admission(
+    setup, tmp_path, monkeypatch,
+):
+    uploads, intent, payload, store = setup
+    from miner import upload as miner_upload
+
+    monkeypatch.setattr(miner_upload.time, "time", lambda: NOW)
+    model = tmp_path / "prepared.safetensors"
+    model.write_bytes(payload)
+    written, requests = [], []
+    with upload_http_server(uploads, port=0, clock=lambda: NOW) as server:
+        server.timeout = 0.05
+        address = f"http://127.0.0.1:{server.server_port}/veda"
+
+        def transfer(request):
+            if request.method == "POST":
+                envelope = json.loads(request.content)
+                requests.append(envelope)
+                assert len(request.content) < 64 * 1024
+                try:
+                    with urlopen(Request(address, request.content, {
+                        "Content-Type": "application/json",
+                    }), timeout=2) as response:
+                        return httpx.Response(response.status, content=response.read())
+                except HTTPError as exc:
+                    return httpx.Response(exc.code, content=exc.read())
+            assert request.method == "PUT" and request.url.scheme == "https"
+            grant = uploads.staging.grants[-1]["Params"]
+            assert int(request.headers["Content-Length"]) == len(payload)
+            uploads.staging.put_object(**grant, Body=request.content)
+            written.append(bytes(request.content))
+            return httpx.Response(200)
+
+        async def invoke():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(transfer)) as client:
+                return await upload_file(
+                    model, audience=intent.audience, genesis_hash=intent.genesis_hash,
+                    hotkey=KEY, client=client,
+                )
+
+        def run_once():
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending = pool.submit(asyncio.run, invoke())
+                deadline = time.monotonic() + 5
+                while not pending.done() and time.monotonic() < deadline:
+                    server.handle_request()  # Original read-only eligibility stays on this thread.
+                return pending.result(timeout=1)
+
+        reference = run_once()
+        assert run_once() == reference  # Same ID/SHA on normal command retry, no local receipt.
+    assert written == [payload, payload]
+    assert [row["intent"]["action"] for row in requests] == ["upload", "seal"] * 2
+    assert len({row["intent"]["upload_id"] for row in requests}) == 1
+    assert store.public_snapshot()["challenges"] == []  # HTTP never spends the chain opportunity.
+    identifier, _ = private_formal_submission(store, reference)
+    archives = []
+    outcome = process_next_admission(
+        store, worker_id="original", current_finalized_block=100, now_ms=100_000,
+        settings=AdmissionSettings(
+            cache_dir=tmp_path / "download", max_model_bytes=10_000, tensor_schema=SCHEMA,
+            private_download=uploads.download,
+            archive=lambda task, _path, validated: archives.append((task, validated)),
+        ),
+        downloader=lambda *_a, **_kw: pytest.fail("private source fell back to HF"),
+    )
+    assert outcome.status is AdmissionStatus.ACCEPTED
+    assert archives[0][0].private_submission == reference
+    assert store.public_challenge(identifier)["model_digest"] == archives[0][1].model_digest
+
+
+@pytest.mark.parametrize("failure", ["put", "identity", "url", "changed_file"])
+def test_miner_upload_failure_preserves_identity_and_does_not_seal(
+    setup, tmp_path, monkeypatch, failure,
+):
+    _, intent, payload, _ = setup
+    from miner import upload as miner_upload
+
+    monkeypatch.setattr(miner_upload.time, "time", lambda: NOW)
+    model = tmp_path / "prepared.safetensors"
+    model.write_bytes(payload)
+    actions = []
+
+    def transfer(request):
+        if request.method == "PUT":
+            assert failure == "put"
+            raise httpx.ReadTimeout("secret bearer query", request=request)
+        signed = json.loads(request.content)["intent"]
+        actions.append(signed["action"])
+        assert signed["action"] == "upload"
+        if failure == "changed_file":
+            model.write_bytes(b"x" * len(payload))
+        return httpx.Response(200, json={
+            "upload_id": "00" * 32 if failure == "identity" else signed["upload_id"],
+            "expires_at": signed["expires_at"], "parts": [{
+                "name": "part-00000", "size_bytes": len(payload),
+                "url": ("http://bad.example" if failure == "url"
+                        else "https://staging.example/part?secret=bearer"),
+            }],
+        })
+
+    async def invoke():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transfer)) as client:
+            return await upload_file(
+                model, audience=intent.audience, genesis_hash=intent.genesis_hash,
+                hotkey=KEY, client=client,
+            )
+
+    with pytest.raises((ValueError, RuntimeError)) as error:
+        asyncio.run(invoke())
+    assert "secret" not in str(error.value) and "bearer" not in str(error.value)
+    assert actions == ["upload"]
+
+
+def configure_environment(monkeypatch, intent):
+    values = {
+        "AUDIENCE": intent.audience, "GENESIS_HASH": intent.genesis_hash,
+        "AUTHORITY_BUCKET": "original-private",
+        "AUTHORITY_STORAGE_URL": "https://authority.example",
+        "AUTHORITY_ACCESS_KEY": "authority-role", "AUTHORITY_SECRET_ACCESS_KEY": "test-secret",
+        "STAGING_STORAGE_URL": "https://staging.example",
+        "STAGING_ACCESS_KEY": "staging-role", "STAGING_SECRET_ACCESS_KEY": "test-secret",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(f"VEDA_UPLOAD_{name}", value)
+    return values
+
+
+def test_upload_factory_has_one_stable_authority_and_no_publisher_fallback(
+    setup, monkeypatch,
+):
+    _, intent, _, store = setup
+    from validator import uploads as module
+
+    for name in tuple(module.os.environ):
+        if name.startswith("VEDA_UPLOAD_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("STORAGE_URL", "https://publisher.example")
+    monkeypatch.setenv("ACCESS_KEY", "publisher-must-not-be-used")
+    monkeypatch.setenv("SECRET_ACCESS_KEY", "publisher-must-not-be-used")
+    assert PrivateUploads.from_environment(store=store, max_bytes=10_000) is None
+    monkeypatch.setenv("VEDA_UPLOAD_AUDIENCE", intent.audience)
+    with pytest.raises(ValueError, match="all VEDA_UPLOAD"):
+        PrivateUploads.from_environment(store=store, max_bytes=10_000)
+    values = configure_environment(monkeypatch, intent)
+    calls = []
+    clients = [MemoryS3(), StagingS3()]
+
+    def make_client(endpoint, key, _secret):
+        calls.append((endpoint, key))
+        return clients[len(calls) - 1]
+
+    monkeypatch.setattr(module, "_environment_client", make_client)
+    configured = PrivateUploads.from_environment(store=store, max_bytes=10_000)
+    assert configured.objects._prefix == "evaluation"
+    assert configured.objects._bucket == values["AUTHORITY_BUCKET"]
+    assert configured.bucket == "affine_video_private" and configured.prefix == "uploads/v1"
+    assert calls == [(values["AUTHORITY_STORAGE_URL"], "authority-role"),
+                     (values["STAGING_STORAGE_URL"], "staging-role")]
+    with pytest.raises(RuntimeError, match="registration lookup"):
+        configured._eligible(intent)
+
+
+@pytest.mark.parametrize("uid,genesis", [(9, "01" * 32), (None, "01" * 32), (9, "ff" * 32)])
+def test_http_entry_uses_readonly_store_and_one_real_finalized_registration_snapshot(
+    setup, tmp_path, monkeypatch, uid, genesis,
+):
+    _, intent, _, store = setup
+    import bittensor as bt
+
+    from validator import uploads as module
+
+    calls = []
+    configured = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def block_info(self, block):
+            assert block == 0
+            return SimpleNamespace(hash="0x" + genesis)
+
+        async def finalized_block(self):
+            return 100
+
+        async def at(self, block):
+            assert block == 100
+            return self
+
+        async def read(self, name, **arguments):
+            calls.append((name, arguments))
+            return uid
+
+    def factory(**arguments):
+        readonly = arguments["store"]
+        assert readonly._connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert arguments["required"] is True
+        configured.append(readonly)
+        return SimpleNamespace(genesis_hash=intent.genesis_hash, **arguments)
+
+    class Server:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def serve_forever(self):
+            api = built[0]
+            if genesis != intent.genesis_hash:
+                with pytest.raises(RuntimeError, match="signature domain"):
+                    api.registration(KEY.ss58_address)
+                return
+            actual_uid, height = api.registration(KEY.ss58_address)
+            assert (actual_uid, height) == (uid, 100)
+            if uid is None:
+                with pytest.raises(ValueError, match="registered"):
+                    api.store.require_upload_eligible(KEY.ss58_address, uid=actual_uid,
+                                                       finalized_block=height)
+            else:
+                api.store.require_upload_eligible(KEY.ss58_address, uid=actual_uid,
+                                                   finalized_block=height)
+
+    built = []
+
+    def server(api, *, port):
+        assert port == 8765
+        built.append(api)
+        return Server()
+
+    monkeypatch.setattr(module.PrivateUploads, "from_environment", factory)
+    monkeypatch.setattr(module, "upload_http_server", server)
+    monkeypatch.setattr(bt, "Client", lambda network: Client())
+    from scoring import spec as spec_module
+
+    monkeypatch.setattr(spec_module, "load_track_spec", lambda _path: SimpleNamespace(
+        netuid=120, model=SimpleNamespace(max_bytes=10_000),
+    ))
+    serve_uploads(database=tmp_path / "state.db", track_spec="unused", network="test", port=8765)
+    assert calls == ([] if genesis != intent.genesis_hash else [
+        ("uid", {"hotkey_ss58": KEY.ss58_address, "netuid": 120}),
+    ])
+    assert store.public_snapshot()["challenges"] == []
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        configured[0].chain_cursor()
+
+
+def reclaim(uploads, store, *, now=NOW + 301, finalized_timestamp=NOW + 301, block=100):
+    return uploads.reclaim_expired(
+        store=store, now=now, finalized_block=block, finalized_timestamp=finalized_timestamp,
+    )
+
+
+def test_staging_gc_obeys_cap_expiry_real_scan_and_exact_part_keys(setup):
+    uploads, intent, payload, store = setup
+    _, params = upload(uploads, intent, payload)
+    foreign = params["Key"] + "-not-in-the-original-manifest"
+    uploads.staging.put_object(Bucket=params["Bucket"], Key=foreign, Body=b"retain")
+    assert reclaim(uploads, store, now=NOW + 300) == 0
+    assert reclaim(uploads, store, finalized_timestamp=NOW + 300) == 0
+    with pytest.raises(RuntimeError, match="behind"):
+        reclaim(uploads, store, block=101)
+    assert uploads.staging.head_object(Bucket=params["Bucket"], Key=params["Key"])[
+        "ContentLength"
+    ] == len(payload)
+    assert reclaim(uploads, store) == 1
+    assert (params["Bucket"], params["Key"]) not in uploads.staging.objects
+    assert uploads.staging.head_object(Bucket=params["Bucket"], Key=foreign)["ContentLength"] == 6
+    stored, record = uploads._read(intent.upload_id)
+    assert record["state"] == "UPLOADING" and record["cleanup"] == "done"
+    assert record["expires_at"] == intent.expires_at
+    assert uploads.objects.get_optional(uploads._quota_name(intent.hotkey)) is not None
+    assert store.public_snapshot()["challenges"] == []
+    assert reclaim(uploads, store) == 0
+    assert uploads._read(intent.upload_id)[0] == stored
+
+
+def test_staging_gc_pins_original_inflight_then_releases_only_after_admission_archive(
+    setup, tmp_path,
+):
+    uploads, intent, payload, store = setup
+    _, params = upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW)
+    identifier, _ = private_formal_submission(store, reference)
+    original = store.public_challenge(identifier)
+    assert reclaim(uploads, store) == 0
+    assert store.public_challenge(identifier) == original
+    archives = []
+    outcome = process_next_admission(
+        store, worker_id="original", current_finalized_block=100, now_ms=100_000,
+        settings=AdmissionSettings(
+            cache_dir=tmp_path / "cached", max_model_bytes=10_000, tensor_schema=SCHEMA,
+            private_download=uploads.download,
+            archive=lambda task, path, validated: archives.append((task, path, validated)),
+        ),
+    )
+    assert outcome.status is AdmissionStatus.ACCEPTED and len(archives) == 1
+    registered = store.public_challenge(identifier)
+    assert registered["state"] == ChallengeState.SCORING
+    assert reclaim(uploads, store) == 1
+    assert store.public_challenge(identifier) == registered
+    assert (params["Bucket"], params["Key"]) not in uploads.staging.objects
+    assert uploads._read(intent.upload_id)[1]["state"] == "SEALED"
+    renewed = replace(intent, expires_at=NOW + 600)
+    with pytest.raises(ValueError, match="formal submission"):
+        authorize(uploads, renewed, now=NOW + 301)
+
+
+@pytest.mark.parametrize("lost_response", [False, True])
+def test_staging_gc_crash_resumes_same_cas_and_cannot_race_permission_renewal(
+    setup, monkeypatch, tmp_path, lost_response,
+):
+    uploads, intent, payload, store = setup
+    _, params = upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW)
+    delete = uploads.staging.delete_object
+    renewed = replace(intent, expires_at=NOW + 600)
+    calls = []
+
+    def crash(**arguments):
+        calls.append(arguments)
+        with pytest.raises(RuntimeError, match="cleanup must finish"):
+            authorize(uploads, renewed, now=NOW + 301)
+        if lost_response:
+            delete(**arguments)
+        raise OSError("injected exact DELETE response failure")
+
+    monkeypatch.setattr(uploads.staging, "delete_object", crash)
+    with pytest.raises(OSError, match="DELETE"):
+        reclaim(uploads, store)
+    _, pending = uploads._read(intent.upload_id)
+    assert pending["state"] == "SEALED" and pending["cleanup"] == "pending"
+    assert pending["expires_at"] == intent.expires_at
+    assert len(uploads.staging.grants) == 1
+    monkeypatch.setattr(uploads.staging, "delete_object", delete)
+    cold = PrivateUploads(
+        objects=uploads.objects, staging_client=uploads.staging,
+        staging_bucket=uploads.bucket, staging_prefix=uploads.prefix,
+        audience=uploads.audience, genesis_hash=uploads.genesis_hash, store=store,
+        registration=uploads.registration, max_bytes=uploads.max_bytes,
+    )
+    assert reclaim(cold, store) == 1
+    assert calls == [{"Bucket": params["Bucket"], "Key": params["Key"]}]
+    authorize(cold, renewed, now=NOW + 301)
+    # The only route back is a signed SAME-file PUT; SEALED and original identity stay fixed.
+    _, restored = cold._read(intent.upload_id)
+    assert restored["state"] == "SEALED" and "cleanup" not in restored
+    uploads.staging.put_object(**params, Body=payload)
+    assert cold.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "repair",
+                         max_bytes=10_000).file_sha256 == intent.file_sha256
+
+
+def test_active_cap_renewal_wins_stale_cleanup_read_without_deleting_parts(setup, monkeypatch):
+    uploads, intent, payload, store = setup
+    _, params = upload(uploads, intent, payload)
+    check = store.upload_is_referenced
+    renewed = replace(intent, expires_at=NOW + 600)
+    raced = False
+
+    def race(*args, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            authorize(uploads, renewed, now=NOW + 301)
+        return check(*args, **kwargs)
+
+    monkeypatch.setattr(store, "upload_is_referenced", race)
+    from validator.production.storage import PreconditionFailed
+
+    with pytest.raises(PreconditionFailed):
+        reclaim(uploads, store)
+    assert uploads.staging.head_object(Bucket=params["Bucket"], Key=params["Key"])[
+        "ContentLength"
+    ] == len(payload)
+    assert uploads._read(intent.upload_id)[1]["expires_at"] == NOW + 600
+    assert reclaim(uploads, store, now=NOW + 400, finalized_timestamp=NOW + 400) == 0
+
+
+def test_late_observed_original_submission_cancels_pending_cleanup(setup, monkeypatch):
+    uploads, intent, payload, store = setup
+    _, params = upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW)
+    check = store.upload_is_referenced
+    calls = 0
+
+    def observe(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            private_formal_submission(store, reference)
+        return check(*args, **kwargs)
+
+    monkeypatch.setattr(store, "upload_is_referenced", observe)
+    assert reclaim(uploads, store) == 0
+    assert "cleanup" not in uploads._read(intent.upload_id)[1]
+    assert uploads.staging.head_object(Bucket=params["Bucket"], Key=params["Key"])[
+        "ContentLength"
+    ] == len(payload)
+
+
+@pytest.mark.parametrize("max_attempts", [1, 2])
+def test_unarchived_deferred_or_blocked_admission_still_pins_original_staging(
+    setup, tmp_path, max_attempts,
+):
+    uploads, intent, payload, store = setup
+    _, params = upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW)
+    identifier, _ = private_formal_submission(store, reference)
+    del uploads.staging.objects[(params["Bucket"], params["Key"])]
+    result = process_next_admission(
+        store, worker_id="original", current_finalized_block=100, now_ms=100_000,
+        settings=AdmissionSettings(
+            cache_dir=tmp_path / "download", max_model_bytes=10_000, tensor_schema=SCHEMA,
+            private_download=uploads.download, max_attempts=max_attempts,
+        ),
+    )
+    assert result.status == (AdmissionStatus.BLOCKED if max_attempts == 1
+                             else AdmissionStatus.DEFERRED)
+    before = store.public_challenge(identifier)
+    assert reclaim(uploads, store) == 0
+    assert "cleanup" not in uploads._read(intent.upload_id)[1]
+    assert store.public_challenge(identifier) == before
+
+
+@pytest.mark.parametrize("mode", ["ready", "lagging_scan", "wrong_network", "before_expiry"])
+def test_evaluator_gc_entry_uses_finalized_time_and_fresh_readonly_original_db(
+    setup, tmp_path, monkeypatch, mode,
+):
+    import threading
+    from datetime import UTC, datetime
+
+    from validator import run as module
+
+    uploads, intent, payload, store = setup
+    _, params = upload(uploads, intent, payload)
+    owner_thread = threading.get_ident()
+    calls = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def block_info(self, height):
+            assert height == 0
+            return SimpleNamespace(hash="0x" + (
+                "ff" * 32 if mode == "wrong_network" else intent.genesis_hash
+            ))
+
+        async def finalized_block(self):
+            return 101 if mode == "lagging_scan" else 100
+
+        async def at(self, height):
+            calls.append(height)
+            return self
+
+        async def timestamp(self):
+            return datetime.fromtimestamp(NOW + (299 if mode == "before_expiry" else 301), UTC)
+
+    original = uploads.reclaim_expired
+
+    def cleanup(**arguments):
+        assert threading.get_ident() != owner_thread
+        assert arguments["store"] is not store
+        assert arguments["store"]._connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        return original(**arguments)
+
+    monkeypatch.setattr(uploads, "reclaim_expired", cleanup)
+    monkeypatch.setattr(module.bt, "Client", lambda *_a, **_kw: Client())
+
+    def run():
+        return asyncio.run(module._reclaim_private_uploads(
+            uploads, database=tmp_path / "state.db", network="test", archive_endpoints=None,
+        ))
+
+    if mode in {"lagging_scan", "wrong_network"}:
+        with pytest.raises(RuntimeError, match="behind|signature domain"):
+            run()
+    else:
+        assert run() == (0 if mode == "before_expiry" else 1)
+    assert ((params["Bucket"], params["Key"]) in uploads.staging.objects) == (mode != "ready")
+    assert calls == ([] if mode == "wrong_network" else [101 if mode == "lagging_scan" else 100])
+
+
+def test_real_run_composes_private_source_only_with_original_admission_archive(
+    setup, tmp_path, monkeypatch,
+):
+    from tests.scoring.test_spec import valid_spec
+    from validator import run as module
+
+    uploads, intent, payload, _ = setup
+    upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW)
+    spec = valid_spec()
+    spec["netuid"] = 120
+    from scoring.spec import parse_track_spec
+
+    track = parse_track_spec(spec)
+    track_path, db_path = tmp_path / "track.json", tmp_path / "state.db"
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b"assembly fixture, not a release manifest")
+    config = SimpleNamespace(
+        track_spec=track_path, validator_database=db_path, artifact_manifest=manifest_path,
+        storage_bucket="private", storage_prefix="evaluation", work_dir=tmp_path / "work",
+        runtime=SimpleNamespace(source_binding="binding.json", sample_cache="samples"),
+        validate_evaluation_device=lambda _device: "cpu",
+        verify_evaluator_manifest=lambda _manifest: None,
+    )
+    bootstrap = manifest_path.read_bytes()
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="fixture")
+    objects.create_plan("bootstrap/artifact_manifest.json", bootstrap)
+    monkeypatch.setattr(objects, "verify_evaluator_boundary", lambda _hidden: None)
+    calls = []
+
+    class StopLoop(BaseException):
+        pass
+
+    class Publisher:
+        def acquire_writer_lock(self, database):
+            assert database == db_path
+
+        def verify_writes(self):
+            pass
+
+        async def recover(self, _track, *, runtime_manifest):
+            assert runtime_manifest == bootstrap
+            return SimpleNamespace(matches=(), committed_match_count=0, required_finalized_block=0)
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def finalized_block(self):
+            return 100
+
+    def factory(**arguments):
+        assert arguments["max_bytes"] == track.model.max_bytes
+        uploads.store = arguments["store"]
+        return uploads
+
+    async def cycle(_client, store, *, work, **_kwargs):
+        settings = work.admission_settings
+        assert settings.private_download.__self__ is uploads
+        assert settings.archive.__self__ is work.evaluator_factory(store).batch_source
+        assert settings.restore is not None and settings.record_retry is not None
+        downloaded = settings.private_download(
+            reference, hotkey=intent.hotkey, cache_dir=tmp_path / "download", max_bytes=10_000,
+        )
+        assert downloaded.path.read_bytes() == payload
+        assert downloaded.file_sha256 == reference.file_sha256
+        calls.append("original worker settings")
+        raise StopLoop
+
+    async def no_op(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(module, "load_track_spec", lambda _path: track)
+    monkeypatch.setattr(module, "load_producer_config", lambda _path: config)
+    monkeypatch.setattr(module.ArtifactManifest, "decode", lambda _body: SimpleNamespace(
+        digest=track.artifact_manifest_sha256, artifacts=(),
+    ))
+    monkeypatch.setattr(
+        module.PrivateObjectStore, "from_evaluator_environment", lambda **_kw: objects,
+    )
+    monkeypatch.setattr(module, "verify_initial_champion", lambda *_a, **_kw: None)
+    monkeypatch.setattr(module, "_require_production_release", lambda *_a: None)
+    monkeypatch.setattr(module, "ConfirmationWorkerPool", lambda *_a, **_kw: SimpleNamespace(
+        close=lambda: calls.append("pool closed"),
+    ))
+    monkeypatch.setattr(module.PrivateUploads, "from_environment", factory)
+    monkeypatch.setattr(module.bt, "Client", lambda *_a, **_kw: Client())
+    monkeypatch.setattr(module, "seed_legacy_exclusions", no_op)
+    monkeypatch.setattr(module, "process_cycle", cycle)
+    monkeypatch.setattr(module, "_reclaim_private_uploads", no_op)
+    monkeypatch.setattr(module, "_publish_due_batch", no_op)
+    exact = tmp_path / "exact"
+    exact.mkdir()
+    with pytest.raises(StopLoop):
+        asyncio.run(module.run_evaluator(
+            track_spec=track_path, database=db_path, model_cache=tmp_path / "models",
+            exact_cache=exact, initial_model=tmp_path / "baseline", network="test",
+            archive_endpoints=None, worker_id="test", publisher=Publisher(),
+            production_config="fixture", once=True,
+        ))
+    assert calls == ["original worker settings", "pool closed"]
 
 
 def authorize(uploads, intent, signature=None, *, now):

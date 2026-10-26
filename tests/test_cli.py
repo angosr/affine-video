@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -7,6 +8,80 @@ import cli as cli_module
 from cli import main
 from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
+
+
+def test_miner_upload_call_returns_only_fixed_identity_and_never_submits(monkeypatch, capsys):
+    from miner import upload as module
+    from miner.submit import PrivateModelSubmission
+
+    calls = []
+
+    async def upload(model, **arguments):
+        calls.append((model, arguments))
+        return PrivateModelSubmission("ab" * 32, "cd" * 32)
+
+    monkeypatch.setattr(module, "upload_model", upload)
+    monkeypatch.setattr(cli_module, "submit_model", lambda *_a, **_kw: pytest.fail("chain call"))
+    main(["miner", "upload", "--model", "prepared.safetensors",
+          "--upload-url", "https://uploads.example/veda", "--wallet-name", "miner",
+          "--hotkey", "original", "--wallet-path", "/test/wallets"])
+    result = json.loads(capsys.readouterr().out)
+    assert result == {"upload_id": "ab" * 32, "file_sha256": "cd" * 32,
+                      "sealed": True, "accepted": False, "chain_submission_enabled": False}
+    assert calls == [("prepared.safetensors", {
+        "audience": "https://uploads.example/veda", "network": "finney",
+        "wallet_name": "miner", "hotkey_name": "original", "wallet_path": "/test/wallets",
+    })]
+
+
+def test_evaluator_upload_command_is_only_same_host_metadata_entry(monkeypatch):
+    from validator import uploads as module
+
+    calls = []
+    monkeypatch.setattr(module, "serve_uploads", lambda **arguments: calls.append(arguments))
+    main(["evaluator", "uploads", "--database", "original.db", "--track-spec", "track.json"])
+    assert calls == [{"database": "original.db", "track_spec": "track.json",
+                      "network": "finney", "port": 8765}]
+
+
+def test_miner_upload_uses_original_wallet_signer_and_genesis_without_chain_write(monkeypatch):
+    from miner import upload as module
+    from miner.submit import PrivateModelSubmission
+
+    hotkey = object()
+    observed = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def block_info(self, height):
+            assert height == 0
+            return SimpleNamespace(hash="0x" + "01" * 32)
+
+    def wallet(**arguments):
+        assert arguments == {"name": "miner", "hotkey": "original", "path": "/wallets"}
+        return SimpleNamespace(hotkey=hotkey)
+
+    async def upload_file(model, **arguments):
+        assert arguments["hotkey"] is hotkey
+        assert arguments["genesis_hash"] == "01" * 32
+        assert arguments["audience"] == "https://uploads.example/veda"
+        observed.append(model)
+        return PrivateModelSubmission("ab" * 32, "cd" * 32)
+
+    monkeypatch.setattr(module.bt, "Client", lambda network: Client())
+    monkeypatch.setattr(module.bt, "Wallet", wallet)
+    monkeypatch.setattr(module, "upload_file", upload_file)
+    result = asyncio.run(module.upload_model(
+        "prepared.safetensors", audience="https://uploads.example/veda", network="test",
+        wallet_name="miner", hotkey_name="original", wallet_path="/wallets",
+    ))
+    assert result == PrivateModelSubmission("ab" * 32, "cd" * 32)
+    assert observed == ["prepared.safetensors"]
 
 
 def test_public_monitor_needs_no_miner_or_validator_setup(monkeypatch, capsys) -> None:

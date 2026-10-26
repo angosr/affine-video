@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from math import isfinite
 from pathlib import Path
 
-from miner.chain import ChainSubmissionError, submit_model
+from miner.chain import submit_model
 from miner.prepare import prepare_model
 from miner.submit import ModelSubmission, PrivateModelSubmission, SubmissionFormatError
 from monitor import fetch_status, render_status
@@ -76,9 +76,25 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--model", required=True)
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--hotkey-address", required=True)
+    upload = miner_commands.add_parser(
+        "upload", help="upload a fixed private model (chain submission is not enabled)",
+    )
+    upload.add_argument("--model", required=True)
+    upload.add_argument("--upload-url", required=True)
+    upload.add_argument("--network", default="finney")
+    upload.add_argument("--wallet-name", default="default")
+    upload.add_argument("--hotkey", default="default")
+    upload.add_argument("--wallet-path")
 
     evaluator = modules.add_parser("evaluator", help="operate evaluation and data production")
     evaluator_commands = evaluator.add_subparsers(dest="command", required=True)
+    uploads = evaluator_commands.add_parser(
+        "uploads", help="serve private upload metadata on CPU loopback only",
+    )
+    uploads.add_argument("--track-spec", required=True)
+    uploads.add_argument("--database", required=True)
+    uploads.add_argument("--network", default="finney")
+    uploads.add_argument("--port", type=int, default=8765)
     produce = evaluator_commands.add_parser("produce", help="produce private evaluation batches")
     produce.add_argument("--config", required=True)
     produce.add_argument("--once", action="store_true")
@@ -174,6 +190,19 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
     try:
+        if arguments.command == "upload":
+            from miner.upload import upload_model
+
+            reference = asyncio.run(upload_model(
+                arguments.model, audience=arguments.upload_url, network=arguments.network,
+                wallet_name=arguments.wallet_name, hotkey_name=arguments.hotkey,
+                wallet_path=arguments.wallet_path,
+            ))
+            print(json.dumps({
+                "upload_id": reference.upload_id, "file_sha256": reference.file_sha256,
+                "sealed": True, "accepted": False, "chain_submission_enabled": False,
+            }, sort_keys=True))
+            return
         if arguments.command == "prepare":
             prepared = prepare_model(
                 arguments.model,
@@ -245,12 +274,25 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
                 "repo_id": submission.repo_id,
                 "revision": submission.revision,
             }
-    except (SubmissionFormatError, ChainSubmissionError, ValueError) as exc:
+    except (SubmissionFormatError, OSError, RuntimeError, ValueError) as exc:
         parser.exit(1, f"error: {exc}\n")
     print(json.dumps(output, sort_keys=True))
 
 
 def _run_evaluator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
+    if arguments.command == "uploads":
+        from validator.uploads import serve_uploads
+
+        try:
+            serve_uploads(
+                database=arguments.database, track_spec=arguments.track_spec,
+                network=arguments.network, port=arguments.port,
+            )
+        except KeyboardInterrupt:
+            return
+        except (RuntimeError, OSError, ValueError) as exc:
+            parser.exit(1, f"error: {exc}\n")
+        return
     if arguments.command == "policy":
         from validator.production.commitment import canonical_json
         from validator.production.storage import evaluator_iam_policy, verify_evaluator_iam_policy

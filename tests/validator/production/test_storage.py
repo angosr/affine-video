@@ -59,11 +59,31 @@ class MemoryS3:
     def delete_object(self, *, Bucket, Key):
         self.objects.pop((Bucket, Key), None)
 
-    def list_objects_v2(self, *, Bucket, Prefix):
-        return {"Contents": [
+    def list_objects_v2(self, *, Bucket, Prefix, MaxKeys=None, StartAfter=None):
+        contents = [
             {"Key": key} for bucket, key in sorted(self.objects)
             if bucket == Bucket and key.startswith(Prefix)
-        ]}
+            and (StartAfter is None or key > StartAfter)
+        ]
+        return {"Contents": contents if MaxKeys is None else contents[:MaxKeys],
+                "IsTruncated": MaxKeys is not None and len(contents) > MaxKeys}
+
+
+def test_private_listing_supports_bounded_original_index_pages():
+    client = MemoryS3()
+    store = PrivateObjectStore(client, bucket="private", prefix="evaluation")
+    for index in range(40):
+        store.create_plan(f"uploads/{index:064x}.json", b"metadata")
+    first = store.list_names("uploads/", limit=16)
+    second = store.list_names("uploads/", limit=16, after=first[-1])
+    last = store.list_names("uploads/", limit=16, after=second[-1])
+    assert len(first) == len(second) == 16 and len(last) == 8
+    assert (*first, *second, *last) == store.list_names("uploads/")
+    assert store.list_names("uploads/", limit=16, after=last[-1]) == ()
+    with pytest.raises(ValueError, match="outside"):
+        store.list_names("uploads/", limit=16, after="plans/1.json")
+    with pytest.raises(ValueError, match="positive"):
+        store.list_names("uploads/", limit=0)
 
 
 def precondition_failed():

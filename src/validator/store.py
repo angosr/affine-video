@@ -551,6 +551,31 @@ class ChallengeStore:
         finally:
             self._connection.rollback()
 
+    def upload_is_referenced(
+        self, hotkey: str, *, reference: PrivateModelSubmission, finalized_block: int,
+    ) -> bool:
+        """Staging GC uses the original scan and admission/archive facts, not a TTL ledger.
+
+        Production registers model_digest only AFTER successful original archive.
+        Until then an in-flight submission pins its staging, including retry/blocked.
+        """
+        self._connection.execute("BEGIN")
+        try:
+            cursor = self.chain_cursor()
+            if (type(finalized_block) is not int or finalized_block < 0
+                    or cursor is None or cursor[0] < finalized_block):
+                raise RuntimeError("upload cleanup scan is behind the finalized snapshot")
+            rows = self._connection.execute(
+                "SELECT c.state, c.model_digest FROM submissions s "
+                "LEFT JOIN challenges c USING(submission_id) "
+                "WHERE s.hotkey=? AND s.netuid=120 AND s.payload=?",
+                (hotkey, reference.encode()),
+            ).fetchall()
+            return any(row["model_digest"] is None and row["state"] not in TERMINAL_STATES
+                       for row in rows)
+        finally:
+            self._connection.rollback()
+
     def bind_track_spec(self, digest: str) -> None:
         """Bind all future challenges in this database to one frozen spec."""
 
