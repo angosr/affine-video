@@ -8,6 +8,7 @@ called by the existing admission worker before its ordinary schema/owner gate.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import sys
@@ -326,9 +327,33 @@ def upload_http_server(
     serving thread. TLS belongs to the existing external HTTPS reverse proxy.
     Creating this object does not start a serving loop or another worker.
     """
+    class RequestReader(io.RawIOBase):
+        """Recompute the remaining receive budget on EVERY raw socket read."""
+
+        def __init__(self, connection: Any, deadline: float) -> None:
+            super().__init__()
+            self.connection = connection
+            self.deadline = deadline
+
+        def readable(self) -> bool:
+            return True
+
+        def readinto(self, buffer: Any) -> int:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("metadata receive deadline exceeded")
+            self.connection.settimeout(remaining)
+            return self.connection.recv_into(buffer)
+
     class Handler(BaseHTTPRequestHandler):
-        # StreamRequestHandler.setup applies this before any request-line/header read.
+        # One absolute budget for request-line, headers AND body, not a renewable idle timer.
         timeout = 10
+
+        def setup(self) -> None:
+            self.receive_deadline = time.monotonic() + self.timeout
+            super().setup()
+            self.rfile.close()
+            self.rfile = io.BufferedReader(RequestReader(self.connection, self.receive_deadline))
 
         def log_message(self, *_args: object) -> None:
             # Do not put request bodies, signed URLs or signature tokens in logs.
@@ -346,7 +371,14 @@ def upload_http_server(
                         or not 0 < int(lengths[0]) <= 64 * 1024
                         or self.headers.get_content_type() != "application/json"):
                     raise TypeError("invalid metadata envelope")
-                payload = self.rfile.read(int(lengths[0]))
+                try:
+                    payload = self.rfile.read(int(lengths[0]))
+                    if time.monotonic() >= self.receive_deadline:
+                        raise TimeoutError("metadata receive deadline exceeded")
+                except TimeoutError:
+                    # No dispatch or attempted response on an expired receiving socket.
+                    return
+                self.connection.settimeout(self.timeout)
                 if len(payload) != int(lengths[0]):
                     raise TypeError("incomplete metadata envelope")
                 request = json.loads(payload)

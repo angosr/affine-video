@@ -3,6 +3,7 @@ import io
 import json
 import socket
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from threading import Barrier, Lock
@@ -560,7 +561,10 @@ def test_single_loopback_http_adapter_handles_only_small_signed_metadata(setup, 
     assert "bearer" not in capsys.readouterr().err
 
 
-def test_http_rejects_body_over_limit_and_does_not_expose_private_errors(setup, monkeypatch):
+@pytest.mark.parametrize("failure", [RuntimeError, TimeoutError])
+def test_http_rejects_body_over_limit_and_does_not_expose_private_errors(
+    setup, monkeypatch, failure,
+):
     uploads, intent, _, _ = setup
     with upload_http_server(uploads, port=0, clock=lambda: NOW) as server:
         status, _, response = http_request(server, b"{}", content_length=64 * 1024 + 1)
@@ -568,7 +572,7 @@ def test_http_rejects_body_over_limit_and_does_not_expose_private_errors(setup, 
         assert uploads.staging.grants == []
 
         def unavailable(*_args, **_kwargs):
-            raise RuntimeError("PRIVATE_ENDPOINT_AND_CREDENTIALS")
+            raise failure("PRIVATE_ENDPOINT_AND_CREDENTIALS")
 
         monkeypatch.setattr(uploads, "authorize", unavailable)
         manifest = ChunkManifest(intent.file_sha256, intent.size_bytes, (
@@ -591,6 +595,8 @@ def test_http_times_out_before_parsing_and_can_serve_the_next_request(
     uploads, _, _, _ = setup
     with upload_http_server(uploads, port=0, clock=lambda: NOW) as server:
         handler = server.RequestHandlerClass
+        assert handler.timeout == 10
+        monkeypatch.setattr(handler, "timeout", 0.05)
         original_setup = handler.setup
         observed_timeouts = []
 
@@ -598,9 +604,6 @@ def test_http_times_out_before_parsing_and_can_serve_the_next_request(
             original_setup(self)
             timeout = self.connection.gettimeout()
             observed_timeouts.append(timeout)
-            if timeout is not None:
-                # Accelerate the actual production timeout; never add a missing one.
-                self.connection.settimeout(min(timeout, 0.05))
 
         monkeypatch.setattr(handler, "setup", setup_connection)
 
@@ -617,8 +620,57 @@ def test_http_times_out_before_parsing_and_can_serve_the_next_request(
             result = pool.submit(stalled_client)
             server.handle_request()
             assert result.result(timeout=2), "partial metadata request held the only handler"
-        assert observed_timeouts == [10]
+        assert observed_timeouts == [0.05]
         assert uploads.staging.grants == []
         status, _, response = http_request(server, {})
         assert status == 400 and response == {"error": "INVALID_UPLOAD_REQUEST"}
-        assert observed_timeouts == [10, 10]
+        assert observed_timeouts == [0.05, 0.05]
+
+
+@pytest.mark.parametrize("prefix", [
+    b"POST /ve",
+    b"POST /veda HTTP/1.1\r\nHost: auth.example\r\nX-Incomplete: ",
+    (b"POST /veda HTTP/1.1\r\nHost: auth.example\r\nContent-Type: application/json\r\n"
+     b"Content-Length: 65536\r\n\r\n"),
+], ids=["request-line", "headers", "body"])
+def test_http_absolute_receive_deadline_rejects_drips_and_serves_next_request(
+    setup, monkeypatch, prefix,
+):
+    uploads, intent, _, _ = setup
+    with upload_http_server(uploads, port=0, clock=lambda: NOW) as server:
+        assert server.RequestHandlerClass.timeout == 10
+        monkeypatch.setattr(server.RequestHandlerClass, "timeout", 0.2)
+
+        def dripping_client():
+            with socket.create_connection(server.server_address, timeout=1) as connection:
+                connection.settimeout(0.02)  # Every new byte arrives within the idle timeout.
+                connection.sendall(prefix)
+                started = time.monotonic()
+                while time.monotonic() - started < 1:
+                    try:
+                        connection.sendall(b"x")
+                        if connection.recv(4096) == b"":
+                            return time.monotonic() - started
+                    except TimeoutError:
+                        continue
+                    except ConnectionError:
+                        return time.monotonic() - started
+                return None  # Close the old unbounded receiver so a red test cannot hang.
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(dripping_client)
+            server.handle_request()
+            elapsed = result.result(timeout=2)
+        assert elapsed is not None, "drips extended the absolute metadata receive budget"
+        assert elapsed < 0.7
+        assert uploads.staging.grants == []
+        assert uploads.objects._client.objects == {}
+        manifest = ChunkManifest(intent.file_sha256, intent.size_bytes, (
+            ChunkPart("part-00000", intent.file_sha256, intent.size_bytes),
+        ))
+        status, _, response = http_request(server, {
+            "intent": asdict(intent), "signature": sign(intent).hex(),
+            "manifest": json.loads(manifest.encode()),
+        })
+        assert status == 200 and response["upload_id"] == intent.upload_id
+        assert len(response["parts"]) == len(uploads.staging.grants) == 1
