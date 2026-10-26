@@ -178,16 +178,17 @@ class PrivateUploads:
         self._eligible(intent)
         stored, previous = self._read(intent.upload_id)
         identity = self._identity(intent)
-        if previous is not None:
-            if any(previous[key] != value for key, value in identity.items()):
-                raise ValueError("upload identity is already fixed")
-            if previous["state"] == "SEALED":
-                raise ValueError("upload is already sealed")
+        if previous is not None and any(
+            previous[key] != value for key, value in identity.items()
+        ):
+            raise ValueError("upload identity is already fixed")
         self._claim_quota(intent, now=now)
         if previous is None or previous["expires_at"] < intent.expires_at:
             document = canonical_json({
                 "format": "veda-upload-v1", **identity,
-                "state": "UPLOADING", "expires_at": intent.expires_at,
+                # Sealing fixes the file/parts, not permission to repair those SAME bytes.
+                "state": "UPLOADING" if previous is None else previous["state"],
+                "expires_at": intent.expires_at,
                 "manifest": json.loads(manifest.encode()),
             })
             if stored is None:

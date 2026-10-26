@@ -143,9 +143,69 @@ def test_seal_freezes_metadata_and_admission_verifies_the_real_source_once(setup
     assert uploads.seal(seal, sign(seal), now=NOW + 2) == reference
     assert not any("/models/" in key for _, key in uploads.objects._client.objects)
     assert all("/uploads/" in key for _, key in uploads.objects._client.objects)
-    with pytest.raises(ValueError, match="already sealed"):
-        authorize(uploads, intent, now=NOW + 2)
+    sealed_facts = dict(uploads.objects._client.objects)
+    authorize(uploads, intent, now=NOW + 2)  # Renew only the same immutable file/parts.
+    assert uploads.objects._client.objects == sealed_facts
     assert store.public_snapshot()["challenges"] == []
+
+
+def test_unsubmitted_sealed_missing_part_can_get_a_new_signed_grant_after_expiry(setup, tmp_path):
+    uploads, intent, payload, store = setup
+    _, params = upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW + 1)
+    _, original = uploads._read(intent.upload_id)
+    del uploads.staging.objects[(params["Bucket"], params["Key"])]
+    with pytest.raises(ModelDownloadError) as missing:
+        uploads.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cold",
+                         max_bytes=10_000)
+    assert missing.value.code == "PRIVATE_UPLOAD_UNAVAILABLE" and missing.value.temporary
+
+    renewed = replace(intent, expires_at=NOW + 600)
+    manifest = ChunkManifest(intent.file_sha256, intent.size_bytes, (
+        ChunkPart("part-00000", intent.file_sha256, intent.size_bytes),
+    ))
+    with upload_http_server(uploads, port=0, clock=lambda: NOW + 301) as server:
+        status, _, grant = http_request(server, {
+            "intent": asdict(renewed), "signature": sign(renewed).hex(),
+            "manifest": json.loads(manifest.encode()),
+        })
+    assert status == 200 and grant["upload_id"] == intent.upload_id
+    assert len(uploads.staging.grants) == 2  # No direct backend repair without a fresh grant.
+    permission = uploads.staging.grants[-1]
+    assert permission["Params"] == params and 0 < permission["ExpiresIn"] <= 299
+    assert grant["parts"][0]["name"] == "part-00000"
+    uploads.staging.put_object(**permission["Params"], Body=payload)
+    _, repaired = uploads._read(intent.upload_id)
+    assert {**original, "expires_at": NOW + 600} == repaired
+    assert repaired["state"] == "SEALED"  # Never reopen metadata or a competition opportunity.
+    downloaded = uploads.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cold",
+                                  max_bytes=10_000)
+    assert downloaded.file_sha256 == intent.file_sha256 and downloaded.path.read_bytes() == payload
+    assert store.public_snapshot()["challenges"] == []
+
+
+def test_sealed_resume_cannot_change_its_file_or_bypass_a_formal_hf_submission(setup):
+    uploads, intent, payload, store = setup
+    upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    uploads.seal(seal, sign(seal), now=NOW + 1)
+    changed = replace(intent, file_sha256="ee" * 32, expires_at=NOW + 600)
+    changed_manifest = ChunkManifest(changed.file_sha256, changed.size_bytes, (
+        ChunkPart("part-00000", changed.file_sha256, changed.size_bytes),
+    ))
+    changed = replace(
+        changed, manifest_sha256=hashlib.sha256(changed_manifest.encode()).hexdigest(),
+    )
+    with pytest.raises(ValueError, match="identity is already fixed"):
+        authorize(uploads, changed, now=NOW + 301)
+    identifier = formal_submission(store)
+    renewed = replace(intent, expires_at=NOW + 600)
+    with pytest.raises(ValueError, match="formal submission"):
+        authorize(uploads, renewed, now=NOW + 301)
+    assert store.get_challenge(identifier).state is ChallengeState.QUEUED
+    assert store.get_challenge(identifier).attempts == 0
+    assert len(uploads.staging.grants) == 1
 
 
 @pytest.mark.parametrize("mutation", [
