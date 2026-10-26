@@ -9,15 +9,22 @@ from miner.chain import ChainSubmissionError, commitment_info, submit_model
 from miner.submit import ModelSubmission, PrivateModelSubmission
 
 
-def test_preparatory_private_reference_cannot_spend_a_chain_opportunity(monkeypatch):
+@pytest.mark.parametrize("submission,netuid,reason", [
+    (PrivateModelSubmission("ab" * 32, "cd" * 32), 7, "SN120"),
+    (b"VDS1" + b"x" * 64, 120, "explicit"),
+    (SimpleNamespace(encode=lambda: b"unexpected"), 120, "explicit"),
+])
+def test_only_explicit_supported_sources_reach_wallet_or_chain(
+    monkeypatch, submission, netuid, reason,
+):
     def unexpected(**_kwargs):
-        pytest.fail("unwired private source opened a wallet or chain")
+        pytest.fail("invalid private source opened a wallet or chain")
 
     monkeypatch.setattr(chain.bt, "Wallet", unexpected)
     monkeypatch.setattr(chain.bt, "Client", unexpected)
-    with pytest.raises(ChainSubmissionError, match="not enabled"):
+    with pytest.raises(ValueError, match=reason):
         asyncio.run(submit_model(
-            PrivateModelSubmission("ab" * 32, "cd" * 32), netuid=120,
+            submission, netuid=netuid,
             network="finney", wallet_name="default", hotkey_name="default",
         ))
 
@@ -41,7 +48,13 @@ def test_commitment_info_enforces_runtime_limit() -> None:
         commitment_info(b"x" * 129)
 
 
-def test_submit_model_signs_with_hotkey_and_waits_for_finalization(monkeypatch) -> None:
+@pytest.mark.parametrize("submission,netuid", [
+    (ModelSubmission("owner/model", "12" * 20), 7),
+    (PrivateModelSubmission("ab" * 32, "cd" * 32), 120),
+])
+def test_submit_model_signs_with_hotkey_and_waits_for_finalization(
+    monkeypatch, submission, netuid,
+) -> None:
     calls: dict[str, object] = {}
 
     class FakeWallet:
@@ -70,12 +83,11 @@ def test_submit_model_signs_with_hotkey_and_waits_for_finalization(monkeypatch) 
 
     monkeypatch.setattr(chain.bt, "Wallet", FakeWallet)
     monkeypatch.setattr(chain.bt, "Client", FakeClient)
-    submission = ModelSubmission("owner/model", "12" * 20)
 
     receipt = asyncio.run(
         submit_model(
             submission,
-            netuid=7,
+            netuid=netuid,
             network="test",
             wallet_name="alice",
             hotkey_name="miner",
@@ -86,6 +98,7 @@ def test_submit_model_signs_with_hotkey_and_waits_for_finalization(monkeypatch) 
     assert receipt.block_hash == "0xabc"
     assert calls["wallet"] == {"name": "alice", "hotkey": "miner", "path": "/wallets"}
     assert calls["network"] == "test"
+    assert calls["call"].params == {"netuid": netuid, "info": commitment_info(submission.encode())}
     assert calls["submit"] == {
         "signer": "hotkey",
         "wait_for_inclusion": True,

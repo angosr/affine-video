@@ -27,7 +27,7 @@ def test_miner_upload_call_returns_only_fixed_identity_and_never_submits(monkeyp
           "--hotkey", "original", "--wallet-path", "/test/wallets"])
     result = json.loads(capsys.readouterr().out)
     assert result == {"upload_id": "ab" * 32, "file_sha256": "cd" * 32,
-                      "sealed": True, "accepted": False, "chain_submission_enabled": False}
+                      "sealed": True, "accepted": False}
     assert calls == [("prepared.safetensors", {
         "audience": "https://uploads.example/veda", "network": "finney",
         "wallet_name": "miner", "hotkey_name": "original", "wallet_path": "/test/wallets",
@@ -302,10 +302,30 @@ def test_private_commit_preview_is_explicit_and_does_not_open_chain(monkeypatch,
     assert document["file_sha256"] == "cd" * 32
     assert document["payload_bytes"] == 68
     assert "repo_id" not in document and "revision" not in document
-    with pytest.raises(SystemExit) as stopped:
-        main(command)
-    assert stopped.value.code == 1
-    assert "not enabled" in capsys.readouterr().err
+
+
+def test_private_commit_uses_same_hotkey_finalization_entry_with_explicit_vds1(monkeypatch, capsys):
+    from miner.submit import PrivateModelSubmission
+
+    calls = []
+
+    async def submit(reference, **arguments):
+        calls.append((reference, arguments))
+        return SimpleNamespace(block_hash="0xabc", extrinsic_id="10-2", message="finalized")
+
+    monkeypatch.setattr(cli_module, "submit_model", submit)
+    main(["miner", "commit", "--upload-id", "ab" * 32, "--file-sha256", "cd" * 32,
+          "--wallet-name", "miner", "--hotkey", "original"])
+    reference, arguments = calls[0]
+    assert reference == PrivateModelSubmission("ab" * 32, "cd" * 32)
+    assert reference.encode() == b"VDS1" + bytes.fromhex("ab" * 32 + "cd" * 32)
+    assert arguments == {"netuid": 120, "network": "finney", "wallet_name": "miner",
+                         "hotkey_name": "original", "wallet_path": None}
+    document = json.loads(capsys.readouterr().out)
+    assert document["source"] == "PRIVATE_S3" and document["block_hash"] == "0xabc"
+    assert document["upload_id"] == reference.upload_id
+    assert document["file_sha256"] == reference.file_sha256
+    assert "repo_id" not in document and "revision" not in document
 
 
 @pytest.mark.parametrize("arguments", [

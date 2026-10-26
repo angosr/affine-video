@@ -56,7 +56,7 @@ def _parser() -> argparse.ArgumentParser:
     source = commit.add_mutually_exclusive_group(required=True)
     source.add_argument("--repo-id")
     source.add_argument(
-        "--upload-id", help="sealed private upload ID (preview only until deployed)",
+        "--upload-id", help="sealed private upload ID, paired with its complete file SHA-256",
     )
     commit.add_argument("--revision")
     commit.add_argument("--file-sha256", help="complete SHA-256 of the sealed private model")
@@ -77,7 +77,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--hotkey-address", required=True)
     upload = miner_commands.add_parser(
-        "upload", help="upload a fixed private model (chain submission is not enabled)",
+        "upload", help="upload a fixed private model before a separate finalized commitment",
     )
     upload.add_argument("--model", required=True)
     upload.add_argument("--upload-url", required=True)
@@ -200,7 +200,7 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
             ))
             print(json.dumps({
                 "upload_id": reference.upload_id, "file_sha256": reference.file_sha256,
-                "sealed": True, "accepted": False, "chain_submission_enabled": False,
+                "sealed": True, "accepted": False,
             }, sort_keys=True))
             return
         if arguments.command == "prepare":
@@ -229,19 +229,14 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
                 raise ValueError("private submission is restricted to SN120")
             if arguments.revision is not None or arguments.file_sha256 is None:
                 raise ValueError("private source requires --file-sha256 and forbids --revision")
-            private = PrivateModelSubmission(arguments.upload_id, arguments.file_sha256)
-            if not arguments.dry_run:
-                raise ValueError("private submission is not enabled; only --dry-run is available")
-            print(json.dumps({
-                "source": "PRIVATE_S3", "upload_id": private.upload_id,
-                "file_sha256": private.file_sha256, "netuid": arguments.netuid,
-                "network": arguments.network, "hotkey": arguments.hotkey,
-                "payload_bytes": len(private.encode()), "payload_hex": private.encode().hex(),
-            }, sort_keys=True))
-            return
-        if arguments.revision is None or arguments.file_sha256 is not None:
-            raise ValueError("HF source requires --revision and forbids --file-sha256")
-        submission = ModelSubmission(arguments.repo_id, arguments.revision)
+            submission = PrivateModelSubmission(arguments.upload_id, arguments.file_sha256)
+            source = {"source": "PRIVATE_S3", "upload_id": submission.upload_id,
+                      "file_sha256": submission.file_sha256}
+        else:
+            if arguments.revision is None or arguments.file_sha256 is not None:
+                raise ValueError("HF source requires --revision and forbids --file-sha256")
+            submission = ModelSubmission(arguments.repo_id, arguments.revision)
+            source = {"repo_id": submission.repo_id, "revision": submission.revision}
         payload = submission.encode()
         if arguments.dry_run:
             output = {
@@ -250,8 +245,7 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
                 "netuid": arguments.netuid,
                 "payload_bytes": len(payload),
                 "payload_hex": payload.hex(),
-                "repo_id": submission.repo_id,
-                "revision": submission.revision,
+                **source,
             }
         else:
             receipt = asyncio.run(
@@ -271,8 +265,7 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
                 "message": receipt.message,
                 "network": arguments.network,
                 "netuid": arguments.netuid,
-                "repo_id": submission.repo_id,
-                "revision": submission.revision,
+                **source,
             }
     except (SubmissionFormatError, OSError, RuntimeError, ValueError) as exc:
         parser.exit(1, f"error: {exc}\n")

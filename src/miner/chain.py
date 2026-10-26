@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import bittensor as bt
 
-from miner.submit import ModelSubmission
+from miner.submit import ModelSubmission, PrivateModelSubmission
 
 _RAW_LIMIT = 128
 
@@ -37,7 +37,7 @@ def commitment_info(payload: bytes) -> dict[str, list[dict[str, bytes]]]:
 
 
 async def submit_model(
-    submission: ModelSubmission,
+    submission: ModelSubmission | PrivateModelSubmission,
     *,
     netuid: int,
     network: str,
@@ -51,8 +51,10 @@ async def submit_model(
         raise ValueError("netuid must fit in an unsigned 16-bit integer")
     if not network:
         raise ValueError("network cannot be empty")
-    if not isinstance(submission, ModelSubmission):
-        raise ChainSubmissionError("private submission is not enabled for chain submission")
+    if not isinstance(submission, (ModelSubmission, PrivateModelSubmission)):
+        raise ValueError("submission must be an explicit HF or private model reference")
+    if isinstance(submission, PrivateModelSubmission) and netuid != 120:
+        raise ValueError("private submission is restricted to SN120")
 
     wallet_arguments = {"name": wallet_name, "hotkey": hotkey_name}
     if wallet_path is not None:
