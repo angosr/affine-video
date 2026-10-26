@@ -6,6 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
+from miner.submit import PrivateModelSubmission, model_source_fields
 from validator.production.commitment import canonical_json, decode_canonical_json
 from validator.production.storage import (
     RETRY_STATE_NAMESPACE,
@@ -238,8 +239,14 @@ class PrivateRetryStore:
         challenge_id: str | None = None,
     ) -> _StoredRetry:
         value = decode_canonical_json(payload)
-        if not isinstance(value, dict) or set(value) != _FIELDS:
+        if not isinstance(value, dict) or set(value) not in (_FIELDS, _FIELDS | {"private_upload"}):
             raise RuntimeError("durable retry state fields are invalid")
+        private = None
+        if "private_upload" in value:
+            try:
+                private = PrivateModelSubmission(**value["private_upload"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("durable retry private source is invalid") from exc
         expected_challenge = task.challenge_id if task is not None else challenge_id
         expected = {
             "format": "veda-retry-state-v1",
@@ -253,11 +260,13 @@ class PrivateRetryStore:
             not _digest(value["submission_id"])
             or not isinstance(value["hotkey"], str)
             or not value["hotkey"]
-            or not isinstance(value["repo_id"], str)
-            or not value["repo_id"]
-            or not isinstance(value["revision"], str)
-            or len(value["revision"]) != 40
-            or not _hex(value["revision"])
+            or (private is not None and (value["repo_id"] is not None
+                                         or value["revision"] is not None))
+            or (private is None and (
+                not isinstance(value["repo_id"], str) or not value["repo_id"]
+                or not isinstance(value["revision"], str) or len(value["revision"]) != 40
+                or not _hex(value["revision"])
+            ))
         ):
             raise RuntimeError("durable retry submission identity is invalid")
         if task is not None and any(
@@ -265,6 +274,8 @@ class PrivateRetryStore:
             for key in ("submission_id", "hotkey", "repo_id", "revision")
         ):
             raise RuntimeError("durable retry state conflicts with its submission")
+        if task is not None and private != getattr(task, "private_submission", None):
+            raise RuntimeError("durable retry state conflicts with its private source")
         attempts = value["attempts"]
         generation = value["generation"]
         state = value["state"]
@@ -328,8 +339,8 @@ class PrivateRetryStore:
             "challenge_id": task.challenge_id,
             "submission_id": task.submission_id,
             "hotkey": task.hotkey,
-            "repo_id": task.repo_id,
-            "revision": task.revision,
+            **model_source_fields(task.repo_id, task.revision,
+                                  getattr(task, "private_submission", None)),
             "stage": self._stage(stage),
             **state,
         }

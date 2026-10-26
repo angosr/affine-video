@@ -8,7 +8,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from miner.submit import MAGIC, ModelSubmission, SubmissionFormatError
+from miner.submit import (
+    MAGIC,
+    PRIVATE_MAGIC,
+    ModelSubmission,
+    PrivateModelSubmission,
+    SubmissionFormatError,
+)
 from validator.queue import ChainPosition, submission_id
 from validator.store import SubmissionRecord
 
@@ -188,16 +194,18 @@ def submission_from_commitment(commitment: ChainCommitment) -> SubmissionRecord 
     """Decode one Veda payload while retaining malformed Veda attempts."""
 
     payload = commitment.payload
-    if not payload.startswith(MAGIC):
+    private = payload.startswith(PRIVATE_MAGIC)
+    if not payload.startswith(MAGIC) and not (private and commitment.netuid == 120):
         return None
     try:
-        model = ModelSubmission.decode(payload)
+        model = (PrivateModelSubmission.decode(payload) if private
+                 else ModelSubmission.decode(payload))
     except SubmissionFormatError:
         repo_id = None
         revision = None
     else:
-        repo_id = model.repo_id
-        revision = model.revision
+        repo_id = model.repo_id if isinstance(model, ModelSubmission) else None
+        revision = model.revision if isinstance(model, ModelSubmission) else None
     return SubmissionRecord(
         submission_id=submission_id(
             commitment.netuid,

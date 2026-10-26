@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 
+from miner.submit import PrivateModelSubmission
 from validator.production.commitment import canonical_json
 from validator.production.retries import PrivateRetryStore
 from validator.production.storage import RETRY_STATE_NAMESPACE, PrivateObjectStore
@@ -69,6 +70,26 @@ def task(*, lease_token: str, attempts: int) -> LeasedChallenge:
         model_path=None,
         file_sha256=None,
     )
+
+
+@pytest.mark.parametrize("mutation", ["upload_id", "file_sha256", "hf"])
+def test_private_retry_keeps_original_source_and_rejects_rebinding(mutation):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    reference = PrivateModelSubmission("ab" * 32, "cd" * 32)
+    original = replace(task(lease_token="original", attempts=1), repo_id=None, revision=None,
+                       private_submission=reference)
+    checkpoint = retries.record_failure(original, "ADMISSION", code="PRIVATE_UPLOAD_UNAVAILABLE",
+                                        summary="missing part", retry_after_ms=200, max_attempts=5)
+    cold = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    assert cold.restore(original, "ADMISSION") == checkpoint
+    if mutation == "hf":
+        changed = replace(original, repo_id="owner/model", revision="12" * 20,
+                          private_submission=None)
+    else:
+        changed = replace(original, private_submission=replace(reference, **{mutation: "ff" * 32}))
+    with pytest.raises(RuntimeError, match="conflicts with its (submission|private source)"):
+        cold.restore(changed, "ADMISSION")
 
 
 def test_retry_state_is_cas_idempotent_blocking_and_resettable() -> None:

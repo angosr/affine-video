@@ -6,6 +6,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from threading import Barrier, Lock
+from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -16,10 +17,14 @@ from safetensors.numpy import save
 
 from miner.submit import ModelSubmission, PrivateModelSubmission, UploadIntent
 from scoring.model import TensorSpec, validate_model
+from validator.admission import AdmissionSettings, AdmissionStatus, process_next_admission
 from validator.chunks import CHUNK_BYTES, ChunkManifest, ChunkPart, build_chunk_manifest, read_part
-from validator.download import ModelDownloadError
+from validator.download import DownloadedModel, ModelDownloadError
+from validator.production.batches import ReadyBatchSource
+from validator.production.retries import PrivateRetryStore
 from validator.production.storage import PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState, submission_id
+from validator.scan import ChainCommitment, submission_from_commitment
 from validator.store import ChallengeStore, SubmissionRecord
 from validator.uploads import PrivateUploads, upload_http_server
 
@@ -106,6 +111,208 @@ def formal_submission(store, hotkey=KEY.ss58_address, block=100):
         position, model.encode(), model.repo_id, model.revision,
     ))
     return identifier
+
+
+def private_formal_submission(store, reference, block=100):
+    record = submission_from_commitment(ChainCommitment(
+        KEY.ss58_address, 120, "ab" * 32, ChainPosition(block, 1, 1), reference.encode(),
+    ))
+    assert record is not None and record.private_submission == reference
+    identifier, _ = store.add_submission(record)
+    store.observe_commitment(
+        hotkey=record.hotkey, netuid=record.netuid, block_hash=record.block_hash,
+        position=record.position, payload=record.payload,
+        submission_id=record.submission_id, legacy_excluded=False,
+    )
+    assert store.get_challenge(identifier).state is ChallengeState.QUEUED
+    return identifier, record
+
+
+def test_private_inflight_repair_uses_original_admission_archive_and_cold_restore(
+    setup, tmp_path, monkeypatch,
+):
+    uploads, intent, payload, store = setup
+    _, params = upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW + 1)
+    identifier, record = private_formal_submission(store, reference)
+    projected = store.public_challenge(identifier)
+    assert projected["repo_id"] is projected["revision"] is None
+    assert projected["private_upload"] == {
+        "upload_id": reference.upload_id, "file_sha256": reference.file_sha256,
+    }
+    assert store.active_competitors({intent.hotkey: 9})[0]["private_upload"] == projected[
+        "private_upload"
+    ]
+    del uploads.staging.objects[(params["Bucket"], params["Key"])]
+    archive = ReadyBatchSource(
+        track=SimpleNamespace(digest="cc" * 32), objects=PrivateObjectStore(
+            MemoryS3(), bucket="archive", prefix="original"), cache_dir=tmp_path / "archive",
+    )
+    retries = PrivateRetryStore(archive.objects, track_spec_digest="cc" * 32)
+    config = AdmissionSettings(
+        cache_dir=tmp_path / "admission", max_model_bytes=10_000, tensor_schema=SCHEMA,
+        retry_base_ms=10, retry_max_ms=100, private_download=uploads.download,
+        archive=archive.archive_model, restore=archive.restore_admission,
+        restore_retry=retries.restore, record_retry=retries.record_failure,
+    )
+
+    def no_hf(*_args, **_kwargs):
+        pytest.fail("VDS1 must not be routed to an HF repository or invented revision")
+
+    first = process_next_admission(
+        store, worker_id="original", settings=config, current_finalized_block=100,
+        now_ms=10, downloader=no_hf,
+    )
+    assert first.status is AdmissionStatus.DEFERRED
+    assert first.code == "PRIVATE_UPLOAD_UNAVAILABLE"
+    unchanged = store.public_challenge(identifier)
+    renewed = replace(intent, expires_at=NOW + 600)
+    with ChallengeStore.readonly(tmp_path / "state.db") as readonly:
+        uploads.store = readonly
+        try:
+            grant = authorize(uploads, renewed, now=NOW + 301)
+        finally:
+            uploads.store = store
+    assert grant.upload_id == reference.upload_id
+    assert store.public_challenge(identifier) == unchanged  # Repair never rewrites S/attempts.
+    latest_cap = uploads.objects.get(uploads._record_name(reference.upload_id))
+    authorize(uploads, replace(intent, expires_at=NOW + 500), now=NOW + 302)
+    assert uploads.objects.get(uploads._record_name(reference.upload_id)) == latest_cap
+    uploads.staging.put_object(**uploads.staging.grants[-1]["Params"], Body=payload)
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms", lambda _b: 1000)
+
+    def archive_then_crash(task, path, validated):
+        assert task.private_submission == reference
+        archive.archive_model(task, path, validated)
+        raise SystemExit("host lost after original models/admission archival")
+
+    with pytest.raises(SystemExit, match="host lost"):
+        process_next_admission(
+            store, worker_id="repair", settings=replace(config, archive=archive_then_crash),
+            current_finalized_block=100, now_ms=30, downloader=no_hf,
+        )
+    # A fresh host must use the original archive even if all staging bytes are gone.
+    uploads.staging.objects.clear()
+    (config.cache_dir / f"{reference.file_sha256}.safetensors").unlink()
+    with ChallengeStore(tmp_path / "cold.db") as cold:
+        cold.add_submission(record)
+        cold.advance_chain_cursor(100, "ab" * 32)
+        def no_staging(*_args, **_kwargs):
+            pytest.fail("confirmed original models archive must precede staging re-upload")
+        result = process_next_admission(
+            cold, worker_id="cold", settings=replace(
+                config, cache_dir=tmp_path / "cold-cache", private_download=no_staging,
+            ), current_finalized_block=100, now_ms=1000, downloader=no_hf,
+        )
+        assert result.status is AdmissionStatus.ACCEPTED
+        restored = cold.public_challenge(identifier)
+        assert restored["state"] == ChallengeState.SCORING
+        assert restored["block_height"] == record.position.block
+        assert restored["file_sha256"] == reference.file_sha256
+        assert restored["private_upload"] == projected["private_upload"]
+        before = len(uploads.staging.grants)
+        uploads.store = cold
+        try:
+            with pytest.raises(ValueError, match="formal submission"):
+                authorize(uploads, renewed, now=NOW + 302)
+        finally:
+            uploads.store = store
+        assert len(uploads.staging.grants) == before
+        later_hf = formal_submission(cold, block=101)
+        assert cold.get_challenge(later_hf).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+
+
+def test_an_earlier_hf_submission_owns_the_same_opportunity_as_private_s3(setup, tmp_path):
+    uploads, intent, payload, store = setup
+    upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW + 1)
+    hf = formal_submission(store)
+    private, _ = private_formal_submission(store, reference, block=101)
+    path = tmp_path / "hf.safetensors"
+    path.write_bytes(payload)
+    def no_private(*_args, **_kwargs):
+        pytest.fail("an earlier original HF opportunity must not be replaced by S3")
+    config = AdmissionSettings(cache_dir=tmp_path / "admit", max_model_bytes=10_000,
+                               tensor_schema=SCHEMA, private_download=no_private)
+    first = process_next_admission(
+        store, worker_id="hf", settings=config, current_finalized_block=110, now_ms=10,
+        downloader=lambda *_a, **_k: DownloadedModel(
+            path, intent.file_sha256, len(payload), None, None,
+        ),
+    )
+    assert first.challenge_id == hf and first.status is AdmissionStatus.ACCEPTED
+    second = process_next_admission(store, worker_id="private", settings=config,
+                                    current_finalized_block=110, now_ms=20)
+    assert second.challenge_id == private and second.status is AdmissionStatus.FAILED
+    assert store.get_challenge(private).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+
+
+def test_private_source_without_runtime_wiring_defers_instead_of_falling_back_to_hf(
+    setup, tmp_path,
+):
+    uploads, intent, _, store = setup
+    reference = PrivateModelSubmission(intent.upload_id, intent.file_sha256)
+    identifier, _ = private_formal_submission(store, reference)
+    config = AdmissionSettings(cache_dir=tmp_path / "no-private", max_model_bytes=10_000,
+                               tensor_schema=SCHEMA)
+    def no_hf(*_args, **_kwargs):
+        pytest.fail("an unconfigured private source must never use HF")
+    result = process_next_admission(store, worker_id="unconfigured", settings=config,
+                                    current_finalized_block=100, now_ms=10, downloader=no_hf)
+    assert result.status is AdmissionStatus.DEFERRED
+    assert result.code == "PRIVATE_UPLOAD_UNAVAILABLE"
+    row = store.public_challenge(identifier)
+    assert row["state"] == ChallengeState.SYSTEM_DEFERRED
+    assert row["model_digest"] is row["file_sha256"] is None
+    assert uploads.staging.grants == []
+
+
+@pytest.mark.parametrize("fault", [
+    "uid0", "deregistered", "excluded", "cursor", "rpc", "other_id", "other_file",
+    "terminal", "scoring",
+])
+def test_private_inflight_repair_cannot_bypass_original_identity_or_eligibility(setup, fault):
+    uploads, intent, payload, store = setup
+    upload(uploads, intent, payload)
+    seal = replace(intent, action="seal")
+    reference = uploads.seal(seal, sign(seal), now=NOW + 1)
+    identifier, _ = private_formal_submission(store, reference)
+    renewed = replace(intent, expires_at=NOW + 600)
+    if fault == "uid0":
+        uploads.registration = lambda _hotkey: (0, 100)
+    elif fault == "deregistered":
+        uploads.registration = lambda _hotkey: (None, 100)
+    elif fault == "excluded":
+        store.seed_legacy_exclusions({intent.hotkey: 100})
+    elif fault == "cursor":
+        uploads.registration = lambda _hotkey: (9, 101)
+    elif fault == "rpc":
+        def unavailable(_hotkey):
+            raise RuntimeError("registration unavailable")
+        uploads.registration = unavailable
+    elif fault == "other_id":
+        renewed = replace(renewed, upload_id="ef" * 32)
+    elif fault == "other_file":
+        changed = ChunkManifest("ef" * 32, intent.size_bytes, (
+            ChunkPart("part-00000", "ef" * 32, intent.size_bytes),
+        ))
+        renewed = replace(renewed, file_sha256="ef" * 32,
+                          manifest_sha256=hashlib.sha256(changed.encode()).hexdigest())
+    elif fault == "terminal":
+        store.transition(identifier, ChallengeState.FETCHING)
+        store.complete_challenge(identifier, ChallengeState.PARTICIPANT_FAILED,
+                                 error_code="INVALID_MODEL", score_block=100)
+    elif fault == "scoring":
+        store.transition(identifier, ChallengeState.FETCHING)
+        store.transition(identifier, ChallengeState.VALIDATING)
+        store.transition(identifier, ChallengeState.SCORING)
+    before = store.public_challenge(identifier)
+    with pytest.raises((ValueError, RuntimeError)):
+        authorize(uploads, renewed, now=NOW + 301)
+    assert store.public_challenge(identifier) == before
+    assert len(uploads.staging.grants) == 1
 
 
 def test_seal_freezes_metadata_and_admission_verifies_the_real_source_once(setup, tmp_path):

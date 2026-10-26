@@ -12,6 +12,12 @@ from math import isfinite
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from miner.submit import (
+    PRIVATE_MAGIC,
+    PrivateModelSubmission,
+    SubmissionFormatError,
+    model_source_fields,
+)
 from validator.queue import (
     TERMINAL_STATES,
     ChainPosition,
@@ -58,6 +64,12 @@ class SubmissionRecord:
             raise ValueError("submission identifier does not match its chain position")
         if (self.repo_id is None) != (self.revision is None):
             raise ValueError("repository and revision must either both exist or both be absent")
+        if self.payload.startswith(PRIVATE_MAGIC) and self.repo_id is not None:
+            raise ValueError("private sources must not masquerade as HF repositories")
+
+    @property
+    def private_submission(self) -> PrivateModelSubmission | None:
+        return _private_submission(self.payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,14 +120,15 @@ class LeasedChallenge:
     submission_id: str
     state: ChallengeState
     hotkey: str
-    repo_id: str
-    revision: str
+    repo_id: str | None
+    revision: str | None
     position: ChainPosition
     lease_token: str
     lease_expires_at_ms: int
     attempts: int
     model_path: str | None
     file_sha256: str | None
+    private_submission: PrivateModelSubmission | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,6 +460,7 @@ class ChallengeStore:
             SELECT choice.hotkey, submission.block_height,
                    submission.extrinsic_index, submission.event_index,
                    submission.submission_id, submission.repo_id, submission.revision,
+                   submission.payload,
                    exclusion.reason AS exclusion_reason
             FROM commitment_choices choice
             LEFT JOIN submissions submission
@@ -466,8 +480,8 @@ class ChallengeStore:
                 "uid": uid_by_hotkey[row["hotkey"]],
                 "hotkey": row["hotkey"],
                 "submission_id": row["submission_id"],
-                "repo_id": row["repo_id"],
-                "revision": row["revision"],
+                **model_source_fields(row["repo_id"], row["revision"],
+                                      _private_submission(bytes(row["payload"]))),
                 "block_height": row["block_height"],
                 "extrinsic_index": row["extrinsic_index"],
                 "event_index": row["event_index"],
@@ -475,7 +489,8 @@ class ChallengeStore:
             for row in rows
             if row["hotkey"] in uid_by_hotkey
             and row["submission_id"] is not None
-            and row["repo_id"] is not None
+            and (row["repo_id"] is not None
+                 or _private_submission(bytes(row["payload"])) is not None)
             and row["exclusion_reason"] is None
         ]
 
@@ -492,6 +507,7 @@ class ChallengeStore:
 
     def require_upload_eligible(
         self, hotkey: str, *, uid: int | None, finalized_block: int,
+        reference: PrivateModelSubmission | None = None,
     ) -> None:
         """Read the original participation facts; an upload never spends an opportunity.
 
@@ -512,11 +528,25 @@ class ChallengeStore:
                 "SELECT 1 FROM competition_exclusions WHERE hotkey=?", (hotkey,),
             ).fetchone() is not None:
                 raise ValueError("hotkey is excluded from this competition")
-            if self._connection.execute(
-                "SELECT 1 FROM submissions s JOIN challenges c USING(submission_id) "
-                "WHERE s.hotkey=? AND c.state != 'SYSTEM_NOT_ADMITTED' LIMIT 1", (hotkey,),
-            ).fetchone() is not None:
-                raise ValueError("hotkey already has a formal submission")
+            prior = self._connection.execute(
+                "SELECT s.payload, s.repo_id, s.revision, c.state, c.resume_state, "
+                "c.model_digest, c.file_sha256 "
+                "FROM submissions s JOIN challenges c USING(submission_id) "
+                "WHERE s.hotkey=? AND c.state != 'SYSTEM_NOT_ADMITTED' "
+                "ORDER BY s.block_height, s.extrinsic_index, s.event_index LIMIT 1", (hotkey,),
+            ).fetchone()
+            if prior is not None:
+                stage = (prior["resume_state"] if prior["state"] in {
+                    ChallengeState.SYSTEM_DEFERRED, ChallengeState.SYSTEM_BLOCKED,
+                } else prior["state"])
+                # This is original-file transport repair, never a fresh opportunity.
+                if (reference is None or bytes(prior["payload"]) != reference.encode()
+                        or prior["repo_id"] is not None or prior["revision"] is not None
+                        or stage not in {ChallengeState.QUEUED, ChallengeState.FETCHING,
+                                         ChallengeState.VALIDATING}
+                        or prior["model_digest"] is not None
+                        or prior["file_sha256"] not in {None, reference.file_sha256}):
+                    raise ValueError("hotkey already has a formal submission")
         finally:
             self._connection.rollback()
 
@@ -727,7 +757,9 @@ class ChallengeStore:
             ):
                 raise RuntimeError("submissions must be inserted in finalized chain order")
 
-            malformed = submission.repo_id is None or submission.revision is None
+            malformed = ((submission.repo_id is None or submission.revision is None)
+                         and not (submission.netuid == 120
+                                  and submission.private_submission is not None))
             exclusion = self._connection.execute(
                 "SELECT reason FROM competition_exclusions WHERE hotkey = ?",
                 (submission.hotkey,),
@@ -1955,7 +1987,7 @@ class ChallengeStore:
                        c.file_sha256, c.model_digest, c.model_size_bytes,
                        c.track_spec_digest,
                        c.created_at_ms, c.updated_at_ms,
-                       s.hotkey, s.repo_id, s.revision, s.block_height,
+                       s.hotkey, s.repo_id, s.revision, s.payload, s.block_height,
                        s.extrinsic_index, s.event_index
                 FROM challenges c
                 JOIN submissions s ON s.submission_id = c.submission_id
@@ -1986,7 +2018,7 @@ class ChallengeStore:
                        c.file_sha256, c.model_digest, c.model_size_bytes,
                        c.track_spec_digest,
                        c.created_at_ms, c.updated_at_ms,
-                       s.hotkey, s.repo_id, s.revision, s.block_height,
+                       s.hotkey, s.repo_id, s.revision, s.payload, s.block_height,
                        s.extrinsic_index, s.event_index
                 FROM challenges c
                 JOIN submissions s ON s.submission_id = c.submission_id
@@ -2080,8 +2112,8 @@ class ChallengeStore:
             "challenge_id": row["challenge_id"],
             "submission_id": row["submission_id"],
             "hotkey": row["hotkey"],
-            "repo_id": row["repo_id"],
-            "revision": row["revision"],
+            **model_source_fields(row["repo_id"], row["revision"],
+                                  _private_submission(bytes(row["payload"]))),
             "block_height": row["block_height"],
             "extrinsic_index": row["extrinsic_index"],
             "event_index": row["event_index"],
@@ -2222,7 +2254,7 @@ class ChallengeStore:
                        c.lease_token, c.lease_expires_at_ms,
                        c.resume_state, c.attempts, s.hotkey, s.repo_id, s.revision,
                        s.block_height, s.extrinsic_index, s.event_index,
-                       c.model_path, c.file_sha256
+                       c.model_path, c.file_sha256, s.payload
                 FROM challenges c
                 JOIN submissions s ON s.submission_id = c.submission_id
                 WHERE (
@@ -2352,6 +2384,7 @@ class ChallengeStore:
                 attempts=row["attempts"] + 1,
                 model_path=row["model_path"],
                 file_sha256=row["file_sha256"],
+                private_submission=_private_submission(bytes(row["payload"])),
             )
         except Exception:
             self._connection.rollback()
@@ -2404,6 +2437,13 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
         if row is None or str(row[0]).lower() != "wal":
             raise RuntimeError("validator database could not enable WAL mode")
         return
+
+
+def _private_submission(payload: bytes) -> PrivateModelSubmission | None:
+    try:
+        return PrivateModelSubmission.decode(payload)
+    except SubmissionFormatError:
+        return None
 
 
 def _block_hash(value: str) -> str:

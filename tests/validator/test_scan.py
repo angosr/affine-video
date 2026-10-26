@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import pytest
 
-from miner.submit import ModelSubmission
+from miner.submit import ModelSubmission, PrivateModelSubmission
 from validator.scan import extract_commitment_reveals, extract_submissions, revealed_payload
 
 BLOCK_HASH = "0x" + "ab" * 32
@@ -74,6 +74,24 @@ def test_preserves_malformed_veda_payload_for_challenge_record() -> None:
     assert len(records) == 1
     assert records[0].repo_id is None
     assert records[0].revision is None
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_private_payload_preserves_original_chain_position_and_explicit_identity(valid):
+    private = PrivateModelSubmission("ab" * 32, "cd" * 32)
+    payload = private.encode() if valid else private.encode()[:-1]
+    block, events = fixture(payload, netuid=120)
+    records = extract_submissions(block_height=100, block_hash=BLOCK_HASH,
+                                  block=block, events=events, netuid=120)
+    assert len(records) == 1
+    assert records[0].payload == payload
+    assert records[0].repo_id is records[0].revision is None
+    assert records[0].private_submission == (private if valid else None)
+    assert records[0].position.extrinsic_index == 1
+    assert records[0].position.event_index == 1
+    block, events = fixture(payload, netuid=7)
+    assert extract_submissions(block_height=100, block_hash=BLOCK_HASH,
+                               block=block, events=events, netuid=7) == []
 
 
 def test_ignores_failed_other_netuid_and_non_veda_calls() -> None:

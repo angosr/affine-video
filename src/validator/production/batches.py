@@ -16,6 +16,7 @@ from pathlib import Path
 import bittensor as bt
 import numpy as np
 
+from miner.submit import model_source_fields
 from scoring.cache import (
     CacheLoadError,
     ExactCacheBatch,
@@ -180,8 +181,8 @@ class ReadyBatchSource:
             "challenge_id": task.challenge_id,
             "submission_id": task.submission_id,
             "hotkey": task.hotkey,
-            "repo_id": task.repo_id,
-            "revision": task.revision,
+            **model_source_fields(task.repo_id, task.revision,
+                                  getattr(task, "private_submission", None)),
             "submission_block": task.position.block,
         }
 
@@ -342,8 +343,8 @@ class ReadyBatchSource:
             "challenge_id": task.challenge_id,
             "submission_id": task.submission_id,
             "hotkey": task.hotkey,
-            "repo_id": task.repo_id,
-            "revision": task.revision,
+            **model_source_fields(task.repo_id, task.revision,
+                                  getattr(task, "private_submission", None)),
             "file_sha256": task.file_sha256,
             "stage": task.state.value,
             "score": result.score,
@@ -370,8 +371,8 @@ class ReadyBatchSource:
             "challenge_id": task.challenge_id,
             "submission_id": task.submission_id,
             "hotkey": task.hotkey,
-            "repo_id": task.repo_id,
-            "revision": task.revision,
+            **model_source_fields(task.repo_id, task.revision,
+                                  getattr(task, "private_submission", None)),
             "file_sha256": task.file_sha256,
             "stage": task.state.value,
         }

@@ -116,6 +116,21 @@ class PrivateModelSubmission:
         return cls(payload[4:36].hex(), payload[36:].hex())
 
 
+def model_source_fields(
+    repo_id: str | None, revision: str | None,
+    private: PrivateModelSubmission | None = None,
+) -> dict[str, object]:
+    """Keep HF documents byte-compatible; private identities never invent HF fields."""
+    result: dict[str, object] = {"repo_id": repo_id, "revision": revision}
+    if private is not None:
+        if repo_id is not None or revision is not None:
+            raise ValueError("private sources must not masquerade as HF repositories")
+        result["private_upload"] = {
+            "upload_id": private.upload_id, "file_sha256": private.file_sha256,
+        }
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class UploadIntent:
     """Short-lived hotkey-signed intent, shared by CLI and upload admission.

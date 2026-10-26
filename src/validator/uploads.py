@@ -93,10 +93,12 @@ class PrivateUploads:
         if not verified:
             raise ValueError("upload hotkey signature is invalid")
 
-    def _eligible(self, intent: UploadIntent) -> None:
+    def _eligible(
+        self, intent: UploadIntent, *, reference: PrivateModelSubmission | None = None,
+    ) -> None:
         uid, finalized_block = self.registration(intent.hotkey)
         self.store.require_upload_eligible(
-            intent.hotkey, uid=uid, finalized_block=finalized_block,
+            intent.hotkey, uid=uid, finalized_block=finalized_block, reference=reference,
         )
 
     @staticmethod
@@ -175,13 +177,16 @@ class PrivateUploads:
         if (manifest.sha256 != intent.file_sha256 or manifest.size != intent.size_bytes
                 or hashlib.sha256(manifest.encode()).hexdigest() != intent.manifest_sha256):
             raise ValueError("upload manifest differs from signed intent")
-        self._eligible(intent)
         stored, previous = self._read(intent.upload_id)
         identity = self._identity(intent)
         if previous is not None and any(
             previous[key] != value for key, value in identity.items()
         ):
             raise ValueError("upload identity is already fixed")
+        self._eligible(intent, reference=(
+            PrivateModelSubmission(intent.upload_id, intent.file_sha256)
+            if previous is not None and previous["state"] == "SEALED" else None
+        ))
         self._claim_quota(intent, now=now)
         if previous is None or previous["expires_at"] < intent.expires_at:
             document = canonical_json({

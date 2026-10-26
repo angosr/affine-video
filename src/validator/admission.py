@@ -64,6 +64,7 @@ class AdmissionSettings:
     restore_retry: RetryRestore | None = None
     record_retry: RetryRecorder | None = None
     eligible: Callable[[object], bool] | None = None
+    private_download: Callable[..., DownloadedModel] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -204,11 +205,26 @@ def process_next_admission(
     if task.state is ChallengeState.FETCHING:
         try:
             if downloaded is None:
-                downloaded = downloader(
-                    task.repo_id,
-                    task.revision,
-                    cache_dir=settings.cache_dir,
-                    max_bytes=settings.max_model_bytes,
+                if task.private_submission is not None:
+                    if settings.private_download is None:
+                        raise ModelDownloadError(
+                            "PRIVATE_UPLOAD_UNAVAILABLE", "private source is not configured",
+                            temporary=True,
+                        )
+                    downloaded = settings.private_download(
+                        task.private_submission, hotkey=task.hotkey,
+                        cache_dir=settings.cache_dir, max_bytes=settings.max_model_bytes,
+                    )
+                else:
+                    downloaded = downloader(
+                        task.repo_id, task.revision,
+                        cache_dir=settings.cache_dir, max_bytes=settings.max_model_bytes,
+                    )
+            if (task.private_submission is not None
+                    and downloaded.file_sha256 != task.private_submission.file_sha256):
+                raise ModelDownloadError(
+                    "PRIVATE_UPLOAD_HASH_MISMATCH", "private source differs from its chain binding",
+                    temporary=True,
                 )
         except ModelDownloadError as exc:
             if exc.temporary:
