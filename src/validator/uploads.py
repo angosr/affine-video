@@ -327,13 +327,15 @@ def upload_http_server(
     Creating this object does not start a serving loop or another worker.
     """
     class Handler(BaseHTTPRequestHandler):
+        # StreamRequestHandler.setup applies this before any request-line/header read.
+        timeout = 10
+
         def log_message(self, *_args: object) -> None:
             # Do not put request bodies, signed URLs or signature tokens in logs.
             pass
 
         def do_POST(self) -> None:
             self.close_connection = True
-            self.connection.settimeout(10)
             code = 400
             document: dict[str, object] = {"error": "INVALID_UPLOAD_REQUEST"}
             try:

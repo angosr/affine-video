@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import socket
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
@@ -578,3 +579,46 @@ def test_http_rejects_body_over_limit_and_does_not_expose_private_errors(setup, 
             "manifest": json.loads(manifest.encode()),
         })
         assert status == 503 and response == {"error": "UPLOAD_UNAVAILABLE"}
+
+
+@pytest.mark.parametrize("partial_request", [
+    b"POST /ve",
+    b"POST /veda HTTP/1.1\r\nHost: auth.example\r\nX-Incomplete: ",
+], ids=["request-line", "headers"])
+def test_http_times_out_before_parsing_and_can_serve_the_next_request(
+    setup, monkeypatch, partial_request,
+):
+    uploads, _, _, _ = setup
+    with upload_http_server(uploads, port=0, clock=lambda: NOW) as server:
+        handler = server.RequestHandlerClass
+        original_setup = handler.setup
+        observed_timeouts = []
+
+        def setup_connection(self):
+            original_setup(self)
+            timeout = self.connection.gettimeout()
+            observed_timeouts.append(timeout)
+            if timeout is not None:
+                # Accelerate the actual production timeout; never add a missing one.
+                self.connection.settimeout(min(timeout, 0.05))
+
+        monkeypatch.setattr(handler, "setup", setup_connection)
+
+        def stalled_client():
+            with socket.create_connection(server.server_address, timeout=1) as connection:
+                connection.settimeout(0.5)
+                connection.sendall(partial_request)
+                try:
+                    return connection.recv(1) == b""
+                except TimeoutError:
+                    return False  # Closing releases the unfixed handler, not the assertion.
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(stalled_client)
+            server.handle_request()
+            assert result.result(timeout=2), "partial metadata request held the only handler"
+        assert observed_timeouts == [10]
+        assert uploads.staging.grants == []
+        status, _, response = http_request(server, {})
+        assert status == 400 and response == {"error": "INVALID_UPLOAD_REQUEST"}
+        assert observed_timeouts == [10, 10]
