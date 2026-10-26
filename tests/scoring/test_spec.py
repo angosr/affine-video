@@ -167,6 +167,20 @@ def test_match_confidence_is_explicit_and_bound_to_the_spec_digest() -> None:
         parse_track_spec(raw)
 
 
+def test_repository_gain_gate_candidate_requires_a_new_spec_binding():
+    candidate = load_track_spec(Path(__file__).resolve().parents[2] / "track.json")
+    assert candidate.scoring.minimum_frontier_gain == 0.003
+    assert candidate.full_video.minimum_gain == 0.003
+    assert candidate.scoring.match_confidence == 0.9975
+    previous = track_spec_dict(candidate)
+    previous["scoring"]["minimum_frontier_gain"] = 0.005
+    previous["full_video"]["minimum_gain"] = 0.005
+    assert parse_track_spec(previous).digest != candidate.digest
+    previous["scoring"]["minimum_frontier_gain"] = 0.003
+    previous["full_video"]["minimum_gain"] = 0.003
+    assert parse_track_spec(previous) == candidate
+
+
 def test_track_rejects_insufficient_production_sources_per_stratum() -> None:
     raw = valid_spec()
     production = raw["source_commitments"]["production"]["all"]

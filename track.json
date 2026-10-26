@@ -22,7 +22,7 @@
     "frame_weight": 0.3,
     "latent_weight": 0.4,
     "metric_version": "veda-video-fidelity-v2",
-    "minimum_gain": 0.005,
+    "minimum_gain": 0.003,
     "temporal_weight": 0.3
   },
   "initial_champion": {
@@ -69,7 +69,7 @@
       }
     ],
     "match_confidence": 0.9975,
-    "minimum_frontier_gain": 0.005,
+    "minimum_frontier_gain": 0.003,
     "query_tile_selection_algorithm": "sha256-segment-quota-v1",
     "query_tiles_per_case": 4,
     "rollouts_per_stratum": 4,

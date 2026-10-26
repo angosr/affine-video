@@ -173,8 +173,8 @@ def test_previous_pending_or_promoted_challenge_forbids_silent_rebinding():
         resolve([won])
 
 
-@pytest.mark.parametrize("old_video_gate", [0.005, 0.02])
-@pytest.mark.parametrize("new_gate", [0.005, 0.02])
+@pytest.mark.parametrize("old_video_gate", [0.003, 0.005, 0.02])
+@pytest.mark.parametrize("new_gate", [0.003, 0.005, 0.02])
 def test_historical_two_stage_outcome_requires_proof_not_current_thresholds(
     old_video_gate, new_gate,
 ):
@@ -200,6 +200,52 @@ def test_historical_two_stage_outcome_requires_proof_not_current_thresholds(
     assert result.champion.hotkey == ("alice" if won else "genesis-hotkey")
     assert result.matches == ()
     assert canonical_json(history[0].document) == original_bytes
+
+
+@pytest.mark.parametrize("exact_gain", [0.002999999999, 0.003, 0.003000000001])
+@pytest.mark.parametrize("full_gain", [0.002999999999, 0.003, 0.003000000001])
+def test_candidate_three_milli_gate_remains_strict_for_both_stages(exact_gain, full_gain):
+    item = challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    item["stages"][0]["paired_gain_lower_bound"] = exact_gain
+    item["stages"][1]["paired_gain_lower_bound"] = full_gain
+    if exact_gain <= 0.003:
+        item["stages"] = item["stages"][:1]
+        item["evaluation_batch"] = item["stages"][0]["evaluation_batch"]
+        item["score_block"] = item["stages"][0]["score_block"]
+        item["paired_gain_lower_bound"] = exact_gain
+    else:
+        item["paired_gain_lower_bound"] = full_gain
+    result = resolve_tournament(
+        [item], track_id="candidate", track_spec_digest="ab" * 32, netuid=7,
+        minimum_gain=0.003, minimum_exact_gain=0.003, initial_champion=genesis(),
+    )
+    winner = exact_gain > 0.003 and full_gain > 0.003
+    assert result.matches[0].outcome is (
+        MatchOutcome.CHALLENGER_WON if winner else MatchOutcome.CHAMPION_RETAINED
+    )
+    assert result.champion.hotkey == ("alice" if winner else "genesis-hotkey")
+
+
+def test_lower_gate_does_not_reopen_a_historical_exact_loss_or_spent_opportunity():
+    old = challenge(1, "alice", score=0.704, incumbent_score=0.7, paired_gain=0.004)
+    old["track_spec_digest"] = "cd" * 32
+    historical = resolve_tournament(
+        [old], track_id="previous", track_spec_digest="cd" * 32, netuid=7,
+        minimum_gain=0.005, minimum_exact_gain=0.005, initial_champion=genesis(),
+    ).matches
+    original = canonical_json(historical[0].document)
+    assert len(historical[0].document["evaluation"]["stages"]) == 1
+    repeated = challenge(2, "alice", state=ChallengeState.REJECTED_DUPLICATE_HOTKEY,
+                         error_code="DUPLICATE_HOTKEY")
+    carried = resolve_tournament(
+        [old, repeated], track_id="candidate", track_spec_digest="ab" * 32, netuid=7,
+        minimum_gain=0.003, minimum_exact_gain=0.003, initial_champion=genesis(),
+        historical_matches=historical,
+    )
+    assert canonical_json(historical[0].document) == original
+    assert carried.champion.hotkey == "genesis-hotkey"
+    assert carried.matches[0].state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
+    assert len(carried.matches) == 1
 
 
 def test_confirmed_historical_champion_is_not_rejudged_by_new_thresholds():
