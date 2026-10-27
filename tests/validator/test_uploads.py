@@ -983,6 +983,149 @@ def test_pending_cleanup_error_survives_other_cleanup_and_cold_status(setup, mon
     assert copy(ctx.uploads).maintenance_status()["private_upload_cleanup_error"] is None
 
 
+@pytest.mark.parametrize("failure", [None, "block_hash", "uid"])
+def test_owner_issuance_uses_one_authenticated_scanned_snapshot(setup, monkeypatch, failure):
+    from datetime import UTC, datetime
+
+    from validator import run
+
+    ctx = setup
+    activate(ctx)
+    upload_id = upload_registration_id(GENESIS, KEY.ss58_address)
+    original_record = ctx.uploads._read(upload_id)[1]
+    original_cursor = ctx.store.chain_cursor()
+    original_matches = ctx.store.public_snapshot()
+    calls = []
+    clock = [NOW]
+    broken = [failure]
+    monkeypatch.setattr("validator.uploads.time.time", lambda: clock[0])
+
+    class Client:
+        def __init__(self):
+            self.height = None
+            self._substrate = SimpleNamespace(block_hash=self.block_hash)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def block_info(self, height):
+            assert height == 0
+            return SimpleNamespace(hash="0x" + GENESIS)
+
+        async def finalized_block(self):
+            head = 201 + sum(call[0] == "head" for call in calls)
+            calls.append(("head", head))
+            return head
+
+        async def block_hash(self, height):
+            calls.append(("hash", height))
+            if broken[0] == "block_hash":
+                raise OSError("fixture RPC unavailable")
+            assert height == original_cursor[0]
+            return "0x" + original_cursor[1].removeprefix("0x")
+
+        async def at(self, height):
+            self.height = height
+            return self
+
+        async def timestamp(self):
+            return datetime.fromtimestamp(clock[0], UTC)
+
+        async def read(self, field, **kwargs):
+            calls.append(("uid", self.height))
+            assert field == "uid" and kwargs == {"hotkey_ss58": KEY.ss58_address,
+                                                  "netuid": 120}
+            if broken[0] == "uid":
+                raise OSError("fixture UID unavailable")
+            return 9
+
+    monkeypatch.setattr(run.bt, "Client", lambda *_a, **_kw: Client())
+
+    def maintain():
+        return asyncio.run(run._reclaim_private_uploads(
+            ctx.uploads, database=ctx.root / "state.db", network="finney", archive_endpoints=None,
+        ))
+
+    if failure:
+        assert maintain()["private_upload_error"] == "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+        failed = ctx.uploads._read(upload_id)[1]
+        assert failed["state"] == "ISSUING" and failed["issue_retry"]["attempts"] == 1
+        assert not ctx.uploads.control.tokens.parents
+        broken[0] = None
+        ctx.uploads._issue_after = ""  # Cold owner starts from the original CAS.
+        assert maintain()["private_upload_error"] == "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+        assert not ctx.uploads.control.tokens.parents  # Durable cooldown is not bypassed.
+        clock[0] += 30
+    assert maintain() == {"private_upload_error": None, "private_upload_cleanup_error": None}
+    record = ctx.uploads._read(upload_id)[1]
+    assert record["state"] == "UPLOADING" and record["mailbox"]["published"]
+    assert "issue_retry" not in record
+    for name in ("upload_id", "hotkey", "generation", "activation_position",
+                 "activation_block_hash"):
+        assert record[name] == original_record[name]
+    assert len(ctx.uploads.control.tokens.parents) == 1
+    assert ctx.store.chain_cursor() == original_cursor
+    assert ctx.store.public_snapshot() == original_matches
+    assert [call for call in calls if call[0] == "uid"]
+    assert all(height == 200 for kind, height in calls if kind in {"uid", "hash"})
+
+
+@pytest.mark.parametrize("failure", ["missing_cursor", "not_finalized", "hash_mismatch"])
+def test_owner_issuance_refuses_unauthenticated_scanned_snapshot(setup, monkeypatch, failure):
+    from datetime import UTC, datetime
+
+    from validator import run
+
+    ctx = setup
+    activate(ctx)
+    database = ctx.root / "state.db"
+    if failure == "missing_cursor":
+        database = ctx.root / "unscanned.db"
+        with ChallengeStore(database):
+            pass
+
+    class Client:
+        def __init__(self):
+            self._substrate = SimpleNamespace(block_hash=self.block_hash)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def block_info(self, _height):
+            return SimpleNamespace(hash="0x" + GENESIS)
+
+        async def finalized_block(self):
+            return 199 if failure == "not_finalized" else 201
+
+        async def block_hash(self, _height):
+            return "0x" + "cd" * 32
+
+        async def at(self, _height):
+            return self
+
+        async def timestamp(self):
+            return datetime.fromtimestamp(NOW, UTC)
+
+        async def read(self, *_args, **_kwargs):
+            pytest.fail("UID lookup must not use an unauthenticated cursor")
+
+    monkeypatch.setattr(run.bt, "Client", lambda *_a, **_kw: Client())
+    assert asyncio.run(run._reclaim_private_uploads(
+        ctx.uploads, database=database, network="finney", archive_endpoints=None,
+    ))["private_upload_error"] == "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+    record = ctx.uploads._read(upload_registration_id(GENESIS, KEY.ss58_address))[1]
+    assert record["state"] == "ISSUING" and record["issue_retry"]["attempts"] == 1
+    assert record["issue_retry"]["error"] == "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+    assert not ctx.uploads.control.tokens.parents
+    assert ctx.store.chain_cursor() == (200, "0x" + "ab" * 32)
+
+
 def test_owner_maintenance_keeps_gc_and_durable_issue_status_independent(setup, monkeypatch):
     from datetime import UTC, datetime
 
@@ -1012,6 +1155,12 @@ def test_owner_maintenance_keeps_gc_and_durable_issue_status_independent(setup, 
     monkeypatch.setattr(PrivateUploads, "reclaim_expired", observed_gc)
 
     class Client:
+        def __init__(self):
+            self._substrate = SimpleNamespace(block_hash=self.block_hash)
+
+        async def block_hash(self, _height):
+            return "0x" + ("ab" * 32 if _height == 200 else f"{_height:064x}")
+
         async def __aenter__(self):
             return self
 
@@ -1022,7 +1171,7 @@ def test_owner_maintenance_keeps_gc_and_durable_issue_status_independent(setup, 
             return SimpleNamespace(hash="0x" + GENESIS)
 
         async def finalized_block(self):
-            return 200
+            return 201
 
         async def at(self, _height):
             return self

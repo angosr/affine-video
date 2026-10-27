@@ -326,13 +326,22 @@ async def _reclaim_private_uploads(
         from copy import copy
 
         async def registration(hotkey: str) -> tuple[int | None, int]:
+            # Qualification and the original scan fence must describe ONE
+            # finalized block, not a newer head fetched during the RPC roundtrip.
+            cursor = store.chain_cursor()
+            if cursor is None:
+                raise RuntimeError("private registration awaits a scanned snapshot")
             async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
                 genesis = (await client.block_info(0)).hash
                 if genesis.removeprefix("0x") != uploads.genesis_hash:
                     raise RuntimeError("private registration network differs")
-                finalized = await client.finalized_block()
-                snapshot = await client.at(finalized)
-                return await snapshot.read("uid", hotkey_ss58=hotkey, netuid=120), finalized
+                if cursor[0] > await client.finalized_block():
+                    raise RuntimeError("private registration scan is not finalized")
+                block_hash = await client._substrate.block_hash(cursor[0])
+                if block_hash.removeprefix("0x") != cursor[1].removeprefix("0x"):
+                    raise RuntimeError("private registration scan hash differs")
+                snapshot = await client.at(cursor[0])
+                return await snapshot.read("uid", hotkey_ss58=hotkey, netuid=120), cursor[0]
 
         # Created and used in this thread; never share the main SQLite connection.
         with ChallengeStore.readonly(database) as store:
