@@ -388,6 +388,40 @@ def test_zero_miners_preproduce_and_full_inventory_pauses_then_refills(inventory
     ).inventory_slot == 0
 
 
+def test_four_batch_target_fills_two_per_slot_without_rewriting_ready(inventory_case, tmp_path):
+    case = inventory_case
+    raw = valid_spec()
+    raw["cache"]["inventory_target_batches"] = 4
+    raw["cache"]["inventory_max_bytes"] = 12_000_000
+    case.track = replace(case.track, cache=parse_track_spec(raw).cache)
+    store = SimpleNamespace(finalized_block_hash=lambda _block: None)
+    coordinator = PlanCoordinator(track=case.track, store=store, objects=case.objects,
+                                  source_pool=case.pool)
+    originals = {}
+    slots = []
+    for block in range(101, 105):
+        head = (block, "0x" + f"{block + 1000:064x}")
+        plan = coordinator.create_next(now_ms=block * 1000, finalized_head=head)
+        slots.append(plan.inventory_slot)
+        assert coordinator.create_next(now_ms=block * 1000, finalized_head=head) is None
+        fixture = make_plan(case, block, plan.inventory_slot)
+        ready = plan.ready(
+            completed_at_ms=(block + 1) * 1000, completed_block=block + 1,
+            exact=fixture.exact, sample_cache=fixture.sample_cache,
+            dense_references=tuple(DenseReference(r.rollout_id, fixture.exact, fixture.exact)
+                                   for r in plan.rollouts),
+        )
+        name = f"plans/{block}.json"
+        case.objects.replace_plan(name, ready.encode(), etag=case.objects.get(name).etag)
+        originals[name] = ready.encode()
+    assert slots == [0, 1, 0, 1]
+    assert coordinator.create_next(now_ms=106_000, finalized_head=(106, "0x" + "ab" * 32)) is None
+    plans = tuple(plan for _, _, plan in coordinator.plans())
+    source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
+    assert source.inventory_status(plans)["target_batches"] == 4
+    assert all(case.objects.get(name).body == body for name, body in originals.items())
+
+
 def test_authority_rejects_corrupt_or_cross_track_facts(inventory_case):
     case = inventory_case
     inventory = Inventory(case.objects, case.track.digest)

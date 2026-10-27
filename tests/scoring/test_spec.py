@@ -181,6 +181,27 @@ def test_repository_gain_gate_candidate_requires_a_new_spec_binding():
     assert parse_track_spec(previous) == candidate
 
 
+def test_repository_four_batch_inventory_requires_a_new_spec_binding() -> None:
+    candidate = load_track_spec(Path(__file__).resolve().parents[2] / "track.json")
+    assert candidate.cache.inventory_target_batches == 4
+    assert candidate.cache.exact_max_bytes == 16 * 1024**3
+    assert candidate.cache.inventory_max_bytes == 512 * 1024**3
+    reserve = 3 * candidate.cache.inventory_target_batches * candidate.cache.exact_max_bytes
+    assert reserve == 192 * 1024**3
+    assert reserve <= candidate.cache.inventory_max_bytes
+
+    previous = track_spec_dict(candidate)
+    previous["cache"]["inventory_target_batches"] = 2
+    assert parse_track_spec(previous).digest != candidate.digest
+    previous["cache"]["inventory_target_batches"] = 4
+    assert parse_track_spec(previous) == candidate
+    previous["cache"]["inventory_max_bytes"] = reserve - 1
+    with pytest.raises(TrackSpecError, match="inventory byte limit"):
+        parse_track_spec(previous)
+    previous["cache"]["inventory_max_bytes"] = reserve
+    assert parse_track_spec(previous).cache.inventory_target_batches == 4
+
+
 def test_track_rejects_insufficient_production_sources_per_stratum() -> None:
     raw = valid_spec()
     production = raw["source_commitments"]["production"]["all"]

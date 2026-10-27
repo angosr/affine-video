@@ -12,7 +12,7 @@
     "format": "veda-exact-cache-v2",
     "generator": "veda-private-rollout-v1",
     "inventory_max_bytes": 549755813888,
-    "inventory_target_batches": 2,
+    "inventory_target_batches": 4,
     "storage_dtype": "float16"
   },
   "full_video": {
