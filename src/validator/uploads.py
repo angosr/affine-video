@@ -61,6 +61,30 @@ def envelope_signing_bytes(document: dict) -> bytes:
     )
 
 
+def _read_upload_record(objects: PrivateObjectStore, genesis_hash: str, upload_id: str):
+    """One decoder for the SAME CAS on the GPU owner and read-only control side."""
+    PrivateModelSubmission(upload_id, "00" * 32)
+    stored = objects.get_optional(f"uploads/{upload_id}.json")
+    if stored is None:
+        return None, None
+    record = decode_canonical_json(stored.body)
+    if (not isinstance(record, dict) or record.get("format") != "veda-upload-v2"
+            or record.get("upload_id") != upload_id
+            or record.get("state") not in {"ISSUING", "UPLOADING", "SEALED"}
+            or upload_registration_id(genesis_hash, record.get("hotkey", "")) != upload_id
+            or type(record.get("expires_at")) is not int):
+        raise ValueError("private upload record is invalid")
+    retry = record.get("issue_retry")
+    if retry is not None and (
+        not isinstance(retry, dict) or set(retry) != {"attempts", "retry_after", "error"}
+        or type(retry["attempts"]) is not int or retry["attempts"] <= 0
+        or type(retry["retry_after"]) is not int or retry["retry_after"] < 0
+        or retry["error"] not in {None, "PRIVATE_UPLOAD_ISSUANCE_FAILED"}
+    ):
+        raise ValueError("private upload issuance retry is invalid")
+    return stored, record
+
+
 class CloudflareR2Tokens:
     """Control-only parent-token mint/revoke; no bucket creation or shared miner key.
 
@@ -84,7 +108,9 @@ class CloudflareR2Tokens:
                 method, f"https://api.cloudflare.com/client/v4/accounts/{self.account}{path}",
                 headers={"Authorization": f"Bearer {self._token}"}, json=body, timeout=10,
             )
-            if method == "DELETE" and response.status_code == 404:
+            if response.status_code == 404 and (method == "DELETE" or (
+                method == "GET" and re.fullmatch(r"/tokens/[a-f0-9]{32}", path)
+            )):
                 return None
             data = response.json()
             if response.status_code >= 400 or not data.get("success"):
@@ -95,16 +121,29 @@ class CloudflareR2Tokens:
 
     def create_parent(self, name: str, bucket: str, ttl: int) -> str:
         # Recover a committed create whose response was lost, without another parent.
-        matches = []
+        identity = re.fullmatch(r"(veda-[a-f0-9]{64}-g)([1-9][0-9]{0,9})", name)
+        if identity is None:
+            raise ValueError("private parent token name is invalid")
+        inventory = []
         for page in range(1, 11):
             rows = self._call("GET", f"/tokens?page={page}&per_page=50")
-            matches.extend(row for row in rows if row.get("name") == name)
+            inventory.extend(rows)
             if len(rows) < 50:
                 break
         else:
             raise RuntimeError("Cloudflare token inventory exceeds bounded lookup")
+        matches = [row for row in inventory if row.get("name") == name]
         if len(matches) > 1:
             raise RuntimeError("duplicate registration parent tokens require reconciliation")
+        # An interrupted issue can leave a parent ID absent from the CAS. Before
+        # granting a NEW generation, reconcile only this registration's older
+        # generations using the same bounded provider inventory and scope check.
+        # Gather pages before deleting, so pagination cannot skip a shifted row.
+        for row in inventory:
+            older = re.fullmatch(re.escape(identity[1]) + r"([1-9][0-9]{0,9})",
+                                 row.get("name") or "")
+            if older is not None and int(older[1]) < int(identity[2]):
+                self.revoke(row["id"], name=row["name"], bucket=bucket)
         if matches:
             return matches[0]["id"]
         groups = self._call("GET", "/tokens/permission_groups")
@@ -129,7 +168,20 @@ class CloudflareR2Tokens:
                 "secret_access_key": result["secretAccessKey"],
                 "session_token": result["sessionToken"]}
 
-    def revoke(self, parent: str) -> None:
+    def revoke(self, parent: str, *, name: str, bucket: str) -> None:
+        # The CAS ID alone is not authority to delete an arbitrary account token.
+        if (not isinstance(parent, str) or re.fullmatch(r"[a-f0-9]{32}", parent) is None
+                or re.fullmatch(r"veda-[a-f0-9]{64}-g[1-9][0-9]{0,9}", name) is None):
+            raise ValueError("private parent token identity is invalid")
+        record = self._call("GET", f"/tokens/{parent}")
+        if record is None:  # A previously committed deletion lost its response.
+            return
+        policies = record.get("policies", [])
+        resource = f"com.cloudflare.edge.r2.bucket.{self.account}_{self.jurisdiction}_{bucket}"
+        if (record.get("id") != parent or record.get("name") != name
+                or len(policies) != 1 or policies[0].get("effect") != "allow"
+                or policies[0].get("resources") != {resource: "*"}):
+            raise ValueError("private parent token does not belong to this registration/bucket")
         self._call("DELETE", f"/tokens/{parent}")
 
 
@@ -137,33 +189,56 @@ class MailboxControl:
     """Control-side operations only; responses contain NO plaintext credentials."""
 
     def __init__(self, *, tokens, signer, publish_mailbox, endpoint: str,
-                 bucket: str, genesis_hash: str):
+                 bucket: str, genesis_hash: str, objects: PrivateObjectStore):
         if getattr(signer, "crypto_type", None) != 0:
             raise ValueError("mailbox signer must be Ed25519")
+        upload_registration_id(genesis_hash, "configuration")
+        match = re.fullmatch(
+            r"https://([a-f0-9]{32})(?:\.(eu|us|fedramp))?\.r2\.cloudflarestorage\.com/?",
+            endpoint,
+        )
+        if (match is None or tokens.account != match[1]
+                or tokens.jurisdiction != (match[2] or "default")
+                or re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket) is None
+                or bucket == "affine_video" or objects._prefix != "evaluation"
+                or objects._bucket == "affine_video"):
+            raise ValueError("control requires the configured private R2 account/bucket/CAS scope")
         self.tokens, self.signer, self.publish_mailbox = tokens, signer, publish_mailbox
         self.endpoint, self.bucket, self.genesis_hash = endpoint, bucket, genesis_hash
+        self.objects = objects
 
     def handle(self, operation: str, record: dict) -> dict:
+        if operation not in {"issue", "revoke", "publish"}:
+            raise ValueError("unsupported mailbox control operation")
         upload_id = upload_registration_id(self.genesis_hash, record["hotkey"])
         if (record["upload_id"] != upload_id or type(record["generation"]) is not int
                 or not 0 < record["generation"] < 1 << 32):
             raise ValueError("mailbox request does not identify a private registration")
+        _, authoritative = _read_upload_record(self.objects, self.genesis_hash, upload_id)
+        if authoritative is None or record != authoritative:
+            raise ValueError("mailbox request differs from its original CAS")
+        record = authoritative
         if operation == "revoke":
+            if not (record.get("cleanup") == "pending"
+                    or (record.get("file_sha256") and record.get("manifest_sha256"))):
+                raise ValueError("private revoke does not match the original lifecycle phase")
             if record.get("parent_token_id"):
-                self.tokens.revoke(record["parent_token_id"])
+                self._revoke_parent(record)
             return {}
         if operation == "publish":
+            if record["state"] != "UPLOADING" or not record.get("mailbox"):
+                raise ValueError("private publish does not match the original lifecycle phase")
             mailbox = record["mailbox"]
             if mailbox["key"] != f"mailbox/v1/{upload_id}.bin":
                 raise ValueError("mailbox publish escaped its registration")
             self.publish_mailbox(mailbox["key"], bytes.fromhex(mailbox["ciphertext"]))
             return {}
-        if operation != "issue":
-            raise ValueError("unsupported mailbox control operation")
+        if record["state"] != "ISSUING" or record.get("cleanup") == "pending":
+            raise ValueError("private issue does not match the original lifecycle phase")
         from bittensor.wallet import Keypair
 
         if record.get("retire_parent"):
-            self.tokens.revoke(record["parent_token_id"])
+            self._revoke_parent(record)
         parent = (None if record.get("retire_parent") else record.get("parent_token_id"))
         parent = parent or self.tokens.create_parent(
             f"veda-{upload_id}-g{record['generation']}", self.bucket, CREDENTIAL_TTL,
@@ -187,6 +262,11 @@ class MailboxControl:
         return {"parent_token_id": parent, "retire_parent": False, "expires_at": expires_at,
                 "mailbox": {"key": f"mailbox/v1/{upload_id}.bin", "ciphertext": blob.hex(),
                             "published": False}}
+
+    def _revoke_parent(self, record: dict) -> None:
+        generation = record["generation"] - int(bool(record.get("retire_parent")))
+        self.tokens.revoke(record["parent_token_id"],
+                           name=f"veda-{record['upload_id']}-g{generation}", bucket=self.bucket)
 
 
 class OwnerMailboxControl:
@@ -259,7 +339,7 @@ def attach_evaluator(*, host: str, container: str, control: MailboxControl) -> i
             if len(line) > 262144:
                 raise RuntimeError("owner attach response exceeds its bound")
             if not line.startswith("VEDA_MAILBOX_REQUEST "):
-                print(line, end="", flush=True)
+                print(line, end="", file=sys.stderr, flush=True)
                 continue
             identifier = None
             try:
@@ -313,21 +393,35 @@ def attach_from_environment(*, host: str, container: str) -> int:
     if len(seed) != 32:
         raise ValueError("control mailbox signing seed must contain exactly 32 bytes")
     signer = Keypair.create_from_seed(seed, crypto_type=0)
+    if signer.ss58_address != os.environ["VEDA_UPLOAD_VALIDATOR_IDENTITY"]:
+        raise ValueError("control mailbox signer differs from the configured public identity")
     client = _environment_client(
         _validated_endpoint(os.environ["STORAGE_URL"]),
         os.environ["ACCESS_KEY"], os.environ["SECRET_ACCESS_KEY"],
     )
     publisher = S3Repository(client, bucket="affine_video", prefix="tracks/main")
+    authority = None
     try:
+        authority = _environment_client(
+            _validated_endpoint(os.environ["VEDA_UPLOAD_AUTHORITY_STORAGE_URL"]),
+            os.environ["VEDA_UPLOAD_AUTHORITY_ACCESS_KEY"],
+            os.environ["VEDA_UPLOAD_AUTHORITY_SECRET_ACCESS_KEY"],
+        )
         return attach_evaluator(host=host, container=container, control=MailboxControl(
             tokens=CloudflareR2Tokens(match[1], os.environ["VEDA_UPLOAD_MANAGEMENT_TOKEN"],
                                       match[2] or "default"),
             signer=signer, publish_mailbox=publisher.publish_mailbox, endpoint=endpoint,
             bucket=os.environ["VEDA_UPLOAD_STAGING_BUCKET"],
             genesis_hash=os.environ["VEDA_UPLOAD_GENESIS_HASH"],
+            objects=PrivateObjectStore(authority,
+                                       bucket=os.environ["VEDA_UPLOAD_AUTHORITY_BUCKET"],
+                                       prefix="evaluation"),
         ))
     finally:
+        if authority is not None:
+            authority.close()
         publisher.close()
+        client.close()
 
 
 class PrivateUploads:
@@ -392,26 +486,7 @@ class PrivateUploads:
         return f"uploads/{upload_id}.json"
 
     def _read(self, upload_id: str):
-        PrivateModelSubmission(upload_id, "00" * 32)
-        stored = self.objects.get_optional(self._record_name(upload_id))
-        if stored is None:
-            return None, None
-        record = decode_canonical_json(stored.body)
-        if (not isinstance(record, dict) or record.get("format") != "veda-upload-v2"
-                or record.get("upload_id") != upload_id
-                or record.get("state") not in {"ISSUING", "UPLOADING", "SEALED"}
-                or upload_registration_id(self.genesis_hash, record.get("hotkey", "")) != upload_id
-                or type(record.get("expires_at")) is not int):
-            raise ValueError("private upload record is invalid")
-        retry = record.get("issue_retry")
-        if retry is not None and (
-            not isinstance(retry, dict) or set(retry) != {"attempts", "retry_after", "error"}
-            or type(retry["attempts"]) is not int or retry["attempts"] <= 0
-            or type(retry["retry_after"]) is not int or retry["retry_after"] < 0
-            or retry["error"] not in {None, "PRIVATE_UPLOAD_ISSUANCE_FAILED"}
-        ):
-            raise ValueError("private upload issuance retry is invalid")
-        return stored, record
+        return _read_upload_record(self.objects, self.genesis_hash, upload_id)
 
     def _replace(self, stored, record: dict):
         name, payload = self._record_name(record["upload_id"]), canonical_json(record)

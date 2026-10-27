@@ -9,6 +9,15 @@ from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
 
 
+def test_evaluator_cycle_logs_do_not_share_mailbox_stdout(capsys):
+    from validator.run import EvaluationCycleResult
+
+    cli_module._print_evaluation_cycle(EvaluationCycleResult(200, None, None, None))
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert json.loads(output.err)["finalized_block"] == 200
+
+
 def test_private_upload_cli_uses_chain_mailbox_and_returns_unsigned_ready(monkeypatch, capsys):
     from miner import upload as module
     from miner.submit import PrivateModelSubmission

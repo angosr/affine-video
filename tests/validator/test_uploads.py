@@ -35,6 +35,7 @@ from validator.uploads import (
     OwnerMailboxControl,
     PrivateUploads,
     attach_evaluator,
+    attach_from_environment,
 )
 
 from .production.test_storage import MemoryS3
@@ -62,6 +63,9 @@ class StagingS3(MemoryS3):
 
 
 class Tokens:
+    account = "ab" * 16
+    jurisdiction = "default"
+
     def __init__(self, events):
         self.events = events
         self.parents = {}
@@ -78,7 +82,8 @@ class Tokens:
         return {"access_key_id": "fixture-access", "secret_access_key": "fixture-secret",
                 "session_token": "fixture-session"}
 
-    def revoke(self, parent):
+    def revoke(self, parent, *, name, bucket):
+        assert parent == name and bucket == "affinemodel"
         self.events.append("revoke")
         self.revoked.add(parent)
 
@@ -88,15 +93,16 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr("validator.uploads.time.time", lambda: NOW)
     events, mailbox = [], {}
     staging = StagingS3(events)
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="evaluation")
     with ChallengeStore(tmp_path / "state.db") as store:
         store.advance_chain_cursor(200, "ab" * 32)
         uploads = PrivateUploads(
-            objects=PrivateObjectStore(MemoryS3(), bucket="private", prefix="evaluation"),
+            objects=objects,
             staging_client=staging, staging_bucket="affinemodel", staging_prefix="uploads/v1",
             genesis_hash=GENESIS, store=store, registration=lambda _h: (9, 200),
             max_bytes=10000, control=MailboxControl(
                 tokens=Tokens(events), signer=SIGNER, endpoint=ENDPOINT,
-                bucket="affinemodel", genesis_hash=GENESIS,
+                bucket="affinemodel", genesis_hash=GENESIS, objects=objects,
                 publish_mailbox=lambda name, body: mailbox.__setitem__(name, body),
             ),
         )
@@ -279,7 +285,7 @@ def test_ready_revoke_failure_defers_without_reading_or_burning_opportunity(
     ctx = setup
     reference = transfer(ctx)
     identifier, _ = submit(ctx, reference)
-    def unavailable(_parent):
+    def unavailable(_parent, **_scope):
         raise failure("control unavailable")
     monkeypatch.setattr(ctx.uploads.control.tokens, "revoke", unavailable)
     result = process_next_admission(
@@ -348,6 +354,8 @@ def test_production_staging_has_no_old_supabase_or_public_fallback(setup, monkey
 def test_cloudflare_transport_mints_prefix_session_not_shared_main_key(monkeypatch):
     admin = CloudflareR2Tokens("ab" * 16, "fixture-management-token")
     calls = []
+    parent_id, name = "12" * 16, "veda-" + "cd" * 32 + "-g1"
+    resource = "com.cloudflare.edge.r2.bucket." + "ab" * 16 + "_default_affinemodel"
     def call(method, path, body=None):
         calls.append((method, path, body))
         if path.startswith("/tokens?"):
@@ -355,21 +363,230 @@ def test_cloudflare_transport_mints_prefix_session_not_shared_main_key(monkeypat
         if path == "/tokens/permission_groups":
             return [{"name": "Workers R2 Storage Bucket Item Write", "id": "write"}]
         if path == "/tokens":
-            return {"id": "parent", "value": "parent-value-not-persisted"}
+            return {"id": parent_id, "value": "parent-value-not-persisted"}
+        if path == f"/tokens/{parent_id}":
+            return {"id": parent_id, "name": name,
+                    "policies": [{"effect": "allow", "resources": {resource: "*"}}]}
         return {"accessKeyId": "temporary", "secretAccessKey": "temporary-secret",
                 "sessionToken": "temporary-session"}
     monkeypatch.setattr(admin, "_call", call)
-    parent = admin.create_parent("veda-registration", "affinemodel", 3600)
+    parent = admin.create_parent(name, "affinemodel", 3600)
     cred = admin.mint(parent, "affinemodel", "uploads/v1/fixture/", 3600)
     assert cred["session_token"] == "temporary-session"
-    assert calls[-1][2] == {"bucket": "affinemodel", "parentAccessKeyId": "parent",
+    assert calls[-1][2] == {"bucket": "affinemodel", "parentAccessKeyId": parent_id,
                            "permission": "object-read-write", "ttlSeconds": 3600,
                            "prefixes": ["uploads/v1/fixture/"]}
-    admin.revoke(parent)
-    assert calls[-1][:2] == ("DELETE", "/tokens/parent")
+    admin.revoke(parent, name=name, bucket="affinemodel")
+    assert calls[-2][:2] == ("GET", f"/tokens/{parent_id}")
+    assert calls[-1][:2] == ("DELETE", f"/tokens/{parent_id}")
 
 
-def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(setup, monkeypatch):
+@pytest.mark.parametrize("operation,tamper", [
+    ("revoke", "parent"), ("issue", "generation"), ("publish", "ciphertext"),
+])
+def test_control_uses_original_cas_not_owner_supplied_management_targets(setup, operation, tamper):
+    ctx = setup
+    reference = transfer(ctx)
+    _, record = ctx.uploads._read(reference.upload_id)
+    forged = {**record}
+    if tamper == "parent":
+        forged["parent_token_id"] = "shared-or-unrelated-parent"
+    elif tamper == "generation":
+        forged["generation"] += 1
+        forged["state"] = "ISSUING"
+    else:
+        forged["mailbox"] = {**record["mailbox"], "ciphertext": (b"untrusted" * 8).hex()}
+    before = list(ctx.events), dict(ctx.mailbox)
+    with pytest.raises(ValueError, match="CAS"):
+        ctx.uploads.control.handle(operation, forged)
+    assert (ctx.events, ctx.mailbox) == before
+
+
+def test_control_never_issues_during_original_cleanup_even_with_matching_cas(setup):
+    ctx = setup
+    activate(ctx)
+    stored, record = ctx.uploads._read(upload_registration_id(GENESIS, KEY.ss58_address))
+    record = {**record, "cleanup": "pending"}
+    ctx.uploads._replace(stored, record)
+    with pytest.raises(ValueError, match="phase"):
+        ctx.uploads.control.handle("issue", record)
+    assert ctx.events == [] and ctx.mailbox == {}
+
+
+@pytest.mark.parametrize("failure", ["missing", "unavailable", "corrupt"])
+def test_control_cas_read_failure_never_falls_back_to_request_record(setup, monkeypatch, failure):
+    ctx = setup
+    activate(ctx)
+    _, record = ctx.uploads._read(upload_registration_id(GENESIS, KEY.ss58_address))
+
+    def failed(_name):
+        if failure == "missing":
+            return None
+        if failure == "corrupt":
+            return SimpleNamespace(body=b"not-canonical-json")
+        raise OSError("private authority unavailable")
+
+    monkeypatch.setattr(ctx.uploads.objects, "get_optional", failed)
+    with pytest.raises((ValueError, OSError)):
+        ctx.uploads.control.handle("issue", record)
+    assert ctx.events == [] and ctx.mailbox == {}
+
+
+@pytest.mark.parametrize("alter", ["name", "bucket", "account", "id", "effect"])
+def test_parent_revoke_checks_account_token_metadata_before_exact_delete(monkeypatch, alter):
+    admin = CloudflareR2Tokens("ab" * 16, "fixture-management-token")
+    parent, name = "12" * 16, "veda-" + "cd" * 32 + "-g1"
+    resource = "com.cloudflare.edge.r2.bucket." + "ab" * 16 + "_default_affinemodel"
+    policy = {"effect": "allow", "resources": {resource: "*"}}
+    token = {"id": parent, "name": name, "policies": [policy]}
+    if alter == "name":
+        token["name"] = "another-registration-or-shared-key"
+    elif alter in {"bucket", "account"}:
+        resource = resource.replace("affinemodel", "otherbucket") if alter == "bucket" else (
+            resource.replace("ab" * 16, "ef" * 16)
+        )
+        policy["resources"] = {resource: "*"}
+    elif alter == "id":
+        token["id"] = "34" * 16
+    else:
+        policy["effect"] = "deny"
+    calls = []
+
+    def read(method, path, body=None):
+        calls.append((method, path))
+        return token
+
+    monkeypatch.setattr(admin, "_call", read)
+    with pytest.raises(ValueError, match="registration/bucket"):
+        admin.revoke(parent, name=name, bucket="affinemodel")
+    assert calls == [("GET", f"/tokens/{parent}")]
+
+
+def test_parent_revoke_lost_delete_response_is_idempotent_without_new_target(monkeypatch):
+    admin = CloudflareR2Tokens("ab" * 16, "fixture-management-token")
+    calls = []
+
+    def deleted(method, path, body=None):
+        calls.append((method, path))
+        return None
+
+    monkeypatch.setattr(admin, "_call", deleted)
+    admin.revoke("12" * 16, name="veda-" + "cd" * 32 + "-g1", bucket="affinemodel")
+    assert calls == [("GET", "/tokens/" + "12" * 16)]
+    with pytest.raises(ValueError, match="identity"):
+        admin.revoke("../arbitrary-url", name="other", bucket="affinemodel")
+    assert len(calls) == 1
+
+
+def test_new_generation_reconciles_prior_parent_whose_issue_response_was_lost(monkeypatch):
+    admin = CloudflareR2Tokens("ab" * 16, "fixture-management-token")
+    prefix = "veda-" + "cd" * 32 + "-g"
+    old_id, new_id = "12" * 16, "34" * 16
+    resource = "com.cloudflare.edge.r2.bucket." + "ab" * 16 + "_default_affinemodel"
+    # g1 committed before its response disappeared; original CAS has no returned ID.
+    old = {"id": old_id, "name": prefix + "1",
+           "policies": [{"effect": "allow", "resources": {resource: "*"}}]}
+    calls = []
+
+    def call(method, path, body=None):
+        calls.append((method, path))
+        if path.startswith("/tokens?"):
+            return [old]
+        if path == "/tokens/" + old_id:
+            return old
+        if path == "/tokens/permission_groups":
+            return [{"name": "Workers R2 Storage Bucket Item Write", "id": "write"}]
+        return {"id": new_id, "value": "fixture-parent-value"}
+
+    monkeypatch.setattr(admin, "_call", call)
+    assert admin.create_parent(prefix + "2", "affinemodel", 3600) == new_id
+    assert calls.index(("DELETE", "/tokens/" + old_id)) < calls.index(("POST", "/tokens"))
+
+
+@pytest.mark.parametrize("alter", ["account", "jurisdiction", "public-bucket", "cas-prefix"])
+def test_control_scope_is_fixed_by_configuration_not_incoming_messages(setup, alter):
+    ctx = setup
+    endpoint, bucket, objects = ENDPOINT, "affinemodel", ctx.uploads.objects
+    if alter == "account":
+        endpoint = ENDPOINT.replace("ab" * 16, "ef" * 16)
+    elif alter == "jurisdiction":
+        endpoint = ENDPOINT.replace(".r2.", ".eu.r2.")
+    elif alter == "public-bucket":
+        bucket = "affine_video"
+    else:
+        objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="not-evaluation")
+    with pytest.raises(ValueError, match="scope"):
+        MailboxControl(tokens=Tokens(ctx.events), signer=SIGNER, endpoint=endpoint, bucket=bucket,
+                       genesis_hash=GENESIS, objects=objects, publish_mailbox=lambda *_a: None)
+    assert ctx.events == []
+
+
+@pytest.mark.parametrize("bad_seed", [None, "mode", "length", "symlink", "identity"])
+def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
+    setup, tmp_path, monkeypatch, bad_seed,
+):
+    ctx = setup
+    seed = tmp_path / "signing.seed"
+    seed.write_bytes(bytes.fromhex("22" * 32) + (b"x" if bad_seed == "length" else b""))
+    seed.chmod(0o644 if bad_seed == "mode" else 0o600)
+    if bad_seed == "symlink":
+        link = tmp_path / "seed-link"
+        link.symlink_to(seed)
+        seed = link
+    environment = {
+        "VEDA_UPLOAD_STAGING_STORAGE_URL": ENDPOINT, "VEDA_UPLOAD_STAGING_BUCKET": "affinemodel",
+        "VEDA_UPLOAD_GENESIS_HASH": GENESIS, "VEDA_UPLOAD_SIGNING_SEED_FILE": str(seed),
+        "VEDA_UPLOAD_VALIDATOR_IDENTITY": (KEY if bad_seed == "identity" else SIGNER).ss58_address,
+        "VEDA_UPLOAD_MANAGEMENT_TOKEN": "fixture-control-token",
+        "STORAGE_URL": "https://public.example", "ACCESS_KEY": "fixture-public-access",
+        "SECRET_ACCESS_KEY": "fixture-public-secret",
+        "VEDA_UPLOAD_AUTHORITY_STORAGE_URL": "https://authority.example",
+        "VEDA_UPLOAD_AUTHORITY_ACCESS_KEY": "fixture-role-access",
+        "VEDA_UPLOAD_AUTHORITY_SECRET_ACCESS_KEY": "fixture-role-secret",
+        "VEDA_UPLOAD_AUTHORITY_BUCKET": "private",
+    }
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    closed, clients, attached = [], [], []
+    authority = ctx.uploads.objects._client
+    monkeypatch.setattr(authority, "close", lambda: closed.append("authority"), raising=False)
+    public = SimpleNamespace(close=lambda: closed.append("public"))
+
+    def client(endpoint, access, secret):
+        clients.append(endpoint)
+        if endpoint == "https://authority.example":
+            assert (access, secret) == ("fixture-role-access", "fixture-role-secret")
+            return authority
+        assert (access, secret) == ("fixture-public-access", "fixture-public-secret")
+        return public
+
+    def attach(*, host, container, control):
+        assert (host, container) == ("gpu-veda", "veda-evaluator")
+        assert control.signer.ss58_address == SIGNER.ss58_address
+        assert control.objects._client is authority
+        activate(ctx)
+        _, record = ctx.uploads._read(upload_registration_id(GENESIS, KEY.ss58_address))
+        # Same original decoder, no authority write or remote management call.
+        with pytest.raises(ValueError, match="CAS"):
+            control.handle("issue", {**record, "generation": record["generation"] + 1})
+        attached.append(True)
+        return 0
+
+    monkeypatch.setattr("validator.uploads._environment_client", client)
+    monkeypatch.setattr("validator.uploads.attach_evaluator", attach)
+    if bad_seed:
+        with pytest.raises((ValueError, OSError)):
+            attach_from_environment(host="gpu-veda", container="veda-evaluator")
+        assert clients == [] and attached == []
+    else:
+        assert attach_from_environment(host="gpu-veda", container="veda-evaluator") == 0
+        assert clients == ["https://public.example", "https://authority.example"]
+        assert closed == ["authority", "public"] and attached == [True]
+
+
+def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(
+    setup, monkeypatch, capsys,
+):
     ctx = setup
     activate(ctx)
     _, record = ctx.uploads._read(upload_registration_id(GENESIS, KEY.ss58_address))
@@ -402,6 +619,8 @@ def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(setup
     assert "docker attach --sig-proxy=false veda-evaluator" in observed[0][-1]
     assert "docker start --attach --interactive veda-evaluator" in observed[0][-1]
     assert "VEDA_UPLOAD_MANAGEMENT_TOKEN" not in environments[0]
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err  # No request/response frames in journal output.
 
 
 def test_owner_actual_subprocess_pipes_without_listener(setup, monkeypatch, capsys):
@@ -425,7 +644,9 @@ def test_owner_actual_subprocess_pipes_without_listener(setup, monkeypatch, caps
     monkeypatch.setattr(subprocess, "Popen", child)
     assert attach_evaluator(host="gpu-veda", container="veda-evaluator",
                             control=ctx.uploads.control) == 0
-    output = capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert not captured.out  # Protocol frames are consumed, business output is stderr only.
+    output = captured.err
     assert "OWNER_PIPE_OK" in output
     assert "fixture-secret" not in output and "fixture-session" not in output
 
@@ -823,4 +1044,5 @@ def test_owner_reconnect_attaches_without_restarting_running_writer(
                             control=setup.uploads.control) == 0
     expected = ("attach --sig-proxy=false veda-evaluator" if running
                 else "start --attach --interactive veda-evaluator")
-    assert capsys.readouterr().out.strip() == expected
+    captured = capsys.readouterr()
+    assert not captured.out and captured.err.strip() == expected

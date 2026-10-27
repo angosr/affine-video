@@ -483,7 +483,7 @@ def _print_evaluation_cycle(result: EvaluationCycleResult) -> None:
         "publication_error": result.publication_error,
         "cycle_error": result.cycle_error,
     }
-    print(json.dumps(output, sort_keys=True), flush=True)
+    print(json.dumps(output, sort_keys=True), file=sys.stderr, flush=True)
 
 
 def _print_weight_cycle(result: WeightCycleResult) -> None:
