@@ -514,14 +514,15 @@ def test_failed_admission_public_match_restores_without_model_ownership(tmp_path
 
 @pytest.mark.parametrize("existing", [False, True])
 @pytest.mark.parametrize("damage", [None, "upload_id", "file_sha256", "manifest_sha256", "hf"])
+@pytest.mark.parametrize("wins", [False, True])
 def test_private_public_history_binds_original_chain_payload_and_spent_opportunity(
-    tmp_path, existing, damage,
+    tmp_path, existing, damage, wins,
 ):
     reference = PrivateModelSubmission("ef" * 32, "ab" * 32, "cd" * 32)
     record = submission_from_commitment(ChainCommitment(
         "alice", 120, "ab" * 32, ChainPosition(101, 0, 0), reference.encode(),
     ))
-    item = scored_challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    item = scored_challenge(1, "alice", score=0.8 if wins else 0.6, incumbent_score=0.7)
     item.update(challenge_id=challenge_id(record.submission_id), submission_id=record.submission_id,
         **model_source_fields(None, None, reference))
     ledger = resolve_tournament(
@@ -557,7 +558,8 @@ def test_private_public_history_binds_original_chain_payload_and_spent_opportuni
             minimum_exact_gain=0.003, initial_champion=genesis_champion(),
         )
         assert canonical_json(replayed.matches[0].document) == original
-        assert replayed.champion.private_submission == reference
+        assert replayed.champion.private_submission == (reference if wins else None)
+        assert (replayed.matches[0].document["evaluation"]["model_object"] is not None) == wins
         hf = ModelSubmission("owner/model", "12" * 20)
         position = ChainPosition(102, 0, 0)
         later = SubmissionRecord(submission_id(120, "cd" * 32, position), "alice", 120,

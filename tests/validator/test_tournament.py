@@ -152,6 +152,40 @@ def test_private_champion_and_history_keep_one_source_without_rejudging():
                             incumbent=genesis())
 
 
+@pytest.mark.parametrize("kind", ["exact_loss", "full_loss", "winner", "failure"])
+def test_private_model_visibility_is_a_strict_immutable_outcome_fact(kind):
+    private = PrivateModelSubmission("ef" * 32, "ab" * 32)
+    if kind == "failure":
+        item = challenge(1, "alice", state=ChallengeState.PARTICIPANT_FAILED,
+                         error_code="INVALID_MODEL")
+    else:
+        item = challenge(1, "alice", score=0.8, incumbent_score=0.7,
+                         paired_gain=-0.01 if kind == "exact_loss" else 0.1)
+        if kind == "full_loss":
+            item.update(final_score=0.6, paired_gain_lower_bound=-0.1)
+            item["stages"][-1].update(score=0.6, paired_gain_lower_bound=-0.1)
+    item.update(model_source_fields(None, None, private))
+    result = resolve([item])
+    document = result.matches[0].document
+    public_name = "models/track/" + "ab" * 32 + "/manifest.json"
+    assert document["evaluation"]["model_object"] == (
+        public_name if kind == "winner" else None
+    )
+    original = canonical_json(document)
+    recorded = recorded_match(document, netuid=7)
+    assert canonical_json(resolve([], history=(recorded,), minimum_gain=0.9)
+                          .champion.public()) == canonical_json(result.champion.public())
+    assert canonical_json(recorded.document) == original
+    altered = {**document, "evaluation": {**document["evaluation"],
+               "model_object": None if kind == "winner" else public_name}}
+    with pytest.raises(ValueError):
+        validate_match_document(altered, sequence=1, track_id="track",
+                                track_spec_digest="ab" * 32, netuid=7,
+                                minimum_gain=0.01, incumbent=genesis())
+    with pytest.raises(ValueError, match="public model"):
+        recorded_match(altered, netuid=7)
+
+
 @pytest.mark.parametrize("damage", ["mixed_hf", "file_sha", "null", "extra_key"])
 def test_private_match_rejects_conflicting_or_incomplete_source_identity(damage):
     private = PrivateModelSubmission("ef" * 32, "ab" * 32)
@@ -279,6 +313,9 @@ def test_candidate_three_milli_gate_remains_strict_for_both_stages(exact_gain, f
         MatchOutcome.CHALLENGER_WON if winner else MatchOutcome.CHAMPION_RETAINED
     )
     assert result.champion.hotkey == ("alice" if winner else "genesis-hotkey")
+    assert result.matches[0].document["evaluation"]["model_object"] == (
+        "models/candidate/" + "ab" * 32 + "/manifest.json" if not private or winner else None
+    )
 
 
 def test_lower_gate_does_not_reopen_a_historical_exact_loss_or_spent_opportunity():

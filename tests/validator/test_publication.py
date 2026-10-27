@@ -1187,8 +1187,10 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path, pr
 @pytest.mark.parametrize(
     "cache_state", ["valid", "missing", "forgotten", "same_size_corruption", "truncated"]
 )
+@pytest.mark.parametrize("private", [False, True])
+@pytest.mark.parametrize("full_loss", [False, True])
 def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
-    tmp_path, cache_state
+    tmp_path, cache_state, private, full_loss, monkeypatch,
 ) -> None:
     track = parse_track_spec(valid_spec())
     model = tmp_path / "retained-challenger.safetensors"
@@ -1231,6 +1233,13 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
             }
         ],
     }
+    if full_loss:
+        challenge = two_stage_challenge(challenge)
+        challenge["stages"][0].update(score=0.8, paired_gain_lower_bound=0.3)
+    if private:
+        challenge.update(model_source_fields(
+            None, None, PrivateModelSubmission("ef" * 32, model_sha256, "cd" * 32),
+        ))
     store = SimpleNamespace(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": [challenge]},
@@ -1267,6 +1276,36 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
 
     assert artifacts is not None
     assert json.loads(artifacts.matches[0][1])["outcome"] == "CHAMPION_RETAINED"
+    if private:
+        assert artifacts.files == () and restored == []
+        document = json.loads(artifacts.matches[0][1])
+        assert document["evaluation"]["model_object"] is None
+        assert document["evaluation"]["file_sha256"] == model_sha256
+        client = MemoryS3()
+        repository = S3Repository(client, bucket="public-data", prefix="tracks/test")
+        asyncio.run(repository.publish(artifacts))
+        assert not any("/models/" in key for key in client.objects)
+        cold = S3Repository(client, bucket="public-data", prefix="tracks/test")
+        monkeypatch.setattr(cold, "_verify_public_file", lambda *_args: pytest.fail(
+            "private losing payload was requested from public storage",
+        ))
+        ledger = asyncio.run(cold.load(track))
+        assert ledger.matches[0].document == document
+        assert asyncio.run(cold.recover(track)).matches == ledger.matches
+        before = dict(client.objects)
+        with pytest.raises(PublicArtifactError, match="public model"):
+            asyncio.run(repository.stage(replace(artifacts, files=(PublicFile(
+                f"models/{track.track_id}/{model_sha256}/manifest.json", model, model_sha256,
+            ),))))
+        assert client.objects == before
+        document["evaluation"]["model_object"] = (
+            f"models/{track.track_id}/{model_sha256}/manifest.json"
+        )
+        altered = replace(artifacts, matches=((artifacts.matches[0][0], canonical_json(document)),))
+        with pytest.raises(PublicArtifactError, match="public model"):
+            asyncio.run(repository.stage(altered))
+        assert client.objects == before
+        return
     assert len(artifacts.files) == 1
     assert artifacts.files[0].object_name == (
         f"models/{track.track_id}/{model_sha256}/manifest.json"
@@ -1291,6 +1330,32 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
     assert len(restored) == (cache_state != "valid")
     asyncio.run(restarted.publish(repeated))
     assert len(restored) == (cache_state != "valid")
+
+
+def test_failed_private_model_has_public_result_without_payload_and_cold_recovers(tmp_path):
+    from validator.queue import ChallengeState
+
+    track = parse_track_spec(valid_spec())
+    item = scored_challenge(1, "alice", state=ChallengeState.PARTICIPANT_FAILED,
+                            error_code="INVALID_MODEL")
+    item.update(model_source_fields(None, None, PrivateModelSubmission("ef" * 32, "ab" * 32)))
+    store = SimpleNamespace(
+        chain_cursor=lambda: (300, "0x" + "12" * 32),
+        public_snapshot=lambda: {"challenges": [item]},
+        active_competitors=lambda _mapping: [], legacy_excluded_hotkeys=lambda: frozenset(),
+        model_path=lambda _identifier: pytest.fail("failed private model path was requested"),
+    )
+    chain = WeightChainState(300, {track.initial_champion.hotkey: 0, "alice": 4}, 1, 1.0, 1, {})
+    artifacts = build_public_artifacts(store, track, chain, version_key=0)
+    assert artifacts.files == ()
+    client = MemoryS3()
+    asyncio.run(S3Repository(client, bucket="test", prefix="tracks/test").publish(artifacts))
+    ledger = asyncio.run(S3Repository(client, bucket="test", prefix="tracks/test").load(track))
+    match = ledger.matches[0]
+    assert match.document["outcome"] == "CHALLENGE_FAILED"
+    assert match.document["evaluation"]["model_object"] is None
+    assert not any("/models/" in key for key in client.objects)
+    assert decode_weight_artifact(artifacts.weights).plan.uids == (0,)
 
 
 @pytest.mark.parametrize("switch_block", [252, 1252])

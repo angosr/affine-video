@@ -777,6 +777,35 @@ class S3Repository:
         weight_fence = decode_weight_artifact(artifacts.weights)
         if weight_fence.track_id != track_id:
             raise PublicArtifactError("public weights target a different track")
+        # Check before any payload PUT: private losses must not carry either an
+        # archive reference or a stray model file. Full track snapshots use the
+        # same canonical resolver as public recovery, including both strict gates.
+        if "scoring" in track_document["spec"] or any(
+            item.object_name.startswith("models/") for item in artifacts.files
+        ):
+            try:
+                track = parse_track_spec(track_document["spec"])
+                model_objects = {}
+                for sequence, (name, payload) in enumerate(artifacts.matches, start=1):
+                    document = _decode_canonical_object(payload, name)
+                    match = validate_match_document(
+                        document, sequence=sequence, track_id=track.track_id,
+                        track_spec_digest=track.digest, netuid=track.netuid,
+                        minimum_gain=track.full_video.minimum_gain,
+                        minimum_exact_gain=track.scoring.minimum_frontier_gain,
+                        incumbent=Champion.from_public(document["incumbent_before"]),
+                    )
+                    if name != match.object_name:
+                        raise ValueError("public model match name is invalid")
+                    evaluation = match.document["evaluation"]
+                    if evaluation["model_object"] is not None:
+                        model_objects[evaluation["model_object"]] = evaluation["file_sha256"]
+                if any(item.object_name.startswith("models/")
+                       and model_objects.get(item.object_name) != item.sha256
+                       for item in artifacts.files):
+                    raise ValueError("unreferenced public model file")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PublicArtifactError("public model publication violates its match") from exc
         if artifacts.runtime_manifest is not None:
             await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
         for artifact in artifacts.files:

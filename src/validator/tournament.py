@@ -91,6 +91,19 @@ class MatchRecord:
         return f"matches/{self.document['track_id']}/{self.sequence:012d}.json"
 
 
+def public_model_object(document: Mapping[str, Any]) -> str | None:
+    """HF archives are unchanged; a private model becomes public only on promotion."""
+    evaluation = document["evaluation"]
+    private = private_model_source(document["submission"])
+    if (evaluation["state"] != ChallengeState.SUCCEEDED
+            or (private is not None and document["outcome"] != MatchOutcome.CHALLENGER_WON)):
+        return None
+    digest = _optional_digest(evaluation["file_sha256"], "public model SHA")
+    if digest is None:
+        raise ValueError("public model identity is missing")
+    return f"models/{document['track_id']}/{digest}/manifest.json"
+
+
 @dataclass(frozen=True, slots=True)
 class Tournament:
     matches: tuple[MatchRecord, ...]
@@ -381,6 +394,9 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
         or challenge.get("stages")
     )):
         raise ValueError("historical non-admission is not a participant result")
+    if ("model_object" not in document["evaluation"]
+            or document["evaluation"]["model_object"] != public_model_object(document)):
+        raise ValueError("historical public model differs from its source and outcome")
     return MatchRecord(sequence, challenge["challenge_id"], challenge["hotkey"], state,
                        score, gain, outcome, after, document)
 
@@ -560,11 +576,7 @@ def _resolve_match(
         "incumbent_score": incumbent_score,
         "paired_gain_lower_bound": score_gain,
         "evaluation_batch": batch,
-        "model_object": (
-            f"models/{track_id}/{file_sha256}/manifest.json"
-            if state is ChallengeState.SUCCEEDED
-            else None
-        ),
+        "model_object": None,
         "stages": stages,
     }
     document = {
@@ -589,6 +601,7 @@ def _resolve_match(
         "champion_after": incumbent.public(),
         "decided_block": decided_block,
     }
+    evaluation["model_object"] = public_model_object(document)
     return (
         MatchRecord(
             sequence,
