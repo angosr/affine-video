@@ -740,7 +740,9 @@ def _normalize_prefix(prefix: str) -> str:
     return normalized
 
 
-def _environment_client(endpoint: str, access_key: str, secret_key: str) -> Any:
+def _environment_client(
+    endpoint: str, access_key: str, secret_key: str, *, region_name: str | None = None,
+) -> Any:
     try:
         import boto3
     except ImportError as exc:
@@ -751,6 +753,7 @@ def _environment_client(endpoint: str, access_key: str, secret_key: str) -> Any:
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         config=client_config(),
+        **({"region_name": region_name} if region_name is not None else {}),
     )
 
 

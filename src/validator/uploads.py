@@ -94,9 +94,11 @@ class PrivateUploads:
         Each process receives its own role values under these same names.
         HTTP needs staging PUT/HEAD; evaluator needs GET/exact DELETE. Neither
         changes the original models writer or per-track private backend.
+        The explicit staging bucket uses R2's auto signing region independently
+        of the authority/public clients and AWS_DEFAULT_REGION.
         """
         names = (
-            "AUDIENCE", "GENESIS_HASH", "AUTHORITY_BUCKET",
+            "AUDIENCE", "GENESIS_HASH", "AUTHORITY_BUCKET", "STAGING_BUCKET",
             "AUTHORITY_STORAGE_URL", "AUTHORITY_ACCESS_KEY", "AUTHORITY_SECRET_ACCESS_KEY",
             "STAGING_STORAGE_URL", "STAGING_ACCESS_KEY", "STAGING_SECRET_ACCESS_KEY",
         )
@@ -105,7 +107,7 @@ class PrivateUploads:
             return None
         if not all(values):
             raise ValueError("all VEDA_UPLOAD domain and restricted storage settings are required")
-        (audience, genesis, bucket, authority_url, authority_key, authority_secret,
+        (audience, genesis, bucket, staging_bucket, authority_url, authority_key, authority_secret,
          staging_url, staging_key, staging_secret) = values
         if bucket == "affine_video":
             raise ValueError("upload authority cannot use the public bucket")
@@ -119,8 +121,10 @@ class PrivateUploads:
                 _environment_client(authority_url, authority_key, authority_secret),
                 bucket=bucket, prefix="evaluation",
             ),
-            staging_client=_environment_client(staging_url, staging_key, staging_secret),
-            staging_bucket="affine_video_private", staging_prefix="uploads/v1",
+            staging_client=_environment_client(
+                staging_url, staging_key, staging_secret, region_name="auto",
+            ),
+            staging_bucket=staging_bucket, staging_prefix="uploads/v1",
             audience=audience, genesis_hash=genesis, store=store,
             registration=registration, max_bytes=max_bytes,
         )

@@ -10,6 +10,7 @@ from dataclasses import asdict, replace
 from threading import Barrier, Lock
 from types import SimpleNamespace
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 import httpx
@@ -204,6 +205,7 @@ def configure_environment(monkeypatch, intent):
     values = {
         "AUDIENCE": intent.audience, "GENESIS_HASH": intent.genesis_hash,
         "AUTHORITY_BUCKET": "original-private",
+        "STAGING_BUCKET": "veda-private-uploads",
         "AUTHORITY_STORAGE_URL": "https://authority.example",
         "AUTHORITY_ACCESS_KEY": "authority-role", "AUTHORITY_SECRET_ACCESS_KEY": "test-secret",
         "STAGING_STORAGE_URL": "https://staging.example",
@@ -234,19 +236,112 @@ def test_upload_factory_has_one_stable_authority_and_no_publisher_fallback(
     calls = []
     clients = [MemoryS3(), StagingS3()]
 
-    def make_client(endpoint, key, _secret):
-        calls.append((endpoint, key))
+    def make_client(endpoint, key, _secret, **kwargs):
+        calls.append((endpoint, key, kwargs))
         return clients[len(calls) - 1]
 
     monkeypatch.setattr(module, "_environment_client", make_client)
     configured = PrivateUploads.from_environment(store=store, max_bytes=10_000)
     assert configured.objects._prefix == "evaluation"
     assert configured.objects._bucket == values["AUTHORITY_BUCKET"]
-    assert configured.bucket == "affine_video_private" and configured.prefix == "uploads/v1"
-    assert calls == [(values["AUTHORITY_STORAGE_URL"], "authority-role"),
-                     (values["STAGING_STORAGE_URL"], "staging-role")]
+    assert configured.bucket == values["STAGING_BUCKET"] and configured.prefix == "uploads/v1"
+    assert calls == [(values["AUTHORITY_STORAGE_URL"], "authority-role", {}),
+                     (values["STAGING_STORAGE_URL"], "staging-role", {"region_name": "auto"})]
     with pytest.raises(RuntimeError, match="registration lookup"):
         configured._eligible(intent)
+
+
+@pytest.mark.parametrize("bucket", [None, ""])
+def test_upload_factory_requires_explicit_staging_bucket_before_clients(setup, monkeypatch, bucket):
+    _, intent, _, store = setup
+    from validator import uploads as module
+
+    configure_environment(monkeypatch, intent)
+    monkeypatch.delenv("VEDA_UPLOAD_STAGING_BUCKET")
+    if bucket is not None:
+        monkeypatch.setenv("VEDA_UPLOAD_STAGING_BUCKET", bucket)
+    monkeypatch.setattr(module, "_environment_client", lambda *_a, **_kw: pytest.fail(
+        "incomplete staging configuration must not construct storage clients",
+    ))
+    with pytest.raises(ValueError, match="all VEDA_UPLOAD"):
+        PrivateUploads.from_environment(store=store, max_bytes=10_000)
+
+
+@pytest.mark.parametrize("bucket", ["veda-private-uploads", "another-private-uploads"])
+def test_r2_staging_presigns_exact_bucket_with_auto_region_only(setup, monkeypatch, bucket):
+    _, intent, _, store = setup
+    configure_environment(monkeypatch, intent)
+    monkeypatch.setenv("VEDA_UPLOAD_STAGING_BUCKET", bucket)
+    endpoint = "https://" + "a" * 32 + ".r2.cloudflarestorage.com"
+    monkeypatch.setenv("VEDA_UPLOAD_STAGING_STORAGE_URL", endpoint)
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-central-1")
+    configured = PrivateUploads.from_environment(store=store, max_bytes=10_000)
+    assert configured.objects._client.meta.region_name == "eu-central-1"
+    assert configured.staging.meta.region_name == "auto"
+    key = f"uploads/v1/owner/{intent.upload_id}/part-00000"
+    url = configured.staging.generate_presigned_url(
+        "put_object", Params={"Bucket": configured.bucket, "Key": key, "ContentLength": 123},
+        ExpiresIn=60, HttpMethod="PUT",
+    )
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    assert parsed.scheme == "https" and parsed.netloc == urlparse(endpoint).netloc
+    assert parsed.path == f"/{bucket}/{key}"
+    assert query["X-Amz-Credential"][0].endswith("/auto/s3/aws4_request")
+    assert query["X-Amz-Expires"] == ["60"]
+    assert set(query["X-Amz-SignedHeaders"][0].split(";")) == {"content-length", "host"}
+
+
+@pytest.mark.parametrize("bucket", ["veda-private-uploads", "another-private-uploads"])
+def test_configured_staging_bucket_covers_parts_repair_and_exact_gc(
+    setup, monkeypatch, tmp_path, bucket,
+):
+    original, intent, payload, store = setup
+    from validator import uploads as module
+
+    values = configure_environment(monkeypatch, intent)
+    monkeypatch.setenv("VEDA_UPLOAD_STAGING_BUCKET", bucket)
+    operations = []
+    for name in ("put_object", "head_object", "get_object", "delete_object"):
+        method = getattr(original.staging, name)
+
+        def observe(*, _method=method, _name=name, **kwargs):
+            assert kwargs["Bucket"] == bucket
+            assert kwargs["Key"].startswith("uploads/v1/")
+            operations.append(_name)
+            return _method(**kwargs)
+
+        monkeypatch.setattr(original.staging, name, observe)
+
+    def client(endpoint, _key, _secret, **_kwargs):
+        return (original.objects._client if endpoint == values["AUTHORITY_STORAGE_URL"]
+                else original.staging)
+
+    monkeypatch.setattr(module, "_environment_client", client)
+    configured = PrivateUploads.from_environment(
+        store=store, max_bytes=10_000, registration=lambda _hotkey: (9, 100),
+    )
+    _, params = upload(configured, intent, payload)
+    assert params["Bucket"] == bucket
+    seal = replace(intent, action="seal")
+    reference = configured.seal(seal, sign(seal), now=NOW + 1)
+    configured.staging.delete_object(Bucket=bucket, Key=params["Key"])
+    with pytest.raises(ModelDownloadError) as missing:
+        configured.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cold",
+                            max_bytes=10_000)
+    assert missing.value.code == "PRIVATE_UPLOAD_UNAVAILABLE" and missing.value.temporary
+    renewed = replace(intent, expires_at=NOW + 600)
+    authorize(configured, renewed, now=NOW + 301)
+    assert configured.staging.grants[-1]["Params"] == params
+    configured.staging.put_object(**params, Body=payload)
+    restored = configured.download(reference, hotkey=intent.hotkey, cache_dir=tmp_path / "cold",
+                                   max_bytes=10_000)
+    assert restored.path.read_bytes() == payload and restored.file_sha256 == intent.file_sha256
+    assert reclaim(configured, store, now=NOW + 601, finalized_timestamp=NOW + 601) == 1
+    assert (bucket, params["Key"]) not in configured.staging.objects
+    assert set(operations) == {"put_object", "head_object", "get_object", "delete_object"}
+    assert configured._read(intent.upload_id)[1]["state"] == "SEALED"
+    assert store.public_snapshot()["challenges"] == []
 
 
 @pytest.mark.parametrize("uid,genesis", [(9, "01" * 32), (None, "01" * 32), (9, "ff" * 32)])
