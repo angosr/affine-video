@@ -47,7 +47,11 @@ from validator.publication import (
     validate_public_weights_url,
 )
 from validator.queue import TERMINAL_STATES
-from validator.release import PRODUCTION_NETUID, require_release_approval
+from validator.release import (
+    PRODUCTION_NETUID,
+    require_release_approval,
+    verify_competition_manifest,
+)
 from validator.scan import submission_from_commitment
 from validator.scoring import (
     EvaluatedStage,
@@ -110,6 +114,7 @@ def _require_production_release(
     track: TrackSpec,
     runtime_manifest: bytes,
     publisher: ArtifactRepository,
+    *, image_id: str | None = None,
 ) -> None:
     """Fail before evaluation when a production repository lacks release approval."""
 
@@ -118,6 +123,7 @@ def _require_production_release(
             track,
             runtime_manifest,
             getattr(publisher, "release_approval", None),
+            image_id=image_id,
         )
     except ValueError as exc:
         raise ValueError(f"formal evaluator release rejected: {exc}") from exc
@@ -413,6 +419,7 @@ async def run_evaluator(
     track = load_track_spec(track_spec)
     data_config = None
     runtime_manifest_payload = None
+    competition_manifest_payload = None
     if production_config is not None:
         data_config = load_producer_config(production_config)
         if data_config.track_spec.resolve() != Path(track_spec).resolve():
@@ -420,11 +427,13 @@ async def run_evaluator(
         if data_config.validator_database.resolve() != Path(database).resolve():
             raise ValueError("production configuration uses a different validator database")
         runtime_manifest_payload = data_config.artifact_manifest.read_bytes()
-        if (
-            ArtifactManifest.decode(runtime_manifest_payload).digest
-            != track.artifact_manifest_sha256
-        ):
-            raise ValueError("artifact manifest does not match the track commitment")
+        competition_manifest_payload = data_config.competition_payload(track)
+        verify_competition_manifest(track, runtime_manifest_payload, competition_manifest_payload)
+        approval = getattr(publisher, "release_approval", None)
+        if approval is not None:
+            publisher.release_approval = replace(
+                approval, competition_manifest=competition_manifest_payload,
+            )
     if production_config is not None:
         lock_publisher = getattr(publisher, "acquire_writer_lock", None)
         verify_public_storage = getattr(publisher, "verify_writes", None)
@@ -443,7 +452,9 @@ async def run_evaluator(
             try:
                 ledger = (
                     await publisher.recover(track) if runtime_manifest_payload is None
-                    else await publisher.recover(track, runtime_manifest=runtime_manifest_payload)
+                    else await publisher.recover(
+                        track, runtime_manifest=competition_manifest_payload,
+                    )
                 )
                 break
             except Exception as exc:
@@ -504,11 +515,12 @@ async def run_evaluator(
         )
         objects.verify_conditional_writes()
         stored_manifest = objects.get(ARTIFACT_MANIFEST_OBJECT).body
-        if stored_manifest != runtime_manifest_payload:
-            raise ValueError("private runtime manifest differs from the verified local manifest")
-        manifest = ArtifactManifest.decode(stored_manifest)
-        if manifest.digest != track.artifact_manifest_sha256:
+        if stored_manifest != competition_manifest_payload:
+            raise ValueError("private competition manifest differs from the verified local binding")
+        competition = ArtifactManifest.decode(stored_manifest)
+        if competition.digest != track.artifact_manifest_sha256:
             raise ValueError("artifact manifest does not match the track commitment")
+        manifest = ArtifactManifest.decode(runtime_manifest_payload)
         _require_production_release(track, runtime_manifest_payload, publisher)
         hidden_artifacts = tuple(
             artifact
@@ -519,7 +531,10 @@ async def run_evaluator(
             )
         )
         objects.verify_evaluator_boundary(hidden_artifacts)
-        data_config.verify_evaluator_manifest(manifest)
+        image = data_config.verify_evaluator_manifest(manifest)
+        _require_production_release(
+            track, runtime_manifest_payload, publisher, image_id=image["image_id"],
+        )
         batch_source = ReadyBatchSource(
             track=track,
             objects=objects,

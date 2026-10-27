@@ -260,6 +260,8 @@ def build_public_artifacts(
         system_matches=system_match_summaries(system_matches),
         historical_matches=historical_matches,
     )
+    if release_approval is not None and runtime_manifest is not None:
+        status["runtime_release"] = release_approval.public_identity(track, runtime_manifest)
     if inventory_status is not None:
         status["inventory"] = {
             key: value for key, value in inventory_status.items() if key != "allocated_stages"
@@ -313,7 +315,7 @@ def build_public_artifacts(
         status=_json_bytes(status),
         system_matches=system_matches,
         files=tuple(files.values()),
-        runtime_manifest=_runtime_manifest(track, runtime_manifest),
+        runtime_manifest=_runtime_manifest(track, runtime_manifest, release_approval),
     )
 
 
@@ -373,25 +375,22 @@ def build_genesis_artifacts(
         terminal_match_sha256=None,
     )
     system_matches = validated_system_matches(track, runtime_manifest, system_matches)
+    status = _status_document(
+        track, chain.finalized_block, tournament, [], [],
+        system_matches=system_match_summaries(system_matches),
+        historical_matches=historical_matches,
+    )
+    if release_approval is not None and runtime_manifest is not None:
+        status["runtime_release"] = release_approval.public_identity(track, runtime_manifest)
     return PublicArtifacts(
         source_block=chain.finalized_block,
         track=_json_bytes({"track_spec_digest": track.digest, "spec": track_spec_dict(track)}),
         summary=_json_bytes(_summary_document(track, chain.finalized_block, tournament)),
         weights=encode_weight_artifact(weights),
         matches=(),
-        status=_json_bytes(
-            _status_document(
-                track,
-                chain.finalized_block,
-                tournament,
-                [],
-                [],
-                system_matches=system_match_summaries(system_matches),
-                historical_matches=historical_matches,
-            )
-        ),
+        status=_json_bytes(status),
         system_matches=system_matches,
-        runtime_manifest=_runtime_manifest(track, runtime_manifest),
+        runtime_manifest=_runtime_manifest(track, runtime_manifest, release_approval),
     )
 
 
@@ -406,12 +405,17 @@ def _verify_candidate_release(
         raise PublicArtifactError(str(exc)) from exc
 
 
-def _runtime_manifest(track: TrackSpec, payload: bytes | None) -> tuple[str, bytes] | None:
+def _runtime_manifest(
+    track: TrackSpec, payload: bytes | None, approval: ReleaseApproval | None = None,
+) -> tuple[str, bytes] | None:
     if payload is None:
         return None
     if hashlib.sha256(payload).hexdigest() != track.artifact_manifest_sha256:
-        raise PublicArtifactError("runtime artifact manifest digest is incorrect")
-    return f"runtime/{track.artifact_manifest_sha256}/manifest.json", payload
+        try:
+            require_release_approval(track, payload, approval)
+        except ValueError as exc:
+            raise PublicArtifactError("runtime artifact manifest digest is incorrect") from exc
+    return f"runtime/{hashlib.sha256(payload).hexdigest()}/manifest.json", payload
 
 
 def encode_weight_artifact(artifact: WeightArtifact) -> bytes:
@@ -766,6 +770,15 @@ class S3Repository:
                     ),
                     self.release_approval,
                 )
+                runtime = (None if artifacts.runtime_manifest is None
+                           else artifacts.runtime_manifest[1])
+                status_release = _decode_canonical_object(artifacts.status, "status").get(
+                    "runtime_release",
+                )
+                expected_release = (None if runtime is None or self.release_approval is None
+                                    else self.release_approval.public_identity(track, runtime))
+                if runtime is not None and status_release != expected_release:
+                    raise ValueError("public runtime identity differs from release approval")
             except (KeyError, TypeError, ValueError) as exc:
                 raise PublicArtifactError(f"formal release rejected: {exc}") from exc
         try:
@@ -817,8 +830,12 @@ class S3Repository:
             await asyncio.to_thread(self._put_immutable, name, payload)
         if artifacts.runtime_manifest is not None:
             track = parse_track_spec(track_document["spec"])
+            competition_manifest = artifacts.runtime_manifest[1]
+            if (self.release_approval is not None
+                    and self.release_approval.competition_manifest is not None):
+                competition_manifest = self.release_approval.competition_manifest
             history = await asyncio.to_thread(
-                self._load_history, track, artifacts.runtime_manifest[1],
+                self._load_history, track, competition_manifest,
             )
             if history:
                 tournament = resolve_tournament(

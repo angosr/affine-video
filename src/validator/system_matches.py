@@ -363,6 +363,7 @@ def _is_release_packaging(logical_name: str) -> bool:
         for name in (
             "runtime/dependencies.lock",
             "runtime/image.tar",
+            "runtime/image.json",
             "runtime/source.zip",
         )
     )

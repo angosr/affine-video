@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,11 +13,19 @@ from tests.scoring.test_spec import valid_spec
 from validator import release
 from validator import system_matches as matches
 from validator.production.commitment import Artifact, ArtifactManifest, canonical_json
-from validator.publication import PublicArtifactError, S3Repository, build_genesis_artifacts
+from validator.publication import (
+    PublicArtifactError,
+    S3Repository,
+    build_genesis_artifacts,
+    build_public_artifacts,
+    decode_weight_artifact,
+)
 from validator.release import ReleaseApproval
+from validator.store import ChallengeStore
 from validator.weights import WeightChainState
 
 from .test_publication import MemoryS3
+from .test_store import submission_at
 
 
 def test_inventory_records_launch_checks_without_claiming_runtime_authorization():
@@ -103,6 +112,195 @@ def rebind_acceptance(candidate, result):
 
 def chain(track):
     return WeightChainState(99, {track.initial_champion.hotkey: 0}, 1, 1.0, 0, {})
+
+
+@pytest.fixture
+def compatible_runtime(approved_candidate):
+    track, original, approval = approved_candidate
+    original_manifest = ArtifactManifest.decode(original)
+    artifacts = tuple(
+        replace(artifact, sha256="ef" * 32, size_bytes=101, object_key="artifacts/new-source")
+        if artifact.logical_name == "runtime/source.zip" else artifact
+        for artifact in original_manifest.artifacts
+        if artifact.logical_name != release.ACCEPTANCE_LOGICAL_NAME
+    ) + (Artifact("runtime/image.json", "aa" * 32, 100, "artifacts/image"),)
+    manifest = ArtifactManifest(tuple(sorted(artifacts, key=lambda item: item.logical_name)))
+    result = deepcopy(json.loads(approval.acceptance))
+    result.update(
+        track_spec_digest=track.digest, competition_manifest_sha256=original_manifest.digest,
+        image_id="sha256:" + "ab" * 32, source_sha256="31" * 32,
+        environment_sha256="32" * 32,
+        runtime_contract_sha256=matches._evidence_runtime_digest(manifest.encode()),
+    )
+    acceptance = canonical_json(result)
+    manifest = ArtifactManifest(tuple(sorted((*manifest.artifacts, Artifact(
+        release.ACCEPTANCE_LOGICAL_NAME, hashlib.sha256(acceptance).hexdigest(),
+        len(acceptance), "artifacts/new-acceptance",
+    )), key=lambda item: item.logical_name)))
+    return track, manifest.encode(), ReleaseApproval(track.digest, acceptance, original)
+
+
+def test_compatible_release_binds_new_source_without_changing_the_competition(compatible_runtime):
+    track, payload, approval = compatible_runtime
+    original = canonical_json(track_spec_dict(track))
+    approval.verify(track, payload)
+    identity = approval.public_identity(track, payload)
+    assert identity["track_spec_digest"] == track.digest
+    assert identity["artifact_manifest_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert identity["competition_manifest_sha256"] == track.artifact_manifest_sha256
+    assert identity["image_id"] == "sha256:" + "ab" * 32
+    assert canonical_json(track_spec_dict(track)) == original
+    with pytest.raises(ValueError, match="differs from candidate"):
+        replace(approval, competition_manifest=None).verify(track, payload)
+    with pytest.raises(ValueError, match="OCI descriptor"):
+        approval.verify(track, payload, image_id="sha256:" + "ff" * 32)
+
+
+def test_runtime_release_keeps_live_track_cursor_queue_and_original_history(
+    compatible_runtime, approved_candidate, tmp_path,
+):
+    """Synthetic CPU publication, no chain/cloud/OCI execution or real miner."""
+    track, payload, approval = compatible_runtime
+    client = MemoryS3()
+    publisher = S3Repository(client, bucket="test", prefix="tracks/main",
+                             release_approval=approved_candidate[2])
+    with ChallengeStore(tmp_path / "unchanged.db", track_spec_digest=track.digest) as store:
+        store.add_submission(submission_at(110, hotkey="queued-miner"))
+        store.advance_chain_cursor(150, "0x" + "12" * 32)
+        snapshot = store.public_snapshot()
+        cursor = store.chain_cursor()
+        state = replace(chain(track), finalized_block=150)
+        original = build_public_artifacts(
+            store, track, state, version_key=0, runtime_manifest=approved_candidate[1],
+            release_approval=approved_candidate[2],
+        )
+        asyncio.run(publisher.publish(original))
+        pointer = client.objects["tracks/main/track.json"]
+        publisher.release_approval = approval
+        # The original one-height/one-snapshot fence remains in force. A normal
+        # scan advances one block before the new runtime is publicly observed.
+        store.advance_chain_cursor(151, "0x" + "13" * 32)
+        cursor = store.chain_cursor()
+        state = replace(state, finalized_block=151)
+        updated = build_public_artifacts(
+            store, track, state, version_key=0, runtime_manifest=payload, release_approval=approval,
+        )
+        asyncio.run(publisher.publish(updated))
+        assert client.objects["tracks/main/track.json"] == pointer
+        assert updated.matches == original.matches == ()
+        assert json.loads(updated.summary)["champion"] == json.loads(original.summary)["champion"]
+        before_weight = decode_weight_artifact(original.weights)
+        after_weight = decode_weight_artifact(updated.weights)
+        assert after_weight.match_sequence == before_weight.match_sequence
+        assert after_weight.terminal_match_sha256 == before_weight.terminal_match_sha256
+        assert after_weight.plan.hotkeys == before_weight.plan.hotkeys
+        assert after_weight.plan.uids == before_weight.plan.uids
+        assert after_weight.plan.weights == before_weight.plan.weights
+        assert decode_weight_artifact(updated.weights).track_spec_digest == track.digest
+        identity = json.loads(updated.status)["runtime_release"]
+        assert identity == approval.public_identity(track, payload)
+        assert updated.runtime_manifest[0] != original.runtime_manifest[0]
+        # Recovery still authenticates the pinned competition manifest, not the
+        # new runtime package, and never clones/relabels the pending submission.
+        cold = S3Repository(client, bucket="test", prefix="tracks/main")
+        ledger = asyncio.run(cold.recover(track))
+        assert ledger.matches == () and ledger.historical_matches == ()
+        assert store.chain_cursor() == cursor and store.public_snapshot() == snapshot
+        assert store.track_spec_digest() == track.digest
+
+
+def test_public_status_cannot_claim_a_different_runtime(compatible_runtime):
+    track, payload, approval = compatible_runtime
+    artifacts = build_genesis_artifacts(track, chain(track), version_key=0,
+                                        runtime_manifest=payload, release_approval=approval)
+    status = json.loads(artifacts.status)
+    status["runtime_release"]["source_sha256"] = "00" * 32
+    artifacts = replace(artifacts, status=canonical_json(status))
+    client = MemoryS3()
+    publisher = S3Repository(client, bucket="test", prefix="tracks/main", release_approval=approval)
+    with pytest.raises(PublicArtifactError, match="runtime identity"):
+        asyncio.run(publisher.publish(artifacts))
+    assert client.calls == []
+
+
+def test_producer_runtime_update_does_not_replace_competition_bootstrap(
+    compatible_runtime, tmp_path, monkeypatch,
+):
+    """CPU assembly only; storage/pool/installed checks have isolated test doubles."""
+    from validator.production import service
+    from validator.production.storage import ARTIFACT_MANIFEST_OBJECT, SOURCE_POOL_OBJECT
+
+    track, payload, approval = compatible_runtime
+    track_path = tmp_path / "track.json"
+    track_path.write_bytes(canonical_json(track_spec_dict(track)))
+    runtime_path = tmp_path / "runtime-manifest.json"
+    runtime_path.write_bytes(payload)
+    competition_path = tmp_path / "competition-manifest.json"
+    competition_path.write_bytes(approval.competition_manifest)
+    acceptance_path = tmp_path / "accepted.json"
+    acceptance_path.write_bytes(approval.acceptance)
+    binding_path = tmp_path / "source-binding.json"
+    binding_path.write_bytes(b"original-binding")
+    bootstrap = {ARTIFACT_MANIFEST_OBJECT: approval.competition_manifest,
+                 SOURCE_POOL_OBJECT: b"original-pool"}
+    def original(name, _path):
+        return bootstrap[name]
+    objects = SimpleNamespace(verify_conditional_writes=lambda: None, ensure_bootstrap=original)
+    monkeypatch.setattr(service.PrivateObjectStore, "from_environment",
+                        lambda **kwargs: objects)
+    seen = []
+    def verify(manifest):
+        assert manifest.encode() == payload
+        return {"image_id": "sha256:" + "ab" * 32}
+    def pool(source, binding, **kwargs):
+        seen.append((source, binding, kwargs))
+        return "original-pool-instance"
+    monkeypatch.setattr(service, "load_bound_source_pool", pool)
+    monkeypatch.setattr(service, "_validate_source_capacity", lambda *_args: None)
+    config = SimpleNamespace(
+        track_spec=track_path, storage_bucket="private", storage_prefix="evaluation",
+        source_pool=tmp_path / "pool", competition_manifest=competition_path,
+        competition_payload=lambda _track: approval.competition_manifest,
+        artifact_manifest=runtime_path, verify_manifest=verify,
+        artifact_path=lambda name: acceptance_path if name == release.ACCEPTANCE_LOGICAL_NAME
+        else binding_path,
+        runtime=SimpleNamespace(source_binding="binding", sample_cache="cache"),
+        work_dir=tmp_path / "unchanged-work",
+    )
+    producer = service.ProducerService(config)
+    assert producer.track.digest == track.digest and producer.manifest.encode() == payload
+    assert producer.pool == "original-pool-instance"
+    assert bootstrap[ARTIFACT_MANIFEST_OBJECT] == approval.competition_manifest
+    assert seen[0][:2] == (b"original-pool", b"original-binding")
+    assert seen[0][2]["expected_root"] == track.source_pool_merkle_root
+
+
+@pytest.mark.parametrize("damage", [
+    "asset", "target", "baseline", "source", "environment", "image",
+])
+def test_compatible_release_cannot_hide_changed_rules_or_runtime(compatible_runtime, damage):
+    track, payload, approval = compatible_runtime
+    manifest = ArtifactManifest.decode(payload)
+    if damage == "asset":
+        manifest = ArtifactManifest(tuple(
+            replace(item, sha256="00" * 32) if item.logical_name == "weights/reference" else item
+            for item in manifest.artifacts
+        ))
+    else:
+        result = json.loads(approval.acceptance)
+        key = {"target": "track_spec_digest", "baseline": "competition_manifest_sha256",
+               "source": "source_sha256", "environment": "environment_sha256",
+               "image": "image_id"}[damage]
+        result[key] = "00" * 32
+        acceptance = canonical_json(result)
+        manifest = ArtifactManifest(tuple(
+            replace(item, sha256=hashlib.sha256(acceptance).hexdigest(), size_bytes=len(acceptance))
+            if item.logical_name == release.ACCEPTANCE_LOGICAL_NAME else item
+            for item in manifest.artifacts
+        ))
+        approval = replace(approval, acceptance=acceptance)
+    with pytest.raises(ValueError, match="competition|installation"):
+        approval.verify(track, manifest.encode())
 
 
 def test_uncoordinated_candidate_cannot_build_genesis():

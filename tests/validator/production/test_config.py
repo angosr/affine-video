@@ -1,15 +1,17 @@
+import hashlib
 import json
 from dataclasses import replace
 
 import pytest
 
-from validator.production.commitment import Artifact, ArtifactManifest
+from validator.production.commitment import Artifact, ArtifactManifest, canonical_json
 from validator.production.config import load_producer_config
 
 
 def document(tmp_path):
     return {
         "artifact_manifest": str(tmp_path / "artifacts.json"),
+        "competition_manifest": str(tmp_path / "competition.json"),
         "artifact_root": str(tmp_path / "artifacts"),
         "evaluator_artifact_root": str(tmp_path / "evaluator-artifacts"),
         "format": "veda-producer-config-v1",
@@ -142,3 +144,46 @@ def test_evaluator_artifact_selection_excludes_hidden_source_inputs(tmp_path) ->
     )
     with pytest.raises(ValueError, match="outside its IAM namespace"):
         config.evaluator_artifact_names(substituted)
+
+
+def test_runtime_verification_uses_a_bound_image_descriptor_not_an_archive(tmp_path, monkeypatch):
+    from validator.production import environment
+
+    raw = document(tmp_path)
+    raw["runtime"]["oci_image"] = "runtime/image.json"
+    path = tmp_path / "config.json"
+    path.write_bytes(canonical_json(raw))
+    config = load_producer_config(path)
+    image = {"format": "veda-runtime-image-v1", "image_id": "sha256:" + "11" * 32,
+             "source_sha256": "22" * 32, "environment_sha256": "33" * 32}
+    monkeypatch.setattr(environment, "evaluation_source_digest", lambda: "22" * 32)
+    monkeypatch.setattr(environment, "evaluation_environment_digest", lambda: "33" * 32)
+    checked = []
+    monkeypatch.setattr(environment, "verify_runtime_environment",
+                        lambda *paths: checked.append(paths))
+    files = {
+        config.runtime.adapter: b"adapter", config.runtime.predictor: b"predictor",
+        config.runtime.feature_model: b"feature", config.runtime.source_binding: b"binding",
+        config.runtime.source_bundle: b"source", config.runtime.dependency_lock: b"lock",
+        config.runtime.oci_image: canonical_json(image),
+        config.runtime.model_root + "/weights.bin": b"teacher",
+        config.runtime.sample_cache + "/index.json": b"sample",
+    }
+    artifacts = []
+    for name, payload in sorted(files.items()):
+        for root in (config.artifact_root, config.evaluator_artifact_root):
+            item = root / name
+            item.parent.mkdir(parents=True, exist_ok=True)
+            item.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        artifacts.append(Artifact(name, digest, len(payload), f"artifacts/{digest}"))
+    manifest = ArtifactManifest(tuple(artifacts))
+    assert config.verify_manifest(manifest) == image
+    assert config.verify_evaluator_manifest(manifest) == image
+    assert config.verify_manifest(manifest) == image
+    assert len(checked) == 3  # Actual source/lock validation is never skipped.
+    assert not list(tmp_path.rglob("*.tar"))
+    image["source_sha256"] = "00" * 32
+    (config.artifact_root / config.runtime.oci_image).write_bytes(canonical_json(image))
+    with pytest.raises(ValueError, match="OCI descriptor"):
+        config.verify_image_descriptor(config.artifact_root)

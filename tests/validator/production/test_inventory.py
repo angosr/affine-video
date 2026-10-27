@@ -5,11 +5,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from scoring.spec import parse_track_spec
+from scoring.spec import parse_track_spec, track_spec_dict
 from tests.scoring.test_spec import valid_spec
 from tests.validator.test_store import submission_at
 from validator.production.batches import ReadyBatchSource
-from validator.production.commitment import SourceLeaf, SourcePool, canonical_json
+from validator.production.commitment import (
+    Artifact,
+    ArtifactManifest,
+    SourceLeaf,
+    SourcePool,
+    canonical_json,
+)
 from validator.production.inventory import ALLOCATION_OBJECT, Inventory
 from validator.production.plan import (
     BatchPlan,
@@ -24,6 +30,7 @@ from validator.production.plan import (
 from validator.production.service import PlanCoordinator
 from validator.production.storage import PrivateObjectStore
 from validator.queue import ChallengeState
+from validator.release import verify_competition_manifest
 from validator.scoring import ScoringSettings, StageOutcome, process_next_scoring
 from validator.store import ChallengeStore
 
@@ -108,6 +115,34 @@ def test_inventory_plan_is_secret_committed_and_unassigned(inventory_case):
         (plan,), commitments=inventory_case.track.source_commitments,
         scoring=inventory_case.track.scoring,
     )
+
+
+def test_runtime_update_reuses_original_ready_and_claim_without_rebinding(inventory_case):
+    case = inventory_case
+    assets = Artifact("weights/teacher", "ab" * 32, 1, "artifacts/teacher")
+    competition = ArtifactManifest((Artifact(
+        "runtime/source.zip", "11" * 32, 1, "artifacts/old-source",
+    ), assets))
+    raw = track_spec_dict(case.track)
+    raw["artifact_manifest_sha256"] = competition.digest
+    case.track = parse_track_spec(raw)
+    plans = (make_plan(case, 101), make_plan(case, 102, 1))
+    for plan in plans:
+        case.objects.create_plan(f"plans/{plan.generation_block}.json", plan.encode())
+    original = claim(Inventory(case.objects, case.track.digest), plans)
+    before = dict(case.objects._client.objects)
+    encoded = tuple(plan.encode() for plan in plans)
+    runtime = ArtifactManifest((Artifact(
+        "runtime/source.zip", "22" * 32, 1, "artifacts/new-source",
+    ), assets))
+    assert verify_competition_manifest(
+        case.track, runtime.encode(), competition.encode(),
+    ) == competition
+    cold = Inventory(case.objects, case.track.digest)
+    assert claim(cold, plans) == original
+    assert case.objects._client.objects == before
+    assert tuple(plan.encode() for plan in plans) == encoded
+    assert all(plan.completed_at_ms == (plan.generation_block + 1) * 1000 for plan in plans)
 
 
 @pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])

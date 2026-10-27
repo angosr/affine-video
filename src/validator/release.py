@@ -8,8 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scoring.spec import TrackSpec
+from validator import system_matches
 from validator.production.commitment import ArtifactManifest, decode_canonical_json
-from validator.system_matches import _evidence_contract_digest, _evidence_runtime_digest
+from validator.system_matches import (
+    _evidence_contract_digest,
+    _evidence_runtime_digest,
+    _is_release_packaging,
+)
 
 PRODUCTION_TRACK_ID = "veda-sn120-v2"
 PRODUCTION_NETUID = 120
@@ -24,6 +29,7 @@ _MAX_ACCEPTANCE_BYTES = 2 * 1024 * 1024
 class ReleaseApproval:
     coordinated_track_digest: str
     acceptance: bytes
+    competition_manifest: bytes | None = None
 
     @classmethod
     def from_environment(cls) -> ReleaseApproval | None:
@@ -41,14 +47,17 @@ class ReleaseApproval:
             raise ValueError("release acceptance has an invalid size")
         return cls(digest, acceptance)
 
-    def verify(self, track: TrackSpec, runtime_manifest: bytes | None) -> None:
+    def verify(
+        self, track: TrackSpec, runtime_manifest: bytes | None, *, image_id: str | None = None,
+    ) -> None:
         if self.coordinated_track_digest != track.digest:
             raise ValueError("candidate digest has not been coordinated for formal publication")
         if runtime_manifest is None:
             raise ValueError("formal release requires its runtime manifest")
         manifest = ArtifactManifest.decode(runtime_manifest)
-        if manifest.digest != track.artifact_manifest_sha256:
-            raise ValueError("formal release runtime manifest differs from candidate")
+        competition = verify_competition_manifest(
+            track, runtime_manifest, self.competition_manifest,
+        )
         if not isinstance(self.acceptance, bytes) or not 0 < len(
             self.acceptance
         ) <= _MAX_ACCEPTANCE_BYTES:
@@ -70,6 +79,16 @@ class ReleaseApproval:
             or result.get("runtime_contract_sha256") != _evidence_runtime_digest(runtime_manifest)
         ):
             raise ValueError("release acceptance differs from active scoring or runtime contracts")
+        if manifest.digest != competition.digest and (
+            result.get("track_spec_digest") != track.digest
+            or result.get("competition_manifest_sha256") != competition.digest
+            or result.get("source_sha256") != system_matches.evaluation_source_digest()
+            or result.get("environment_sha256") != system_matches.evaluation_environment_digest()
+            or not _image_id(result.get("image_id"))
+        ):
+            raise ValueError("runtime release is not bound to this competition and installation")
+        if image_id is not None and result.get("image_id") != image_id:
+            raise ValueError("release acceptance differs from the OCI descriptor")
         experiments = result.get("experiments")
         if not isinstance(experiments, dict) or set(experiments) != REQUIRED_EXPERIMENTS:
             raise ValueError("release acceptance is missing mandatory experiments")
@@ -99,12 +118,54 @@ class ReleaseApproval:
                 ):
                     raise ValueError(f"release evidence is not bound by the manifest: {identifier}")
 
+    def public_identity(self, track: TrackSpec, runtime_manifest: bytes) -> dict[str, object]:
+        """Describe the verified running release, not a new competition identity."""
+        self.verify(track, runtime_manifest)
+        result = decode_canonical_json(self.acceptance)
+        return {
+            "track_spec_digest": track.digest,
+            "competition_manifest_sha256": track.artifact_manifest_sha256,
+            "artifact_manifest_sha256": hashlib.sha256(runtime_manifest).hexdigest(),
+            "acceptance_sha256": hashlib.sha256(self.acceptance).hexdigest(),
+            "image_id": result.get("image_id"),
+            "source_sha256": result.get("source_sha256"),
+            "environment_sha256": result.get("environment_sha256"),
+        }
+
+
+def verify_competition_manifest(
+    track: TrackSpec, runtime_manifest: bytes, competition_manifest: bytes | None = None,
+) -> ArtifactManifest:
+    """Keep the original track commitment; only runtime packaging may be replaced.
+
+    The pinned original manifest also authenticates historical references and
+    READY data. It is never replaced by a new executable package in bootstrap.
+    """
+    runtime = ArtifactManifest.decode(runtime_manifest)
+    competition = ArtifactManifest.decode(
+        runtime_manifest if competition_manifest is None else competition_manifest,
+    )
+    if competition.digest != track.artifact_manifest_sha256:
+        raise ValueError("formal release runtime manifest differs from candidate competition")
+    def assets(manifest: ArtifactManifest):
+        return tuple(artifact for artifact in manifest.artifacts
+                     if not _is_release_packaging(artifact.logical_name))
+    if assets(runtime) != assets(competition):
+        raise ValueError("compatible runtime release changes committed competition assets")
+    return competition
+
+
+def _image_id(value: object) -> bool:
+    return (isinstance(value, str) and value.startswith("sha256:") and len(value) == 71
+            and all(char in "0123456789abcdef" for char in value[7:]))
+
 
 def require_release_approval(
-    track: TrackSpec, runtime_manifest: bytes | None, approval: ReleaseApproval | None
+    track: TrackSpec, runtime_manifest: bytes | None, approval: ReleaseApproval | None,
+    *, image_id: str | None = None,
 ) -> None:
     if approval is None:
         raise ValueError(
             "formal publication requires verified acceptance and coordinated track digest"
         )
-    approval.verify(track, runtime_manifest)
+    approval.verify(track, runtime_manifest, image_id=image_id)

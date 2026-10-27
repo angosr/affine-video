@@ -71,6 +71,7 @@ from validator.production.storage import (
     StoredObject,
 )
 from validator.production.workers import close_workers
+from validator.release import ACCEPTANCE_LOGICAL_NAME, ReleaseApproval, verify_competition_manifest
 from validator.store import ChallengeStore
 
 _FAST_PLAN_ATTEMPTS = 5
@@ -363,20 +364,26 @@ class ProducerService:
         source_pool_payload = self.objects.ensure_bootstrap(
             SOURCE_POOL_OBJECT, config.source_pool
         )
-        self.manifest = ArtifactManifest.decode(
-            self.objects.ensure_bootstrap(
-                ARTIFACT_MANIFEST_OBJECT, config.artifact_manifest
-            )
-        )
-        if self.manifest.digest != self.track.artifact_manifest_sha256:
-            raise ValueError("artifact manifest does not match the track commitment")
-        config.verify_manifest(self.manifest)
+        competition = config.competition_payload(self.track)
+        if self.objects.ensure_bootstrap(
+            ARTIFACT_MANIFEST_OBJECT, config.competition_manifest,
+        ) != competition:
+            raise ValueError("private competition manifest differs from its track commitment")
+        runtime = config.artifact_manifest.read_bytes()
+        verify_competition_manifest(self.track, runtime, competition)
+        self.manifest = ArtifactManifest.decode(runtime)
+        image = config.verify_manifest(self.manifest)
+        ReleaseApproval(
+            self.track.digest, config.artifact_path(ACCEPTANCE_LOGICAL_NAME).read_bytes(),
+            competition,
+        ).verify(self.track, runtime, image_id=image["image_id"])
         self.pool = load_bound_source_pool(
             source_pool_payload,
             config.artifact_path(config.runtime.source_binding).read_bytes(),
             expected_root=self.track.source_pool_merkle_root,
             expected_commitments=self.track.source_commitment_documents,
             sample_cache=config.artifact_path(config.runtime.sample_cache),
+            verification_cache=config.work_dir / "artifact-verification/assets.json",
         )
         _validate_source_capacity(self.pool, self.track)
         config.work_dir.mkdir(parents=True, exist_ok=True)

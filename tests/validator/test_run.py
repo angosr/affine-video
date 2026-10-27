@@ -1373,7 +1373,8 @@ def test_production_evaluator_checks_release_for_custom_repository(monkeypatch) 
     publisher = SimpleNamespace(release_approval=object())
     calls = []
 
-    def require(candidate, manifest, approval):
+    def require(candidate, manifest, approval, *, image_id=None):
+        assert image_id is None
         calls.append((candidate, manifest, approval))
 
     monkeypatch.setattr(run_module, "require_release_approval", require)
@@ -1382,7 +1383,7 @@ def test_production_evaluator_checks_release_for_custom_repository(monkeypatch) 
 
 
 def test_production_evaluator_rejects_missing_release_approval(monkeypatch) -> None:
-    def reject(*_args):
+    def reject(*_args, **_kwargs):
         raise ValueError("formal publication requires approval")
 
     monkeypatch.setattr(run_module, "require_release_approval", reject)

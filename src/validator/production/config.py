@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -35,6 +36,7 @@ class ProducerConfig:
     validator_database: Path
     source_pool: Path
     artifact_manifest: Path
+    competition_manifest: Path
     artifact_root: Path
     evaluator_artifact_root: Path
     work_dir: Path
@@ -63,20 +65,24 @@ class ProducerConfig:
             raise ValueError("runtime artifact path escapes evaluator_artifact_root")
         return candidate
 
-    def verify_manifest(self, manifest: Any) -> None:
-        manifest.verify_local(self.artifact_root)
+    def verify_manifest(self, manifest: Any) -> dict[str, str]:
+        files = (
+            self.runtime.adapter, self.runtime.predictor, self.runtime.feature_model,
+            self.runtime.source_binding, self.runtime.source_bundle,
+            self.runtime.dependency_lock, self.runtime.oci_image,
+        )
         manifest.verify_runtime_coverage(
             self.artifact_root,
-            files=(
-                self.runtime.adapter,
-                self.runtime.predictor,
-                self.runtime.feature_model,
-                self.runtime.source_binding,
-                self.runtime.source_bundle,
-                self.runtime.dependency_lock,
-                self.runtime.oci_image,
-            ),
+            files=files,
             directories=(self.runtime.model_root, self.runtime.sample_cache),
+        )
+        prefixes = (self.runtime.model_root.rstrip("/") + "/",
+                    self.runtime.sample_cache.rstrip("/") + "/")
+        names = tuple(item.logical_name for item in manifest.artifacts
+                      if item.logical_name in files or item.logical_name.startswith(prefixes))
+        manifest.verify_local(
+            self.artifact_root, logical_names=names,
+            verification_cache=self.work_dir / "artifact-verification/assets.json",
         )
         from validator.production.environment import verify_runtime_environment
 
@@ -84,6 +90,7 @@ class ProducerConfig:
             self.artifact_path(self.runtime.source_bundle),
             self.artifact_path(self.runtime.dependency_lock),
         )
+        return self.verify_image_descriptor(self.artifact_root)
 
     def evaluator_artifact_names(self, manifest: Any) -> tuple[str, ...]:
         """Select runtime bytes needed for scoring, excluding every hidden source input."""
@@ -123,11 +130,14 @@ class ProducerConfig:
             raise ValueError("evaluator runtime artifact is outside its IAM namespace")
         return tuple(sorted(files))
 
-    def verify_evaluator_manifest(self, manifest: Any) -> None:
+    def verify_evaluator_manifest(self, manifest: Any) -> dict[str, str]:
         """Verify the committed runtime without reading the hidden pool or full SampleCache."""
 
         names = self.evaluator_artifact_names(manifest)
-        manifest.verify_local(self.evaluator_artifact_root, logical_names=names)
+        manifest.verify_local(
+            self.evaluator_artifact_root, logical_names=names,
+            verification_cache=self.work_dir / "artifact-verification/assets.json",
+        )
         manifest.verify_runtime_coverage(
             self.evaluator_artifact_root,
             files=(
@@ -146,6 +156,36 @@ class ProducerConfig:
             self.evaluator_artifact_path(self.runtime.source_bundle),
             self.evaluator_artifact_path(self.runtime.dependency_lock),
         )
+        return self.verify_image_descriptor(self.evaluator_artifact_root)
+
+    def competition_payload(self, track: Any) -> bytes:
+        payload = self.competition_manifest.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != track.artifact_manifest_sha256:
+            raise ValueError("competition manifest does not match the track commitment")
+        return payload
+
+    def verify_image_descriptor(self, root: Path) -> dict[str, str]:
+        """Bind OCI identity without requiring a docker-save archive or socket.
+
+        The existing owner must compare this image ID with Engine's actual
+        container Image before start; the process verifies source/lock itself.
+        """
+        from validator.production.commitment import decode_canonical_json
+        from validator.production.environment import (
+            evaluation_environment_digest,
+            evaluation_source_digest,
+        )
+        from validator.release import _image_id
+
+        payload = decode_canonical_json((root / self.runtime.oci_image).read_bytes())
+        if (not isinstance(payload, dict) or set(payload) != {
+            "format", "image_id", "source_sha256", "environment_sha256",
+        } or payload["format"] != "veda-runtime-image-v1"
+                or not _image_id(payload["image_id"])
+                or payload["source_sha256"] != evaluation_source_digest()
+                or payload["environment_sha256"] != evaluation_environment_digest()):
+            raise ValueError("OCI descriptor differs from the installed runtime")
+        return payload
 
     def validate_evaluation_device(self, device: str | None) -> str:
         """Resolve a CUDA ordinal to an allowed physical evaluation GPU."""
@@ -186,6 +226,7 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
         value,
         {
             "artifact_manifest",
+            "competition_manifest",
             "artifact_root",
             "evaluator_artifact_root",
             "format",
@@ -249,6 +290,7 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
         validator_database=_path(root["validator_database"], "validator_database"),
         source_pool=_path(root["source_pool"], "source_pool"),
         artifact_manifest=_path(root["artifact_manifest"], "artifact_manifest"),
+        competition_manifest=_path(root["competition_manifest"], "competition_manifest"),
         artifact_root=_path(root["artifact_root"], "artifact_root"),
         evaluator_artifact_root=_path(
             root["evaluator_artifact_root"], "evaluator_artifact_root"
