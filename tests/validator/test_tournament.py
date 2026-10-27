@@ -182,6 +182,11 @@ def test_private_model_visibility_is_a_strict_immutable_outcome_fact(kind):
         validate_match_document(altered, sequence=1, track_id="track",
                                 track_spec_digest="ab" * 32, netuid=7,
                                 minimum_gain=0.01, incumbent=genesis())
+    if kind in {"exact_loss", "full_loss"}:
+        # Only the manifest-authenticated history reader accepts an old public
+        # loser archive; validation of a NEW match above must still reject it.
+        assert canonical_json(recorded_match(altered, netuid=7).document) == canonical_json(altered)
+        altered["evaluation"]["model_object"] = "models/foreign/" + "ab" * 32 + "/manifest.json"
     with pytest.raises(ValueError, match="public model"):
         recorded_match(altered, netuid=7)
 

@@ -30,7 +30,7 @@ from validator.chunks import (
     verify_chunked_content,
 )
 from validator.production.batches import BatchDisclosure, public_selected_inputs_document
-from validator.production.commitment import ArtifactManifest, verify_source_proof
+from validator.production.commitment import Artifact, ArtifactManifest, verify_source_proof
 from validator.production.inventory import Inventory
 from validator.production.plan import (
     BatchPlan,
@@ -1082,6 +1082,40 @@ class S3Repository:
         """Recover authoritative facts without auditing previously published bulk."""
         return await asyncio.to_thread(self._recover, track, runtime_manifest)
 
+    async def collect_history_artifacts(self) -> tuple[Artifact, ...]:
+        """Collect original references for a rules migration, never a second ledger.
+
+        Reuse normal authenticated recovery (including staged immutable tails).
+        A changing track or weight fence requires recollection before binding.
+        This reads only small public facts, not model or disclosure payloads.
+        """
+        return await asyncio.to_thread(self._collect_history_artifacts)
+
+    def _collect_history_artifacts(self) -> tuple[Artifact, ...]:
+        pointer = self._get_optional("track.json")
+        fence = self._get_optional("weights.json")
+        if pointer is None or fence is None:
+            raise PublicArtifactError("maintenance requires a published track and weight fence")
+        document = _decode_track_document(pointer)
+        track = parse_track_spec(document["spec"])
+        weight = decode_weight_artifact(fence)
+        if (weight.track_id != track.track_id or weight.track_spec_digest != track.digest
+                or weight.netuid != track.netuid or weight.mechid != track.mechid):
+            raise PublicArtifactError("maintenance weight fence targets a different track")
+        ledger = self._recover(track)
+        artifacts = tuple(sorted((
+            Artifact(
+                HISTORICAL_MATCHES_PREFIX + match.object_name,
+                hashlib.sha256(_json_bytes(match.document)).hexdigest(),
+                len(_json_bytes(match.document)), match.object_name,
+            )
+            for match in (*ledger.historical_matches, *ledger.matches)
+        ), key=lambda artifact: artifact.logical_name))
+        if (self._get_optional("track.json") != pointer
+                or self._get_optional("weights.json") != fence):
+            raise PublicArtifactError("maintenance public fence changed during collection")
+        return artifacts
+
     def _load_history(
         self, track: TrackSpec, runtime_manifest: bytes | None = None,
     ) -> tuple[MatchRecord, ...]:
@@ -1822,7 +1856,7 @@ def _status_document(
 
     phase = "SCHEDULED" if source_block < track.track_start_block else "ACCEPTING"
     challenge_by_id = {item["submission_id"]: item for item in challenges}
-    match_by_id = {item.challenge_id: item for item in tournament.matches}
+    match_by_id = {item.challenge_id: item for item in (*historical_matches, *tournament.matches)}
     initial = genesis_champion(track)
     active_rows: list[dict[str, Any]] = [
         {
@@ -1865,6 +1899,10 @@ def _status_document(
             challenge.get("track_spec_digest") is not None
             and challenge["track_spec_digest"] != track.digest
         )
+        if historical and match is not None:
+            # Old results come from the authenticated immutable decision, not
+            # a synthetic "historical" outcome or a newer champion observation.
+            challenge = {**challenge, **challenge_from_match(match.document)}
         is_champion = tournament.champion.challenge_id == challenge["challenge_id"]
         # Stage aggregates are safe before raw reveal. Project only these
         # commitments, never arbitrary metric payloads (prompts/seeds/cases).
@@ -1883,23 +1921,22 @@ def _status_document(
                 "state": challenge["state"],
                 "queue_position": None,
                 "match_sequence": None if match is None else match.sequence,
-                "score": (tournament.champion.score if is_champion else
+                "score": (match.final_score if historical and match is not None else
+                          tournament.champion.score if is_champion else
                           challenge["final_score"] if challenge["final_score"] is not None
                           else latest_score),
                 "file_sha256": challenge.get("file_sha256"),
                 "model_digest": challenge.get("model_digest"),
                 "stages": stages,
                 "incumbent_score": challenge["incumbent_score"],
-                "score_gain": (
-                    challenge.get("paired_gain_lower_bound") if historical or match is None
-                    else None if match is None else match.score_gain
-                ),
+                "score_gain": (challenge.get("paired_gain_lower_bound") if match is None
+                               else match.score_gain),
                 "batch_generated_block": (
                     None
                     if challenge["evaluation_batch"] is None
                     else challenge["evaluation_batch"]["generated_block"]
                 ),
-                "outcome": "HISTORICAL" if historical else None if match is None else match.outcome,
+                "outcome": None if match is None else match.outcome,
                 "champion": is_champion,
                 "attempts": (
                     None if historical and challenge["created_at_ms"] == 0
@@ -1915,15 +1952,19 @@ def _status_document(
     if original is not None and not any(
         row["challenge_id"] == champion.challenge_id for row in active_rows
     ):
+        evaluation = original.document["evaluation"]
+        batch = evaluation["evaluation_batch"]
         active_rows.append({
             "uid": champion.uid,
             "hotkey": champion.hotkey, "challenge_id": champion.challenge_id,
             "track_spec_digest": original.document["track_spec_digest"],
-            "submission_block": champion.position.block, "state": "CHAMPION",
-            "queue_position": None, "match_sequence": None, "score": champion.score,
-            "incumbent_score": None, "score_gain": None, "batch_generated_block": None,
-            "outcome": "HISTORICAL", "champion": True, "attempts": None,
-            "error_code": None, "alert": False,
+            "submission_block": champion.position.block, "state": original.state,
+            "queue_position": None, "match_sequence": original.sequence,
+            "score": original.final_score, "incumbent_score": evaluation["incumbent_score"],
+            "score_gain": original.score_gain,
+            "batch_generated_block": None if batch is None else batch["generated_block"],
+            "outcome": original.outcome, "champion": True, "attempts": None,
+            "error_code": evaluation["error_code"], "alert": False,
         })
     waiting = [
         row

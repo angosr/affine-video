@@ -43,9 +43,15 @@ from validator.publication import (
     fetch_weight_artifact,
     validate_public_weights_url,
 )
-from validator.queue import ChainPosition
+from validator.queue import ChainPosition, challenge_id
 from validator.store import ChallengeStore
-from validator.tournament import genesis_champion, resolve_tournament
+from validator.tournament import (
+    Tournament,
+    challenge_from_match,
+    genesis_champion,
+    historical_champion,
+    resolve_tournament,
+)
 from validator.weights import WeightArtifact, WeightChainState, WeightPlan
 
 from .test_store import submission_at
@@ -293,6 +299,227 @@ def test_maintenance_cold_load_and_publication_carry_original_champion(maintenan
         "isolated/maintenance/" + case.history[0].object_name
     ] == case.body
     assert not any("matches/maintenance/" in key for key in case.client.objects)
+
+
+@pytest.mark.parametrize("private", [False, True], ids=["hf", "private"])
+@pytest.mark.parametrize("kind", ["exact_loss", "full_loss", "win", "failure"])
+def test_status_projects_original_historical_results_not_a_history_label(private, kind):
+    previous = parse_track_spec(valid_spec())
+    first = scored_challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    if kind == "failure":
+        second = scored_challenge(2, "bob", state="PARTICIPANT_FAILED",
+                                  error_code="INVALID_MODEL")
+    else:
+        second = scored_challenge(2, "bob", score=0.9, incumbent_score=0.8,
+                                  paired_gain=0.0 if kind == "exact_loss" else 0.1)
+        if kind == "full_loss":
+            second.update(final_score=0.7, paired_gain_lower_bound=-0.1)
+            second["stages"][-1].update(score=0.7, paired_gain_lower_bound=-0.1)
+    if private:
+        for index, item in enumerate((first, second), 1):
+            item.update(model_source_fields(
+                None, None, PrivateModelSubmission(f"{index:064x}", "ab" * 32),
+            ))
+    history = resolve_tournament(
+        [first, second], track_id=previous.track_id, track_spec_digest=previous.digest,
+        netuid=previous.netuid, minimum_gain=previous.full_video.minimum_gain,
+        initial_champion=genesis_champion(previous),
+    ).matches
+    original = tuple(canonical_json(match.document) for match in history)
+    raw = valid_spec()
+    raw.update(track_id="maintenance", track_start_block=300)
+    current = parse_track_spec(raw)
+    champion = historical_champion(history, genesis_champion(current))
+    challenges = [
+        {**challenge_from_match(match.document), "track_spec_digest": previous.digest,
+         "attempts": 0, "created_at_ms": 0}
+        for match in history
+    ]
+    competitors = [{**item, "uid": index + 3} for index, item in enumerate(challenges)]
+    status = publication_module._status_document(
+        current, 301, Tournament((), champion, ()), competitors, challenges,
+        system_matches=[], historical_matches=history,
+    )
+    rows = {row["challenge_id"]: row for row in status["participants"]}
+    for match in history:
+        row = rows[match.challenge_id]
+        assert row["outcome"] == match.outcome
+        assert row["match_sequence"] == match.sequence
+        assert row["score"] == match.final_score
+        assert row["score_gain"] == match.score_gain
+        assert row["incumbent_score"] == match.document["evaluation"]["incumbent_score"]
+        assert row["track_spec_digest"] == previous.digest
+        assert row["attempts"] is None and row["queue_position"] is None
+        assert row["champion"] == (champion.challenge_id == match.challenge_id)
+    assert "HISTORICAL" not in json.dumps(status)
+    assert tuple(canonical_json(match.document) for match in history) == original
+
+
+def test_status_historical_champion_without_active_commitment_keeps_original_result(
+    maintenance_history,
+):
+    case = maintenance_history
+    status = json.loads(build_genesis_artifacts(
+        case.track, case.chain, version_key=0, runtime_manifest=case.manifest.encode(),
+        historical_matches=case.history,
+    ).status)
+    match = case.history[-1]
+    row = next(row for row in status["participants"] if row["challenge_id"] == match.challenge_id)
+    assert row["outcome"] == match.outcome
+    assert row["match_sequence"] == match.sequence
+    assert row["state"] == match.state
+    assert row["score"] == match.final_score
+    assert row["score_gain"] == match.score_gain
+    assert row["incumbent_score"] == match.document["evaluation"]["incumbent_score"]
+    assert row["champion"] is True
+
+
+@pytest.mark.parametrize("legacy_public", [False, True])
+def test_cold_history_preserves_private_loser_archive_policy_without_reading_its_model(
+    legacy_public, tmp_path,
+):
+    runtime = Artifact("runtime/source.zip", "ab" * 32, 1, "source")
+    previous = parse_track_spec(valid_spec())
+    item = scored_challenge(1, "alice", score=0.7, incumbent_score=0.7)
+    private = PrivateModelSubmission("ef" * 32, "ab" * 32)
+    item.update(model_source_fields(None, None, private))
+    record = replace(submission_at(101, hotkey="alice"),
+                     payload=private.encode(), repo_id=None, revision=None)
+    item.update(challenge_id=challenge_id(record.submission_id), submission_id=record.submission_id)
+    match = resolve_tournament(
+        [item], track_id=previous.track_id, track_spec_digest=previous.digest,
+        netuid=previous.netuid, minimum_gain=previous.full_video.minimum_gain,
+        initial_champion=genesis_champion(previous),
+    ).matches[0]
+    document = json.loads(canonical_json(match.document))
+    if legacy_public:
+        document["evaluation"]["model_object"] = (
+            f"models/{previous.track_id}/{'ab' * 32}/manifest.json"
+        )
+    original = canonical_json(document)
+    manifest = ArtifactManifest((Artifact(
+        HISTORICAL_MATCHES_PREFIX + match.object_name, hashlib.sha256(original).hexdigest(),
+        len(original), match.object_name,
+    ), runtime))
+    raw = valid_spec()
+    raw.update(track_id="maintenance", track_start_block=300,
+               artifact_manifest_sha256=manifest.digest)
+    track = parse_track_spec(raw)
+    client = MemoryS3()
+    client.objects[f"isolated/history/{match.object_name}"] = original
+    client.objects[f"isolated/history/runtime/{manifest.digest}/manifest.json"] = manifest.encode()
+    get = client.get_object
+    def read(**kwargs):
+        assert "/models/" not in kwargs["Key"], "historical losing payload must not be required"
+        return get(**kwargs)
+    client.get_object = read
+    cold = S3Repository(client, bucket="test", prefix="isolated/history")
+    ledger = asyncio.run(cold.load(track))
+    restored = ledger.historical_matches[0]
+    assert canonical_json(restored.document) == original
+    assert restored.outcome == "CHAMPION_RETAINED"
+    assert restored.champion_after == match.champion_after
+    assert ledger.matches == () and client.calls == []
+    # Synthetic finalized input exercises the original DB restore and opportunity
+    # gate; this is not a real chain transaction or cloud validation.
+    with ChallengeStore(tmp_path / "cold.db", track_spec_digest=track.digest) as store:
+        assert store.restore_public_matches(
+            ledger.historical_matches, submissions={record.submission_id: record},
+        ) == 1
+        store.advance_chain_cursor(300, "0x" + "12" * 32)
+        row = store.public_snapshot()["challenges"][0]
+        assert row["state"] == "SUCCEEDED" and row["block_height"] == record.position.block
+        assert row["track_spec_digest"] == previous.digest
+        assert row["private_upload"]["upload_id"] == private.upload_id
+        with pytest.raises(ValueError, match="formal submission"):
+            store.require_upload_eligible("alice", uid=3, finalized_block=300)
+    assert canonical_json(restored.document) == original
+
+
+@pytest.mark.parametrize("state", ["current", "inherited", "combined", "staged"])
+def test_maintenance_collects_original_history_from_recover_not_a_manual_match_list(
+    maintenance_history, state,
+):
+    case = maintenance_history
+    expected = tuple(artifact for artifact in case.manifest.artifacts
+                     if artifact.logical_name.startswith(HISTORICAL_MATCHES_PREFIX))
+    if state in {"inherited", "combined"}:
+        artifacts = build_genesis_artifacts(
+            case.track, case.chain, version_key=0, runtime_manifest=case.manifest.encode(),
+            historical_matches=case.history,
+        )
+        if state == "combined":
+            failed = scored_challenge(2, "bob", state="PARTICIPANT_FAILED",
+                                      error_code="INVALID_MODEL")
+            failed["block_height"] = 301
+            tournament = resolve_tournament(
+                [failed], track_id=case.track.track_id, track_spec_digest=case.track.digest,
+                netuid=case.track.netuid, minimum_gain=case.track.full_video.minimum_gain,
+                initial_champion=genesis_champion(case.track), historical_matches=case.history,
+            )
+            match = tournament.matches[0]
+            body = canonical_json(match.document)
+            artifacts = replace(
+                artifacts, matches=((match.object_name, body),),
+                summary=canonical_json(publication_module._summary_document(
+                    case.track, 301, tournament,
+                )),
+                weights=encode_weight_artifact(replace(
+                    decode_weight_artifact(artifacts.weights), match_sequence=1,
+                    terminal_match_sha256=hashlib.sha256(body).hexdigest(),
+                )),
+            )
+            expected = tuple(sorted((*expected, Artifact(
+                HISTORICAL_MATCHES_PREFIX + match.object_name, hashlib.sha256(body).hexdigest(),
+                len(body), match.object_name,
+            )), key=lambda artifact: artifact.logical_name))
+        asyncio.run(case.repository.publish(artifacts))
+    elif state == "staged":
+        # A valid immutable tail may exist before its mutable weight commit.
+        empty = build_genesis_artifacts(case.previous, case.chain, version_key=0)
+        case.client.objects["isolated/maintenance/summary.json"] = empty.summary
+        case.client.objects["isolated/maintenance/weights.json"] = empty.weights
+    client = case.client
+    original = dict(client.objects)
+    puts = list(client.calls)
+    cold = S3Repository(client, bucket="test", prefix="isolated/maintenance")
+    assert asyncio.run(cold.collect_history_artifacts()) == expected
+    assert client.objects == original and client.calls == puts
+    assert client.objects["isolated/maintenance/" + case.history[0].object_name] == case.body
+
+
+@pytest.mark.parametrize("damage", ["missing_match", "bad_fence", "moving_fence"])
+def test_automatic_history_collection_rejects_missing_or_unfenced_facts(
+    maintenance_history, damage,
+):
+    case = maintenance_history
+    if damage == "missing_match":
+        case.client.objects.pop("isolated/maintenance/" + case.history[0].object_name)
+    elif damage == "bad_fence":
+        key = "isolated/maintenance/weights.json"
+        weight = decode_weight_artifact(case.client.objects[key])
+        case.client.objects[key] = encode_weight_artifact(
+            replace(weight, terminal_match_sha256="00" * 32),
+        )
+    else:
+        get = case.client.get_object
+        reads = 0
+        def changing(**kwargs):
+            nonlocal reads
+            if kwargs["Key"].endswith("/weights.json"):
+                reads += 1
+                if reads == 3:
+                    weight = decode_weight_artifact(case.client.objects[kwargs["Key"]])
+                    case.client.objects[kwargs["Key"]] = encode_weight_artifact(
+                        replace(weight, version_key=weight.version_key + 1),
+                    )
+            return get(**kwargs)
+        case.client.get_object = changing
+    writes = len(case.client.calls)
+    cold = S3Repository(case.client, bucket="test", prefix="isolated/maintenance")
+    with pytest.raises(PublicArtifactError):
+        asyncio.run(cold.collect_history_artifacts())
+    assert len(case.client.calls) == writes
 
 
 def test_maintenance_rejects_accidental_genesis_reset_before_pointers(maintenance_history):

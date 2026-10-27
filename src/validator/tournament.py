@@ -394,8 +394,15 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
         or challenge.get("stages")
     )):
         raise ValueError("historical non-admission is not a participant result")
+    model_objects = [public_model_object(document)]
+    if (private is not None and state is ChallengeState.SUCCEEDED
+            and outcome is MatchOutcome.CHAMPION_RETAINED):
+        # Older releases published successful private losers. Preserve their
+        # authenticated exact archive reference without imposing today's rule
+        # or requiring that losing model to be downloaded during recovery.
+        model_objects.append(f"models/{document['track_id']}/{challenge['file_sha256']}/manifest.json")
     if ("model_object" not in document["evaluation"]
-            or document["evaluation"]["model_object"] != public_model_object(document)):
+            or document["evaluation"]["model_object"] not in model_objects):
         raise ValueError("historical public model differs from its source and outcome")
     return MatchRecord(sequence, challenge["challenge_id"], challenge["hotkey"], state,
                        score, gain, outcome, after, document)
