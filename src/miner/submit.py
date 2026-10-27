@@ -7,13 +7,15 @@ bytes can be tested independently of a network connection.
 
 from __future__ import annotations
 
-import json
+import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 MAGIC = b"VDA1"
 PRIVATE_MAGIC = b"VDS1"
+READY_MAGIC = b"VDR1"
+ACTIVATE_MAGIC = b"VDU1"
 REVISION_BYTES = 20
 REVISION_HEX_LENGTH = REVISION_BYTES * 2
 MAX_REPO_ID_BYTES = 96
@@ -100,18 +102,25 @@ class PrivateModelSubmission:
 
     upload_id: str
     file_sha256: str
+    manifest_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        for name in ("upload_id", "file_sha256"):
+        for name in ("upload_id", "file_sha256", "manifest_sha256"):
             value = getattr(self, name)
+            if name == "manifest_sha256" and value is None:
+                continue
             if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
                 raise SubmissionFormatError(f"{name} must be a full lowercase SHA-256 value")
 
     def encode(self) -> bytes:
-        return PRIVATE_MAGIC + bytes.fromhex(self.upload_id) + bytes.fromhex(self.file_sha256)
+        prefix = READY_MAGIC if self.manifest_sha256 is not None else PRIVATE_MAGIC
+        return (prefix + bytes.fromhex(self.upload_id) + bytes.fromhex(self.file_sha256)
+                + (bytes.fromhex(self.manifest_sha256) if self.manifest_sha256 else b""))
 
     @classmethod
     def decode(cls, payload: bytes) -> PrivateModelSubmission:
+        if len(payload) == 100 and payload.startswith(READY_MAGIC):
+            return cls(payload[4:36].hex(), payload[36:68].hex(), payload[68:].hex())
         if len(payload) != 68 or not payload.startswith(PRIVATE_MAGIC):
             raise SubmissionFormatError("private submission must be exactly 68 VDS1 bytes")
         return cls(payload[4:36].hex(), payload[36:].hex())
@@ -129,6 +138,8 @@ def model_source_fields(
         result["private_upload"] = {
             "upload_id": private.upload_id, "file_sha256": private.file_sha256,
         }
+        if private.manifest_sha256 is not None:
+            result["private_upload"]["manifest_sha256"] = private.manifest_sha256
     return result
 
 
@@ -137,51 +148,44 @@ def private_model_source(value: Mapping[str, object]) -> PrivateModelSubmission 
     if "private_upload" not in value:
         return None
     private = value["private_upload"]
-    if (not isinstance(private, Mapping) or set(private) != {"upload_id", "file_sha256"}
+    if (not isinstance(private, Mapping) or set(private) not in (
+        {"upload_id", "file_sha256"}, {"upload_id", "file_sha256", "manifest_sha256"},
+    )
             or value.get("repo_id") is not None or value.get("revision") is not None):
         raise SubmissionFormatError("private source identity conflicts with HF fields")
-    return PrivateModelSubmission(private["upload_id"], private["file_sha256"])
+    return PrivateModelSubmission(
+        private["upload_id"], private["file_sha256"], private.get("manifest_sha256"),
+    )
+
+
+def upload_registration_id(genesis_hash: str, hotkey: str) -> str:
+    """One private registration per SN120 hotkey and chain, not a second opportunity."""
+    if re.fullmatch(r"[0-9a-f]{64}", genesis_hash) is None or not hotkey:
+        raise ValueError("private registration requires genesis hash and hotkey")
+    return hashlib.sha256(
+        b"veda-registration-v1\0" + bytes.fromhex(genesis_hash) + b"120\0" + hotkey.encode(),
+    ).hexdigest()
+
+
+def activation_message(genesis_hash: str, hotkey: str) -> bytes:
+    return b"veda-activate-v1\0" + bytes.fromhex(upload_registration_id(genesis_hash, hotkey))
 
 
 @dataclass(frozen=True, slots=True)
-class UploadIntent:
-    """Short-lived hotkey-signed intent, shared by CLI and upload admission.
+class UploadActivation:
+    """Ed25519 proof carried by the registered hotkey; NOT a model submission."""
 
-    Retrying the exact intent is idempotent, not another competition attempt.
-    The audience is a configured HTTPS authority; genesis separates forks.
-    """
-
-    audience: str
-    genesis_hash: str
-    hotkey: str
-    netuid: int
-    action: str
-    upload_id: str
-    file_sha256: str
-    size_bytes: int
-    manifest_sha256: str
-    expires_at: int
+    signature: bytes
 
     def __post_init__(self) -> None:
-        from urllib.parse import urlparse
+        if not isinstance(self.signature, bytes) or len(self.signature) != 64:
+            raise SubmissionFormatError("activation requires a 64-byte Ed25519 signature")
 
-        PrivateModelSubmission(self.upload_id, self.file_sha256)
-        PrivateModelSubmission(self.upload_id, self.manifest_sha256)
-        if re.fullmatch(r"[0-9a-f]{64}", self.genesis_hash) is None:
-            raise ValueError("upload genesis hash must be a full lowercase SHA-256 value")
-        url = urlparse(self.audience)
-        if (url.scheme != "https" or not url.netloc or url.username is not None
-                or url.password is not None or url.query or url.fragment):
-            raise ValueError("upload audience must be a credential-free HTTPS endpoint")
-        if (not self.hotkey or len(self.hotkey) > 64 or type(self.netuid) is not int
-                or self.netuid != 120 or self.action not in {"upload", "seal"}
-                or type(self.size_bytes) is not int or self.size_bytes <= 0
-                or type(self.expires_at) is not int or self.expires_at <= 0):
-            raise ValueError("upload intent fields are invalid")
+    def encode(self) -> bytes:
+        return ACTIVATE_MAGIC + self.signature
 
-    def signing_message(self) -> bytes:
-        from dataclasses import asdict
-
-        return b"veda-private-upload-v1\0" + json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":"), allow_nan=False,
-        ).encode("ascii")
+    @classmethod
+    def decode(cls, payload: bytes) -> UploadActivation:
+        if len(payload) != 68 or not payload.startswith(ACTIVATE_MAGIC):
+            raise SubmissionFormatError("private activation must be exactly 68 VDU1 bytes")
+        return cls(payload[4:])

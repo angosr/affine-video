@@ -1,121 +1,366 @@
-"""Private upload metadata admission and the original ADMISSION source adapter.
+"""Private R2 activation/mailbox/ready, sharing original CAS and ADMISSION.
 
-The thin HTTP adapter uses only authorize/seal. It never handles model bodies
-or writes the models archive. Real byte verification happens in download,
-called by the existing admission worker before its ordinary schema/owner gate.
+No HTTP listener or presigned authorization. Management operations and the
+mailbox signer are injected by the control owner, never sent to miners/GPU.
 """
-
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import json
 import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from math import ceil
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
-from miner.submit import PrivateModelSubmission, UploadIntent
+from miner.submit import (
+    PrivateModelSubmission,
+    UploadActivation,
+    activation_message,
+    private_model_source,
+    upload_registration_id,
+)
 from scoring.model import model_file_sha256
 from validator.chunks import ChunkManifest, verify_chunked_content
 from validator.download import DownloadedModel, ModelDownloadError
-from validator.production.commitment import canonical_json
+from validator.production.commitment import canonical_json, decode_canonical_json
 from validator.production.storage import (
     PrivateObjectStore,
-    StoredObject,
     _environment_client,
     _validated_endpoint,
 )
 from validator.store import ChallengeStore
 
-
-@dataclass(frozen=True, slots=True)
-class UploadPartGrant:
-    """A retryable write to one original-format part; never log its bearer URL."""
-
-    name: str
-    size_bytes: int
-    url: str = field(repr=False)
+CREDENTIAL_TTL = 3600
+MAX_MANIFEST_BYTES = 64 * 1024
 
 
-@dataclass(frozen=True, slots=True)
-class UploadGrant:
-    """Only the fixed parts from the authenticated original chunk manifest."""
+def ed25519_verify(hotkey: str, message: bytes, signature: bytes) -> bool:
+    from bittensor.wallet import Keypair
 
-    upload_id: str
-    expires_at: int
-    parts: tuple[UploadPartGrant, ...]
+    try:
+        return len(signature) == 64 and bool(
+            Keypair(ss58_address=hotkey, crypto_type=0).verify(message, signature),
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def manifest_signing_bytes(document: dict) -> bytes:
+    return b"veda-upload-manifest-v1\0" + canonical_json(
+        {key: value for key, value in document.items() if key != "signature"},
+    )
+
+
+def envelope_signing_bytes(document: dict) -> bytes:
+    return b"veda-mailbox-v1\0" + canonical_json(
+        {key: value for key, value in document.items() if key != "signature"},
+    )
+
+
+class CloudflareR2Tokens:
+    """Control-only parent-token mint/revoke; no bucket creation or shared miner key.
+
+    Adapted from upstream Affine f4203d8 r2.py. Raw API errors/response bodies
+    never become public errors or logs. This client is NOT constructed on GPU.
+    """
+
+    def __init__(self, account: str, token: str, jurisdiction: str = "default") -> None:
+        if re.fullmatch(r"[a-f0-9]{32}", account) is None or not token:
+            raise ValueError("Cloudflare control credentials are required")
+        if jurisdiction not in {"default", "eu", "us", "fedramp"}:
+            raise ValueError("unsupported R2 jurisdiction")
+        self.account, self._token = account, token
+        self.jurisdiction = jurisdiction
+
+    def _call(self, method: str, path: str, body: dict | None = None):
+        import httpx
+
+        try:
+            response = httpx.request(
+                method, f"https://api.cloudflare.com/client/v4/accounts/{self.account}{path}",
+                headers={"Authorization": f"Bearer {self._token}"}, json=body, timeout=10,
+            )
+            if method == "DELETE" and response.status_code == 404:
+                return None
+            data = response.json()
+            if response.status_code >= 400 or not data.get("success"):
+                raise RuntimeError("Cloudflare control operation was not confirmed")
+            return data["result"]
+        except Exception as exc:
+            raise RuntimeError("Cloudflare control operation unavailable") from exc
+
+    def create_parent(self, name: str, bucket: str, ttl: int) -> str:
+        # Recover a committed create whose response was lost, without another parent.
+        matches = []
+        for page in range(1, 11):
+            rows = self._call("GET", f"/tokens?page={page}&per_page=50")
+            matches.extend(row for row in rows if row.get("name") == name)
+            if len(rows) < 50:
+                break
+        else:
+            raise RuntimeError("Cloudflare token inventory exceeds bounded lookup")
+        if len(matches) > 1:
+            raise RuntimeError("duplicate registration parent tokens require reconciliation")
+        if matches:
+            return matches[0]["id"]
+        groups = self._call("GET", "/tokens/permission_groups")
+        permission = next(row["id"] for row in groups
+                          if row["name"] == "Workers R2 Storage Bucket Item Write")
+        result = self._call("POST", "/tokens", {
+            "name": name,
+            "expires_on": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                        time.gmtime(time.time() + ttl + 600)),
+            "policies": [{"effect": "allow", "permission_groups": [{"id": permission}],
+                          "resources": {f"com.cloudflare.edge.r2.bucket."
+                                        f"{self.account}_{self.jurisdiction}_{bucket}": "*"}}],
+        })
+        return result["id"]
+
+    def mint(self, parent: str, bucket: str, prefix: str, ttl: int) -> dict[str, str]:
+        result = self._call("POST", "/r2/temp-access-credentials", {
+            "bucket": bucket, "parentAccessKeyId": parent,
+            "permission": "object-read-write", "prefixes": [prefix], "ttlSeconds": ttl,
+        })
+        return {"access_key_id": result["accessKeyId"],
+                "secret_access_key": result["secretAccessKey"],
+                "session_token": result["sessionToken"]}
+
+    def revoke(self, parent: str) -> None:
+        self._call("DELETE", f"/tokens/{parent}")
+
+
+class MailboxControl:
+    """Control-side operations only; responses contain NO plaintext credentials."""
+
+    def __init__(self, *, tokens, signer, publish_mailbox, endpoint: str,
+                 bucket: str, genesis_hash: str):
+        if getattr(signer, "crypto_type", None) != 0:
+            raise ValueError("mailbox signer must be Ed25519")
+        self.tokens, self.signer, self.publish_mailbox = tokens, signer, publish_mailbox
+        self.endpoint, self.bucket, self.genesis_hash = endpoint, bucket, genesis_hash
+
+    def handle(self, operation: str, record: dict) -> dict:
+        upload_id = upload_registration_id(self.genesis_hash, record["hotkey"])
+        if (record["upload_id"] != upload_id or type(record["generation"]) is not int
+                or not 0 < record["generation"] < 1 << 32):
+            raise ValueError("mailbox request does not identify a private registration")
+        if operation == "revoke":
+            if record.get("parent_token_id"):
+                self.tokens.revoke(record["parent_token_id"])
+            return {}
+        if operation == "publish":
+            mailbox = record["mailbox"]
+            if mailbox["key"] != f"mailbox/v1/{upload_id}.bin":
+                raise ValueError("mailbox publish escaped its registration")
+            self.publish_mailbox(mailbox["key"], bytes.fromhex(mailbox["ciphertext"]))
+            return {}
+        if operation != "issue":
+            raise ValueError("unsupported mailbox control operation")
+        from bittensor.wallet import Keypair
+
+        if record.get("retire_parent"):
+            self.tokens.revoke(record["parent_token_id"])
+        parent = (None if record.get("retire_parent") else record.get("parent_token_id"))
+        parent = parent or self.tokens.create_parent(
+            f"veda-{upload_id}-g{record['generation']}", self.bucket, CREDENTIAL_TTL,
+        )
+        credential = self.tokens.mint(parent, self.bucket,
+                                      f"uploads/v1/{upload_id}/", CREDENTIAL_TTL)
+        if (set(credential) != {"access_key_id", "secret_access_key", "session_token"}
+                or not all(isinstance(v, str) and v for v in credential.values())):
+            raise RuntimeError("temporary R2 credential response is incomplete")
+        expires_at = int(time.time()) + CREDENTIAL_TTL
+        envelope = {
+            "format": "veda-mailbox-v1", "genesis_hash": self.genesis_hash,
+            "hotkey": record["hotkey"], "upload_id": upload_id,
+            "generation": record["generation"], "endpoint": self.endpoint,
+            "activation_block_hash": record["activation_block_hash"],
+            "bucket": self.bucket, "prefix": f"uploads/v1/{upload_id}/",
+            "validator": self.signer.ss58_address, "expires_at": expires_at, **credential,
+        }
+        envelope["signature"] = self.signer.sign(envelope_signing_bytes(envelope)).hex()
+        blob = Keypair.encrypt_for(record["hotkey"], canonical_json(envelope), crypto_type=0)
+        return {"parent_token_id": parent, "retire_parent": False, "expires_at": expires_at,
+                "mailbox": {"key": f"mailbox/v1/{upload_id}.bin", "ciphertext": blob.hex(),
+                            "published": False}}
+
+
+class OwnerMailboxControl:
+    """Fixed RPC over the EXISTING attached owner's SSH stdin/stdout, not a listener.
+
+    Control's attach wrapper answers only issue/revoke/publish. A lock keeps
+    ADMISSION and bounded cleanup responses on the same single owner channel.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def handle(self, operation: str, record: dict) -> dict:
+        import json
+        import select
+        import uuid
+
+        with self._lock:
+            identifier = uuid.uuid4().hex
+            sys.stdout.write("VEDA_MAILBOX_REQUEST " + json.dumps({
+                "id": identifier, "operation": operation, "record": record,
+            }, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+            deadline = time.monotonic() + 45
+            while True:
+                remaining = max(0, deadline - time.monotonic())
+                if not select.select([sys.stdin], [], [], remaining)[0]:
+                    raise RuntimeError("control owner mailbox response timed out")
+                raw = sys.stdin.buffer.raw.readline(262145)
+                if not raw or len(raw) > 262144:
+                    raise RuntimeError("control owner mailbox response is invalid")
+                try:
+                    response = json.loads(raw)
+                except (ValueError, TypeError) as exc:
+                    raise RuntimeError("control owner mailbox response is invalid") from exc
+                if response.get("id") == identifier:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("control owner mailbox response timed out")
+            if response.get("error"):
+                raise RuntimeError("control owner mailbox operation unavailable")
+            return response["result"]
+
+
+def attach_evaluator(*, host: str, container: str, control: MailboxControl) -> int:
+    """Existing control owner wraps its ONE SSH attach, never starts a second writer."""
+    import json
+    import subprocess
+
+    if any(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", value) is None
+           for value in (host, container)):
+        raise ValueError("owner SSH alias/container name is invalid")
+    process = subprocess.Popen(
+        ["ssh", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+         "-o", "ServerAliveCountMax=3", "-T", host, "docker", "start", "--attach",
+         "--interactive", container], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+        env={name: value for name, value in os.environ.items()
+             if name in {"PATH", "HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK", "LANG", "LC_ALL"}},
+    )
+    try:
+        while line := process.stdout.readline(262145):
+            if len(line) > 262144:
+                raise RuntimeError("owner attach response exceeds its bound")
+            if not line.startswith("VEDA_MAILBOX_REQUEST "):
+                print(line, end="", flush=True)
+                continue
+            identifier = None
+            try:
+                request = json.loads(line.removeprefix("VEDA_MAILBOX_REQUEST "))
+                identifier = request["id"]
+                if re.fullmatch(r"[a-f0-9]{32}", identifier) is None:
+                    raise ValueError("invalid owner request identifier")
+                result = control.handle(request["operation"], request["record"])
+                response = {"id": identifier, "result": result}
+            except Exception:
+                # Never print control API bodies, temporary credentials or seed material.
+                response = {"id": identifier, "error": "MAILBOX_CONTROL_UNAVAILABLE"}
+            process.stdin.write(json.dumps(response, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+        return process.wait()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        process.stdin.close()
+        process.stdout.close()
+
+
+def attach_from_environment(*, host: str, container: str) -> int:
+    """Control service only; none of these secrets/config paths enter the SSH argv."""
+    import stat
+
+    from bittensor.wallet import Keypair
+
+    from validator.publication import S3Repository
+
+    endpoint = os.environ["VEDA_UPLOAD_STAGING_STORAGE_URL"]
+    match = re.fullmatch(
+        r"https://([a-f0-9]{32})(?:\.(eu|us|fedramp))?\.r2\.cloudflarestorage\.com/?",
+        endpoint,
+    )
+    if match is None:
+        raise ValueError("control requires the R2 S3 API endpoint")
+    # Opening with O_NOFOLLOW avoids copying/generating/replacing any wallet/key file.
+    fd = os.open(os.environ["VEDA_UPLOAD_SIGNING_SEED_FILE"], os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != os.geteuid()):
+            raise ValueError("control mailbox seed must be an owner-only 0600 regular file")
+        seed = stream.read(33)
+    if len(seed) != 32:
+        raise ValueError("control mailbox signing seed must contain exactly 32 bytes")
+    signer = Keypair.create_from_seed(seed, crypto_type=0)
+    client = _environment_client(
+        _validated_endpoint(os.environ["STORAGE_URL"]),
+        os.environ["ACCESS_KEY"], os.environ["SECRET_ACCESS_KEY"],
+    )
+    publisher = S3Repository(client, bucket="affine_video", prefix="tracks/main")
+    try:
+        return attach_evaluator(host=host, container=container, control=MailboxControl(
+            tokens=CloudflareR2Tokens(match[1], os.environ["VEDA_UPLOAD_MANAGEMENT_TOKEN"],
+                                      match[2] or "default"),
+            signer=signer, publish_mailbox=publisher.publish_mailbox, endpoint=endpoint,
+            bucket=os.environ["VEDA_UPLOAD_STAGING_BUCKET"],
+            genesis_hash=os.environ["VEDA_UPLOAD_GENESIS_HASH"],
+        ))
+    finally:
+        publisher.close()
 
 
 class PrivateUploads:
-    """One CAS upload record plus a hotkey quota pointer, NOT an opportunity ledger.
-
-    The host must supply restricted staging/authority clients and
-    a finalized SN120 registration lookup, never a client-provided UID.
-    """
+    """The SAME upload CAS, not a second participation database."""
 
     def __init__(
         self, *, objects: PrivateObjectStore, staging_client: Any,
-        staging_bucket: str, staging_prefix: str, audience: str, genesis_hash: str,
-        store: ChallengeStore, registration: Callable[[str], tuple[int | None, int]] | None,
-        max_bytes: int,
+        staging_bucket: str, staging_prefix: str, genesis_hash: str,
+        store: ChallengeStore, max_bytes: int,
+        registration: Callable[[str], tuple[int | None, int]] | None = None,
+        control: MailboxControl | OwnerMailboxControl | None = None,
     ) -> None:
-        if (not staging_bucket or "/" in staging_bucket or staging_bucket == "affine_video"
-                or not staging_prefix or any(
-                    part in {"", ".", ".."} for part in staging_prefix.split("/")
-                ) or max_bytes <= 0):
-            raise ValueError("private staging scope or byte limit is invalid")
-        self.objects = objects
-        self.staging = staging_client
-        self.bucket = staging_bucket
-        self.prefix = staging_prefix
-        self.audience = audience
-        self.genesis_hash = genesis_hash
-        self.store = store
-        self.registration = registration
-        self.max_bytes = max_bytes
+        if (not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", staging_bucket)
+                or staging_bucket == "affine_video" or staging_prefix != "uploads/v1"
+                or max_bytes <= 0):
+            raise ValueError("private R2 staging scope or limit is invalid")
+        upload_registration_id(genesis_hash, "configuration")
+        self.objects, self.staging = objects, staging_client
+        self.bucket, self.prefix = staging_bucket, staging_prefix
+        self.genesis_hash, self.store, self.max_bytes = genesis_hash, store, max_bytes
+        self.registration, self.control = registration, control
         self._gc_after = ""
+        self._issue_after = ""
 
     @classmethod
-    def from_environment(
-        cls, *, store: ChallengeStore, max_bytes: int,
-        registration: Callable[[str], tuple[int | None, int]] | None = None,
-        required: bool = False,
-    ) -> PrivateUploads | None:
-        """Use explicit restricted credentials, never publisher/admin fallbacks.
-
-        Each process receives its own role values under these same names.
-        HTTP needs staging PUT/HEAD; evaluator needs GET/exact DELETE. Neither
-        changes the original models writer or per-track private backend.
-        Staging is R2 only; its explicit bucket and auto signing region do not
-        change the authority/public clients or AWS_DEFAULT_REGION.
-        """
+    def from_environment(cls, *, store: ChallengeStore, max_bytes: int) -> PrivateUploads | None:
         names = (
-            "AUDIENCE", "GENESIS_HASH", "AUTHORITY_BUCKET", "STAGING_BUCKET",
+            "GENESIS_HASH", "AUTHORITY_BUCKET", "STAGING_BUCKET",
             "AUTHORITY_STORAGE_URL", "AUTHORITY_ACCESS_KEY", "AUTHORITY_SECRET_ACCESS_KEY",
             "STAGING_STORAGE_URL", "STAGING_ACCESS_KEY", "STAGING_SECRET_ACCESS_KEY",
         )
         values = tuple(os.environ.get(f"VEDA_UPLOAD_{name}") for name in names)
-        if not any(values) and not required:
+        if not any(values):
             return None
         if not all(values):
-            raise ValueError("all VEDA_UPLOAD domain and restricted storage settings are required")
-        (audience, genesis, bucket, staging_bucket, authority_url, authority_key, authority_secret,
+            raise ValueError("all private R2 and authority settings are required")
+        (genesis, bucket, staging_bucket, authority_url, authority_key, authority_secret,
          staging_url, staging_key, staging_secret) = values
         if bucket == "affine_video":
             raise ValueError("upload authority cannot use the public bucket")
-        # Validate before constructing any clients; do not log settings/credentials.
-        UploadIntent(audience, genesis, "configuration", 120, "upload", "00" * 32,
-                     "00" * 32, 1, "00" * 32, 1)
-        authority_url = _validated_endpoint(authority_url)
         if not re.fullmatch(
             r"https://[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?\.r2\.cloudflarestorage\.com/?",
             staging_url,
@@ -125,235 +370,252 @@ class PrivateUploads:
             raise ValueError("R2 staging bucket name is invalid")
         return cls(
             objects=PrivateObjectStore(
-                _environment_client(authority_url, authority_key, authority_secret),
-                bucket=bucket, prefix="evaluation",
+                _environment_client(_validated_endpoint(authority_url), authority_key,
+                                    authority_secret), bucket=bucket, prefix="evaluation",
             ),
             staging_client=_environment_client(
                 staging_url, staging_key, staging_secret, region_name="auto",
-            ),
-            staging_bucket=staging_bucket, staging_prefix="uploads/v1",
-            audience=audience, genesis_hash=genesis, store=store,
-            registration=registration, max_bytes=max_bytes,
+            ), staging_bucket=staging_bucket, staging_prefix="uploads/v1",
+            genesis_hash=genesis, store=store, max_bytes=max_bytes,
+            control=OwnerMailboxControl(),
         )
-
-    def _authenticate(self, intent: UploadIntent, signature: bytes, *, now: int) -> None:
-        if (intent.audience != self.audience or intent.genesis_hash != self.genesis_hash
-                or not 0 < intent.expires_at - now <= 300
-                or intent.size_bytes > self.max_bytes or len(signature) != 64):
-            raise ValueError("upload signature domain, expiry or size is invalid")
-        from bittensor.wallet import Keypair
-
-        try:
-            verified = Keypair(ss58_address=intent.hotkey, crypto_type=0).verify(
-                intent.signing_message(), signature,
-            )
-        except (ValueError, TypeError) as exc:
-            raise ValueError("upload hotkey signature is invalid") from exc
-        if not verified:
-            raise ValueError("upload hotkey signature is invalid")
-
-    def _eligible(
-        self, intent: UploadIntent, *, reference: PrivateModelSubmission | None = None,
-    ) -> None:
-        if self.registration is None:
-            raise RuntimeError("upload authorization requires a finalized registration lookup")
-        uid, finalized_block = self.registration(intent.hotkey)
-        self.store.require_upload_eligible(
-            intent.hotkey, uid=uid, finalized_block=finalized_block, reference=reference,
-        )
-
-    @staticmethod
-    def _identity(intent: UploadIntent) -> dict[str, object]:
-        return {
-            "hotkey": intent.hotkey, "upload_id": intent.upload_id,
-            "file_sha256": intent.file_sha256, "size_bytes": intent.size_bytes,
-            "manifest_sha256": intent.manifest_sha256,
-        }
 
     @staticmethod
     def _record_name(upload_id: str) -> str:
         return f"uploads/{upload_id}.json"
 
-    @staticmethod
-    def _quota_name(hotkey: str) -> str:
-        return f"uploads/hotkeys/{hashlib.sha256(hotkey.encode()).hexdigest()}.json"
-
-    def _key(self, intent: UploadIntent) -> str:
-        owner = hashlib.sha256(intent.hotkey.encode()).hexdigest()
-        return f"{self.prefix}/{owner}/{intent.upload_id}"
-
-    def _read(self, upload_id: str) -> tuple[StoredObject | None, dict[str, Any] | None]:
+    def _read(self, upload_id: str):
+        PrivateModelSubmission(upload_id, "00" * 32)
         stored = self.objects.get_optional(self._record_name(upload_id))
         if stored is None:
             return None, None
-        value = json.loads(stored.body)
-        fields = {
-            "format", "hotkey", "upload_id", "file_sha256", "size_bytes", "expires_at", "state",
-            "manifest", "manifest_sha256",
-        }
-        if (not isinstance(value, dict) or set(value) not in (fields, fields | {"cleanup"})
-                or ("cleanup" in value and value["cleanup"] not in {"pending", "done"})
-                or value["format"] != "veda-upload-v1" or value["upload_id"] != upload_id
-                or not isinstance(value["hotkey"], str) or not value["hotkey"]
-                or value["state"] not in {"UPLOADING", "SEALED"}
-                or type(value["expires_at"]) is not int
-                or type(value["size_bytes"]) is not int
-                or not 0 < value["size_bytes"] <= self.max_bytes):
+        record = decode_canonical_json(stored.body)
+        if (not isinstance(record, dict) or record.get("format") != "veda-upload-v2"
+                or record.get("upload_id") != upload_id
+                or record.get("state") not in {"ISSUING", "UPLOADING", "SEALED"}
+                or upload_registration_id(self.genesis_hash, record.get("hotkey", "")) != upload_id
+                or type(record.get("expires_at")) is not int):
             raise ValueError("private upload record is invalid")
-        PrivateModelSubmission(value["upload_id"], value["file_sha256"])
-        manifest = ChunkManifest.decode(canonical_json(value["manifest"]))
-        if (manifest.sha256 != value["file_sha256"] or manifest.size != value["size_bytes"]
-                or hashlib.sha256(manifest.encode()).hexdigest() != value["manifest_sha256"]):
-            raise ValueError("private upload manifest conflicts with its identity")
-        return stored, value
+        return stored, record
 
-    def _claim_quota(self, intent: UploadIntent, *, now: int) -> None:
-        name = self._quota_name(intent.hotkey)
-        stored = self.objects.get_optional(name)
-        expires = intent.expires_at
-        if stored is not None:
-            value = json.loads(stored.body)
-            if (not isinstance(value, dict) or set(value) != {
-                "hotkey", "upload_id", "expires_at",
-            } or value["hotkey"] != intent.hotkey or type(value["expires_at"]) is not int):
-                raise ValueError("private upload quota pointer is invalid")
-            PrivateModelSubmission(value["upload_id"], intent.file_sha256)
-            if value["upload_id"] != intent.upload_id and value["expires_at"] > now:
-                raise ValueError("another upload is active")
-            if value["upload_id"] == intent.upload_id and value["expires_at"] >= expires:
-                return
-        document = canonical_json({
-            "hotkey": intent.hotkey, "upload_id": intent.upload_id, "expires_at": expires,
-        })
-        if stored is None:
-            self.objects.create_plan(name, document)
-        else:
-            self.objects.replace_plan(name, document, etag=stored.etag)
+    def _replace(self, stored, record: dict):
+        name, payload = self._record_name(record["upload_id"]), canonical_json(record)
+        return (self.objects.create_plan(name, payload) if stored is None
+                else self.objects.replace_plan(name, payload, etag=stored.etag))
 
-    def authorize(
-        self, intent: UploadIntent, signature: bytes, *, manifest: ChunkManifest, now: int,
-    ) -> UploadGrant:
-        started = time.monotonic()
-        if intent.action != "upload":
-            raise ValueError("expected an upload intent")
-        self._authenticate(intent, signature, now=now)
-        manifest = ChunkManifest.decode(manifest.encode())
-        if (manifest.sha256 != intent.file_sha256 or manifest.size != intent.size_bytes
-                or hashlib.sha256(manifest.encode()).hexdigest() != intent.manifest_sha256):
-            raise ValueError("upload manifest differs from signed intent")
-        stored, previous = self._read(intent.upload_id)
-        if previous is not None and previous.get("cleanup") == "pending":
-            raise RuntimeError("original upload cleanup must finish before issuing permissions")
-        identity = self._identity(intent)
-        if previous is not None and any(
-            previous[key] != value for key, value in identity.items()
-        ):
-            raise ValueError("upload identity is already fixed")
-        self._eligible(intent, reference=(
-            PrivateModelSubmission(intent.upload_id, intent.file_sha256)
-            if previous is not None and previous["state"] == "SEALED" else None
-        ))
-        self._claim_quota(intent, now=now)
-        if previous is None or previous["expires_at"] < intent.expires_at:
-            document = canonical_json({
-                "format": "veda-upload-v1", **identity,
-                # Sealing fixes the file/parts, not permission to repair those SAME bytes.
-                "state": "UPLOADING" if previous is None else previous["state"],
-                "expires_at": intent.expires_at,
-                "manifest": json.loads(manifest.encode()),
-            })
-            if stored is None:
-                self.objects.create_plan(self._record_name(intent.upload_id), document)
-            else:
-                self.objects.replace_plan(
-                    self._record_name(intent.upload_id), document, etag=stored.etag,
-                )
-        parts = []
-        for part in manifest.parts:
-            remaining = intent.expires_at - now - ceil(time.monotonic() - started)
-            if remaining <= 0:
-                raise ValueError("upload intent expired before capability issuance")
-            url = self.staging.generate_presigned_url(
-                "put_object", Params={
-                    "Bucket": self.bucket, "Key": f"{self._key(intent)}/{part.name}",
-                    "ContentLength": part.size,
-                }, ExpiresIn=remaining, HttpMethod="PUT",
-            )
-            parsed = urlparse(url)
-            if (parsed.scheme != "https" or not parsed.netloc
-                    or parsed.username is not None or parsed.password is not None):
-                raise ValueError("private upload capability requires HTTPS")
-            parts.append(UploadPartGrant(part.name, part.size, url))
-        return UploadGrant(intent.upload_id, intent.expires_at, tuple(parts))
+    def observe_activation(
+        self, activation: UploadActivation, *, hotkey: str, block: int,
+        extrinsic_index: int, event_index: int, block_hash: str,
+    ) -> None:
+        """Record the signed chain request before the original scanner advances.
 
-    def seal(
-        self, intent: UploadIntent, signature: bytes, *, now: int,
-    ) -> PrivateModelSubmission:
-        """Freeze metadata, not acceptance. HEAD confirms only transport completion."""
-        if intent.action != "seal":
-            raise ValueError("expected a seal intent")
-        self._authenticate(intent, signature, now=now)
-        stored, record = self._read(intent.upload_id)
-        if (stored is None or record is None or any(
-            record[key] != value for key, value in self._identity(intent).items()
-        )):
-            raise ValueError("upload has no matching authorization")
-        if record.get("cleanup") == "pending":
-            raise RuntimeError("original upload cleanup is still pending")
-        reference = PrivateModelSubmission(intent.upload_id, intent.file_sha256)
-        if record["state"] == "SEALED":
-            return reference
-        self._eligible(intent)
-        manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
-        for part in manifest.parts:
-            observed = self.staging.head_object(
-                Bucket=self.bucket, Key=f"{self._key(intent)}/{part.name}",
-            )
-            if observed.get("ContentLength") != part.size:
-                raise ValueError("upload part is not complete")
-        self.objects.replace_plan(
-            self._record_name(intent.upload_id), canonical_json({**record, "state": "SEALED"}),
-            etag=stored.etag,
+        This is NOT a submission/attempt. Credential issuance waits for the
+        original finalized DB qualification gate, including concurrent HF.
+        """
+        if not ed25519_verify(hotkey, activation_message(self.genesis_hash, hotkey),
+                              activation.signature):
+            raise ValueError("activation requires an Ed25519 hotkey signature")
+        upload_id = upload_registration_id(self.genesis_hash, hotkey)
+        block_hash = block_hash.removeprefix("0x")
+        if re.fullmatch(r"[a-f0-9]{64}", block_hash) is None:
+            raise ValueError("private activation requires its finalized block hash")
+        stored, record = self._read(upload_id)
+        position = [block, extrinsic_index, event_index]
+        previous_position = ((record or {}).get("activation_request") or {}).get(
+            "position", (record or {}).get("activation_position", []),
         )
-        return reference
+        if record is not None and position <= previous_position:
+            return
+        if record is not None and record.get("cleanup") == "pending":
+            raise RuntimeError("original private upload cleanup must finish")
+        if record is not None:
+            # Do NOT put an existing ready into ISSUING merely because another
+            # request appeared. Qualification happens first; original ADMISSION
+            # must remain usable if reactivation is refused or temporarily fails.
+            self._replace(stored, {**record, "activation_request": {
+                "position": position, "block_hash": block_hash,
+            }})
+            return
+        self._replace(stored, {
+            **(record or {}), "format": "veda-upload-v2", "hotkey": hotkey,
+            "upload_id": upload_id, "activation_position": position,
+            "activation_block_hash": block_hash,
+            "generation": (record or {}).get("generation", 0) + 1,
+            "state": "ISSUING", "expires_at": (record or {}).get("expires_at", 0),
+            "parent_token_id": (record or {}).get("parent_token_id"),
+            "retire_parent": bool((record or {}).get("parent_token_id")),
+            "mailbox": None,
+        })
+
+    def issue_pending(self, *, now: int) -> bool:
+        """One control operation; live qualification remains the original SQLite gate."""
+        if self.control is None or self.registration is None:
+            raise RuntimeError("private mailbox control owner is not configured")
+        names = self.objects.list_names("uploads/", limit=16, after=self._issue_after or None)
+        if not names and self._issue_after:
+            self._issue_after = ""
+            names = self.objects.list_names("uploads/", limit=16)
+        for name in names:
+            self._issue_after = name
+            if name.count("/") != 1 or not name.endswith(".json"):
+                continue
+            upload_id = name[8:-5]
+            stored, record = self._read(upload_id)
+            if record.get("cleanup") == "pending":
+                continue
+            if (record["state"] == "UPLOADING" and record.get("mailbox")
+                    and not record["mailbox"].get("published")):
+                self.republish_mailbox(upload_id)
+                return True
+            pending = record.get("activation_request")
+            if record["state"] != "ISSUING" and pending is None:
+                continue
+            rows = [row for row in self.store.public_snapshot()["challenges"]
+                    if row["hotkey"] == record["hotkey"]]
+            exempt = (any(row["state"] == "SYSTEM_NOT_ADMITTED" for row in rows)
+                      and not any(row["state"] != "SYSTEM_NOT_ADMITTED" for row in rows))
+            reference = (PrivateModelSubmission(upload_id, record["file_sha256"],
+                                                record["manifest_sha256"])
+                         if record.get("file_sha256") and not exempt else None)
+            if reference is None:
+                # This is a read of the ORIGINAL formal submission, not a new
+                # eligibility ledger or an inferred/replaced model identity.
+                for row in rows:
+                    private = private_model_source(row)
+                    if (row["hotkey"] == record["hotkey"] and private is not None
+                            and private.upload_id == upload_id
+                            and row["state"] != "SYSTEM_NOT_ADMITTED"):
+                        reference = private
+                        break
+            uid, finalized = self.registration(record["hotkey"])
+            try:
+                self.store.require_upload_eligible(record["hotkey"], uid=uid,
+                                                   finalized_block=finalized, reference=reference)
+            except ValueError:
+                if pending is not None:
+                    self._replace(stored, {k: v for k, v in record.items()
+                                           if k != "activation_request"})
+                raise
+            if pending is not None:
+                cleared = {"activation_request", "cleanup"}
+                if exempt:
+                    cleared |= {"file_sha256", "manifest_sha256", "manifest", "size_bytes"}
+                record = {**{k: v for k, v in record.items() if k not in cleared},
+                          "activation_position": pending["position"],
+                          "activation_block_hash": pending["block_hash"],
+                          "generation": record["generation"] + 1, "state": "ISSUING",
+                          "retire_parent": bool(record["parent_token_id"]), "mailbox": None}
+                stored = self._replace(stored, record)
+            if reference is not None and record.get("file_sha256") is None:
+                record = {**record, "file_sha256": reference.file_sha256,
+                          "manifest_sha256": reference.manifest_sha256}
+                stored = self._replace(stored, record)
+            # Management, credentials, signing and encryption all stay on control.
+            result = self.control.handle("issue", record)
+            if set(result) != {"parent_token_id", "retire_parent", "expires_at", "mailbox"}:
+                raise RuntimeError("private control response has an invalid shape")
+            self._replace(stored, {**record, **result, "state": "UPLOADING"})
+            self.republish_mailbox(upload_id)
+            return True
+        return False
+
+    def republish_mailbox(self, upload_id: str) -> None:
+        stored, record = self._read(upload_id)
+        if record is None or record["state"] != "UPLOADING" or self.control is None:
+            raise ValueError("private mailbox is not available")
+        self.control.handle("publish", record)
+        self._replace(stored, {**record, "mailbox": {**record["mailbox"], "published": True}})
+
+    def _seal_ready(self, reference: PrivateModelSubmission, hotkey: str):
+        try:
+            stored, record = self._read(reference.upload_id)
+        except Exception as exc:
+            raise RuntimeError("private upload authority is unavailable") from exc
+        if record is None or record["hotkey"] != hotkey or reference.manifest_sha256 is None:
+            raise ValueError("ready does not identify an original private registration")
+        if record.get("cleanup") == "pending" or record["state"] == "ISSUING":
+            raise RuntimeError("private upload lifecycle is not ready for admission")
+        if record.get("file_sha256") is not None and (
+            record["file_sha256"] != reference.file_sha256
+            or record["manifest_sha256"] != reference.manifest_sha256
+        ):
+            raise ValueError("ready cannot replace its original model or manifest")
+        if record.get("file_sha256") is None:
+            record = {**record, "file_sha256": reference.file_sha256,
+                      "manifest_sha256": reference.manifest_sha256}
+            stored = self._replace(stored, record)
+        if record["parent_token_id"]:
+            if self.control is None:
+                raise RuntimeError("ready awaits control-owner write revocation")
+            try:
+                self.control.handle("revoke", record)
+            except Exception as exc:
+                raise RuntimeError("private ready write revocation is unconfirmed") from exc
+            record = {**record, "parent_token_id": None}
+            stored = self._replace(stored, record)
+        if record["state"] == "SEALED":
+            return record
+        try:
+            response = self.staging.get_object(
+                Bucket=self.bucket, Key=f"{self.prefix}/{reference.upload_id}/manifest.json",
+            )
+            body = response["Body"]
+            try:
+                raw = body.read(MAX_MANIFEST_BYTES + 1)
+            finally:
+                body.close()
+            if (len(raw) <= MAX_MANIFEST_BYTES
+                    and response.get("ContentLength", len(raw)) != len(raw)):
+                raise RuntimeError("private manifest transport was incomplete")
+        except Exception as exc:
+            raise RuntimeError("private manifest transport is unavailable") from exc
+        if (len(raw) > MAX_MANIFEST_BYTES
+                or hashlib.sha256(raw).hexdigest() != reference.manifest_sha256):
+            raise ValueError("ready manifest failed its original SHA")
+        document = decode_canonical_json(raw)
+        if (not isinstance(document, dict)
+                or set(document) != {"format", "genesis_hash", "hotkey", "upload_id", "manifest",
+                                    "signature"}
+                or document["format"] != "veda-upload-manifest-v1"
+                or document["genesis_hash"] != self.genesis_hash or document["hotkey"] != hotkey
+                or document["upload_id"] != reference.upload_id
+                or not ed25519_verify(hotkey, manifest_signing_bytes(document),
+                                      bytes.fromhex(document["signature"]))):
+            raise ValueError("private manifest identity or Ed25519 signature is invalid")
+        manifest = ChunkManifest.decode(canonical_json(document["manifest"]))
+        if manifest.sha256 != reference.file_sha256 or manifest.size > self.max_bytes:
+            raise ValueError("private ready model identity or length differs")
+        record = {**record, "state": "SEALED", "manifest": document["manifest"],
+                  "file_sha256": reference.file_sha256,
+                  "manifest_sha256": reference.manifest_sha256, "size_bytes": manifest.size}
+        self._replace(stored, record)
+        return record
 
     def download(
         self, reference: PrivateModelSubmission, *, hotkey: str, cache_dir: str | Path,
         max_bytes: int,
     ) -> DownloadedModel:
-        """ADMISSION source adapter: verify actual bytes once, then normal validation."""
+        """Revoke first, verify bytes once, then original ADMISSION/schema/archive."""
         try:
-            _, record = self._read(reference.upload_id)
+            record = self._seal_ready(reference, hotkey)
+        except ValueError as exc:
+            raise ModelDownloadError("PRIVATE_UPLOAD_BINDING_MISMATCH",
+                                     "private ready binding is invalid") from exc
         except Exception as exc:
-            raise ModelDownloadError(
-                "PRIVATE_UPLOAD_AUTHORITY_UNAVAILABLE", "private source cannot be verified",
-                temporary=True,
-            ) from exc
-        if (record is None or record["state"] != "SEALED"
-                or record.get("cleanup") == "pending"):
-            raise ModelDownloadError(
-                "PRIVATE_UPLOAD_UNAVAILABLE", "private source is not available",
-                temporary=True,
-            )
-        if record["hotkey"] != hotkey or record["file_sha256"] != reference.file_sha256:
-            raise ModelDownloadError(
-                "PRIVATE_UPLOAD_BINDING_MISMATCH", "private source is not sealed for this hotkey",
-            )
+            raise ModelDownloadError("PRIVATE_UPLOAD_UNAVAILABLE",
+                                     "private source is temporarily unavailable",
+                                     temporary=True) from exc
         if record["size_bytes"] > max_bytes:
-            raise ModelDownloadError("MODEL_TOO_LARGE", "private source exceeds the byte limit")
+            raise ModelDownloadError("MODEL_TOO_LARGE", "private source exceeds byte limit")
         manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
         target = Path(cache_dir) / f"{reference.file_sha256}.safetensors"
-        intent_key = (
-            f"{self.prefix}/{hashlib.sha256(hotkey.encode()).hexdigest()}/{reference.upload_id}"
-        )
 
         def open_part(name: str):
-            response = self.staging.get_object(
-                Bucket=self.bucket, Key=f"{intent_key}/{name}",
-            )
-            return response["Body"]
+            return self.staging.get_object(
+                Bucket=self.bucket, Key=f"{self.prefix}/{reference.upload_id}/{name}",
+            )["Body"]
 
-        temporary: Path | None = None
+        temporary = None
         try:
             if (target.is_file() and target.stat().st_size == manifest.size
                     and model_file_sha256(target) == reference.file_sha256):
@@ -369,15 +631,12 @@ class PrivateUploads:
             os.replace(temporary, target)
             temporary = None
         except ValueError as exc:
-            raise ModelDownloadError(
-                "PRIVATE_UPLOAD_HASH_MISMATCH", "private source failed byte verification",
-                temporary=True,
-            ) from exc
+            raise ModelDownloadError("PRIVATE_UPLOAD_HASH_MISMATCH",
+                                     "private source failed byte verification",
+                                     temporary=True) from exc
         except Exception as exc:
-            raise ModelDownloadError(
-                "PRIVATE_UPLOAD_UNAVAILABLE", "private source is temporarily unavailable",
-                temporary=True,
-            ) from exc
+            raise ModelDownloadError("PRIVATE_UPLOAD_UNAVAILABLE", "private source unavailable",
+                                     temporary=True) from exc
         finally:
             active_error = sys.exc_info()[0] is not None
             if temporary is not None:
@@ -385,170 +644,61 @@ class PrivateUploads:
                     temporary.unlink(missing_ok=True)
                 except OSError as exc:
                     if not active_error:
-                        raise ModelDownloadError(
-                            "PRIVATE_UPLOAD_UNAVAILABLE", "private source cleanup failed",
-                            temporary=True,
-                        ) from exc
+                        raise ModelDownloadError("PRIVATE_UPLOAD_UNAVAILABLE",
+                                                 "private source cleanup failed",
+                                                 temporary=True) from exc
         return DownloadedModel(target, reference.file_sha256, manifest.size, None, None)
 
     def reclaim_expired(
         self, *, store: ChallengeStore, finalized_block: int,
         finalized_timestamp: int, now: int,
     ) -> int:
-        """One upload per call; original facts and cap expiry protect live references.
-
-        Only evaluator calls this, after a real finalized timestamp/scan fence.
-        The pending marker in the SAME CAS record excludes permission issuance
-        during DELETE, and resumes exact-key cleanup after a crash. Metadata,
-        SEALED identity and original chain/opportunity facts are never deleted.
-        """
-        def page(after: str | None) -> tuple[str, ...]:
-            return tuple(name for name in self.objects.list_names("uploads/", limit=16, after=after)
-                         if name.startswith("uploads/") and name.count("/") == 1
-                         and name.endswith(".json"))
-
-        names = page(self._gc_after or None)
-        if not names and self._gc_after:
+        """One prefix per call; original scan fence, reference and cap expiry apply."""
+        names = self.objects.list_names("uploads/", limit=16, after=self._gc_after or None)
+        if not names:
             self._gc_after = ""
-            names = page(None)
+            names = self.objects.list_names("uploads/", limit=16)
         for name in names:
             self._gc_after = name
-            upload_id = name.removeprefix("uploads/").removesuffix(".json")
-            stored, record = self._read(upload_id)
-            if (record is None or stored is None or record.get("cleanup") == "done"
+            if name.count("/") != 1 or not name.endswith(".json"):
+                continue
+            stored, record = self._read(name[8:-5])
+            if (record.get("cleanup") == "done" or record["state"] == "ISSUING"
                     or record["expires_at"] >= min(now, finalized_timestamp)):
                 continue
-            reference = PrivateModelSubmission(upload_id, record["file_sha256"])
-            if store.upload_is_referenced(
-                record["hotkey"], reference=reference, finalized_block=finalized_block,
-            ):
-                if record.get("cleanup") == "pending":
-                    original = {key: value for key, value in record.items() if key != "cleanup"}
-                    self.objects.replace_plan(name, canonical_json(original), etag=stored.etag)
+            references = [private for row in store.public_snapshot()["challenges"]
+                          if row["hotkey"] == record["hotkey"]
+                          and (private := row.get("private_upload")) is not None
+                          and private["upload_id"] == record["upload_id"]]
+            if any(store.upload_is_referenced(
+                record["hotkey"], reference=PrivateModelSubmission(**private),
+                finalized_block=finalized_block,
+            ) for private in references):
                 continue
+            if not references:
+                store.upload_is_referenced(
+                    record["hotkey"],
+                    reference=PrivateModelSubmission(record["upload_id"], "00" * 32),
+                    finalized_block=finalized_block,
+                )
             if record.get("cleanup") != "pending":
                 record = {**record, "cleanup": "pending"}
-                stored = self.objects.replace_plan(name, canonical_json(record), etag=stored.etag)
-            # Recheck after the CAS fence; a newly observed in-flight S keeps its bytes.
-            if store.upload_is_referenced(
-                record["hotkey"], reference=reference, finalized_block=finalized_block,
-            ):
-                original = {key: value for key, value in record.items() if key != "cleanup"}
-                self.objects.replace_plan(name, canonical_json(original), etag=stored.etag)
-                return 0
-            root = (f"{self.prefix}/{hashlib.sha256(record['hotkey'].encode()).hexdigest()}"
-                    f"/{upload_id}")
-            manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
-            for part in manifest.parts:
-                self.staging.delete_object(Bucket=self.bucket, Key=f"{root}/{part.name}")
-            self.objects.replace_plan(
-                name, canonical_json({**record, "cleanup": "done"}), etag=stored.etag,
-            )
-            return len(manifest.parts)
+                stored = self._replace(stored, record)
+            if record["parent_token_id"]:
+                if self.control is None:
+                    continue
+                self.control.handle("revoke", record)
+                record = {**record, "parent_token_id": None}
+                stored = self._replace(stored, record)
+            prefix = f"{self.prefix}/{record['upload_id']}/"
+            response = self.staging.list_objects_v2(Bucket=self.bucket, Prefix=prefix, MaxKeys=1000)
+            if response.get("IsTruncated"):
+                raise RuntimeError("private cleanup exceeds its bounded inventory")
+            keys = [row["Key"] for row in response.get("Contents", [])]
+            if any(not key.startswith(prefix) for key in keys):
+                raise ValueError("private cleanup escaped registration prefix")
+            for key in keys:
+                self.staging.delete_object(Bucket=self.bucket, Key=key)
+            self._replace(stored, {**record, "cleanup": "done"})
+            return len(keys)
         return 0
-
-
-def serve_uploads(*, database: str | Path, track_spec: str | Path, network: str, port: int) -> None:
-    """Sole CPU metadata entry, same-host read-only DB; TLS remains the managed proxy."""
-    import bittensor as bt
-
-    from scoring.spec import load_track_spec
-
-    track = load_track_spec(track_spec)
-    if track.netuid != 120:
-        raise ValueError("private upload service is restricted to SN120")
-
-    async def registration(hotkey: str) -> tuple[int | None, int]:
-        async with asyncio.timeout(10), bt.Client(network) as client:
-            genesis = (await client.block_info(0)).hash
-            if not isinstance(genesis, str) or genesis.removeprefix("0x") != uploads.genesis_hash:
-                raise RuntimeError("upload registration network differs from its signature domain")
-            finalized = await client.finalized_block()
-            snapshot = await client.at(finalized)
-            uid = await snapshot.read("uid", hotkey_ss58=hotkey, netuid=120)
-            return uid, finalized
-
-    with ChallengeStore.readonly(database) as store:
-        uploads = PrivateUploads.from_environment(
-            store=store, max_bytes=track.model.max_bytes, required=True,
-            registration=lambda hotkey: asyncio.run(registration(hotkey)),
-        )
-        assert uploads is not None
-        with upload_http_server(uploads, port=port) as server:
-            server.serve_forever()
-
-
-def upload_http_server(
-    uploads: PrivateUploads, *, port: int, clock: Callable[[], float] = time.time,
-) -> HTTPServer:
-    """Build the sole bounded metadata adapter, bound ONLY to IPv4 loopback.
-
-    The owner constructs this and its read-only SQLite connection in the same
-    serving thread. TLS belongs to the existing external HTTPS reverse proxy.
-    Creating this object does not start a serving loop or another worker.
-    """
-    class Handler(BaseHTTPRequestHandler):
-        # StreamRequestHandler.setup applies this before any request-line/header read.
-        timeout = 10
-
-        def log_message(self, *_args: object) -> None:
-            # Do not put request bodies, signed URLs or signature tokens in logs.
-            pass
-
-        def do_POST(self) -> None:
-            self.close_connection = True
-            code = 400
-            document: dict[str, object] = {"error": "INVALID_UPLOAD_REQUEST"}
-            try:
-                lengths = self.headers.get_all("Content-Length", [])
-                if (self.path != (urlparse(uploads.audience).path or "/")
-                        or self.headers.get("Transfer-Encoding") is not None
-                        or len(lengths) != 1 or not lengths[0].isdigit()
-                        or not 0 < int(lengths[0]) <= 64 * 1024
-                        or self.headers.get_content_type() != "application/json"):
-                    raise TypeError("invalid metadata envelope")
-                payload = self.rfile.read(int(lengths[0]))
-                if len(payload) != int(lengths[0]):
-                    raise TypeError("incomplete metadata envelope")
-                request = json.loads(payload)
-                if not isinstance(request, dict) or not isinstance(request.get("intent"), dict):
-                    raise TypeError("invalid metadata envelope")
-                intent = UploadIntent(**request["intent"])
-                expected = {"intent", "signature"} | (
-                    {"manifest"} if intent.action == "upload" else set()
-                )
-                if set(request) != expected or not isinstance(request["signature"], str):
-                    raise TypeError("invalid metadata envelope")
-                signature = bytes.fromhex(request["signature"])
-                if intent.action == "upload":
-                    manifest = ChunkManifest.decode(canonical_json(request["manifest"]))
-                    grant = uploads.authorize(
-                        intent, signature, manifest=manifest, now=int(clock()),
-                    )
-                    # Bearer URLs go only in the authenticated HTTP response, not logs/disk.
-                    document = {
-                        "upload_id": grant.upload_id, "expires_at": grant.expires_at,
-                        "parts": [{"name": part.name, "size_bytes": part.size_bytes,
-                                   "url": part.url} for part in grant.parts],
-                    }
-                else:
-                    reference = uploads.seal(intent, signature, now=int(clock()))
-                    document = {"upload_id": reference.upload_id,
-                                "file_sha256": reference.file_sha256,
-                                "sealed": True, "accepted": False}
-                code = 200
-            except (TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
-                pass
-            except ValueError:
-                code, document = 403, {"error": "UPLOAD_DENIED"}
-            except Exception:
-                code, document = 503, {"error": "UPLOAD_UNAVAILABLE"}
-            encoded = canonical_json(document)
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(encoded)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(encoded)
-
-    return HTTPServer(("127.0.0.1", port), Handler)

@@ -56,10 +56,11 @@ def _parser() -> argparse.ArgumentParser:
     source = commit.add_mutually_exclusive_group(required=True)
     source.add_argument("--repo-id")
     source.add_argument(
-        "--upload-id", help="sealed private upload ID, paired with its complete file SHA-256",
+        "--upload-id", help="private registration ID, paired with file and signed manifest SHA",
     )
     commit.add_argument("--revision")
-    commit.add_argument("--file-sha256", help="complete SHA-256 of the sealed private model")
+    commit.add_argument("--file-sha256", help="complete SHA-256 of the uploaded private model")
+    commit.add_argument("--manifest-sha256", help="complete SHA-256 of its signed ready manifest")
     commit.add_argument("--netuid", default=DEFAULT_NETUID, type=int)
     commit.add_argument("--network", default="finney")
     commit.add_argument("--wallet-name", default="default")
@@ -77,10 +78,11 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--hotkey-address", required=True)
     upload = miner_commands.add_parser(
-        "upload", help="upload a fixed private model before a separate finalized commitment",
+        "upload", help="activate an Ed25519 mailbox and upload privately before finalized ready",
     )
     upload.add_argument("--model", required=True)
-    upload.add_argument("--upload-url", required=True)
+    upload.add_argument("--mailbox-url", required=True)
+    upload.add_argument("--validator-identity", required=True)
     upload.add_argument("--network", default="finney")
     upload.add_argument("--wallet-name", default="default")
     upload.add_argument("--hotkey", default="default")
@@ -88,13 +90,11 @@ def _parser() -> argparse.ArgumentParser:
 
     evaluator = modules.add_parser("evaluator", help="operate evaluation and data production")
     evaluator_commands = evaluator.add_subparsers(dest="command", required=True)
-    uploads = evaluator_commands.add_parser(
-        "uploads", help="serve private upload metadata on CPU loopback only",
+    attach = evaluator_commands.add_parser(
+        "attach", help="control owner: attach one evaluator and answer fixed mailbox operations",
     )
-    uploads.add_argument("--track-spec", required=True)
-    uploads.add_argument("--database", required=True)
-    uploads.add_argument("--network", default="finney")
-    uploads.add_argument("--port", type=int, default=8765)
+    attach.add_argument("--host", required=True)
+    attach.add_argument("--container", required=True)
     produce = evaluator_commands.add_parser("produce", help="produce private evaluation batches")
     produce.add_argument("--config", required=True)
     produce.add_argument("--once", action="store_true")
@@ -194,13 +194,15 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
             from miner.upload import upload_model
 
             reference = asyncio.run(upload_model(
-                arguments.model, audience=arguments.upload_url, network=arguments.network,
+                arguments.model, mailbox_url=arguments.mailbox_url,
+                validator_identity=arguments.validator_identity, network=arguments.network,
                 wallet_name=arguments.wallet_name, hotkey_name=arguments.hotkey,
                 wallet_path=arguments.wallet_path,
             ))
             print(json.dumps({
                 "upload_id": reference.upload_id, "file_sha256": reference.file_sha256,
-                "sealed": True, "accepted": False,
+                "manifest_sha256": reference.manifest_sha256,
+                "uploaded": True, "accepted": False,
             }, sort_keys=True))
             return
         if arguments.command == "prepare":
@@ -227,13 +229,17 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
         if arguments.upload_id is not None:
             if arguments.netuid != DEFAULT_NETUID:
                 raise ValueError("private submission is restricted to SN120")
-            if arguments.revision is not None or arguments.file_sha256 is None:
-                raise ValueError("private source requires --file-sha256 and forbids --revision")
-            submission = PrivateModelSubmission(arguments.upload_id, arguments.file_sha256)
+            if (arguments.revision is not None or arguments.file_sha256 is None
+                    or arguments.manifest_sha256 is None):
+                raise ValueError("private ready requires file and manifest SHA; forbids revision")
+            submission = PrivateModelSubmission(arguments.upload_id, arguments.file_sha256,
+                                                arguments.manifest_sha256)
             source = {"source": "PRIVATE_S3", "upload_id": submission.upload_id,
-                      "file_sha256": submission.file_sha256}
+                      "file_sha256": submission.file_sha256,
+                      "manifest_sha256": submission.manifest_sha256}
         else:
-            if arguments.revision is None or arguments.file_sha256 is not None:
+            if (arguments.revision is None or arguments.file_sha256 is not None
+                    or arguments.manifest_sha256 is not None):
                 raise ValueError("HF source requires --revision and forbids --file-sha256")
             submission = ModelSubmission(arguments.repo_id, arguments.revision)
             source = {"repo_id": submission.repo_id, "revision": submission.revision}
@@ -273,18 +279,15 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
 
 
 def _run_evaluator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
-    if arguments.command == "uploads":
-        from validator.uploads import serve_uploads
+    if arguments.command == "attach":
+        from validator.uploads import attach_from_environment
 
         try:
-            serve_uploads(
-                database=arguments.database, track_spec=arguments.track_spec,
-                network=arguments.network, port=arguments.port,
-            )
-        except KeyboardInterrupt:
-            return
-        except (RuntimeError, OSError, ValueError) as exc:
-            parser.exit(1, f"error: {exc}\n")
+            code = attach_from_environment(host=arguments.host, container=arguments.container)
+        except (OSError, RuntimeError, KeyError, ValueError):
+            parser.exit(1, "error: evaluator control owner could not attach\n")
+        if code:
+            parser.exit(code, "error: evaluator owner SSH exited\n")
         return
     if arguments.command == "policy":
         from validator.production.commitment import canonical_json

@@ -10,7 +10,7 @@ from typing import Any
 
 from miner.submit import (
     MAGIC,
-    PRIVATE_MAGIC,
+    READY_MAGIC,
     ModelSubmission,
     PrivateModelSubmission,
     SubmissionFormatError,
@@ -194,7 +194,7 @@ def submission_from_commitment(commitment: ChainCommitment) -> SubmissionRecord 
     """Decode one Veda payload while retaining malformed Veda attempts."""
 
     payload = commitment.payload
-    private = payload.startswith(PRIVATE_MAGIC)
+    private = payload.startswith(READY_MAGIC)
     if not payload.startswith(MAGIC) and not (private and commitment.netuid == 120):
         return None
     try:

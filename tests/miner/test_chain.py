@@ -50,7 +50,7 @@ def test_commitment_info_enforces_runtime_limit() -> None:
 
 @pytest.mark.parametrize("submission,netuid", [
     (ModelSubmission("owner/model", "12" * 20), 7),
-    (PrivateModelSubmission("ab" * 32, "cd" * 32), 120),
+    (PrivateModelSubmission("ab" * 32, "cd" * 32, "ef" * 32), 120),
 ])
 def test_submit_model_signs_with_hotkey_and_waits_for_finalization(
     monkeypatch, submission, netuid,
@@ -60,6 +60,7 @@ def test_submit_model_signs_with_hotkey_and_waits_for_finalization(
     class FakeWallet:
         def __init__(self, **kwargs) -> None:
             calls["wallet"] = kwargs
+            self.hotkey = SimpleNamespace(crypto_type=0)
 
     class FakeClient:
         def __init__(self, network: str) -> None:

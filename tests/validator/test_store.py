@@ -513,11 +513,11 @@ def test_failed_admission_public_match_restores_without_model_ownership(tmp_path
 
 
 @pytest.mark.parametrize("existing", [False, True])
-@pytest.mark.parametrize("damage", [None, "upload_id", "file_sha256", "hf"])
+@pytest.mark.parametrize("damage", [None, "upload_id", "file_sha256", "manifest_sha256", "hf"])
 def test_private_public_history_binds_original_chain_payload_and_spent_opportunity(
     tmp_path, existing, damage,
 ):
-    reference = PrivateModelSubmission("ef" * 32, "ab" * 32)
+    reference = PrivateModelSubmission("ef" * 32, "ab" * 32, "cd" * 32)
     record = submission_from_commitment(ChainCommitment(
         "alice", 120, "ab" * 32, ChainPosition(101, 0, 0), reference.encode(),
     ))

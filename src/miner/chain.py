@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import bittensor as bt
 
-from miner.submit import ModelSubmission, PrivateModelSubmission
+from miner.submit import ModelSubmission, PrivateModelSubmission, UploadActivation
 
 _RAW_LIMIT = 128
 
@@ -37,7 +37,7 @@ def commitment_info(payload: bytes) -> dict[str, list[dict[str, bytes]]]:
 
 
 async def submit_model(
-    submission: ModelSubmission | PrivateModelSubmission,
+    submission: ModelSubmission | PrivateModelSubmission | UploadActivation,
     *,
     netuid: int,
     network: str,
@@ -51,10 +51,12 @@ async def submit_model(
         raise ValueError("netuid must fit in an unsigned 16-bit integer")
     if not network:
         raise ValueError("network cannot be empty")
-    if not isinstance(submission, (ModelSubmission, PrivateModelSubmission)):
+    if not isinstance(submission, (ModelSubmission, PrivateModelSubmission, UploadActivation)):
         raise ValueError("submission must be an explicit HF or private model reference")
-    if isinstance(submission, PrivateModelSubmission) and netuid != 120:
+    if isinstance(submission, (PrivateModelSubmission, UploadActivation)) and netuid != 120:
         raise ValueError("private submission is restricted to SN120")
+    if isinstance(submission, PrivateModelSubmission) and submission.manifest_sha256 is None:
+        raise ValueError("private ready requires the signed manifest SHA-256")
 
     wallet_arguments = {"name": wallet_name, "hotkey": hotkey_name}
     if wallet_path is not None:
@@ -62,6 +64,12 @@ async def submit_model(
 
     try:
         wallet = bt.Wallet(**wallet_arguments)
+    except Exception as exc:
+        raise ChainSubmissionError("the original wallet could not be opened") from exc
+    if (isinstance(submission, (PrivateModelSubmission, UploadActivation))
+            and getattr(wallet.hotkey, "crypto_type", None) != 0):
+        raise ValueError("private registration and ready require an existing Ed25519 hotkey")
+    try:
         call = bt.calls.Commitments.set_commitment(
             netuid=netuid,
             info=commitment_info(submission.encode()),

@@ -1,4 +1,3 @@
-import asyncio
 import json
 from types import SimpleNamespace
 
@@ -10,78 +9,30 @@ from validator.queue import ChainPosition, ChallengeState, submission_id
 from validator.store import ChallengeStore, SubmissionRecord
 
 
-def test_miner_upload_call_returns_only_fixed_identity_and_never_submits(monkeypatch, capsys):
+def test_private_upload_cli_uses_chain_mailbox_and_returns_unsigned_ready(monkeypatch, capsys):
     from miner import upload as module
     from miner.submit import PrivateModelSubmission
 
     calls = []
-
-    async def upload(model, **arguments):
-        calls.append((model, arguments))
-        return PrivateModelSubmission("ab" * 32, "cd" * 32)
-
+    async def upload(model, **kwargs):
+        calls.append((model, kwargs))
+        return PrivateModelSubmission("ab" * 32, "cd" * 32, "ef" * 32)
     monkeypatch.setattr(module, "upload_model", upload)
-    monkeypatch.setattr(cli_module, "submit_model", lambda *_a, **_kw: pytest.fail("chain call"))
     main(["miner", "upload", "--model", "prepared.safetensors",
-          "--upload-url", "https://uploads.example/veda", "--wallet-name", "miner",
-          "--hotkey", "original", "--wallet-path", "/test/wallets"])
+          "--mailbox-url", "https://public.example/mailbox/v1",
+          "--validator-identity", "pinned-validator"])
     result = json.loads(capsys.readouterr().out)
     assert result == {"upload_id": "ab" * 32, "file_sha256": "cd" * 32,
-                      "sealed": True, "accepted": False}
-    assert calls == [("prepared.safetensors", {
-        "audience": "https://uploads.example/veda", "network": "finney",
-        "wallet_name": "miner", "hotkey_name": "original", "wallet_path": "/test/wallets",
-    })]
+                      "manifest_sha256": "ef" * 32, "uploaded": True, "accepted": False}
+    assert calls[0][1]["mailbox_url"] == "https://public.example/mailbox/v1"
+    assert calls[0][1]["validator_identity"] == "pinned-validator"
 
 
-def test_evaluator_upload_command_is_only_same_host_metadata_entry(monkeypatch):
-    from validator import uploads as module
-
-    calls = []
-    monkeypatch.setattr(module, "serve_uploads", lambda **arguments: calls.append(arguments))
-    main(["evaluator", "uploads", "--database", "original.db", "--track-spec", "track.json"])
-    assert calls == [{"database": "original.db", "track_spec": "track.json",
-                      "network": "finney", "port": 8765}]
-
-
-def test_miner_upload_uses_original_wallet_signer_and_genesis_without_chain_write(monkeypatch):
-    from miner import upload as module
-    from miner.submit import PrivateModelSubmission
-
-    hotkey = object()
-    observed = []
-
-    class Client:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            pass
-
-        async def block_info(self, height):
-            assert height == 0
-            return SimpleNamespace(hash="0x" + "01" * 32)
-
-    def wallet(**arguments):
-        assert arguments == {"name": "miner", "hotkey": "original", "path": "/wallets"}
-        return SimpleNamespace(hotkey=hotkey)
-
-    async def upload_file(model, **arguments):
-        assert arguments["hotkey"] is hotkey
-        assert arguments["genesis_hash"] == "01" * 32
-        assert arguments["audience"] == "https://uploads.example/veda"
-        observed.append(model)
-        return PrivateModelSubmission("ab" * 32, "cd" * 32)
-
-    monkeypatch.setattr(module.bt, "Client", lambda network: Client())
-    monkeypatch.setattr(module.bt, "Wallet", wallet)
-    monkeypatch.setattr(module, "upload_file", upload_file)
-    result = asyncio.run(module.upload_model(
-        "prepared.safetensors", audience="https://uploads.example/veda", network="test",
-        wallet_name="miner", hotkey_name="original", wallet_path="/wallets",
-    ))
-    assert result == PrivateModelSubmission("ab" * 32, "cd" * 32)
-    assert observed == ["prepared.safetensors"]
+def test_retired_loopback_upload_service_and_http_url_flags_are_not_aliases():
+    with pytest.raises(SystemExit):
+        main(["evaluator", "uploads", "--database", "original.db", "--track-spec", "track.json"])
+    with pytest.raises(SystemExit):
+        main(["miner", "upload", "--model", "file", "--upload-url", "https://old.example"])
 
 
 def test_public_monitor_needs_no_miner_or_validator_setup(monkeypatch, capsys) -> None:
@@ -295,16 +246,17 @@ def test_private_commit_preview_is_explicit_and_does_not_open_chain(monkeypatch,
         pytest.fail("preparatory private source opened a chain connection")
 
     monkeypatch.setattr(cli_module, "submit_model", unexpected)
-    command = ["miner", "commit", "--upload-id", "ab" * 32, "--file-sha256", "cd" * 32]
+    command = ["miner", "commit", "--upload-id", "ab" * 32, "--file-sha256", "cd" * 32,
+               "--manifest-sha256", "ef" * 32]
     main([*command, "--dry-run"])
     document = json.loads(capsys.readouterr().out)
     assert document["source"] == "PRIVATE_S3"
     assert document["file_sha256"] == "cd" * 32
-    assert document["payload_bytes"] == 68
+    assert document["payload_bytes"] == 100
     assert "repo_id" not in document and "revision" not in document
 
 
-def test_private_commit_uses_same_hotkey_finalization_entry_with_explicit_vds1(monkeypatch, capsys):
+def test_private_ready_uses_same_hotkey_finalization_entry(monkeypatch, capsys):
     from miner.submit import PrivateModelSubmission
 
     calls = []
@@ -315,10 +267,10 @@ def test_private_commit_uses_same_hotkey_finalization_entry_with_explicit_vds1(m
 
     monkeypatch.setattr(cli_module, "submit_model", submit)
     main(["miner", "commit", "--upload-id", "ab" * 32, "--file-sha256", "cd" * 32,
-          "--wallet-name", "miner", "--hotkey", "original"])
+          "--manifest-sha256", "ef" * 32, "--wallet-name", "miner", "--hotkey", "original"])
     reference, arguments = calls[0]
-    assert reference == PrivateModelSubmission("ab" * 32, "cd" * 32)
-    assert reference.encode() == b"VDS1" + bytes.fromhex("ab" * 32 + "cd" * 32)
+    assert reference == PrivateModelSubmission("ab" * 32, "cd" * 32, "ef" * 32)
+    assert reference.encode() == b"VDR1" + bytes.fromhex("ab" * 32 + "cd" * 32 + "ef" * 32)
     assert arguments == {"netuid": 120, "network": "finney", "wallet_name": "miner",
                          "hotkey_name": "original", "wallet_path": None}
     document = json.loads(capsys.readouterr().out)

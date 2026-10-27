@@ -78,7 +78,7 @@ def test_preserves_malformed_veda_payload_for_challenge_record() -> None:
 
 @pytest.mark.parametrize("valid", [True, False])
 def test_private_payload_preserves_original_chain_position_and_explicit_identity(valid):
-    private = PrivateModelSubmission("ab" * 32, "cd" * 32)
+    private = PrivateModelSubmission("ab" * 32, "cd" * 32, "ef" * 32)
     payload = private.encode() if valid else private.encode()[:-1]
     block, events = fixture(payload, netuid=120)
     records = extract_submissions(block_height=100, block_hash=BLOCK_HASH,

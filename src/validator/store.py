@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from miner.submit import (
     PRIVATE_MAGIC,
+    READY_MAGIC,
     PrivateModelSubmission,
     SubmissionFormatError,
     model_source_fields,
@@ -65,7 +66,7 @@ class SubmissionRecord:
             raise ValueError("submission identifier does not match its chain position")
         if (self.repo_id is None) != (self.revision is None):
             raise ValueError("repository and revision must either both exist or both be absent")
-        if self.payload.startswith(PRIVATE_MAGIC) and self.repo_id is not None:
+        if self.payload.startswith((PRIVATE_MAGIC, READY_MAGIC)) and self.repo_id is not None:
             raise ValueError("private sources must not masquerade as HF repositories")
 
     @property

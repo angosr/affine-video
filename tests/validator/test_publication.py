@@ -1096,7 +1096,7 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path, pr
             )
         ]
     }
-    reference = PrivateModelSubmission("ef" * 32, model_sha256) if private else None
+    reference = PrivateModelSubmission("ef" * 32, model_sha256, "cd" * 32) if private else None
     if reference is not None:
         snapshot["challenges"][0].update(model_source_fields(None, None, reference))
     store = SimpleNamespace(

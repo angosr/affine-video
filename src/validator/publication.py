@@ -875,6 +875,19 @@ class S3Repository:
                 # Never rewrite a frozen source-block snapshot for new information.
                 _LOG.warning("system benchmark status deferred until a new block")
 
+    def publish_mailbox(self, name: str, ciphertext: bytes) -> None:
+        """The existing public prefix carries ONLY the sealed credential blob.
+
+        This deliberately cannot write formal track/weights/match objects.
+        Caller is the control-side mailbox signer, not a miner/S3 credential.
+        """
+        if (re.fullmatch(r"mailbox/v1/[a-f0-9]{64}\.bin", name) is None
+                or not isinstance(ciphertext, bytes) or not 48 <= len(ciphertext) <= 65536):
+            raise PublicArtifactError("invalid encrypted mailbox object")
+        self._put(name, ciphertext, False, content_type="application/octet-stream")
+        if self._get_optional(name) != ciphertext:
+            raise PublicArtifactError("encrypted mailbox readback failed")
+
     async def load_system_matches(
         self, track: TrackSpec, runtime_manifest: bytes | None,
     ) -> tuple[tuple[str, bytes], ...]:
@@ -1679,6 +1692,7 @@ class S3Repository:
         *,
         if_match: str | None = None,
         if_none_match: str | None = None,
+        content_type: str = "application/json; charset=utf-8",
     ) -> None:
         if not payload or len(payload) > _MAX_PUBLIC_OBJECT_BYTES:
             raise PublicArtifactError(f"public object size is invalid: {name}")
@@ -1686,7 +1700,7 @@ class S3Repository:
             "Bucket": self._bucket,
             "Key": f"{self._prefix}/{name}",
             "Body": payload,
-            "ContentType": "application/json; charset=utf-8",
+            "ContentType": content_type,
             "CacheControl": (
                 "public, max-age=31536000, immutable" if immutable else "no-store, max-age=0"
             ),

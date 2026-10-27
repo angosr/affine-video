@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from miner.submit import ACTIVATE_MAGIC, UploadActivation
 from validator.competition import LEGACY_ACTIVATION_PREFIX, is_valid_legacy_activation
 from validator.scan import (
     ChainCommitment,
@@ -37,6 +38,7 @@ async def scan_finalized_blocks(
     netuid: int,
     track_start_block: int,
     max_blocks: int = 100,
+    private_uploads: Any = None,
 ) -> ScanResult:
     """Scan one bounded batch and commit the cursor after each complete block."""
 
@@ -67,6 +69,18 @@ async def scan_finalized_blocks(
         )
         submissions_by_position = {submission.position: submission for submission in submissions}
         for commitment in commitments:
+            if (private_uploads is not None and netuid == 120
+                    and commitment.payload.startswith(ACTIVATE_MAGIC)):
+                try:
+                    private_uploads.observe_activation(
+                        UploadActivation.decode(commitment.payload), hotkey=commitment.hotkey,
+                        block=commitment.position.block,
+                        extrinsic_index=commitment.position.extrinsic_index,
+                        event_index=commitment.position.event_index,
+                        block_hash=commitment.block_hash,
+                    )
+                except ValueError:
+                    LOGGER.warning("invalid private Ed25519 activation at block %s", block_height)
             legacy_excluded = is_valid_legacy_activation(
                 commitment.payload, hotkey=commitment.hotkey, netuid=netuid,
             )

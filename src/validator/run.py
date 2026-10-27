@@ -313,7 +313,7 @@ async def _reclaim_private_uploads(
     uploads: PrivateUploads, *, database: str | Path, network: str,
     archive_endpoints: list[str] | None,
 ) -> int:
-    """Bounded staging cleanup inside the existing evaluator, not another service."""
+    """One bounded mailbox/GC pass inside the existing evaluator owner."""
     async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
         genesis = (await client.block_info(0)).hash
         if not isinstance(genesis, str) or genesis.removeprefix("0x") != uploads.genesis_hash:
@@ -323,12 +323,30 @@ async def _reclaim_private_uploads(
         timestamp = int((await snapshot.timestamp()).timestamp())
 
     def reclaim() -> int:
+        from copy import copy
+
+        async def registration(hotkey: str) -> tuple[int | None, int]:
+            async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
+                genesis = (await client.block_info(0)).hash
+                if genesis.removeprefix("0x") != uploads.genesis_hash:
+                    raise RuntimeError("private registration network differs")
+                finalized = await client.finalized_block()
+                snapshot = await client.at(finalized)
+                return await snapshot.read("uid", hotkey_ss58=hotkey, netuid=120), finalized
+
         # Created and used in this thread; never share the main SQLite connection.
         with ChallengeStore.readonly(database) as store:
-            return uploads.reclaim_expired(
-                store=store, finalized_block=finalized, finalized_timestamp=timestamp,
-                now=int(time.time()),
-            )
+            worker = copy(uploads)
+            worker.store = store
+            worker.registration = lambda hotkey: asyncio.run(registration(hotkey))
+            try:
+                worker.issue_pending(now=int(time.time()))
+                return worker.reclaim_expired(
+                    store=store, finalized_block=finalized, finalized_timestamp=timestamp,
+                    now=int(time.time()),
+                )
+            finally:
+                uploads._issue_after, uploads._gc_after = worker._issue_after, worker._gc_after
 
     return await asyncio.to_thread(reclaim)
 
@@ -590,7 +608,7 @@ async def run_evaluator(
                     uploads, database=database, network=network,
                     archive_endpoints=archive_endpoints,
                 ))
-                next_upload_cleanup = now + 300.0
+                next_upload_cleanup = now + max(5.0, poll_seconds)
             if (
                 system_match_loader is not None
                 and system_match_task is None and now >= next_system_match_refresh
@@ -747,6 +765,7 @@ async def run_evaluator(
                             published_match_count=published_match_count,
                             max_scan_blocks=max_scan_blocks,
                             recovery_matches=recovery_matches[recovery_index:],
+                            private_uploads=uploads,
                             # One height identifies one immutable public snapshot.
                             # Keep finished work leased until it can enter the next
                             # snapshot, including after a partially failed publication.
@@ -1045,6 +1064,7 @@ async def process_cycle(
     max_scan_blocks: int = 100,
     recovery_matches: Sequence[MatchRecord] = (),
     minimum_finalized_block: int = 0,
+    private_uploads: PrivateUploads | None = None,
 ) -> EvaluationCycleResult:
     """Scan/publish independently of one leased FIFO task; commit on the owner loop."""
 
@@ -1085,6 +1105,7 @@ async def process_cycle(
         netuid=netuid,
         track_start_block=track_start_block,
         max_blocks=max_scan_blocks,
+        **({"private_uploads": private_uploads} if private_uploads is not None else {}),
     )
     finalized_block = await client.finalized_block()
     restored_matches = store.restore_public_matches(recovery_matches)

@@ -1,11 +1,15 @@
-"""Signed metadata calls and fixed-part PUTs; never submit a chain transaction."""
+"""Chain activation, local Ed25519 mailbox decrypt, native R2 upload, then ready.
 
+No private key or management credential leaves its owner. Upload is not the
+formal competition submission; the separate finalized ready fixes S.
+"""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import re
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -13,105 +17,153 @@ from urllib.parse import urlparse
 import bittensor as bt
 import httpx
 
-from miner.submit import PrivateModelSubmission, UploadIntent
+from miner.chain import submit_model
+from miner.submit import (
+    PrivateModelSubmission,
+    UploadActivation,
+    activation_message,
+    upload_registration_id,
+)
 from validator.chunks import build_chunk_manifest, read_part
+from validator.production.commitment import canonical_json, decode_canonical_json
+from validator.s3 import client_config
+from validator.uploads import ed25519_verify, envelope_signing_bytes, manifest_signing_bytes
 
 
 async def upload_model(
-    model: str | Path, *, audience: str, network: str, wallet_name: str,
-    hotkey_name: str, wallet_path: str | None = None,
+    model: str | Path, *, mailbox_url: str, validator_identity: str, network: str,
+    wallet_name: str, hotkey_name: str, wallet_path: str | None = None,
 ) -> PrivateModelSubmission:
-    """Retrying this command uses the same owner/file/domain ID, not a new model.
-
-    The API only seals the declaration. Original ADMISSION still verifies the
-    real full SHA/schema/owner and persists the model before any scoring.
-    """
+    """Activate using the EXISTING Ed25519 hotkey, then upload; never auto-ready."""
     if not network:
         raise ValueError("upload network cannot be empty")
-    UploadIntent(audience, "00" * 32, "configuration", 120, "upload", "00" * 32,
-                 "00" * 32, 1, "00" * 32, 1)
     arguments = {"name": wallet_name, "hotkey": hotkey_name}
     if wallet_path is not None:
         arguments["path"] = wallet_path
     wallet = bt.Wallet(**arguments)
+    if getattr(wallet.hotkey, "crypto_type", None) != 0:
+        raise ValueError("private upload requires an existing registered Ed25519 hotkey")
     async with bt.Client(network) as chain:
         genesis = (await chain.block_info(0)).hash
     if not isinstance(genesis, str):
         raise RuntimeError("upload network genesis is unavailable")
-    async with httpx.AsyncClient(follow_redirects=False, timeout=60.0) as client:
-        return await upload_file(
-            model, audience=audience, genesis_hash=genesis.removeprefix("0x"),
-            hotkey=wallet.hotkey, client=client,
-        )
+    genesis = genesis.removeprefix("0x")
+    activation = UploadActivation(wallet.hotkey.sign(
+        activation_message(genesis, wallet.hotkey.ss58_address),
+    ))
+    receipt = await submit_model(activation, netuid=120, network=network, wallet_name=wallet_name,
+                                 hotkey_name=hotkey_name, wallet_path=wallet_path)
+    async with httpx.AsyncClient(follow_redirects=False, timeout=20) as client:
+        return await upload_file(model, mailbox_url=mailbox_url,
+                                 validator_identity=validator_identity, genesis_hash=genesis,
+                                 hotkey=wallet.hotkey, client=client,
+                                 activation_block_hash=receipt.block_hash.removeprefix("0x"))
+
+
+def _temporary_client(envelope: dict):
+    import boto3
+
+    return boto3.client(
+        "s3", endpoint_url=envelope["endpoint"], region_name="auto",
+        aws_access_key_id=envelope["access_key_id"],
+        aws_secret_access_key=envelope["secret_access_key"],
+        aws_session_token=envelope["session_token"], config=client_config(),
+    )
+
+
+def decrypt_mailbox(
+    blob: bytes, *, hotkey: Any, validator_identity: str, genesis_hash: str,
+) -> dict:
+    """Pin the validator BEFORE trusting any endpoint, prefix or credential."""
+    if getattr(hotkey, "crypto_type", None) != 0:
+        raise ValueError("private mailbox requires Ed25519; sr25519 is not decrypt-compatible")
+    if not blob or len(blob) > 65536:
+        raise ValueError("private mailbox blob is invalid")
+    envelope = decode_canonical_json(hotkey.decrypt(blob))
+    expected = {
+        "format", "genesis_hash", "hotkey", "upload_id", "generation", "endpoint", "bucket",
+        "prefix", "validator", "expires_at", "access_key_id", "secret_access_key",
+        "session_token", "signature", "activation_block_hash",
+    }
+    upload_id = upload_registration_id(genesis_hash, hotkey.ss58_address)
+    if (not isinstance(envelope, dict) or set(envelope) != expected
+            or envelope["format"] != "veda-mailbox-v1"
+            or envelope["genesis_hash"] != genesis_hash
+            or envelope["hotkey"] != hotkey.ss58_address or envelope["upload_id"] != upload_id
+            or envelope["validator"] != validator_identity
+            or not ed25519_verify(validator_identity, envelope_signing_bytes(envelope),
+                                  bytes.fromhex(envelope["signature"]))
+            or type(envelope["generation"]) is not int or envelope["generation"] < 1
+            or type(envelope["expires_at"]) is not int
+            or re.fullmatch(r"[a-f0-9]{64}", envelope["activation_block_hash"]) is None
+            or not re.fullmatch(
+                r"https://[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?\.r2\.cloudflarestorage\.com/?",
+                envelope["endpoint"],
+            )
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", envelope["bucket"])
+            or envelope["bucket"] == "affine_video"
+            or envelope["prefix"] != f"uploads/v1/{upload_id}/"
+            or not all(isinstance(envelope[k], str) and envelope[k]
+                       for k in ("access_key_id", "secret_access_key", "session_token"))):
+        raise ValueError("private mailbox identity, signature, scope or expiry is invalid")
+    return envelope
 
 
 async def upload_file(
-    model: str | Path, *, audience: str, genesis_hash: str, hotkey: Any,
-    client: httpx.AsyncClient,
+    model: str | Path, *, mailbox_url: str, validator_identity: str, genesis_hash: str,
+    hotkey: Any, client: httpx.AsyncClient, s3_factory: Any = _temporary_client,
+    timeout_seconds: float = 300, activation_block_hash: str | None = None,
 ) -> PrivateModelSubmission:
-    """Send original 40MiB parts, never a full file through the metadata API."""
-    path = Path(model)
-    manifest = build_chunk_manifest(path)
-    owner = hotkey.ss58_address
-    manifest_sha = hashlib.sha256(manifest.encode()).hexdigest()
-    upload_id = hashlib.sha256(json.dumps(
-        ["veda-upload-v1", audience, genesis_hash, owner, manifest.sha256, manifest_sha],
-        separators=(",", ":"), ensure_ascii=True,
-    ).encode()).hexdigest()
-    reference = PrivateModelSubmission(upload_id, manifest.sha256)
-
-    async def request(action: str) -> dict[str, Any]:
-        intent = UploadIntent(
-            audience, genesis_hash, owner, 120, action, upload_id, manifest.sha256,
-            manifest.size, manifest_sha, int(time.time()) + 300,
-        )
-        envelope = {"intent": asdict(intent),
-                    "signature": hotkey.sign(intent.signing_message()).hex()}
-        if action == "upload":
-            envelope["manifest"] = json.loads(manifest.encode())
-        response = await client.post(audience, json=envelope)
-        if response.status_code != 200:
-            raise RuntimeError("private upload metadata request was not accepted")
-        result = response.json()
-        if not isinstance(result, dict) or result.get("upload_id") != upload_id:
-            raise ValueError("private upload response has a different identity")
-        return result
-
+    """Read encrypted PUBLIC mailbox; send only parts/manifest to PRIVATE R2."""
+    parsed = urlparse(mailbox_url)
+    if (parsed.scheme != "https" or not parsed.netloc or parsed.username is not None
+            or parsed.password is not None or parsed.query or parsed.fragment):
+        raise ValueError("mailbox requires the existing public HTTPS object prefix")
+    if getattr(hotkey, "crypto_type", None) != 0:
+        raise ValueError("private upload requires an existing Ed25519 hotkey")
+    manifest = build_chunk_manifest(model)
+    upload_id = upload_registration_id(genesis_hash, hotkey.ss58_address)
+    url = f"{mailbox_url.rstrip('/')}/{upload_id}.bin"
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        response = await client.get(url, headers={"Cache-Control": "no-cache"})
+        if response.status_code == 200:
+            envelope = decrypt_mailbox(response.content, hotkey=hotkey,
+                                       validator_identity=validator_identity,
+                                       genesis_hash=genesis_hash)
+            if (envelope["expires_at"] > time.time() + 30
+                    and (activation_block_hash is None
+                         or envelope["activation_block_hash"] == activation_block_hash)):
+                break
+        if response.status_code not in {200, 400, 404} or time.monotonic() >= deadline:
+            raise RuntimeError("private mailbox is unavailable; no model was submitted")
+        await asyncio.sleep(min(2, max(0, deadline - time.monotonic())))
+    s3 = s3_factory(envelope)
+    prefix, bucket = envelope["prefix"], envelope["bucket"]
     try:
-        grant = await request("upload")
         for index, part in enumerate(manifest.parts):
-            if type(grant.get("expires_at")) is not int:
-                raise ValueError("private upload response omitted its expiry")
-            if grant["expires_at"] <= int(time.time()) + 30:
-                grant = await request("upload")
-            parts = grant.get("parts")
-            if not isinstance(parts, list) or len(parts) != len(manifest.parts):
-                raise ValueError("private upload response changed its part manifest")
-            capability = parts[index]
-            if (not isinstance(capability, dict) or set(capability) != {
-                "name", "size_bytes", "url",
-            } or capability["name"] != part.name or capability["size_bytes"] != part.size
-                    or not isinstance(capability["url"], str)):
-                raise ValueError("private upload response changed its part identity")
-            url = urlparse(capability["url"])
-            if (url.scheme != "https" or not url.netloc or url.username is not None
-                    or url.password is not None or url.fragment):
-                raise ValueError("private upload capability requires HTTPS")
-            content = read_part(path, index, part.size)
-            if hashlib.sha256(content).hexdigest() != part.sha256:
-                raise ValueError("local model changed after its upload identity was fixed")
-            response = await client.put(
-                capability["url"], content=content,
-                headers={"Content-Length": str(part.size)},
-            )
-            if not 200 <= response.status_code < 300:
-                raise RuntimeError("private upload part failed; retry the same file")
-            del response, content
-        sealed = await request("seal")
-        if (sealed.get("file_sha256") != reference.file_sha256
-                or sealed.get("sealed") is not True or sealed.get("accepted") is not False):
-            raise ValueError("private upload seal response has a different identity")
-    except (httpx.HTTPError, json.JSONDecodeError) as exc:
-        # Do not expose presigned bearer URLs, response bodies or signatures.
-        raise RuntimeError("private upload transport failed; retry the same file") from exc
-    return reference
+            if time.time() + 15 >= envelope["expires_at"]:
+                raise RuntimeError("private upload credential expired; reactivate the same upload")
+            body = read_part(model, index, part.size)
+            if len(body) != part.size or hashlib.sha256(body).hexdigest() != part.sha256:
+                raise ValueError("model changed during upload")
+            await asyncio.to_thread(s3.put_object, Bucket=bucket, Key=prefix + part.name,
+                                    Body=body, ContentLength=part.size)
+        if build_chunk_manifest(model) != manifest:
+            raise ValueError("model changed before its signed manifest")
+        document = {
+            "format": "veda-upload-manifest-v1", "genesis_hash": genesis_hash,
+            "hotkey": hotkey.ss58_address, "upload_id": upload_id,
+            "manifest": json.loads(manifest.encode()),
+        }
+        document["signature"] = hotkey.sign(manifest_signing_bytes(document)).hex()
+        raw = canonical_json(document)
+        await asyncio.to_thread(s3.put_object, Bucket=bucket, Key=prefix + "manifest.json",
+                                Body=raw, ContentLength=len(raw))
+    except (ValueError, RuntimeError):
+        raise
+    except Exception as exc:
+        raise RuntimeError("private R2 transfer unavailable; retry the same registration") from exc
+    finally:
+        s3.close()
+    return PrivateModelSubmission(upload_id, manifest.sha256, hashlib.sha256(raw).hexdigest())
