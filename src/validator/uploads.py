@@ -239,10 +239,17 @@ def attach_evaluator(*, host: str, container: str, control: MailboxControl) -> i
     if any(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", value) is None
            for value in (host, container)):
         raise ValueError("owner SSH alias/container name is invalid")
+    # One SSH session, one existing container. A transport reconnect attaches
+    # without restarting the evaluator or its original in-flight opportunity.
+    command = (
+        f'if [ "$(docker inspect --format \'{{{{.State.Running}}}}\' {container})" = true ]; '
+        f"then exec docker attach --sig-proxy=false {container}; "
+        f"else exec docker start --attach --interactive {container}; fi"
+    )
     process = subprocess.Popen(
         ["ssh", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
-         "-o", "ServerAliveCountMax=3", "-T", host, "docker", "start", "--attach",
-         "--interactive", container], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+         "-o", "ServerAliveCountMax=3", "-T", host, command],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
         env={name: value for name, value in os.environ.items()
              if name in {"PATH", "HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK", "LANG", "LC_ALL"}},

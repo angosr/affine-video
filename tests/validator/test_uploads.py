@@ -394,7 +394,8 @@ def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(setup
     assert "fixture-secret" not in incoming.saved and "fixture-session" not in incoming.saved
     assert "access_key_id" not in incoming.saved
     assert set(response["result"]) == {"parent_token_id", "retire_parent", "expires_at", "mailbox"}
-    assert observed[0][-5:] == ["docker", "start", "--attach", "--interactive", "veda-evaluator"]
+    assert "docker attach --sig-proxy=false veda-evaluator" in observed[0][-1]
+    assert "docker start --attach --interactive veda-evaluator" in observed[0][-1]
     assert "VEDA_UPLOAD_MANAGEMENT_TOKEN" not in environments[0]
 
 
@@ -539,3 +540,31 @@ def test_malformed_owner_response_is_infrastructure_not_a_miner_binding_error(mo
     monkeypatch.setattr("select.select", lambda *_args: ([reader], [], []))
     with pytest.raises(RuntimeError, match="response is invalid"):
         OwnerMailboxControl().handle("revoke", {})
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_owner_reconnect_attaches_without_restarting_running_writer(
+    setup, tmp_path, monkeypatch, capsys, running,
+):
+    import subprocess
+
+    docker = tmp_path / "docker"
+    docker.write_text(
+        '#!/bin/sh\nif [ "$1" = inspect ]; then echo '
+        + ("true" if running else "false") + '; else printf "%s\\n" "$*"; fi\n',
+    )
+    docker.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path) + ":/usr/bin:/bin")
+    real_popen = subprocess.Popen
+
+    def isolated_shell(argv, **kwargs):
+        # Execute the real fixed remote command with a fixture Docker binary,
+        # never SSH/connect to a daemon/start a business container.
+        return real_popen(["/bin/sh", "-c", argv[-1]], **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", isolated_shell)
+    assert attach_evaluator(host="gpu-veda", container="veda-evaluator",
+                            control=setup.uploads.control) == 0
+    expected = ("attach --sig-proxy=false veda-evaluator" if running
+                else "start --attach --interactive veda-evaluator")
+    assert capsys.readouterr().out.strip() == expected
