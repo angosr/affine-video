@@ -312,7 +312,7 @@ async def _publish_due_batch(
 async def _reclaim_private_uploads(
     uploads: PrivateUploads, *, database: str | Path, network: str,
     archive_endpoints: list[str] | None,
-) -> int:
+) -> dict[str, str | None]:
     """One bounded mailbox/GC pass inside the existing evaluator owner."""
     async with bt.Client(network, archive_endpoints=archive_endpoints) as client:
         genesis = (await client.block_info(0)).hash
@@ -322,7 +322,7 @@ async def _reclaim_private_uploads(
         snapshot = await client.at(finalized)
         timestamp = int((await snapshot.timestamp()).timestamp())
 
-    def reclaim() -> int:
+    def reclaim() -> dict[str, str | None]:
         from copy import copy
 
         async def registration(hotkey: str) -> tuple[int | None, int]:
@@ -340,11 +340,30 @@ async def _reclaim_private_uploads(
             worker.store = store
             worker.registration = lambda hotkey: asyncio.run(registration(hotkey))
             try:
-                worker.issue_pending(now=int(time.time()))
-                return worker.reclaim_expired(
-                    store=store, finalized_block=finalized, finalized_timestamp=timestamp,
-                    now=int(time.time()),
-                )
+                issue_error = None
+                try:
+                    worker.issue_pending(now=int(time.time()))
+                except ValueError:
+                    # Original eligibility refusal does not consume an opportunity.
+                    _LOG.info("PRIVATE_UPLOAD_INELIGIBLE; original qualification retained")
+                except Exception:
+                    issue_error = "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+                cleanup_error = None
+                try:
+                    worker.reclaim_expired(
+                        store=store, finalized_block=finalized, finalized_timestamp=timestamp,
+                        now=int(time.time()),
+                    )
+                except Exception:
+                    cleanup_error = "PRIVATE_UPLOAD_CLEANUP_FAILED"
+                status = {"private_upload_error": issue_error,
+                          "private_upload_cleanup_error": cleanup_error}
+                try:
+                    for key, code in worker.maintenance_status().items():
+                        status[key] = code or status[key]
+                except Exception:
+                    status["private_upload_error"] = "PRIVATE_UPLOAD_ISSUANCE_STATUS_UNAVAILABLE"
+                return status
             finally:
                 uploads._issue_after, uploads._gc_after = worker._issue_after, worker._gc_after
 
@@ -579,7 +598,7 @@ async def run_evaluator(
         next_inventory_refresh = 0.0
         disclosure_task: asyncio.Task[str | None | Literal[False]] | None = None
         next_disclosure_refresh = 0.0
-        upload_cleanup_task: asyncio.Task[int] | None = None
+        upload_cleanup_task: asyncio.Task[dict[str, str | None]] | None = None
         next_upload_cleanup = 0.0
 
         def refresh_metadata() -> None:
@@ -597,11 +616,20 @@ async def run_evaluator(
                 system_match_task = None
             now = asyncio.get_running_loop().time()
             if upload_cleanup_task is not None and upload_cleanup_task.done():
+                inventory = dict(evaluator.inventory_status or {"allocated_stages": []})
                 try:
-                    upload_cleanup_task.result()
+                    upload_status = upload_cleanup_task.result()
                 except Exception:
-                    # Fixed code only: backend exceptions can contain credentials/URLs.
-                    _LOG.warning("PRIVATE_UPLOAD_CLEANUP_FAILED; original references retained")
+                    upload_status = {"private_upload_error":
+                                     "PRIVATE_UPLOAD_ISSUANCE_STATUS_UNAVAILABLE"}
+                for key, code in upload_status.items():
+                    if code and code != inventory.get(key):
+                        # Fixed code only: backend exceptions can contain credentials/URLs.
+                        _LOG.warning("%s; original references retained", code)
+                        if alert is not None:
+                            alert(code, {})
+                    inventory[key] = code
+                evaluator.inventory_status = inventory
                 upload_cleanup_task = None
             if uploads is not None and upload_cleanup_task is None and now >= next_upload_cleanup:
                 upload_cleanup_task = asyncio.create_task(_reclaim_private_uploads(

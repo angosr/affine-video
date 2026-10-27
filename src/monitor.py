@@ -132,7 +132,8 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
                 f"({age / 1_000_000_000:.0f}s ago)" if valid else "unknown"
             )
             details.append(f"{label}: {value}" + (f" {yellow}STALE{reset}" if stale else ""))
-        for key in ("refresh_error", "disclosure_error"):
+        for key in ("refresh_error", "disclosure_error", "private_upload_error",
+                    "private_upload_cleanup_error"):
             if inventory.get(key):
                 details.append(f"{yellow}{key}: {inventory[key]}{reset}")
         lines[2:2] = details

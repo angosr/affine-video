@@ -403,6 +403,14 @@ class PrivateUploads:
                 or upload_registration_id(self.genesis_hash, record.get("hotkey", "")) != upload_id
                 or type(record.get("expires_at")) is not int):
             raise ValueError("private upload record is invalid")
+        retry = record.get("issue_retry")
+        if retry is not None and (
+            not isinstance(retry, dict) or set(retry) != {"attempts", "retry_after", "error"}
+            or type(retry["attempts"]) is not int or retry["attempts"] <= 0
+            or type(retry["retry_after"]) is not int or retry["retry_after"] < 0
+            or retry["error"] not in {None, "PRIVATE_UPLOAD_ISSUANCE_FAILED"}
+        ):
+            raise ValueError("private upload issuance retry is invalid")
         return stored, record
 
     def _replace(self, stored, record: dict):
@@ -433,8 +441,6 @@ class PrivateUploads:
         )
         if record is not None and position <= previous_position:
             return
-        if record is not None and record.get("cleanup") == "pending":
-            raise RuntimeError("original private upload cleanup must finish")
         if record is not None:
             # Do NOT put an existing ready into ISSUING merely because another
             # request appeared. Qualification happens first; original ADMISSION
@@ -470,68 +476,120 @@ class PrivateUploads:
             stored, record = self._read(upload_id)
             if record.get("cleanup") == "pending":
                 continue
-            if (record["state"] == "UPLOADING" and record.get("mailbox")
-                    and not record["mailbox"].get("published")):
-                self.republish_mailbox(upload_id)
-                return True
-            pending = record.get("activation_request")
-            if record["state"] != "ISSUING" and pending is None:
+            unpublished = (record["state"] == "UPLOADING" and record.get("mailbox")
+                           and not record["mailbox"].get("published"))
+            if not unpublished and record["state"] != "ISSUING" and not record.get(
+                "activation_request",
+            ):
                 continue
-            rows = [row for row in self.store.public_snapshot()["challenges"]
-                    if row["hotkey"] == record["hotkey"]]
-            exempt = (any(row["state"] == "SYSTEM_NOT_ADMITTED" for row in rows)
-                      and not any(row["state"] != "SYSTEM_NOT_ADMITTED" for row in rows))
-            reference = (PrivateModelSubmission(upload_id, record["file_sha256"],
-                                                record["manifest_sha256"])
-                         if record.get("file_sha256") and not exempt else None)
-            if reference is None:
-                # This is a read of the ORIGINAL formal submission, not a new
-                # eligibility ledger or an inferred/replaced model identity.
-                for row in rows:
-                    private = private_model_source(row)
-                    if (row["hotkey"] == record["hotkey"] and private is not None
-                            and private.upload_id == upload_id
-                            and row["state"] != "SYSTEM_NOT_ADMITTED"):
-                        reference = private
-                        break
-            uid, finalized = self.registration(record["hotkey"])
+            retry = record.get("issue_retry", {})
+            if retry.get("retry_after", 0) > now:
+                continue
+            attempts = retry.get("attempts", 0) + 1
+            # Persist the cooldown BEFORE external I/O, including a lost response
+            # or owner crash. Only this original upload record owns retry state.
+            record = {**record, "issue_retry": {
+                "attempts": attempts,
+                "retry_after": now + min(300, 30 * 2 ** min(attempts - 1, 4)),
+                "error": retry.get("error"),
+            }}
+            stored = self._replace(stored, record)
             try:
-                self.store.require_upload_eligible(record["hotkey"], uid=uid,
-                                                   finalized_block=finalized, reference=reference)
+                self._issue_record(stored, record, unpublished=bool(unpublished))
             except ValueError:
-                if pending is not None:
-                    self._replace(stored, {k: v for k, v in record.items()
-                                           if k != "activation_request"})
+                # An original eligibility refusal is not a Cloudflare failure.
+                current, latest = self._read(upload_id)
+                self._replace(current, {k: v for k, v in latest.items() if k != "issue_retry"})
                 raise
-            if pending is not None:
-                cleared = {"activation_request", "cleanup"}
-                if exempt:
-                    cleared |= {"file_sha256", "manifest_sha256", "manifest", "size_bytes"}
-                record = {**{k: v for k, v in record.items() if k not in cleared},
-                          "activation_position": pending["position"],
-                          "activation_block_hash": pending["block_hash"],
-                          "generation": record["generation"] + 1, "state": "ISSUING",
-                          "retire_parent": bool(record["parent_token_id"]), "mailbox": None}
-                stored = self._replace(stored, record)
-            if reference is not None and record.get("file_sha256") is None:
-                record = {**record, "file_sha256": reference.file_sha256,
-                          "manifest_sha256": reference.manifest_sha256}
-                stored = self._replace(stored, record)
-            # Management, credentials, signing and encryption all stay on control.
-            result = self.control.handle("issue", record)
-            if set(result) != {"parent_token_id", "retire_parent", "expires_at", "mailbox"}:
-                raise RuntimeError("private control response has an invalid shape")
-            self._replace(stored, {**record, **result, "state": "UPLOADING"})
-            self.republish_mailbox(upload_id)
+            except Exception:
+                current, latest = self._read(upload_id)
+                if (latest["state"] == "UPLOADING" and not latest.get("activation_request")
+                        and (latest.get("mailbox") or {}).get("published")):
+                    # The final CAS committed but its response was lost. Durable
+                    # completion, not a second mint/retry, decides success.
+                    return True
+                self._replace(current, {**latest, "issue_retry": {
+                    **record["issue_retry"], "error": "PRIVATE_UPLOAD_ISSUANCE_FAILED",
+                }})
+                raise
             return True
         return False
+
+    def maintenance_status(self) -> dict[str, str | None]:
+        """Rebuild public errors from original small CAS records, also after restart.
+
+        A different mailbox's success cannot erase an outstanding failure. This
+        is a read-only projection, not another failure list/queue or authority.
+        """
+        status = {"private_upload_error": None, "private_upload_cleanup_error": None}
+        for name in self.objects.list_names("uploads/"):
+            if name.count("/") != 1 or not name.endswith(".json"):
+                continue
+            _, record = self._read(name[8:-5])
+            if (record.get("issue_retry") or {}).get("error"):
+                status["private_upload_error"] = "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+            if record.get("cleanup") == "pending":
+                status["private_upload_cleanup_error"] = "PRIVATE_UPLOAD_CLEANUP_FAILED"
+        return status
+
+    def _issue_record(self, stored, record: dict, *, unpublished: bool) -> None:
+        upload_id = record["upload_id"]
+        if unpublished:
+            self.republish_mailbox(upload_id)
+            return
+        pending = record.get("activation_request")
+        rows = [row for row in self.store.public_snapshot()["challenges"]
+                if row["hotkey"] == record["hotkey"]]
+        exempt = (any(row["state"] == "SYSTEM_NOT_ADMITTED" for row in rows)
+                  and not any(row["state"] != "SYSTEM_NOT_ADMITTED" for row in rows))
+        reference = (PrivateModelSubmission(upload_id, record["file_sha256"],
+                                            record["manifest_sha256"])
+                     if record.get("file_sha256") and not exempt else None)
+        if reference is None:
+            # Read the ORIGINAL formal submission, not a new eligibility ledger.
+            for row in rows:
+                private = private_model_source(row)
+                if (private is not None and private.upload_id == upload_id
+                        and row["state"] != "SYSTEM_NOT_ADMITTED"):
+                    reference = private
+                    break
+        uid, finalized = self.registration(record["hotkey"])
+        try:
+            self.store.require_upload_eligible(record["hotkey"], uid=uid,
+                                               finalized_block=finalized, reference=reference)
+        except ValueError:
+            if pending is not None:
+                self._replace(stored, {k: v for k, v in record.items()
+                                       if k != "activation_request"})
+            raise
+        if pending is not None:
+            cleared = {"activation_request", "cleanup"}
+            if exempt:
+                cleared |= {"file_sha256", "manifest_sha256", "manifest", "size_bytes"}
+            record = {**{k: v for k, v in record.items() if k not in cleared},
+                      "activation_position": pending["position"],
+                      "activation_block_hash": pending["block_hash"],
+                      "generation": record["generation"] + 1, "state": "ISSUING",
+                      "retire_parent": bool(record["parent_token_id"]), "mailbox": None}
+            stored = self._replace(stored, record)
+        if reference is not None and record.get("file_sha256") is None:
+            record = {**record, "file_sha256": reference.file_sha256,
+                      "manifest_sha256": reference.manifest_sha256}
+            stored = self._replace(stored, record)
+        # Management, credentials, signing and encryption all stay on control.
+        result = self.control.handle("issue", record)
+        if set(result) != {"parent_token_id", "retire_parent", "expires_at", "mailbox"}:
+            raise RuntimeError("private control response has an invalid shape")
+        self._replace(stored, {**record, **result, "state": "UPLOADING"})
+        self.republish_mailbox(upload_id)
 
     def republish_mailbox(self, upload_id: str) -> None:
         stored, record = self._read(upload_id)
         if record is None or record["state"] != "UPLOADING" or self.control is None:
             raise ValueError("private mailbox is not available")
         self.control.handle("publish", record)
-        self._replace(stored, {**record, "mailbox": {**record["mailbox"], "published": True}})
+        self._replace(stored, {**{k: v for k, v in record.items() if k != "issue_retry"},
+                               "mailbox": {**record["mailbox"], "published": True}})
 
     def _seal_ready(self, reference: PrivateModelSubmission, hotkey: str):
         try:

@@ -244,8 +244,13 @@ def test_mailbox_lost_publish_replays_exact_ciphertext_after_cold_restart(setup,
         ctx.uploads.issue_pending(now=NOW)
     blob = next(iter(ctx.mailbox.values()))
     monkeypatch.setattr(ctx.uploads.control, "publish_mailbox", original)
-    assert ctx.uploads.issue_pending(now=NOW)
+    assert not ctx.uploads.issue_pending(now=NOW)
+    assert ctx.uploads.maintenance_status()["private_upload_error"] == (
+        "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+    )
+    assert ctx.uploads.issue_pending(now=NOW + 30)
     assert next(iter(ctx.mailbox.values())) == blob
+    assert ctx.uploads.maintenance_status()["private_upload_error"] is None
 
 
 @pytest.mark.parametrize("alter", ["other-validator", "other-owner", "other-chain", "tamper"])
@@ -459,6 +464,257 @@ def test_native_scanner_activation_is_not_a_submission_and_ready_keeps_actual_s(
         assert len(challenges) == 1 and challenges[0]["block_height"] == 151
         assert challenges[0]["attempts"] == 0
         assert uploads._read(reference.upload_id)[1]["activation_position"] == [150, 2, 3]
+
+
+def test_failed_cleanup_reactivation_can_scan_then_clean_before_reissue(setup, monkeypatch):
+    from validator import chain
+
+    ctx = setup
+    reference = transfer(ctx)
+    now = NOW + CREDENTIAL_TTL + 1
+    delete = ctx.uploads.staging.delete_object
+    monkeypatch.setattr(ctx.uploads.staging, "delete_object",
+                        lambda **_kw: (_ for _ in ()).throw(OSError("delete unavailable")))
+    with pytest.raises(OSError):
+        ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                    finalized_timestamp=now, now=now)
+    assert ctx.uploads._read(reference.upload_id)[1]["cleanup"] == "pending"
+    signature = KEY.sign(activation_message(GENESIS, KEY.ss58_address))
+
+    async def commitments(_client, *, netuid, block_height):
+        block_hash = f"{block_height:064x}"
+        return block_hash, ([ChainCommitment(
+            KEY.ss58_address, netuid, block_hash, ChainPosition(block_height, 1, 1),
+            UploadActivation(signature).encode(),
+        )] if block_height == 201 else [])
+
+    async def finalized():
+        return 202
+
+    monkeypatch.setattr(chain, "finalized_commitments", commitments)
+    result = asyncio.run(chain.scan_finalized_blocks(
+        SimpleNamespace(finalized_block=finalized), ctx.store, netuid=120,
+        track_start_block=150, private_uploads=ctx.uploads,
+    ))
+    assert result.submissions_found == 0 and ctx.store.chain_cursor()[0] == 202
+    record = ctx.uploads._read(reference.upload_id)[1]
+    assert record["activation_request"]["position"] == [201, 1, 1]
+    assert record["generation"] == 1 and record["cleanup"] == "pending"
+    assert not ctx.uploads.issue_pending(now=now)  # No credentials during deletion.
+    with pytest.raises(RuntimeError, match="scan"):
+        ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=203,
+                                    finalized_timestamp=now, now=now)
+    monkeypatch.setattr(ctx.uploads.staging, "delete_object", delete)
+    assert ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=202,
+                                      finalized_timestamp=now, now=now) == 2
+    ctx.uploads.registration = lambda _h: (9, 202)
+    assert ctx.uploads.issue_pending(now=now)
+    record = ctx.uploads._read(reference.upload_id)[1]
+    assert record["generation"] == 2 and record["activation_position"] == [201, 1, 1]
+    assert "cleanup" not in record and ctx.store.public_snapshot()["challenges"] == []
+
+
+def test_mailbox_issue_retry_survives_cold_owner_and_clears_only_after_recovery(setup, monkeypatch):
+    from copy import copy
+
+    ctx = setup
+    activate(ctx)
+    control = ctx.uploads.control.handle
+    calls = []
+
+    def denied(operation, record):
+        calls.append(operation)
+        raise RuntimeError("fixture-secret endpoint authorization detail")
+
+    monkeypatch.setattr(ctx.uploads.control, "handle", denied)
+    upload_id = upload_registration_id(GENESIS, KEY.ss58_address)
+    now = NOW
+    for attempt in range(1, 7):
+        with pytest.raises(RuntimeError):
+            ctx.uploads.issue_pending(now=now)
+        retry = ctx.uploads._read(upload_id)[1]["issue_retry"]
+        assert retry["attempts"] == attempt
+        assert 30 <= retry["retry_after"] - now <= 300
+        assert retry["error"] == "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+        # Fresh process projection and cooldown both come from the SAME original CAS.
+        cold = copy(ctx.uploads)
+        cold._issue_after = ""
+        assert cold.maintenance_status()["private_upload_error"] == "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+        assert not cold.issue_pending(now=retry["retry_after"] - 1)
+        assert len(calls) == attempt
+        now = retry["retry_after"]
+    assert b"fixture-secret" not in ctx.uploads._read(upload_id)[0].body
+    monkeypatch.setattr(ctx.uploads.control, "handle", control)
+    assert cold.issue_pending(now=now)
+    assert cold.maintenance_status()["private_upload_error"] is None
+    assert "issue_retry" not in cold._read(upload_id)[1]
+    assert ctx.store.public_snapshot()["challenges"] == []
+
+
+def test_another_mailbox_success_does_not_clear_original_durable_issue_error(setup, monkeypatch):
+    ctx = setup
+    activate(ctx)
+    control = ctx.uploads.control.handle
+
+    def denied(operation, record):
+        if record["hotkey"] == KEY.ss58_address:
+            raise RuntimeError("management unavailable")
+        return control(operation, record)
+
+    monkeypatch.setattr(ctx.uploads.control, "handle", denied)
+    with pytest.raises(RuntimeError):
+        ctx.uploads.issue_pending(now=NOW)
+    activate(ctx, key=SIGNER)
+    assert ctx.uploads.issue_pending(now=NOW)
+    assert ctx.uploads.maintenance_status()["private_upload_error"] == (
+        "PRIVATE_UPLOAD_ISSUANCE_FAILED"
+    )
+
+
+def test_final_mailbox_cas_response_loss_uses_original_completed_fact(setup, monkeypatch):
+    ctx = setup
+    activate(ctx)
+    replace_record = ctx.uploads._replace
+
+    def lost(stored, record):
+        result = replace_record(stored, record)
+        if (record.get("mailbox") or {}).get("published"):
+            raise OSError("final CAS response lost")
+        return result
+
+    monkeypatch.setattr(ctx.uploads, "_replace", lost)
+    assert ctx.uploads.issue_pending(now=NOW)
+    assert not ctx.uploads.issue_pending(now=NOW)
+    assert ctx.events == ["parent", "mint"] and len(ctx.mailbox) == 1
+    assert ctx.uploads.maintenance_status() == {
+        "private_upload_error": None, "private_upload_cleanup_error": None,
+    }
+
+
+def test_pending_cleanup_error_survives_other_cleanup_and_cold_status(setup, monkeypatch):
+    from copy import copy
+
+    ctx = setup
+    reference = transfer(ctx)
+    activate(ctx, key=SIGNER)
+    ctx.uploads.issue_pending(now=NOW)
+    other_id = upload_registration_id(GENESIS, SIGNER.ss58_address)
+    ctx.uploads.staging.put_object(Bucket="affinemodel",
+                                   Key=f"uploads/v1/{other_id}/part-00000", Body=b"fixture")
+    delete = ctx.uploads.staging.delete_object
+
+    def failure(**kwargs):
+        if reference.upload_id in kwargs["Key"]:
+            raise OSError("original prefix delete failed")
+        return delete(**kwargs)
+
+    monkeypatch.setattr(ctx.uploads.staging, "delete_object", failure)
+    now = NOW + CREDENTIAL_TTL + 1
+    # Start immediately after B so the original bounded/wrapping iterator visits A first.
+    ctx.uploads._gc_after = ctx.uploads._record_name(other_id)
+    with pytest.raises(OSError):
+        ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                    finalized_timestamp=now, now=now)
+    assert ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                      finalized_timestamp=now, now=now) in (0, 1)
+    assert copy(ctx.uploads).maintenance_status()["private_upload_cleanup_error"] == (
+        "PRIVATE_UPLOAD_CLEANUP_FAILED"
+    )
+    monkeypatch.setattr(ctx.uploads.staging, "delete_object", delete)
+    ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                finalized_timestamp=now, now=now)
+    assert copy(ctx.uploads).maintenance_status()["private_upload_cleanup_error"] is None
+
+
+def test_owner_maintenance_keeps_gc_and_durable_issue_status_independent(setup, monkeypatch):
+    from datetime import UTC, datetime
+
+    from scoring.spec import parse_track_spec
+    from tests.scoring.test_spec import valid_spec
+    from tests.validator.test_publication import MemoryS3 as PublicMemoryS3
+    from validator import run
+    from validator.publication import build_public_artifacts, decode_weight_artifact
+    from validator.weights import WeightChainState
+
+    ctx = setup
+    activate(ctx)
+    calls = []
+    control = ctx.uploads.control.handle
+
+    def denied(_operation, _record):
+        calls.append("issue")
+        raise RuntimeError("private backend endpoint and fixture-secret")
+
+    monkeypatch.setattr(ctx.uploads.control, "handle", denied)
+    reclaim = PrivateUploads.reclaim_expired
+
+    def observed_gc(worker, **kwargs):
+        calls.append("gc")
+        return reclaim(worker, **kwargs)
+
+    monkeypatch.setattr(PrivateUploads, "reclaim_expired", observed_gc)
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def block_info(self, _height):
+            return SimpleNamespace(hash="0x" + GENESIS)
+
+        async def finalized_block(self):
+            return 200
+
+        async def at(self, _height):
+            return self
+
+        async def timestamp(self):
+            return datetime.fromtimestamp(NOW, UTC)
+
+        async def read(self, _field, **_kwargs):
+            return 9
+
+    monkeypatch.setattr(run.bt, "Client", lambda *_a, **_kw: Client())
+    track = parse_track_spec(valid_spec())
+    public = PublicMemoryS3()
+    publisher = S3Repository(public, bucket="fixture", prefix="test")
+
+    def publish(status, block):
+        if block > 200:
+            ctx.store.advance_chain_cursor(block, f"{block:064x}")
+        chain = WeightChainState(
+            finalized_block=block, uid_by_hotkey={track.initial_champion.hotkey: 0},
+            min_allowed_weights=1, max_weight=1.0, weights_rate_limit=1,
+            last_update_by_hotkey={},
+        )
+        artifacts = build_public_artifacts(
+            ctx.store, track, chain, version_key=0,
+            inventory_status={"allocated_stages": [], **status},
+        )
+        assert artifacts is not None
+        asyncio.run(publisher.publish(artifacts))
+        weights = decode_weight_artifact(public.objects["test/weights.json"])
+        assert weights.source_block == block and weights.plan.uids == (0,)
+        assert json.loads(public.objects["test/status.json"])["inventory"] == status
+
+    for block in (200, 201):
+        status = asyncio.run(run._reclaim_private_uploads(
+            ctx.uploads, database=ctx.root / "state.db", network="finney", archive_endpoints=None,
+        ))
+        assert status == {"private_upload_error": "PRIVATE_UPLOAD_ISSUANCE_FAILED",
+                          "private_upload_cleanup_error": None}
+        publish(status, block)
+    assert calls == ["issue", "gc", "gc"]
+    monkeypatch.setattr(ctx.uploads.control, "handle", control)
+    monkeypatch.setattr("validator.uploads.time.time", lambda: NOW + 30)
+    status = asyncio.run(run._reclaim_private_uploads(
+        ctx.uploads, database=ctx.root / "state.db", network="finney", archive_endpoints=None,
+    ))
+    assert status == {"private_upload_error": None, "private_upload_cleanup_error": None}
+    publish(status, 202)
+    assert ctx.store.public_snapshot()["challenges"] == []
 
 
 def test_missing_original_part_can_be_repaired_without_replacing_ready_or_s(setup):

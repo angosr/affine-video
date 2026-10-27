@@ -22,16 +22,22 @@ def test_monitor_inventory_and_disclosure_error_recovery(monkeypatch):
         "observed_at_ns": 199_000_000_000, "disclosure_observed_at_ns": 198_000_000_000,
         "ready_batches": 4, "producing_batches": 0, "target_batches": 2,
         "refresh_error": "INVENTORY_REFRESH_FAILED", "disclosure_error": "DATA_DISCLOSURE_FAILURE",
+        "private_upload_error": "PRIVATE_UPLOAD_ISSUANCE_FAILED",
+        "private_upload_cleanup_error": "PRIVATE_UPLOAD_CLEANUP_FAILED",
     }
     status = {"participants": [], "inventory": inventory}
     failed = render_status(status, color=False)
     assert "INVENTORY_REFRESH_FAILED" in failed and "DATA_DISCLOSURE_FAILURE" in failed
+    assert "PRIVATE_UPLOAD_ISSUANCE_FAILED" in failed and "PRIVATE_UPLOAD_CLEANUP_FAILED" in failed
     assert "1970-01-01T00:03:19+00:00" in failed
     assert "1970-01-01T00:03:18+00:00" in failed
-    inventory.update(refresh_error=None, disclosure_error=None)
+    inventory.update(refresh_error=None, disclosure_error=None, private_upload_error=None,
+                     private_upload_cleanup_error=None)
     recovered = render_status(status, color=False)
     assert "INVENTORY_REFRESH_FAILED" not in recovered
     assert "DATA_DISCLOSURE_FAILURE" not in recovered and "STALE" not in recovered
+    assert "PRIVATE_UPLOAD_ISSUANCE_FAILED" not in recovered
+    assert "PRIVATE_UPLOAD_CLEANUP_FAILED" not in recovered
     assert "4 ready / 0 producing / 2 target" in recovered
 
 
