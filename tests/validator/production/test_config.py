@@ -147,7 +147,7 @@ def test_evaluator_artifact_selection_excludes_hidden_source_inputs(tmp_path) ->
 
 
 def test_runtime_verification_uses_a_bound_image_descriptor_not_an_archive(tmp_path, monkeypatch):
-    from validator.production import environment
+    from validator.production import commitment, environment
 
     raw = document(tmp_path)
     raw["runtime"]["oci_image"] = "runtime/image.json"
@@ -178,10 +178,23 @@ def test_runtime_verification_uses_a_bound_image_descriptor_not_an_archive(tmp_p
         digest = hashlib.sha256(payload).hexdigest()
         artifacts.append(Artifact(name, digest, len(payload), f"artifacts/{digest}"))
     manifest = ArtifactManifest(tuple(artifacts))
+    original_sha = commitment._file_sha256
+    hashed = []
+
+    def count_hash(path):
+        hashed.append(path)
+        return original_sha(path)
+
+    monkeypatch.setattr(commitment, "_file_sha256", count_hash)
     assert config.verify_manifest(manifest) == image
     assert config.verify_evaluator_manifest(manifest) == image
     assert config.verify_manifest(manifest) == image
     assert len(checked) == 3  # Actual source/lock validation is never skipped.
+    assert all(hashed.count(config.artifact_root / name) == 2 for name in files)
+    selected = config.evaluator_artifact_names(manifest)
+    assert all(hashed.count(config.evaluator_artifact_root / name) == 1 for name in selected)
+    assert len(hashed) == 2 * len(files) + len(selected)
+    assert not (config.work_dir / "artifact-verification").exists()
     assert not list(tmp_path.rglob("*.tar"))
     image["source_sha256"] = "00" * 32
     (config.artifact_root / config.runtime.oci_image).write_bytes(canonical_json(image))

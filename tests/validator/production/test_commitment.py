@@ -176,7 +176,9 @@ def test_source_cache_binding_requires_exact_leaf_and_sample_coverage(tmp_path) 
         )
 
 
-def test_artifact_manifest_is_canonical_and_verifies_local_bytes(tmp_path) -> None:
+def test_artifact_manifest_is_canonical_and_verifies_local_bytes(tmp_path, monkeypatch) -> None:
+    from validator.production import commitment
+
     content = b"pinned runtime bytes"
     (tmp_path / "runtime.tar").write_bytes(content)
     artifact = Artifact(
@@ -187,57 +189,28 @@ def test_artifact_manifest_is_canonical_and_verifies_local_bytes(tmp_path) -> No
     )
     manifest = ArtifactManifest((artifact,))
 
+    original_sha = commitment._file_sha256
+    hashed = []
+
+    def count_hash(path):
+        hashed.append(path)
+        return original_sha(path)
+
+    monkeypatch.setattr(commitment, "_file_sha256", count_hash)
     manifest.verify_local(tmp_path)
     assert len(manifest.digest) == 64
     assert ArtifactManifest.decode(canonical_json(manifest.document())) == manifest
+    ArtifactManifest.decode(manifest.encode()).verify_local(tmp_path)
+    assert hashed == [tmp_path / "runtime.tar"] * 2
+
+    (tmp_path / "runtime.tar").write_bytes(b"x" * len(content))
+    with pytest.raises(ValueError, match="digest"):
+        manifest.verify_local(tmp_path)
+    assert len(hashed) == 3
 
     (tmp_path / "runtime.tar").write_bytes(b"changed")
     with pytest.raises(ValueError, match="wrong size"):
         manifest.verify_local(tmp_path)
-
-
-def test_same_host_asset_verification_cache_never_hides_changed_bytes(tmp_path, monkeypatch):
-    from validator.production import commitment
-
-    asset = tmp_path / "weights"
-    asset.write_bytes(b"same-size")
-    alias = tmp_path / "readonly-view"
-    alias.mkdir()
-    (alias / "weights").hardlink_to(asset)
-    manifest = ArtifactManifest((Artifact(
-        "weights", hashlib.sha256(b"same-size").hexdigest(), 9, "artifacts/weights",
-    ),))
-    cache = tmp_path / "verified.json"
-    # Simulated settled filesystem identity, no real waiting or large weights.
-    monkeypatch.setattr(commitment, "time_ns", lambda: asset.stat().st_ctime_ns + 2_000_000_000)
-    sha = commitment._file_sha256
-    calls = []
-    def count(path):
-        calls.append(path)
-        return sha(path)
-    monkeypatch.setattr(commitment, "_file_sha256", count)
-    manifest.verify_local(tmp_path, verification_cache=cache)
-    fresh = ArtifactManifest.decode(manifest.encode())
-    fresh.verify_local(tmp_path, verification_cache=cache)
-    assert len(calls) == 1  # Persisted cache survives a new verifier instance.
-    fresh.verify_local(alias, verification_cache=cache)
-    assert len(calls) == 1  # The same inode under a different runtime mount path.
-    (tmp_path / "new-hardlink").hardlink_to(asset)
-    fresh.verify_local(tmp_path, verification_cache=cache)
-    assert len(calls) == 2  # Creating a new view changed ctime; conservatively rehash.
-    replacement = tmp_path / "replacement"
-    replacement.write_bytes(b"same-size")
-    replacement.replace(asset)
-    fresh.verify_local(tmp_path, verification_cache=cache)
-    assert len(calls) == 3  # Same path/size/SHA claim, but a different inode.
-    asset.write_bytes(b"corrupted")
-    with pytest.raises(ValueError, match="digest"):
-        fresh.verify_local(tmp_path, verification_cache=cache)
-    assert len(calls) == 4
-    cache.write_text("broken")
-    asset.write_bytes(b"same-size")
-    fresh.verify_local(tmp_path, verification_cache=cache)
-    assert len(calls) == 5
 
 
 def test_artifact_manifest_must_cover_every_runtime_file(tmp_path) -> None:

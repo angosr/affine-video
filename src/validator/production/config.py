@@ -82,7 +82,6 @@ class ProducerConfig:
                       if item.logical_name in files or item.logical_name.startswith(prefixes))
         manifest.verify_local(
             self.artifact_root, logical_names=names,
-            verification_cache=self.work_dir / "artifact-verification/assets.json",
         )
         from validator.production.environment import verify_runtime_environment
 
@@ -136,7 +135,6 @@ class ProducerConfig:
         names = self.evaluator_artifact_names(manifest)
         manifest.verify_local(
             self.evaluator_artifact_root, logical_names=names,
-            verification_cache=self.work_dir / "artifact-verification/assets.json",
         )
         manifest.verify_runtime_coverage(
             self.evaluator_artifact_root,

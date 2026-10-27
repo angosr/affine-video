@@ -383,7 +383,6 @@ class ProducerService:
             expected_root=self.track.source_pool_merkle_root,
             expected_commitments=self.track.source_commitment_documents,
             sample_cache=config.artifact_path(config.runtime.sample_cache),
-            verification_cache=config.work_dir / "artifact-verification/assets.json",
         )
         _validate_source_capacity(self.pool, self.track)
         config.work_dir.mkdir(parents=True, exist_ok=True)

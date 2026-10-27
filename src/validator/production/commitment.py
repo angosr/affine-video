@@ -4,13 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import tempfile
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from time import time_ns
 from typing import Any
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -301,10 +297,7 @@ class SourceCacheBinding:
             condition,
         )
 
-    def verify_local(
-        self, pool: SourcePool, sample_cache: str | Path, *,
-        verification_cache: Path | None = None,
-    ) -> None:
+    def verify_local(self, pool: SourcePool, sample_cache: str | Path) -> None:
         """Reject an ID-preserving substitution of any encoded source input."""
 
         if pool.root != self.source_pool_merkle_root:
@@ -313,18 +306,15 @@ class SourceCacheBinding:
         index = root / "index.json"
         text = root / "text.safetensors"
         condition = root / "cond.safetensors"
-        if self.condition_sha256 is None and condition.exists():
-            raise ValueError("unexpected encoded sample conditions are present")
-        expected = [(index, self.index_sha256, "index"), (text, self.text_sha256, "text")]
-        if self.condition_sha256 is not None:
-            expected.append((condition, self.condition_sha256, "conditions"))
-        for path, digest, label in expected:
-            try:
-                ArtifactManifest((Artifact(
-                    path.name, digest, path.stat().st_size, f"artifacts/{digest}",
-                ),)).verify_local(root, verification_cache=verification_cache)
-            except ValueError as exc:
-                raise ValueError(f"encoded sample {label} differs from its source binding") from exc
+        if _file_sha256(index) != self.index_sha256:
+            raise ValueError("encoded sample index differs from its source binding")
+        if _file_sha256(text) != self.text_sha256:
+            raise ValueError("encoded sample text differs from its source binding")
+        if self.condition_sha256 is None:
+            if condition.exists():
+                raise ValueError("unexpected encoded sample conditions are present")
+        elif _file_sha256(condition) != self.condition_sha256:
+            raise ValueError("encoded sample conditions differ from their source binding")
 
         def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             result: dict[str, Any] = {}
@@ -359,7 +349,6 @@ def load_bound_source_pool(
     expected_root: str,
     expected_commitments: tuple[dict[str, str], ...] | None = None,
     sample_cache: str | Path,
-    verification_cache: Path | None = None,
 ) -> SourcePool:
     """Load the only source pool whose committed inputs may enter runtime."""
 
@@ -369,7 +358,7 @@ def load_bound_source_pool(
     if expected_commitments is not None and pool.public_commitments() != expected_commitments:
         raise ValueError("source pool differs from the public selection index")
     binding = SourceCacheBinding.decode(source_binding)
-    binding.verify_local(pool, sample_cache, verification_cache=verification_cache)
+    binding.verify_local(pool, sample_cache)
     return pool
 
 
@@ -483,25 +472,12 @@ class ArtifactManifest:
         root: str | Path,
         *,
         logical_names: tuple[str, ...] | None = None,
-        verification_cache: Path | None = None,
     ) -> None:
         base = Path(root)
         selected = None if logical_names is None else set(logical_names)
         known = {artifact.logical_name for artifact in self.artifacts}
         if selected is not None and (not selected or not selected <= known):
             raise ValueError("selected artifact names are empty or absent from the manifest")
-        cached = {}
-        if verification_cache is not None:
-            try:
-                stat = verification_cache.stat()
-                if (stat.st_uid == os.geteuid() and not stat.st_mode & 0o077
-                        and stat.st_size <= 2 * 1024 * 1024):
-                    payload = json.loads(verification_cache.read_bytes())
-                    if isinstance(payload, dict):
-                        cached = payload
-            except (OSError, ValueError):
-                pass  # A cache never authorizes content; a miss requires SHA.
-        verified = {}
         for artifact in self.artifacts:
             if selected is not None and artifact.logical_name not in selected:
                 continue
@@ -510,43 +486,8 @@ class ArtifactManifest:
                 raise ValueError(
                     f"artifact is missing or has the wrong size: {artifact.logical_name}"
                 )
-            stat = path.stat()
-            identity = [artifact.sha256, stat.st_dev, stat.st_ino, stat.st_size,
-                        stat.st_mtime_ns, stat.st_ctime_ns]
-            # The same immutable bind/hardlink may have different producer and
-            # evaluator paths. Reuse only its actual filesystem identity + SHA.
-            key = f"{stat.st_dev}:{stat.st_ino}:{artifact.sha256}"
-            stable = time_ns() - max(stat.st_mtime_ns, stat.st_ctime_ns) >= 1_000_000_000
-            if stable and cached.get(key) == identity:
-                verified[key] = identity
-                continue
-            cached.pop(key, None)
             if _file_sha256(path) != artifact.sha256:
                 raise ValueError(f"artifact digest does not match: {artifact.logical_name}")
-            after = path.stat()
-            if identity != [artifact.sha256, after.st_dev, after.st_ino, after.st_size,
-                            after.st_mtime_ns, after.st_ctime_ns]:
-                raise ValueError(f"artifact changed during verification: {artifact.logical_name}")
-            if stable:
-                verified[key] = identity
-        if verification_cache is not None:
-            temporary = None
-            try:
-                verification_cache.parent.mkdir(parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(
-                    dir=verification_cache.parent, delete=False,
-                ) as out:
-                    temporary = Path(out.name)
-                    out.write(canonical_json({**cached, **verified}))
-                    out.flush()
-                    os.fsync(out.fileno())
-                os.replace(temporary, verification_cache)
-            except OSError:
-                pass  # Fully verified bytes remain usable if caching is unavailable.
-            finally:
-                if temporary is not None:
-                    with suppress(OSError):
-                        temporary.unlink(missing_ok=True)
 
     def verify_runtime_coverage(
         self,
