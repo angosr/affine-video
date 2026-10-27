@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -94,8 +95,8 @@ class PrivateUploads:
         Each process receives its own role values under these same names.
         HTTP needs staging PUT/HEAD; evaluator needs GET/exact DELETE. Neither
         changes the original models writer or per-track private backend.
-        The explicit staging bucket uses R2's auto signing region independently
-        of the authority/public clients and AWS_DEFAULT_REGION.
+        Staging is R2 only; its explicit bucket and auto signing region do not
+        change the authority/public clients or AWS_DEFAULT_REGION.
         """
         names = (
             "AUDIENCE", "GENESIS_HASH", "AUTHORITY_BUCKET", "STAGING_BUCKET",
@@ -115,7 +116,13 @@ class PrivateUploads:
         UploadIntent(audience, genesis, "configuration", 120, "upload", "00" * 32,
                      "00" * 32, 1, "00" * 32, 1)
         authority_url = _validated_endpoint(authority_url)
-        staging_url = _validated_endpoint(staging_url)
+        if not re.fullmatch(
+            r"https://[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?\.r2\.cloudflarestorage\.com/?",
+            staging_url,
+        ):
+            raise ValueError("upload staging requires an R2 S3 API endpoint")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", staging_bucket):
+            raise ValueError("R2 staging bucket name is invalid")
         return cls(
             objects=PrivateObjectStore(
                 _environment_client(authority_url, authority_key, authority_secret),

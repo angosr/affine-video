@@ -205,10 +205,10 @@ def configure_environment(monkeypatch, intent):
     values = {
         "AUDIENCE": intent.audience, "GENESIS_HASH": intent.genesis_hash,
         "AUTHORITY_BUCKET": "original-private",
-        "STAGING_BUCKET": "veda-private-uploads",
+        "STAGING_BUCKET": "affinemodel",
         "AUTHORITY_STORAGE_URL": "https://authority.example",
         "AUTHORITY_ACCESS_KEY": "authority-role", "AUTHORITY_SECRET_ACCESS_KEY": "test-secret",
-        "STAGING_STORAGE_URL": "https://staging.example",
+        "STAGING_STORAGE_URL": "https://" + "a" * 32 + ".r2.cloudflarestorage.com",
         "STAGING_ACCESS_KEY": "staging-role", "STAGING_SECRET_ACCESS_KEY": "test-secret",
     }
     for name, value in values.items():
@@ -267,12 +267,51 @@ def test_upload_factory_requires_explicit_staging_bucket_before_clients(setup, m
         PrivateUploads.from_environment(store=store, max_bytes=10_000)
 
 
-@pytest.mark.parametrize("bucket", ["veda-private-uploads", "another-private-uploads"])
-def test_r2_staging_presigns_exact_bucket_with_auto_region_only(setup, monkeypatch, bucket):
+@pytest.mark.parametrize("endpoint", [
+    "https://project.storage.supabase.co/storage/v1/s3",
+    "https://private-models.example",
+    "https://pub-test.r2.dev",
+    "https://" + "a" * 32 + ".apac.r2.cloudflarestorage.com",
+    "https://" + "a" * 32 + ".r2.cloudflarestorage.com/uploads",
+])
+def test_environment_rejects_non_r2_staging_before_clients(setup, monkeypatch, endpoint):
+    _, intent, _, store = setup
+    from validator import uploads as module
+
+    configure_environment(monkeypatch, intent)
+    monkeypatch.setenv("VEDA_UPLOAD_STAGING_STORAGE_URL", endpoint)
+    monkeypatch.setattr(module, "_environment_client", lambda *_a, **_kw: pytest.fail(
+        "non-R2 staging must be rejected before constructing either client",
+    ))
+    with pytest.raises(ValueError, match="R2 S3 API endpoint"):
+        PrivateUploads.from_environment(store=store, max_bytes=10_000)
+
+
+@pytest.mark.parametrize("bucket", [
+    "affine_video_private", "ab", "a" * 64, "-affinemodel", "affinemodel-", "AffineModel",
+])
+def test_environment_rejects_invalid_r2_bucket_before_clients(setup, monkeypatch, bucket):
+    _, intent, _, store = setup
+    from validator import uploads as module
+
+    configure_environment(monkeypatch, intent)
+    monkeypatch.setenv("VEDA_UPLOAD_STAGING_BUCKET", bucket)
+    monkeypatch.setattr(module, "_environment_client", lambda *_a, **_kw: pytest.fail(
+        "invalid R2 bucket must be rejected before constructing either client",
+    ))
+    with pytest.raises(ValueError, match="R2 staging bucket"):
+        PrivateUploads.from_environment(store=store, max_bytes=10_000)
+
+
+@pytest.mark.parametrize("bucket", ["affinemodel", "another-private-uploads"])
+@pytest.mark.parametrize("jurisdiction", ["", ".eu", ".us", ".fedramp"])
+def test_r2_staging_presigns_exact_bucket_with_auto_region_only(
+    setup, monkeypatch, bucket, jurisdiction,
+):
     _, intent, _, store = setup
     configure_environment(monkeypatch, intent)
     monkeypatch.setenv("VEDA_UPLOAD_STAGING_BUCKET", bucket)
-    endpoint = "https://" + "a" * 32 + ".r2.cloudflarestorage.com"
+    endpoint = "https://" + "a" * 32 + jurisdiction + ".r2.cloudflarestorage.com"
     monkeypatch.setenv("VEDA_UPLOAD_STAGING_STORAGE_URL", endpoint)
     monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-central-1")
     configured = PrivateUploads.from_environment(store=store, max_bytes=10_000)
@@ -292,7 +331,7 @@ def test_r2_staging_presigns_exact_bucket_with_auto_region_only(setup, monkeypat
     assert set(query["X-Amz-SignedHeaders"][0].split(";")) == {"content-length", "host"}
 
 
-@pytest.mark.parametrize("bucket", ["veda-private-uploads", "another-private-uploads"])
+@pytest.mark.parametrize("bucket", ["affinemodel", "another-private-uploads"])
 def test_configured_staging_bucket_covers_parts_repair_and_exact_gc(
     setup, monkeypatch, tmp_path, bucket,
 ):
