@@ -375,6 +375,7 @@ def attach_from_environment(*, host: str, container: str) -> int:
 
     from validator.publication import S3Repository
 
+    management_token = os.environ["CLOUDFLARE_CONTROL_API_TOKEN"]
     endpoint = os.environ["VEDA_UPLOAD_STAGING_STORAGE_URL"]
     match = re.fullmatch(
         r"https://([a-f0-9]{32})(?:\.(eu|us|fedramp))?\.r2\.cloudflarestorage\.com/?",
@@ -408,8 +409,7 @@ def attach_from_environment(*, host: str, container: str) -> int:
             os.environ["VEDA_UPLOAD_AUTHORITY_SECRET_ACCESS_KEY"],
         )
         return attach_evaluator(host=host, container=container, control=MailboxControl(
-            tokens=CloudflareR2Tokens(match[1], os.environ["VEDA_UPLOAD_MANAGEMENT_TOKEN"],
-                                      match[2] or "default"),
+            tokens=CloudflareR2Tokens(match[1], management_token, match[2] or "default"),
             signer=signer, publish_mailbox=publisher.publish_mailbox, endpoint=endpoint,
             bucket=os.environ["VEDA_UPLOAD_STAGING_BUCKET"],
             genesis_hash=os.environ["VEDA_UPLOAD_GENESIS_HASH"],

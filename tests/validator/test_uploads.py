@@ -571,7 +571,9 @@ def test_control_scope_is_fixed_by_configuration_not_incoming_messages(setup, al
     assert ctx.events == []
 
 
-@pytest.mark.parametrize("bad_seed", [None, "mode", "length", "symlink", "identity"])
+@pytest.mark.parametrize("bad_seed", [
+    None, "mode", "length", "symlink", "identity", "missing-manager",
+])
 def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
     setup, tmp_path, monkeypatch, bad_seed,
 ):
@@ -587,7 +589,7 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
         "VEDA_UPLOAD_STAGING_STORAGE_URL": ENDPOINT, "VEDA_UPLOAD_STAGING_BUCKET": "affinemodel",
         "VEDA_UPLOAD_GENESIS_HASH": GENESIS, "VEDA_UPLOAD_SIGNING_SEED_FILE": str(seed),
         "VEDA_UPLOAD_VALIDATOR_IDENTITY": (KEY if bad_seed == "identity" else SIGNER).ss58_address,
-        "VEDA_UPLOAD_MANAGEMENT_TOKEN": "fixture-control-token",
+        "CLOUDFLARE_CONTROL_API_TOKEN": "fixture-control-token",
         "STORAGE_URL": "https://public.example", "ACCESS_KEY": "fixture-public-access",
         "SECRET_ACCESS_KEY": "fixture-public-secret",
         "VEDA_UPLOAD_AUTHORITY_STORAGE_URL": "https://authority.example",
@@ -597,6 +599,10 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
     }
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setenv("VEDA_UPLOAD_MANAGEMENT_TOKEN", "fixture-obsolete-manager")
+    monkeypatch.setenv("Token_value", "fixture-storage-token-not-manager")
+    if bad_seed == "missing-manager":
+        monkeypatch.delenv("CLOUDFLARE_CONTROL_API_TOKEN")
     closed, clients, attached = [], [], []
     authority = ctx.uploads.objects._client
     monkeypatch.setattr(authority, "close", lambda: closed.append("authority"), raising=False)
@@ -612,6 +618,7 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
 
     def attach(*, host, container, control):
         assert (host, container) == ("gpu-veda", "veda-evaluator")
+        assert control.tokens._token == "fixture-control-token"
         assert control.signer.ss58_address == SIGNER.ss58_address
         assert control.objects._client is authority
         activate(ctx)
@@ -624,7 +631,12 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
 
     monkeypatch.setattr("validator.uploads._environment_client", client)
     monkeypatch.setattr("validator.uploads.attach_evaluator", attach)
-    if bad_seed:
+    if bad_seed == "missing-manager":
+        with pytest.raises(KeyError) as failure:
+            attach_from_environment(host="gpu-veda", container="veda-evaluator")
+        assert failure.value.args == ("CLOUDFLARE_CONTROL_API_TOKEN",)
+        assert clients == [] and attached == []
+    elif bad_seed:
         with pytest.raises((ValueError, OSError)):
             attach_from_environment(host="gpu-veda", container="veda-evaluator")
         assert clients == [] and attached == []
@@ -651,7 +663,8 @@ def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(
     outgoing = io.StringIO("VEDA_MAILBOX_REQUEST " + json.dumps(request) + "\n")
     observed = []
     environments = []
-    monkeypatch.setenv("VEDA_UPLOAD_MANAGEMENT_TOKEN", "fixture-control-secret")
+    monkeypatch.setenv("CLOUDFLARE_CONTROL_API_TOKEN", "fixture-control-secret")
+    monkeypatch.setenv("Token_value", "fixture-storage-token")
 
     def process(argv, **kwargs):
         observed.append(argv)
@@ -668,7 +681,8 @@ def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(
     assert set(response["result"]) == {"parent_token_id", "retire_parent", "expires_at", "mailbox"}
     assert "docker attach --sig-proxy=false veda-evaluator" in observed[0][-1]
     assert "docker start --attach --interactive veda-evaluator" in observed[0][-1]
-    assert "VEDA_UPLOAD_MANAGEMENT_TOKEN" not in environments[0]
+    assert "CLOUDFLARE_CONTROL_API_TOKEN" not in environments[0]
+    assert "Token_value" not in environments[0]
     captured = capsys.readouterr()
     assert not captured.out and not captured.err  # No request/response frames in journal output.
 
