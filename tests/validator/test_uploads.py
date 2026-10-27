@@ -384,6 +384,78 @@ def test_gc_pins_original_ready_until_archive_then_exactly_cleans_only_its_prefi
     assert ctx.uploads.staging.objects[("affinemodel", "uploads/v1/another/part")][0] == b"keep"
 
 
+@pytest.mark.parametrize("count,interrupt_after", [
+    (1000, None), (1001, None), (2001, None), (1001, 17),
+])
+def test_gc_deletes_one_page_and_cold_resumes_original_pending_cas(
+    setup, monkeypatch, count, interrupt_after,
+):
+    ctx = setup
+    reference = transfer(ctx)
+    staging = ctx.uploads.staging
+    prefix = f"uploads/v1/{reference.upload_id}/"
+    for index in range(count - 2):  # The original upload has a part and manifest.
+        staging.put_object(Bucket="affinemodel", Key=f"{prefix}extra-{index:04d}", Body=b"small")
+    staging.put_object(Bucket="affinemodel", Key="uploads/v1/another/keep", Body=b"keep")
+    original = ctx.store.public_snapshot()
+    deleted, listings = [], []
+    list_objects, delete_object = staging.list_objects_v2, staging.delete_object
+    fail = interrupt_after is not None
+
+    def list_page(**kwargs):
+        assert kwargs == {"Bucket": "affinemodel", "Prefix": prefix, "MaxKeys": 1000}
+        listings.append(kwargs)
+        return list_objects(**kwargs)
+
+    def delete(**kwargs):
+        assert kwargs["Key"].startswith(prefix) and "revoke" in ctx.events
+        if fail and len(deleted) == interrupt_after:
+            raise OSError("interrupted page deletion")
+        delete_object(**kwargs)
+        deleted.append(kwargs["Key"])
+
+    monkeypatch.setattr(staging, "list_objects_v2", list_page)
+    monkeypatch.setattr(staging, "delete_object", delete)
+    now = NOW + CREDENTIAL_TTL + 1
+    if fail:
+        with pytest.raises(OSError, match="interrupted page"):
+            ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                        finalized_timestamp=now, now=now)
+        assert len(deleted) == interrupt_after and len(listings) == 1
+        assert ctx.uploads._read(reference.upload_id)[1]["cleanup"] == "pending"
+        fail = False
+
+    remaining = count - len(deleted)
+    while remaining:
+        # A new owner reads only the same CAS and existing SQLite facts. No page cursor.
+        with ChallengeStore.readonly(ctx.root / "state.db") as store:
+            cold = PrivateUploads(
+                objects=ctx.uploads.objects, staging_client=staging,
+                staging_bucket="affinemodel", staging_prefix="uploads/v1",
+                genesis_hash=GENESIS, store=store, max_bytes=10000, control=ctx.uploads.control,
+            )
+            before = len(listings)
+            removed = cold.reclaim_expired(store=store, finalized_block=200,
+                                           finalized_timestamp=now, now=now)
+        assert len(listings) == before + 1
+        assert removed == min(1000, remaining)
+        remaining -= removed
+        record = cold._read(reference.upload_id)[1]
+        assert record["cleanup"] == ("pending" if remaining else "done")
+        assert record["parent_token_id"] is None
+    assert len(deleted) == len(set(deleted)) == count
+    assert ctx.events.count("revoke") == 1
+    assert ctx.store.public_snapshot() == original
+    assert staging.objects == {
+        ("affinemodel", "uploads/v1/another/keep"):
+            staging.objects[("affinemodel", "uploads/v1/another/keep")],
+    }
+    before = len(listings)
+    assert cold.reclaim_expired(store=ctx.store, finalized_block=200,
+                                finalized_timestamp=now, now=now) == 0
+    assert len(listings) == before
+
+
 @pytest.mark.parametrize("endpoint", [
     "https://old.supabase.co/storage/v1/s3", "https://public.r2.dev", ENDPOINT + "/path",
 ])

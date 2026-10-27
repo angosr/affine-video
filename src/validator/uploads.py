@@ -793,7 +793,7 @@ class PrivateUploads:
         self, *, store: ChallengeStore, finalized_block: int,
         finalized_timestamp: int, now: int,
     ) -> int:
-        """One prefix per call; original scan fence, reference and cap expiry apply."""
+        """One page of one prefix per call; scan, reference and cap expiry still apply."""
         names = self.objects.list_names("uploads/", limit=16, after=self._gc_after or None)
         if not names:
             self._gc_after = ""
@@ -832,13 +832,14 @@ class PrivateUploads:
                 stored = self._replace(stored, record)
             prefix = f"{self.prefix}/{record['upload_id']}/"
             response = self.staging.list_objects_v2(Bucket=self.bucket, Prefix=prefix, MaxKeys=1000)
-            if response.get("IsTruncated"):
-                raise RuntimeError("private cleanup exceeds its bounded inventory")
             keys = [row["Key"] for row in response.get("Contents", [])]
             if any(not key.startswith(prefix) for key in keys):
                 raise ValueError("private cleanup escaped registration prefix")
             for key in keys:
                 self.staging.delete_object(Bucket=self.bucket, Key=key)
-            self._replace(stored, {**record, "cleanup": "done"})
+            # Re-list the remaining first page next round, including after a crash
+            # partway through deletion. The original CAS stays pending until empty.
+            if not response.get("IsTruncated"):
+                self._replace(stored, {**record, "cleanup": "done"})
             return len(keys)
         return 0
