@@ -238,6 +238,56 @@ def test_activation_and_mailbox_replay_do_not_duplicate_parent_or_opportunity(se
     assert ctx.events.count("parent") == 1 and ctx.store.public_snapshot()["challenges"] == []
 
 
+@pytest.mark.parametrize("cold_owner", [False, True])
+def test_seventeenth_activation_is_reachable_after_full_page_and_owner_restart(setup, cold_owner):
+    from contextlib import nullcontext
+
+    ctx = setup
+    keys = [Keypair.create_from_seed(index.to_bytes(32, "big"), crypto_type=0)
+            for index in range(3, 20)]
+    identities = sorted((upload_registration_id(GENESIS, key.ss58_address), key) for key in keys)
+    uid_by_hotkey = {key.ss58_address: uid for uid, key in enumerate(keys, start=1)}
+    ctx.uploads.registration = lambda hotkey: (uid_by_hotkey[hotkey], 200)
+    for key in keys:
+        activate(ctx, key=key)
+    for _ in range(16):
+        assert ctx.uploads.issue_pending(now=NOW)
+    for upload_id, _ in identities[:16]:
+        assert ctx.uploads._read(upload_id)[1]["mailbox"]["published"]
+    last_id = identities[-1][0]
+    assert ctx.uploads._read(last_id)[1]["state"] == "ISSUING"
+    connection = (ChallengeStore.readonly(ctx.root / "state.db")
+                  if cold_owner else nullcontext(ctx.store))
+    with connection as store:
+        owner = ctx.uploads
+        if cold_owner:
+            # New owner and SQLite connection; only original CAS/provider facts survive.
+            owner = PrivateUploads(
+                objects=ctx.uploads.objects, staging_client=ctx.uploads.staging,
+                staging_bucket="affinemodel", staging_prefix="uploads/v1",
+                genesis_hash=GENESIS, store=store, max_bytes=10000,
+                registration=ctx.uploads.registration, control=ctx.uploads.control,
+            )
+            assert owner._issue_after == ""
+            assert not owner.issue_pending(now=NOW)  # First full page is already complete.
+        assert owner.issue_pending(now=NOW)
+        assert owner._read(last_id)[1]["mailbox"]["published"]
+        assert len(ctx.mailbox) == 17 and ctx.events.count("parent") == 17
+        # A later request before the cursor remains reachable after empty-page wrap.
+        first_id, first_key = identities[0]
+        ctx.store.advance_chain_cursor(201, "cd" * 32)
+        owner.registration = lambda hotkey: (uid_by_hotkey[hotkey], 201)
+        owner.observe_activation(
+            UploadActivation(first_key.sign(activation_message(GENESIS, first_key.ss58_address))),
+            hotkey=first_key.ss58_address, block=201, extrinsic_index=2, event_index=3,
+            block_hash="cd" * 32,
+        )
+        assert owner.issue_pending(now=NOW)
+        assert owner._read(first_id)[1]["generation"] == 2
+        assert ctx.events.count("parent") == 18
+        assert store.public_snapshot()["challenges"] == []
+
+
 def test_mailbox_lost_publish_replays_exact_ciphertext_after_cold_restart(setup, monkeypatch):
     ctx = setup
     activate(ctx)
