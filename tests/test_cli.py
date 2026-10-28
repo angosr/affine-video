@@ -18,6 +18,19 @@ def test_evaluator_cycle_logs_do_not_share_mailbox_stdout(capsys):
     assert json.loads(output.err)["finalized_block"] == 200
 
 
+def test_evaluator_attach_is_one_local_owner_path(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr("validator.uploads.attach_from_environment",
+                        lambda **kwargs: calls.append(kwargs) or 0)
+    main(["evaluator", "attach", "--container", "veda-evaluator"])
+    assert calls == [{"container": "veda-evaluator"}]
+    assert capsys.readouterr().out == ""
+    for host in ("local", "gpu-veda"):
+        with pytest.raises(SystemExit):
+            main(["evaluator", "attach", "--host", host, "--container", "veda-evaluator"])
+    assert calls == [{"container": "veda-evaluator"}]  # No remote/local compatibility mode.
+
+
 def test_private_upload_cli_uses_chain_mailbox_and_returns_unsigned_ready(monkeypatch, capsys):
     from miner import upload as module
     from miner.submit import PrivateModelSubmission

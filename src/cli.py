@@ -93,7 +93,6 @@ def _parser() -> argparse.ArgumentParser:
     attach = evaluator_commands.add_parser(
         "attach", help="control owner: attach one evaluator and answer fixed mailbox operations",
     )
-    attach.add_argument("--host", required=True)
     attach.add_argument("--container", required=True)
     produce = evaluator_commands.add_parser("produce", help="produce private evaluation batches")
     produce.add_argument("--config", required=True)
@@ -283,11 +282,11 @@ def _run_evaluator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
         from validator.uploads import attach_from_environment
 
         try:
-            code = attach_from_environment(host=arguments.host, container=arguments.container)
+            code = attach_from_environment(container=arguments.container)
         except (OSError, RuntimeError, KeyError, ValueError):
             parser.exit(1, "error: evaluator control owner could not attach\n")
         if code:
-            parser.exit(code, "error: evaluator owner SSH exited\n")
+            parser.exit(code, "error: evaluator owner Docker attach exited\n")
         return
     if arguments.command == "policy":
         from validator.production.commitment import canonical_json

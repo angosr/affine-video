@@ -359,28 +359,34 @@ class OwnerMailboxControl:
             return response["result"]
 
 
-def attach_evaluator(*, host: str, container: str, control: MailboxControl) -> int:
-    """Existing control owner wraps its ONE SSH attach, never starts a second writer."""
+def attach_evaluator(*, container: str, control: MailboxControl) -> int:
+    """Production owner attaches ONE local container using the same stdio protocol."""
     import json
     import subprocess
 
-    if any(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", value) is None
-           for value in (host, container)):
-        raise ValueError("owner SSH alias/container name is invalid")
-    # One SSH session, one existing container. A transport reconnect attaches
-    # without restarting the evaluator or its original in-flight opportunity.
-    command = (
-        f'if [ "$(docker inspect --format \'{{{{.State.Running}}}}\' {container})" = true ]; '
-        f"then exec docker attach --sig-proxy=false {container}; "
-        f"else exec docker start --attach --interactive {container}; fi"
-    )
+    if re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", container) is None:
+        raise ValueError("owner container name is invalid")
+    environment = {name: value for name, value in os.environ.items()
+                   if name in {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL"}}
+    # Pin the local daemon, ignoring any inherited remote Docker context/host.
+    docker = ["docker", "--host=unix:///var/run/docker.sock"]
+    try:
+        state = subprocess.run(
+            [*docker, "inspect", "--format", "{{.State.Running}}", container],
+            capture_output=True, text=True, check=True, timeout=15, env=environment,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("owner cannot inspect its local evaluator") from exc
+    if state not in {"true", "false"}:
+        raise RuntimeError("owner received an invalid local container state")
+    # Reconnect never restarts a running writer. No shell, SSH, or new container.
+    command = ([*docker, "attach", "--sig-proxy=false", container] if state == "true"
+               else [*docker, "start", "--attach", "--interactive", container])
     process = subprocess.Popen(
-        ["ssh", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
-         "-o", "ServerAliveCountMax=3", "-T", host, command],
+        command,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
-        env={name: value for name, value in os.environ.items()
-             if name in {"PATH", "HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK", "LANG", "LC_ALL"}},
+        env=environment,
     )
     try:
         while line := process.stdout.readline(262145):
@@ -415,8 +421,8 @@ def attach_evaluator(*, host: str, container: str, control: MailboxControl) -> i
         process.stdout.close()
 
 
-def attach_from_environment(*, host: str, container: str) -> int:
-    """Control service only; none of these secrets/config paths enter the SSH argv."""
+def attach_from_environment(*, container: str) -> int:
+    """Production owner only; secrets/config paths never enter Docker argv/env."""
     import stat
 
     from bittensor.wallet import Keypair
@@ -456,7 +462,7 @@ def attach_from_environment(*, host: str, container: str) -> int:
             os.environ["VEDA_UPLOAD_AUTHORITY_ACCESS_KEY"],
             os.environ["VEDA_UPLOAD_AUTHORITY_SECRET_ACCESS_KEY"],
         )
-        return attach_evaluator(host=host, container=container, control=MailboxControl(
+        return attach_evaluator(container=container, control=MailboxControl(
             tokens=CloudflareR2Tokens(match[1], management_token, match[2] or "default"),
             signer=signer, publish_mailbox=publisher.publish_mailbox, endpoint=endpoint,
             bucket=os.environ["VEDA_UPLOAD_STAGING_BUCKET"],
