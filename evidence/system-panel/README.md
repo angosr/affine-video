@@ -6,15 +6,17 @@ deployed evaluator. Public URLs and the single `weights.json` path stay fixed ac
 
 ## Published evidence
 
-The [r2 release reports and raw GPU logs](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/system_matches/veda-sn120-v2-r2/evidence/README.md)
-retain their original runtime and input identities. Their [inventory](acceptance/inventory.json)
-is a release-specific index, not an authorization for newer source.
+Follow the active track's artifact manifest for its bound acceptance and raw evidence.
+Each report retains its original runtime, hardware and input identities; a historical result
+does not authorize newer source or establish a rerun on different hardware.
+The checked-in [research inventory](acceptance/inventory.json) is a historical index,
+not the active release's acceptance or an additional launch checklist.
 
 [`validator/release.py`](../../src/validator/release.py) verifies runtime-bound acceptance for
 E2 (numerical fidelity), E3 (two-stage GPU execution), and E16 (determinism and error handling).
-Startup also checks runtime integrity, storage and data isolation. Research is not an additional
-seventeen-item launch gate; failed cost or overhead studies are not relabeled as passes.
-The E3 accelerated chain fixture does not establish real-miner rewards or chain transactions.
+Startup also checks runtime integrity, storage and data isolation. Research studies are separate
+from these release requirements. Component tests and accelerated chain fixtures do not establish
+real-miner rewards, chain transactions or complete host-loss recovery.
 
 ## Maintenance tooling
 

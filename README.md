@@ -135,12 +135,8 @@ archiving, confirmed by the `SCORING` state.
    The champion receives this mechanism's full weight
    until replaced or no longer eligible; the registered UID0 baseline is the fallback.
 
-Maintenance releases must retain confirmed champions and spent submission opportunities. A release
-introducing a new track must preserve prior immutable matches by their original keys, hashes and
-identities, without applying new thresholds or relabelling old scores. New match sequence numbers
-belong to the new track namespace. Recovery must verify original finalized chain submissions and
-restore their confirmed outcomes and eligibility before admitting new work. Existing chain
-eligibility and UID0 fallback still apply.
+Maintenance preserves confirmed champions, spent submission opportunities and original match
+records; it does not rejudge past results under new rules.
 
 Infrastructure failures defer and retry the original challenge; they do not count as miner
 losses. Retries preserve already-bound evaluation data and archived stage results rather than
@@ -182,12 +178,10 @@ can consume the same file; do not run a second weight-setting process for the sa
 
 ## Development and verification
 
-Code boundaries are [`miner`](src/miner) (one-shot submission), [`scoring`](src/scoring)
-(selector validation and metrics), and [`validator`](src/validator) (evaluation, publication
-and independent weight setting). Public viewing uses `veda monitor`; evaluator-only operations
-use `veda evaluator run`, `produce`, `policy`, `retry`, `leaderboard`, `challenges` and `challenge`
-(see `uv run veda evaluator --help`). The evaluator and data producer run separately; miners
-and ordinary validators do not run them.
+Code boundaries are [`miner`](src/miner) (submission), [`scoring`](src/scoring) (validation and
+metrics), and [`validator`](src/validator) (evaluation, publication and independent weight setting).
+The evaluator and data producer run separately; miners and ordinary validators do not run them.
+Operator commands are documented by `uv run veda evaluator --help`.
 
 ```bash
 uv run ruff check src tests
@@ -195,5 +189,5 @@ uv run pytest
 ```
 
 GPU-dependent validation needs the frozen runtime in [`Dockerfile.runtime`](Dockerfile.runtime).
-[Runtime verification](evidence/system-panel/README.md) links release identities, raw GPU evidence
-and known operational limits. Research experiments are not additional miner submission requirements.
+[Runtime verification](evidence/system-panel/README.md) explains evidence binding and operational
+limits. Research experiments are not additional miner submission requirements.
