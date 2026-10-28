@@ -430,7 +430,7 @@ def attach_from_environment(*, container: str) -> int:
     from validator.publication import S3Repository
 
     management_token = os.environ["CLOUDFLARE_CONTROL_API_TOKEN"]
-    endpoint = os.environ["VEDA_UPLOAD_STAGING_STORAGE_URL"]
+    endpoint, bucket = _upload_r2_settings()
     match = re.fullmatch(
         r"https://([a-f0-9]{32})(?:\.(eu|us|fedramp))?\.r2\.cloudflarestorage\.com/?",
         endpoint,
@@ -458,24 +458,47 @@ def attach_from_environment(*, container: str) -> int:
     authority = None
     try:
         authority = _environment_client(
-            _validated_endpoint(os.environ["VEDA_UPLOAD_AUTHORITY_STORAGE_URL"]),
-            os.environ["VEDA_UPLOAD_AUTHORITY_ACCESS_KEY"],
-            os.environ["VEDA_UPLOAD_AUTHORITY_SECRET_ACCESS_KEY"],
+            endpoint, profile_name=os.environ["EVALUATOR_PRIVATE_READ_PROFILE"],
         )
         return attach_evaluator(container=container, control=MailboxControl(
             tokens=CloudflareR2Tokens(match[1], management_token, match[2] or "default"),
             signer=signer, publish_mailbox=publisher.publish_mailbox, endpoint=endpoint,
-            bucket=os.environ["VEDA_UPLOAD_STAGING_BUCKET"],
+            bucket=bucket,
             genesis_hash=os.environ["VEDA_UPLOAD_GENESIS_HASH"],
-            objects=PrivateObjectStore(authority,
-                                       bucket=os.environ["VEDA_UPLOAD_AUTHORITY_BUCKET"],
-                                       prefix="evaluation"),
+            objects=PrivateObjectStore(authority, bucket=bucket, prefix="evaluation"),
         ))
     finally:
         if authority is not None:
             authority.close()
         publisher.close()
         client.close()
+
+
+def _upload_r2_settings() -> tuple[str, str]:
+    """Uploads and metadata share the ONE private R2 address and bucket."""
+    retired = (
+        "AUTHORITY_STORAGE_URL", "AUTHORITY_ACCESS_KEY", "AUTHORITY_SECRET_ACCESS_KEY",
+        "AUTHORITY_BUCKET", "STAGING_STORAGE_URL", "STAGING_BUCKET",
+        "STAGING_ACCESS_KEY", "STAGING_SECRET_ACCESS_KEY",
+    )
+    if any("VEDA_UPLOAD_" + name in os.environ for name in retired):
+        raise ValueError("retired upload credentials/address cannot be mixed with private profiles")
+    if any(name in os.environ for name in (
+        "EVALUATOR_PRIVATE_STORAGE_URL", "EVALUATOR_PRIVATE_ACCESS_KEY",
+        "EVALUATOR_PRIVATE_SECRET_ACCESS_KEY",
+    )):
+        raise ValueError("authority profiles cannot be mixed with explicit credentials")
+    endpoint = os.environ["PRIVATE_STORAGE_URL"]
+    if not re.fullmatch(
+        r"https://[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?\.r2\.cloudflarestorage\.com/?",
+        endpoint,
+    ):
+        raise ValueError("upload staging requires an R2 S3 API endpoint")
+    bucket = os.environ["PRIVATE_STORAGE_BUCKET"]
+    if (not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket)
+            or bucket == "affine_video"):
+        raise ValueError("private R2 bucket name is invalid")
+    return endpoint, bucket
 
 
 class PrivateUploads:
@@ -505,36 +528,24 @@ class PrivateUploads:
         self.submission_timestamp: Callable[[int], int] | None = None
 
     @classmethod
-    def from_environment(cls, *, store: ChallengeStore, max_bytes: int) -> PrivateUploads | None:
-        names = (
-            "GENESIS_HASH", "AUTHORITY_BUCKET", "STAGING_BUCKET",
-            "AUTHORITY_STORAGE_URL", "AUTHORITY_ACCESS_KEY", "AUTHORITY_SECRET_ACCESS_KEY",
-            "STAGING_STORAGE_URL", "STAGING_ACCESS_KEY", "STAGING_SECRET_ACCESS_KEY",
-        )
-        values = tuple(os.environ.get(f"VEDA_UPLOAD_{name}") for name in names)
-        if not any(values):
+    def from_environment(
+        cls, *, store: ChallengeStore, max_bytes: int, authority: PrivateObjectStore | None = None,
+    ) -> PrivateUploads | None:
+        if not any(name.startswith("VEDA_UPLOAD_") for name in os.environ):
             return None
-        if not all(values):
-            raise ValueError("all private R2 and authority settings are required")
-        (genesis, bucket, staging_bucket, authority_url, authority_key, authority_secret,
-         staging_url, staging_key, staging_secret) = values
-        if bucket == "affine_video":
-            raise ValueError("upload authority cannot use the public bucket")
-        if not re.fullmatch(
-            r"https://[a-f0-9]{32}(?:\.(?:eu|us|fedramp))?\.r2\.cloudflarestorage\.com/?",
-            staging_url,
-        ):
-            raise ValueError("upload staging requires an R2 S3 API endpoint")
-        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", staging_bucket):
-            raise ValueError("R2 staging bucket name is invalid")
+        endpoint, bucket = _upload_r2_settings()
+        genesis = os.environ["VEDA_UPLOAD_GENESIS_HASH"]
+        profile = os.environ["VEDA_UPLOAD_STAGING_PROFILE"]
+        if not profile.strip():
+            raise ValueError("a named private model profile is required")
+        if (authority is None or authority._bucket != bucket
+                or authority._credential_role != "evaluator"):
+            raise ValueError("uploads require the same configured production authority bucket")
         return cls(
-            objects=PrivateObjectStore(
-                _environment_client(_validated_endpoint(authority_url), authority_key,
-                                    authority_secret), bucket=bucket, prefix="evaluation",
-            ),
+            objects=authority.with_prefix("evaluation"),
             staging_client=_environment_client(
-                staging_url, staging_key, staging_secret, region_name="auto",
-            ), staging_bucket=staging_bucket, staging_prefix="uploads/v1",
+                endpoint, profile_name=profile, region_name="auto",
+            ), staging_bucket=bucket, staging_prefix="uploads/v1",
             genesis_hash=genesis, store=store, max_bytes=max_bytes,
             control=OwnerMailboxControl(),
         )

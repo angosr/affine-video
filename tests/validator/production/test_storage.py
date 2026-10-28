@@ -372,6 +372,214 @@ def test_environment_clients_share_s3_region_without_changing_object_paths(monke
     assert store._prefix == "tracks/main"
 
 
+def test_split_private_clients_keep_reads_and_conditional_writes_separate(tmp_path):
+    calls = []
+    backend = MemoryS3()
+
+    class Read:
+        def __getattr__(self, operation):
+            assert operation in {"get_object", "head_object", "list_objects_v2"}
+
+            def read(**kwargs):
+                calls.append(("read", operation))
+                if "source_pool" in kwargs.get("Key", ""):
+                    raise PermissionError("hidden source denied by fixture capability")
+                return getattr(backend, operation)(**kwargs)
+            return read
+
+    class Write:
+        def __getattr__(self, operation):
+            assert operation in {"put_object", "delete_object"}
+
+            def write(**kwargs):
+                calls.append(("write", operation))
+                key = kwargs["Key"]
+                if "/plans/" in key and not key.endswith("/plans/allocations.json"):
+                    raise PermissionError("producer plans are not writable")
+                return getattr(backend, operation)(**kwargs)
+            return write
+
+    backend.put_object(Bucket="affinemodel", Key="evaluation/plans/100.json", Body=b"original")
+    store = PrivateObjectStore(Read(), write_client=Write(), bucket="affinemodel",
+                               prefix="evaluation", credential_role="evaluator")
+    assert store.get("plans/100.json").body == b"original"
+    assert store.list_names("plans") == ("plans/100.json",)
+    with pytest.raises(PermissionError, match="not writable"):
+        store.create_plan("plans/100.json", b"changed")
+    allocation = store.create_plan("plans/allocations.json", b"one")
+    store.replace_plan("plans/allocations.json", b"two", etag=allocation.etag)
+    with pytest.raises(PreconditionFailed):
+        store.replace_plan("plans/allocations.json", b"stale", etag=allocation.etag)
+    with pytest.raises(PermissionError, match="hidden"):
+        store.get("bootstrap/source_pool.json")
+    store.verify_conditional_writes()  # Including cleanup Delete, never via the RO client.
+    model = tmp_path / "small-fixture"
+    model.write_bytes(b"synthetic legacy archive fixture")
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()
+    store.put_content(model, sha256=digest, object_name=f"models/{digest}")
+    assert store.download_content(f"models/{digest}", tmp_path / "restored",
+                                   sha256=digest, size_bytes=model.stat().st_size).read_bytes() == (
+        model.read_bytes()
+    )
+    upload = store.with_prefix("evaluation/uploads")
+    assert upload._client is store._client and upload._write_client is store._write_client
+    assert backend.objects[("affinemodel", "evaluation/plans/100.json")][0] == b"original"
+    assert {kind for kind, _op in calls} == {"read", "write"}
+
+
+@pytest.mark.parametrize("role", ["producer", "evaluator"])
+def test_named_profiles_reconstruct_by_role_without_pickling_credentials(monkeypatch, role):
+    calls = []
+
+    def client(endpoint, *args, profile_name=None):
+        assert endpoint == "https://private.example" and not args
+        calls.append(profile_name)
+        return MemoryS3()
+
+    monkeypatch.setenv("PRIVATE_STORAGE_URL", "https://private.example")
+    monkeypatch.setenv("PRIVATE_STORAGE_BUCKET", "affinemodel")
+    monkeypatch.setenv("PRIVATE_AWS_PROFILE", "producer")
+    monkeypatch.setenv("EVALUATOR_PRIVATE_READ_PROFILE", "read")
+    monkeypatch.setenv("EVALUATOR_PRIVATE_WRITE_PROFILE", "write")
+    monkeypatch.setattr(storage_module, "_environment_client", client)
+    factory = (PrivateObjectStore.from_environment if role == "producer" else
+               PrivateObjectStore.from_evaluator_environment)
+    store = factory(bucket="affinemodel", prefix="evaluation")
+    restored = pickle.loads(pickle.dumps(store))
+    assert restored._credential_role == role
+    assert set(restored.__getstate__()) == {
+        "_bucket", "_prefix", "_credential_role", "_reconnect_from_environment",
+    }
+    assert calls == (["producer"] * 2 if role == "producer" else ["read", "write"] * 2)
+    assert (restored._client is restored._write_client) == (role == "producer")
+
+
+@pytest.mark.parametrize("bad", ["missing-write", "empty", "keys", "duplicate-url", "bucket"])
+def test_profile_role_configuration_never_falls_back_to_explicit_keys(monkeypatch, bad):
+    monkeypatch.setenv("PRIVATE_STORAGE_URL", "https://private.example")
+    monkeypatch.setenv("PRIVATE_STORAGE_BUCKET", "affinemodel")
+    monkeypatch.setenv("EVALUATOR_PRIVATE_READ_PROFILE", "read")
+    monkeypatch.setenv("EVALUATOR_PRIVATE_WRITE_PROFILE", "write")
+    if bad == "missing-write":
+        monkeypatch.delenv("EVALUATOR_PRIVATE_WRITE_PROFILE")
+    elif bad == "empty":
+        monkeypatch.setenv("EVALUATOR_PRIVATE_READ_PROFILE", " ")
+    elif bad == "keys":
+        monkeypatch.setenv("EVALUATOR_PRIVATE_ACCESS_KEY", "fixture-old-key")
+    elif bad == "duplicate-url":
+        monkeypatch.setenv("EVALUATOR_PRIVATE_STORAGE_URL", "https://another-authority.example")
+    else:
+        monkeypatch.setenv("PRIVATE_STORAGE_BUCKET", "another-bucket")
+    monkeypatch.setattr(storage_module, "_environment_client",
+                        lambda *_a, **_k: pytest.fail("invalid profile must not create a client"))
+    with pytest.raises(ValueError):
+        PrivateObjectStore.from_evaluator_environment(bucket="affinemodel", prefix="evaluation")
+
+
+@pytest.mark.parametrize("bad", ["missing-profile", "missing-private-address", "legacy-mix"])
+def test_private_producer_never_uses_public_keys_for_profile_configuration(monkeypatch, bad):
+    monkeypatch.setenv("STORAGE_URL", "https://public.example")
+    monkeypatch.setenv("ACCESS_KEY", "fixture-public-key")
+    monkeypatch.setenv("SECRET_ACCESS_KEY", "fixture-public-secret")
+    monkeypatch.setenv("PRIVATE_STORAGE_URL", "https://private.example")
+    monkeypatch.setenv("PRIVATE_STORAGE_BUCKET", "affinemodel")
+    if bad != "missing-profile":
+        monkeypatch.setenv("PRIVATE_AWS_PROFILE", "producer")
+    if bad == "missing-private-address":
+        monkeypatch.delenv("PRIVATE_STORAGE_URL")
+    elif bad == "legacy-mix":
+        monkeypatch.setenv("PRIVATE_ACCESS_KEY", "fixture-private-key")
+    monkeypatch.setattr(storage_module, "_environment_client",
+                        lambda *_a, **_k: pytest.fail("must not fall back to public credentials"))
+    with pytest.raises((KeyError, ValueError)):
+        PrivateObjectStore.from_environment(bucket="affinemodel", prefix="evaluation")
+
+
+def _native_process_profile(tmp_path, monkeypatch):
+    import shlex
+    import sys
+
+    provider = tmp_path / "fixture_credentials.py"
+    counter = tmp_path / "invocations"
+    provider.write_text(
+        "import json,sys\nfrom pathlib import Path\n"
+        "p=Path(sys.argv[1]); n=int(p.read_text())+1 if p.exists() else 1\n"
+        "p.write_text(str(n))\n"
+        "print(json.dumps(dict(Version=1, AccessKeyId='fixture-access', "
+        "SecretAccessKey='fixture-secret', SessionToken='fixture-session-'+str(n), "
+        "Expiration='2050-01-01T%02d:00:00Z'%n)))\n",
+    )
+    profile = tmp_path / "config"
+    command = shlex.join([sys.executable, str(provider), str(counter)])
+    profile.write_text("[profile fixture]\nregion = auto\ncredential_process = " + command + "\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(profile))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-static-keys"))
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ambient-key-must-not-win")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret-must-not-win")
+    return counter
+
+
+def test_sdk_process_profile_refreshes_session_on_same_client_without_network(
+    tmp_path, monkeypatch,
+):
+    from datetime import UTC, datetime
+
+    from botocore.exceptions import ProfileNotFound
+
+    counter = _native_process_profile(tmp_path, monkeypatch)
+    client = storage_module._environment_client("https://private.example", profile_name="fixture")
+    try:
+        credentials = client._request_signer._credentials
+        assert credentials.method == "custom-process"
+        assert credentials.get_frozen_credentials().token == "fixture-session-1"
+        credentials._time_fetcher = lambda: datetime(2050, 1, 1, 0, 59, 59, tzinfo=UTC)
+        assert credentials.get_frozen_credentials().token == "fixture-session-2"
+        assert counter.read_text() == "2"  # SDK invokes the real fixture process on refresh.
+        with pytest.raises(ProfileNotFound):
+            storage_module._environment_client("https://private.example", profile_name="missing")
+        with pytest.raises(ValueError, match="mixed"):
+            storage_module._environment_client("https://private.example", "old", "keys",
+                                               profile_name="fixture")
+    finally:
+        client.close()
+
+
+def _inspect_spawned_profile_store(store, output):
+    output.put((store._credential_role, store._prefix, store._client.meta.endpoint_url,
+                store._client._request_signer._credentials.method,
+                store._write_client._request_signer._credentials.method))
+
+
+def test_named_profiles_rebuild_in_real_spawn_child(tmp_path, monkeypatch):
+    import multiprocessing
+
+    counter = _native_process_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("PRIVATE_STORAGE_URL", "https://private.example")
+    monkeypatch.setenv("PRIVATE_STORAGE_BUCKET", "affinemodel")
+    monkeypatch.setenv("EVALUATOR_PRIVATE_READ_PROFILE", "fixture")
+    monkeypatch.setenv("EVALUATOR_PRIVATE_WRITE_PROFILE", "fixture")
+    store = PrivateObjectStore.from_evaluator_environment(bucket="affinemodel", prefix="evaluation")
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    child = context.Process(target=_inspect_spawned_profile_store, args=(store, output))
+    try:
+        child.start()
+        assert output.get(timeout=20) == ("evaluator", "evaluation", "https://private.example",
+                                         "custom-process", "custom-process")
+        child.join(timeout=20)
+        assert child.exitcode == 0
+        assert counter.read_text() == "4"  # Two native providers in each process.
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=5)
+        output.close()
+        output.join_thread()
+        store._client.close()
+        store._write_client.close()
+
+
 def test_content_is_chunked_and_restored_with_complete_verification(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(chunks, "CHUNK_BYTES", 4)
     source = tmp_path / "source.bin"

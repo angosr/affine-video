@@ -579,7 +579,10 @@ async def run_evaluator(
         store = resources.enter_context(ChallengeStore(database, track_spec_digest=track.digest))
         if confirmation_pool is not None:
             resources.callback(confirmation_pool.close)
-        uploads = PrivateUploads.from_environment(store=store, max_bytes=track.model.max_bytes)
+        uploads = PrivateUploads.from_environment(
+            store=store, max_bytes=track.model.max_bytes,
+            authority=None if batch_source is None else batch_source.objects,
+        )
         if uploads is not None:
             if track.netuid != DEFAULT_NETUID or batch_source is None:
                 raise ValueError("private upload admission requires SN120 and its models archive")

@@ -288,6 +288,7 @@ class PrivateObjectStore:
         *,
         bucket: str,
         prefix: str,
+        write_client: Any = None,
         reconnect_from_environment: bool = False,
         credential_role: str = "producer",
     ) -> None:
@@ -295,6 +296,7 @@ class PrivateObjectStore:
             raise ValueError("private storage bucket is invalid")
         normalized = _normalize_prefix(prefix)
         self._client = client
+        self._write_client = client if write_client is None else write_client
         self._bucket = bucket
         self._prefix = normalized
         self._reconnect_from_environment = reconnect_from_environment
@@ -304,9 +306,9 @@ class PrivateObjectStore:
 
     @classmethod
     def from_environment(cls, *, bucket: str, prefix: str) -> PrivateObjectStore:
-        endpoint, access_key, secret_key = _storage_credentials("producer")
+        client, write_client = _storage_clients("producer", bucket=bucket)
         return cls(
-            _environment_client(endpoint, access_key, secret_key),
+            client, write_client=write_client,
             bucket=bucket,
             prefix=prefix,
             reconnect_from_environment=True,
@@ -317,14 +319,21 @@ class PrivateObjectStore:
     def from_evaluator_environment(cls, *, bucket: str, prefix: str) -> PrivateObjectStore:
         """Use a distinct IAM identity which cannot read the hidden source pool."""
 
-        endpoint, access_key, secret_key = _storage_credentials("evaluator")
+        client, write_client = _storage_clients("evaluator", bucket=bucket)
         return cls(
-            _environment_client(endpoint, access_key, secret_key),
+            client, write_client=write_client,
             bucket=bucket,
             prefix=prefix,
             reconnect_from_environment=True,
             credential_role="evaluator",
         )
+
+    def with_prefix(self, prefix: str) -> PrivateObjectStore:
+        """Share the same role/capabilities, bucket and authority at another original key root."""
+        return type(self)(self._client, write_client=self._write_client,
+                          bucket=self._bucket, prefix=prefix,
+                          reconnect_from_environment=self._reconnect_from_environment,
+                          credential_role=self._credential_role)
 
     def verify_evaluator_boundary(self, hidden_artifacts: tuple[Artifact, ...]) -> None:
         """Fail unless evaluator IAM denies hidden manifests, chunks, and listings."""
@@ -438,7 +447,7 @@ class PrivateObjectStore:
             if self.get(name).body != b'{"state":"ready"}':
                 raise StorageError("conditional replacement was not durable")
         finally:
-            self._client.delete_object(Bucket=self._bucket, Key=key)
+            self._write_client.delete_object(Bucket=self._bucket, Key=key)
 
     def get(self, name: str) -> StoredObject:
         response = self._client.get_object(Bucket=self._bucket, Key=self._key(name))
@@ -520,7 +529,7 @@ class PrivateObjectStore:
                 continue
             content = read_part(source, index, part.size)
             try:
-                self._client.put_object(
+                self._write_client.put_object(
                     Bucket=self._bucket,
                     Key=key,
                     Body=content,
@@ -666,7 +675,7 @@ class PrivateObjectStore:
             arguments["IfNoneMatch"] = if_none_match
         if if_match is not None:
             arguments["IfMatch"] = if_match
-        self._client.put_object(**arguments)
+        self._write_client.put_object(**arguments)
 
     def _key(self, name: str) -> str:
         normalized = name.strip("/")
@@ -680,6 +689,34 @@ def _reject_hidden_batch_transport(object_name: str) -> None:
         EXACT_NAMESPACE, INPUTS_NAMESPACE, LATENTS_NAMESPACE, VIDEOS_NAMESPACE,
     }:
         raise StorageError("hidden batch payloads are GPU-local, not private S3 objects")
+
+
+def _storage_clients(role: str, *, bucket: str) -> tuple[Any, Any]:
+    """Named SDK profiles retain credential_process refresh; no frozen key copies."""
+    names = (("EVALUATOR_PRIVATE_READ_PROFILE", "EVALUATOR_PRIVATE_WRITE_PROFILE")
+             if role == "evaluator" else ("PRIVATE_AWS_PROFILE",))
+    if any(name in os.environ for name in names):
+        if not all(os.environ.get(name, "").strip() for name in names):
+            raise ValueError("all private role profiles must be configured together")
+        legacy = (("EVALUATOR_PRIVATE_STORAGE_URL", "EVALUATOR_PRIVATE_ACCESS_KEY",
+                   "EVALUATOR_PRIVATE_SECRET_ACCESS_KEY") if role == "evaluator"
+                  else ("PRIVATE_ACCESS_KEY", "PRIVATE_SECRET_ACCESS_KEY"))
+        if any(name in os.environ for name in legacy):
+            raise ValueError("private role profiles cannot be mixed with explicit credentials")
+        if os.environ.get("PRIVATE_STORAGE_BUCKET") != bucket:
+            raise ValueError("private role bucket differs from the shared private bucket")
+        endpoint = _validated_endpoint(os.environ["PRIVATE_STORAGE_URL"])
+        read = _environment_client(endpoint, profile_name=os.environ[names[0]])
+        write = (read if len(names) == 1 else
+                 _environment_client(endpoint, profile_name=os.environ[names[1]]))
+        return read, write
+    if role == "producer" and "PRIVATE_STORAGE_BUCKET" in os.environ and not all(
+        os.environ.get(name) for name in ("PRIVATE_ACCESS_KEY", "PRIVATE_SECRET_ACCESS_KEY")
+    ):
+        raise ValueError("private producer needs a named profile or explicit private keys")
+    endpoint, access_key, secret_key = _storage_credentials(role)
+    client = _environment_client(endpoint, access_key, secret_key)
+    return client, client
 
 
 def _storage_credentials(role: str) -> tuple[str, str, str]:
@@ -741,12 +778,22 @@ def _normalize_prefix(prefix: str) -> str:
 
 
 def _environment_client(
-    endpoint: str, access_key: str, secret_key: str, *, region_name: str | None = None,
+    endpoint: str, access_key: str | None = None, secret_key: str | None = None, *,
+    region_name: str | None = None, profile_name: str | None = None,
 ) -> Any:
     try:
         import boto3
     except ImportError as exc:
         raise RuntimeError("private storage requires the 'storage' package extra") from exc
+    if profile_name is not None:
+        if not profile_name.strip() or access_key is not None or secret_key is not None:
+            raise ValueError("a named profile cannot be mixed with explicit credentials")
+        return boto3.Session(profile_name=profile_name).client(
+            "s3", endpoint_url=endpoint, config=client_config(),
+            **({"region_name": region_name} if region_name is not None else {}),
+        )
+    if not access_key or not secret_key:
+        raise ValueError("explicit access key and secret key must be configured together")
     return boto3.client(
         "s3",
         endpoint_url=endpoint,

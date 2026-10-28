@@ -683,17 +683,61 @@ def test_gc_deletes_one_page_and_cold_resumes_original_pending_cas(
     "https://old.supabase.co/storage/v1/s3", "https://public.r2.dev", ENDPOINT + "/path",
 ])
 def test_production_staging_has_no_old_supabase_or_public_fallback(setup, monkeypatch, endpoint):
-    values = {
-        "GENESIS_HASH": GENESIS, "AUTHORITY_BUCKET": "private",
-        "STAGING_BUCKET": "affinemodel", "AUTHORITY_STORAGE_URL": "https://private.example",
-        "AUTHORITY_ACCESS_KEY": "fixture", "AUTHORITY_SECRET_ACCESS_KEY": "fixture",
-        "STAGING_STORAGE_URL": endpoint, "STAGING_ACCESS_KEY": "fixture",
-        "STAGING_SECRET_ACCESS_KEY": "fixture",
-    }
-    for name, value in values.items():
-        monkeypatch.setenv("VEDA_UPLOAD_" + name, value)
+    monkeypatch.setenv("PRIVATE_STORAGE_URL", endpoint)
+    monkeypatch.setenv("PRIVATE_STORAGE_BUCKET", "affinemodel")
+    monkeypatch.setenv("VEDA_UPLOAD_GENESIS_HASH", GENESIS)
+    monkeypatch.setenv("VEDA_UPLOAD_STAGING_PROFILE", "fixture-body-profile")
     with pytest.raises(ValueError, match="R2 S3 API"):
         PrivateUploads.from_environment(store=setup.store, max_bytes=10000)
+
+
+def test_profile_uploads_reuse_original_authority_and_one_private_address(setup, monkeypatch):
+    ctx = setup
+    authority = ctx.uploads.objects
+    authority._bucket, authority._credential_role = "affinemodel", "evaluator"
+    authority._prefix = "evaluation/tracks/" + "ab" * 32
+    monkeypatch.setenv("PRIVATE_STORAGE_URL", ENDPOINT)
+    monkeypatch.setenv("PRIVATE_STORAGE_BUCKET", "affinemodel")
+    monkeypatch.setenv("VEDA_UPLOAD_GENESIS_HASH", GENESIS)
+    monkeypatch.setenv("VEDA_UPLOAD_STAGING_PROFILE", "model-body")
+    calls = []
+
+    def client(endpoint, **kwargs):
+        calls.append((endpoint, kwargs))
+        return ctx.uploads.staging
+
+    monkeypatch.setattr("validator.uploads._environment_client", client)
+    uploads = PrivateUploads.from_environment(store=ctx.store, max_bytes=10000, authority=authority)
+    assert calls == [(ENDPOINT, {"profile_name": "model-body", "region_name": "auto"})]
+    assert uploads.objects._client is authority._client
+    assert uploads.objects._write_client is authority._write_client
+    assert uploads.objects._prefix == "evaluation" and uploads.bucket == authority._bucket
+    assert authority._prefix.endswith("ab" * 32)  # Original data scope untouched.
+
+
+@pytest.mark.parametrize("bad", ["missing-profile", "empty-profile", "legacy", "bucket", "role"])
+def test_upload_profiles_refuse_missing_or_mixed_configuration(setup, monkeypatch, bad):
+    ctx = setup
+    authority = ctx.uploads.objects
+    authority._bucket, authority._credential_role = "affinemodel", "evaluator"
+    monkeypatch.setenv("PRIVATE_STORAGE_URL", ENDPOINT)
+    monkeypatch.setenv("PRIVATE_STORAGE_BUCKET", "affinemodel")
+    monkeypatch.setenv("VEDA_UPLOAD_GENESIS_HASH", GENESIS)
+    monkeypatch.setenv("VEDA_UPLOAD_STAGING_PROFILE", "model-body")
+    if bad == "missing-profile":
+        monkeypatch.delenv("VEDA_UPLOAD_STAGING_PROFILE")
+    elif bad == "empty-profile":
+        monkeypatch.setenv("VEDA_UPLOAD_STAGING_PROFILE", " ")
+    elif bad == "legacy":
+        monkeypatch.setenv("VEDA_UPLOAD_AUTHORITY_STORAGE_URL", "https://old-authority.example")
+    elif bad == "bucket":
+        authority._bucket = "other"
+    else:
+        authority._credential_role = "producer"
+    monkeypatch.setattr("validator.uploads._environment_client",
+                        lambda *_a, **_k: pytest.fail("invalid upload settings must not fall back"))
+    with pytest.raises((KeyError, ValueError)):
+        PrivateUploads.from_environment(store=ctx.store, max_bytes=10000, authority=authority)
 
 
 def test_cloudflare_transport_mints_prefix_session_not_shared_main_key(monkeypatch):
@@ -881,16 +925,13 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
         link.symlink_to(seed)
         seed = link
     environment = {
-        "VEDA_UPLOAD_STAGING_STORAGE_URL": ENDPOINT, "VEDA_UPLOAD_STAGING_BUCKET": "affinemodel",
+        "PRIVATE_STORAGE_URL": ENDPOINT, "PRIVATE_STORAGE_BUCKET": "affinemodel",
         "VEDA_UPLOAD_GENESIS_HASH": GENESIS, "VEDA_UPLOAD_SIGNING_SEED_FILE": str(seed),
         "VEDA_UPLOAD_VALIDATOR_IDENTITY": (KEY if bad_seed == "identity" else SIGNER).ss58_address,
         "CLOUDFLARE_CONTROL_API_TOKEN": "fixture-control-token",
         "STORAGE_URL": "https://public.example", "ACCESS_KEY": "fixture-public-access",
         "SECRET_ACCESS_KEY": "fixture-public-secret",
-        "VEDA_UPLOAD_AUTHORITY_STORAGE_URL": "https://authority.example",
-        "VEDA_UPLOAD_AUTHORITY_ACCESS_KEY": "fixture-role-access",
-        "VEDA_UPLOAD_AUTHORITY_SECRET_ACCESS_KEY": "fixture-role-secret",
-        "VEDA_UPLOAD_AUTHORITY_BUCKET": "private",
+        "EVALUATOR_PRIVATE_READ_PROFILE": "fixture-read-profile",
     }
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
@@ -899,14 +940,16 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
     if bad_seed == "missing-manager":
         monkeypatch.delenv("CLOUDFLARE_CONTROL_API_TOKEN")
     closed, clients, attached = [], [], []
+    ctx.uploads.objects._bucket = "affinemodel"
     authority = ctx.uploads.objects._client
     monkeypatch.setattr(authority, "close", lambda: closed.append("authority"), raising=False)
     public = SimpleNamespace(close=lambda: closed.append("public"))
 
-    def client(endpoint, access, secret):
+    def client(endpoint, access=None, secret=None, **kwargs):
         clients.append(endpoint)
-        if endpoint == "https://authority.example":
-            assert (access, secret) == ("fixture-role-access", "fixture-role-secret")
+        if endpoint == ENDPOINT:
+            assert (access, secret) == (None, None)
+            assert kwargs == {"profile_name": "fixture-read-profile"}
             return authority
         assert (access, secret) == ("fixture-public-access", "fixture-public-secret")
         return public
@@ -937,7 +980,7 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
         assert clients == [] and attached == []
     else:
         assert attach_from_environment(container="veda-evaluator") == 0
-        assert clients == ["https://public.example", "https://authority.example"]
+        assert clients == ["https://public.example", ENDPOINT]
         assert closed == ["authority", "public"] and attached == [True]
 
 
@@ -961,6 +1004,8 @@ def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(
     monkeypatch.setenv("CLOUDFLARE_CONTROL_API_TOKEN", "fixture-control-secret")
     monkeypatch.setenv("Token_value", "fixture-storage-token")
     monkeypatch.setenv("DOCKER_HOST", "tcp://not-a-production-daemon.invalid:1234")
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/fixture/owner-only-config")
+    monkeypatch.setenv("EVALUATOR_PRIVATE_READ_PROFILE", "fixture-owner-role")
     monkeypatch.setattr("subprocess.run", lambda *_a, **_k: SimpleNamespace(stdout="true\n"))
 
     def process(argv, **kwargs):
@@ -981,6 +1026,8 @@ def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(
     assert "CLOUDFLARE_CONTROL_API_TOKEN" not in environments[0]
     assert "Token_value" not in environments[0]
     assert "DOCKER_HOST" not in environments[0]
+    assert "AWS_CONFIG_FILE" not in environments[0]
+    assert "EVALUATOR_PRIVATE_READ_PROFILE" not in environments[0]
     captured = capsys.readouterr()
     assert not captured.out and not captured.err  # No request/response frames in journal output.
 
