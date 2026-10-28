@@ -612,7 +612,7 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path, tenure)
             }
         )
         baseline = replace(genesis_champion(), tenure_block=genesis_champion().position.block)
-        policy = PromotionSpec("veda-exact-tenure-v1", 0.001, 604800) if tenure else None
+        policy = PromotionSpec("veda-exact-tenure-v1", 0.002, 604800) if tenure else None
         if tenure:
             public["stages"][0]["promotion"] = promotion_context(
                 policy, initial_gain=0.003, incumbent=baseline, established_ms=1000,

@@ -244,7 +244,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
                 or type(policy["decay_seconds"]) is not int
                 or policy["decay_seconds"] != 604800
                 or isinstance(policy["minimum_gain"], bool)
-                or policy["minimum_gain"] != 0.001):
+                or policy["minimum_gain"] != 0.002):
             raise TrackSpecError("unsupported exact tenure promotion policy")
         promotion = PromotionSpec(**policy)
         raw = {key: value for key, value in raw.items() if key != "promotion"}

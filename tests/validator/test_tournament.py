@@ -127,17 +127,17 @@ def resolve(items: list[dict], *, history=(), minimum_gain=0.01):
 
 
 @pytest.mark.parametrize(("elapsed", "expected"), [
-    (0, 0.003), (302400000, 0.002), (604800000, 0.001), (900000000, 0.001),
+    (0, 0.003), (302400000, 0.0025), (604800000, 0.002), (900000000, 0.002),
     (-1, 0.003),
 ])
 def test_tenure_threshold_uses_original_chain_time(elapsed, expected):
-    policy = PromotionSpec("veda-exact-tenure-v1", 0.001, 604800)
+    policy = PromotionSpec("veda-exact-tenure-v1", 0.002, 604800)
     assert tenure_threshold(policy, initial_gain=0.003, established_ms=1000,
                             submitted_ms=1000 + elapsed) == expected
 
 
 def tenure_challenge(sequence, incumbent, *, gain, submitted_ms, established_ms=1000):
-    policy = PromotionSpec("veda-exact-tenure-v1", 0.001, 604800)
+    policy = PromotionSpec("veda-exact-tenure-v1", 0.002, 604800)
     row = challenge(sequence, f"tenure-{sequence}", score=0.8,
                     incumbent_score=0.7, paired_gain=gain)
     # The new policy has exactly one real stage, never a synthetic full result.
@@ -156,14 +156,14 @@ def resolve_tenure(rows, history=(), *, track_id="track"):
         rows, track_id=track_id, track_spec_digest="ab" * 32, netuid=7,
         minimum_gain=0.003, minimum_exact_gain=0.003,
         initial_champion=replace(genesis(), tenure_block=100), historical_matches=history,
-        promotion=PromotionSpec("veda-exact-tenure-v1", 0.001, 604800),
+        promotion=PromotionSpec("veda-exact-tenure-v1", 0.002, 604800),
     )
 
 
 @pytest.mark.parametrize("elapsed,gain,won", [
     (0, 0.003, False), (0, 0.003000001, True),
-    (302400000, 0.002, False), (302400000, 0.002000001, True),
-    (604800000, 0.001, False), (604800000, 0.001000001, True),
+    (302400000, 0.0025, False), (302400000, 0.002500001, True),
+    (604800000, 0.002, False), (604800000, 0.002000001, True),
 ])
 def test_exact_tenure_strict_boundary_and_private_winner_reader(elapsed, gain, won):
     row = tenure_challenge(1, replace(genesis(), tenure_block=100), gain=gain,
@@ -183,7 +183,7 @@ def test_exact_tenure_strict_boundary_and_private_winner_reader(elapsed, gain, w
         record.document, sequence=1, track_id="track", track_spec_digest="ab" * 32,
         netuid=7, minimum_gain=0.003, minimum_exact_gain=0.003,
         incumbent=replace(genesis(), tenure_block=100),
-        promotion=PromotionSpec("veda-exact-tenure-v1", 0.001, 604800),
+        promotion=PromotionSpec("veda-exact-tenure-v1", 0.002, 604800),
     )
     delayed = {**row, "score_block": 5000,
                "stages": [{**row["stages"][0], "score_block": 5000}]}
@@ -196,11 +196,11 @@ def test_retained_scores_and_maintenance_do_not_reset_tenure():
     history = tuple(recorded_match(r.document, netuid=7) for r in resolve_tenure([first]).matches)
     carried = historical_champion(history, replace(genesis(), position=ChainPosition(999, 0, 0)))
     assert carried.tenure_block == 100
-    later = tenure_challenge(2, carried, gain=0.00100001, submitted_ms=604801000)
+    later = tenure_challenge(2, carried, gain=0.00200001, submitted_ms=604801000)
     result = resolve_tenure([later], history, track_id="maintenance")
     assert result.matches[0].outcome == MatchOutcome.CHALLENGER_WON
     assert result.champion.tenure_block == later["score_block"]
-    reset = tenure_challenge(3, result.champion, gain=0.002, submitted_ms=604802000,
+    reset = tenure_challenge(3, result.champion, gain=0.0025, submitted_ms=604802000,
                              established_ms=604802000)
     assert reset["stages"][0]["promotion"]["minimum_gain"] == 0.003
     reset_history = (*history, recorded_match(result.matches[0].document, netuid=7))

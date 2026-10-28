@@ -412,7 +412,7 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
         if stages and "promotion" in stages[0]:
             context = stages[0]["promotion"]
             expected = promotion_context(
-                PromotionSpec("veda-exact-tenure-v1", 0.001, 604800), initial_gain=0.003,
+                PromotionSpec("veda-exact-tenure-v1", 0.002, 604800), initial_gain=0.003,
                 incumbent=replace(before, tenure_block=context.get("established_block")),
                 established_ms=context.get("established_timestamp_ms"),
                 submission_block=position.block,
@@ -488,7 +488,7 @@ def historical_champion(matches: tuple[MatchRecord, ...], baseline: Champion) ->
         if "promotion" in (match.document["evaluation"].get("stages") or [{}])[0]:
             context = match.document["evaluation"]["stages"][0]["promotion"]
             expected = promotion_context(
-                PromotionSpec("veda-exact-tenure-v1", 0.001, 604800), initial_gain=0.003,
+                PromotionSpec("veda-exact-tenure-v1", 0.002, 604800), initial_gain=0.003,
                 incumbent=incumbent, established_ms=context["established_timestamp_ms"],
                 submission_block=match.document["submission"]["block_height"],
                 submitted_ms=context["submission_timestamp_ms"],

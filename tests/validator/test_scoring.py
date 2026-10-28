@@ -636,7 +636,7 @@ def test_tenure_exact_finishes_once_and_preserves_context_on_restart(
     from tests.scoring.test_spec import valid_spec
 
     raw = valid_spec()
-    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.001,
+    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.002,
                         "decay_seconds": 604800}
     raw["scoring"].update(minimum_frontier_gain=0.003, match_confidence=0.9975,
                            bootstrap_resamples=4000)
@@ -680,7 +680,7 @@ def test_tenure_exact_finishes_once_and_preserves_context_on_restart(
     ))
     monkeypatch.setattr(scoring_module, "IsolatedEvaluator", lambda *_args, **_kwargs:
                         lambda _task: StageOutcome(0.8, {
-                            "incumbent_score": 0.7, "paired_gain_lower_bound": 0.0021,
+                            "incumbent_score": 0.7, "paired_gain_lower_bound": 0.0026,
                         }))
     path = tmp_path / "validator.db"
     with ChallengeStore(path) as store:
@@ -714,7 +714,7 @@ def test_tenure_exact_finishes_once_and_preserves_context_on_restart(
     assert restored == original
     assert len(restored["stages"]) == 1
     context = restored["stages"][0]["promotion"]
-    assert context["minimum_gain"] == 0.002
+    assert context["minimum_gain"] == 0.0025
     assert context["submission_timestamp_ms"] == 302401000
     assert clocks == [80]
 

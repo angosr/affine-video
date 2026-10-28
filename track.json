@@ -17,7 +17,7 @@
   },
   "promotion": {
     "format": "veda-exact-tenure-v1",
-    "minimum_gain": 0.001,
+    "minimum_gain": 0.002,
     "decay_seconds": 604800
   },
   "full_video": {

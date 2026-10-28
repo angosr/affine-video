@@ -323,7 +323,7 @@ def test_exact_tenure_admits_one_original_ready_without_confirmation_inventory(
 ):
     case = inventory_case
     raw = track_spec_dict(case.track)
-    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.001,
+    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.002,
                         "decay_seconds": 604800}
     raw["scoring"].update(minimum_frontier_gain=0.003, match_confidence=0.9975,
                            bootstrap_resamples=4000)

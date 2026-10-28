@@ -1559,13 +1559,13 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
     assert len(restored) == (cache_state != "valid")
 
 
-@pytest.mark.parametrize("gain,won", [(0.002, False), (0.00200001, True)])
+@pytest.mark.parametrize("gain,won", [(0.0025, False), (0.00250001, True)])
 def test_exact_tenure_private_result_publication_and_cold_reader(tmp_path, gain, won):
     from tests.validator.test_tournament import tenure_challenge
     from validator.tournament import genesis_champion
 
     raw = valid_spec()
-    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.001,
+    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.002,
                         "decay_seconds": 604800}
     raw["scoring"].update(minimum_frontier_gain=0.003, match_confidence=0.9975,
                            bootstrap_resamples=4000)
@@ -1609,7 +1609,7 @@ def test_exact_tenure_private_result_publication_and_cold_reader(tmp_path, gain,
         historical_matches=history, runtime_manifest=manifest.encode(),
     )
     document = json.loads(artifacts.matches[0][1])
-    assert document["minimum_gain"] == 0.002
+    assert document["minimum_gain"] == 0.0025
     assert document["outcome"] == ("CHALLENGER_WON" if won else "CHAMPION_RETAINED")
     assert len(document["evaluation"]["stages"]) == 1
     client = MemoryS3()

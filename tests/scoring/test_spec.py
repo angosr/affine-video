@@ -145,7 +145,7 @@ def test_exact_tenure_policy_is_explicit_and_does_not_relabel_old_specs():
     raw = valid_spec()
     old = parse_track_spec(raw)
     assert old.promotion is None
-    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.001,
+    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.002,
                         "decay_seconds": 604800}
     raw["scoring"]["minimum_frontier_gain"] = 0.003
     raw["scoring"]["match_confidence"] = 0.9975
@@ -157,6 +157,10 @@ def test_exact_tenure_policy_is_explicit_and_does_not_relabel_old_specs():
     from validator.tournament import genesis_champion
     assert genesis_champion(current).tenure_block is None
     assert genesis_champion(old).tenure_block == old.track_start_block
+    raw["promotion"]["minimum_gain"] = 0.001
+    with pytest.raises(ValueError, match="promotion policy"):
+        parse_track_spec(raw)
+    raw["promotion"]["minimum_gain"] = 0.002
     raw["promotion"]["decay_seconds"] = 1
     with pytest.raises(ValueError, match="promotion policy"):
         parse_track_spec(raw)
