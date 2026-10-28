@@ -105,11 +105,12 @@ class Inventory:
         plans: tuple[BatchPlan, ...], submission_block: int, disclosure_delay_seconds: int,
         submission_timestamp_ms: int,
     ) -> dict[str, Any] | None:
-        """Bind the earliest-expiring unpublished READY eligible at submission.
+        """Bind the earliest-expiring READY that was secret at original submission.
 
         A batch is reusable, not consumed by a claim. Late scanning, retries and
         publication never move the submission boundary or substitute newer data.
-        A durable claim is reused before considering disclosure or pool ordering.
+        Disclosure after S cannot invalidate even a delayed first claim. Existing
+        durable claims are reused before considering pool ordering.
         """
         if stage not in _STAGES or any(not _digest(value) for value in (
             challenge_id, file_sha256, model_digest,
@@ -160,8 +161,6 @@ class Inventory:
                         proof.leaf.source_family_id for proof in plan.source_proofs
                     )
                 ):
-                    continue
-                if self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is not None:
                     continue
                 row = {
                     "ordinal": len(claims) + 1, "challenge_id": challenge_id, "stage": stage,

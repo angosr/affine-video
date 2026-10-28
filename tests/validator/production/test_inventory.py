@@ -403,9 +403,34 @@ def test_overlap_uses_oldest_unpublished_ready_without_changing_seals(inventory_
     assert {plan.plan_digest: plan.encode() for plan in plans} == sealed
 
 
-@pytest.mark.parametrize("disclosed_index,selected_index", [(1, 2), (2, 1)])
-def test_new_claim_skips_expired_disclosed_incomplete_and_after_submission_plans(
-    inventory_case, disclosed_index, selected_index,
+@pytest.mark.parametrize("include_newer", [False, True])
+def test_first_late_claim_keeps_original_s_eligibility_after_disclosure(
+    inventory_case, include_newer,
+):
+    case = inventory_case
+    oldest = make_plan(case, 101)
+    plans = (oldest, make_plan(case, 150, 1)) if include_newer else (oldest,)
+    sealed = {plan.plan_digest: plan.encode() for plan in plans}
+    case.objects.create_plan(f"disclosed/{oldest.plan_digest}.json", canonical_json({
+        "plan_digest": oldest.plan_digest, "exact_sha256": oldest.exact.sha256,
+    }))
+    inventory = Inventory(case.objects, case.track.digest)
+    assert inventory.read()[1]["claims"] == []
+    # Publication is at/after R; admission may finish later, but S remains before R.
+    original = claim(inventory, tuple(reversed(plans)), submission_block=200)
+    assert original is not None
+    assert original["plan_digest"] == oldest.plan_digest
+    assert original["ready_sha256"] == hashlib.sha256(sealed[oldest.plan_digest]).hexdigest()
+    assert original["submission_block"] == 200
+    assert original["submission_timestamp_ms"] == 200_000
+    assert claim(Inventory(case.objects, case.track.digest), plans,
+                 submission_block=200) == original
+    assert {plan.plan_digest: plan.encode() for plan in plans} == sealed
+
+
+@pytest.mark.parametrize("disclosed_index", [1, 2])
+def test_new_claim_skips_expired_incomplete_and_after_submission_not_later_disclosure(
+    inventory_case, disclosed_index,
 ):
     case = inventory_case
     plans = (make_plan(case, 101), make_plan(case, 102, 1), make_plan(case, 103),
@@ -416,7 +441,7 @@ def test_new_claim_skips_expired_disclosed_incomplete_and_after_submission_plans
     }))
     row = claim(Inventory(case.objects, case.track.digest), tuple(reversed(plans)),
                 submission_block=1902)
-    assert row["plan_digest"] == plans[selected_index].plan_digest
+    assert row["plan_digest"] == plans[1].plan_digest
 
 
 def test_earliest_expiry_ties_are_stable_across_input_order(inventory_case):
@@ -768,7 +793,7 @@ def test_same_stage_cas_race_reuses_only_the_original_claim(inventory_case, monk
     assert len(inventory.read()[1]["claims"]) == 1
 
 
-def test_disclosure_blocks_new_claims_but_not_durable_original_claims(inventory_case):
+def test_expiry_at_original_s_blocks_new_claims_but_later_disclosure_does_not(inventory_case):
     case = inventory_case
     plan = make_plan(case, 101)
     inventory = Inventory(case.objects, case.track.digest)
@@ -778,7 +803,7 @@ def test_disclosure_blocks_new_claims_but_not_durable_original_claims(inventory_
     }))
     assert claim(inventory, (plan,), identifier="a2" * 32,
                  submission_block=1902) is None
-    assert claim(inventory, (plan,), identifier="a3" * 32) is None
+    assert claim(inventory, (plan,), identifier="a3" * 32)["plan_digest"] == plan.plan_digest
     assert claim(inventory, (plan,)) == original
 
 
