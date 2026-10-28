@@ -86,6 +86,70 @@ def test_private_listing_supports_bounded_original_index_pages():
         store.list_names("uploads/", limit=0)
 
 
+@pytest.mark.parametrize("directory", [
+    "plans", "plans/", "uploads/", "attempts/digest/", "source-pool/hidden.parts/",
+])
+def test_private_directory_listing_preserves_scoped_prefix(directory):
+    root = "evaluation/tracks/data/"
+    relative = directory.strip("/")
+    calls = []
+
+    class ScopedS3(MemoryS3):
+        def list_objects_v2(self, *, Bucket, Prefix, **kwargs):
+            calls.append(Prefix)
+            if Prefix != root + relative + "/":
+                raise PermissionError("directory capability requires trailing slash")
+            return super().list_objects_v2(Bucket=Bucket, Prefix=Prefix, **kwargs)
+
+    client = ScopedS3()
+    store = PrivateObjectStore(client, bucket="private", prefix=root)
+    store.create_plan(relative + "/one.json", b"original")
+    store.create_plan(relative + "-sibling/two.json", b"unrelated")
+    store.create_plan(relative + ".json", b"directory marker is not an entry")
+    assert store.list_names(directory) == (relative + "/one.json",)
+    assert calls == [root + relative + "/"]
+
+
+def test_private_directory_listing_resumes_seventeenth_upload_across_service_pages():
+    root = "evaluation/"
+    calls = []
+
+    class PagedS3(MemoryS3):
+        def list_objects_v2(self, *, Bucket, Prefix, MaxKeys=None, StartAfter=None,
+                            ContinuationToken=None):
+            assert Prefix == root + "uploads/"
+            assert StartAfter is None or ContinuationToken is None
+            calls.append((MaxKeys, StartAfter, ContinuationToken))
+            contents = super().list_objects_v2(
+                Bucket=Bucket, Prefix=Prefix, StartAfter=StartAfter,
+            )["Contents"]
+            # Opaque service pages can be shorter than the requested limit.
+            if ContinuationToken is not None:
+                contents = [item for item in contents if item["Key"] > ContinuationToken]
+            page = contents[:min(3, MaxKeys) if MaxKeys is not None else 3]
+            response = {"Contents": page, "IsTruncated": len(page) < len(contents)}
+            if response["IsTruncated"]:
+                response["NextContinuationToken"] = page[-1]["Key"]
+            return response
+
+    store = PrivateObjectStore(PagedS3(), bucket="private", prefix=root)
+    expected = tuple(f"uploads/{index:064x}.json" for index in range(17))
+    for name in reversed(expected):
+        store.create_plan(name, b"metadata")
+    store.create_plan("uploads-sibling/other.json", b"unrelated")
+    first = store.list_names("uploads/", limit=16)
+    assert first == expected[:16]
+    assert [limit for limit, _, _ in calls] == [16, 13, 10, 7, 4, 1]
+    assert all(after is None for _, after, _ in calls)
+    assert all(token is not None for _, _, token in calls[1:])
+    assert store.list_names("uploads/", limit=16, after=first[-1]) == expected[16:]
+    assert calls[-1] == (16, root + expected[15], None)
+    assert store.list_names("uploads/", limit=16, after=expected[-1]) == ()
+    assert store.list_names("uploads/") == expected
+    with pytest.raises(ValueError, match="outside"):
+        store.list_names("uploads/", limit=16, after="uploads-sibling/other.json")
+
+
 def precondition_failed():
     error = RuntimeError("precondition failed")
     error.response = {
@@ -320,8 +384,8 @@ def test_evaluator_boundary_rejects_readable_noninitial_hidden_chunk() -> None:
     ("source-pool/assets/hidden", False),
     ("source-pool/assets/hidden.parts/part-00000", False),
     ("source-pool/assets/hidden.parts/part-00001", False),
-    ("source-pool", False),
-    ("source-pool/assets/hidden.parts", False),
+    ("source-pool/", False),
+    ("source-pool/assets/hidden.parts/", False),
     (None, False),
     (None, True),
 ])
@@ -333,7 +397,7 @@ def test_evaluator_boundary_checks_each_distinct_capability(leak, shared_client)
         "source-pool/assets/hidden.parts/part-00000",
         "source-pool/assets/hidden.parts/part-00001",
     ]
-    prefixes = ["source-pool", "source-pool/assets/hidden.parts"]
+    prefixes = ["source-pool/", "source-pool/assets/hidden.parts/"]
 
     class CapabilityS3(MemoryS3):
         def __init__(self, readable):

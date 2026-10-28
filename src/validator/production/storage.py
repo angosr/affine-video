@@ -567,7 +567,7 @@ class PrivateObjectStore:
     def list_names(
         self, prefix: str, *, limit: int | None = None, after: str | None = None,
     ) -> tuple[str, ...]:
-        """List a small private index with strong-consistency assumptions."""
+        """List a private directory index, retaining its scoped trailing slash."""
 
         if limit is not None and (type(limit) is not int or limit <= 0):
             raise ValueError("private listing limit must be positive")
@@ -579,7 +579,7 @@ class PrivateObjectStore:
         token: str | None = None
         names: list[str] = []
         while True:
-            arguments: dict[str, Any] = {"Bucket": self._bucket, "Prefix": query}
+            arguments: dict[str, Any] = {"Bucket": self._bucket, "Prefix": query + "/"}
             if limit is not None:
                 arguments["MaxKeys"] = min(1000, limit - len(names))
             if token is not None:

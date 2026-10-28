@@ -461,10 +461,19 @@ def test_activation_and_mailbox_replay_do_not_duplicate_parent_or_opportunity(se
 
 
 @pytest.mark.parametrize("cold_owner", [False, True])
-def test_seventeenth_activation_is_reachable_after_full_page_and_owner_restart(setup, cold_owner):
+def test_seventeenth_activation_is_reachable_after_full_page_and_owner_restart(
+    setup, cold_owner, monkeypatch,
+):
     from contextlib import nullcontext
 
     ctx = setup
+    list_objects = ctx.uploads.objects._client.list_objects_v2
+
+    def scoped_list(*, Prefix, **kwargs):
+        assert Prefix == "evaluation/uploads/"
+        return list_objects(Prefix=Prefix, **kwargs)
+
+    monkeypatch.setattr(ctx.uploads.objects._client, "list_objects_v2", scoped_list)
     keys = [Keypair.create_from_seed(index.to_bytes(32, "big"), crypto_type=0)
             for index in range(3, 20)]
     identities = sorted((upload_registration_id(GENESIS, key.ss58_address), key) for key in keys)
