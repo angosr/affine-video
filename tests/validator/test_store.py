@@ -568,7 +568,11 @@ def test_private_public_history_binds_original_chain_payload_and_spent_opportuni
         assert store.get_challenge(later_id).state is ChallengeState.REJECTED_DUPLICATE_HOTKEY
 
 
-def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None:
+@pytest.mark.parametrize("tenure", [False, True])
+def test_verified_public_match_restores_disposable_local_state(tmp_path, tenure) -> None:
+    from scoring.spec import PromotionSpec
+    from validator.tournament import promotion_context
+
     digest = "ab" * 32
     with ChallengeStore(tmp_path / "validator.db", track_spec_digest=digest) as store:
         identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=10)
@@ -607,14 +611,22 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
                 ],
             }
         )
+        baseline = replace(genesis_champion(), tenure_block=genesis_champion().position.block)
+        policy = PromotionSpec("veda-exact-tenure-v1", 0.001, 604800) if tenure else None
+        if tenure:
+            public["stages"][0]["promotion"] = promotion_context(
+                policy, initial_gain=0.003, incumbent=baseline, established_ms=1000,
+                submission_block=100, submitted_ms=2000,
+            )
         tournament = resolve_tournament(
             [public],
             track_id="track",
             track_spec_digest=digest,
             netuid=7,
-            minimum_gain=0.001,
-            minimum_exact_gain=0.5,
-            initial_champion=genesis_champion(),
+            minimum_gain=0.003 if tenure else 0.001,
+            minimum_exact_gain=0.003 if tenure else 0.5,
+            initial_champion=baseline,
+            promotion=policy,
         )
 
         assert (
@@ -636,6 +648,10 @@ def test_verified_public_match_restores_disposable_local_state(tmp_path) -> None
         assert [stage["stage"] for stage in store.public_challenge(identifier)["stages"]] == [
             ChallengeState.SCORING
         ]
+        if tenure:
+            assert store.public_challenge(identifier)["stages"][0]["promotion"] == (
+                public["stages"][0]["promotion"]
+            )
 
 
 @pytest.mark.parametrize("exact_time,confirmation_time", [(1000, 1000), (1000, 900)])

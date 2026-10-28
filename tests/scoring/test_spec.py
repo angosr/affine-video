@@ -141,6 +141,27 @@ def test_parse_track_spec_produces_typed_values_and_stable_digest() -> None:
     assert parse_track_spec(track_spec_dict(first)) == first
 
 
+def test_exact_tenure_policy_is_explicit_and_does_not_relabel_old_specs():
+    raw = valid_spec()
+    old = parse_track_spec(raw)
+    assert old.promotion is None
+    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.001,
+                        "decay_seconds": 604800}
+    raw["scoring"]["minimum_frontier_gain"] = 0.003
+    raw["scoring"]["match_confidence"] = 0.9975
+    raw["scoring"]["bootstrap_resamples"] = 4000
+    raw["full_video"]["minimum_gain"] = 0.003
+    current = parse_track_spec(raw)
+    assert current.promotion.decay_seconds == 604800
+    assert current.digest != old.digest
+    from validator.tournament import genesis_champion
+    assert genesis_champion(current).tenure_block is None
+    assert genesis_champion(old).tenure_block == old.track_start_block
+    raw["promotion"]["decay_seconds"] = 1
+    with pytest.raises(ValueError, match="promotion policy"):
+        parse_track_spec(raw)
+
+
 @pytest.mark.parametrize("field,value", [
     ("inventory_target_batches", 1), ("inventory_target_batches", 3),
     ("inventory_target_batches", 10), ("inventory_max_bytes", 5_999_999),
@@ -173,11 +194,13 @@ def test_repository_gain_gate_candidate_requires_a_new_spec_binding():
     assert candidate.full_video.minimum_gain == 0.003
     assert candidate.scoring.match_confidence == 0.9975
     previous = track_spec_dict(candidate)
+    previous.pop("promotion", None)
     previous["scoring"]["minimum_frontier_gain"] = 0.005
     previous["full_video"]["minimum_gain"] = 0.005
     assert parse_track_spec(previous).digest != candidate.digest
     previous["scoring"]["minimum_frontier_gain"] = 0.003
     previous["full_video"]["minimum_gain"] = 0.003
+    previous["promotion"] = track_spec_dict(candidate)["promotion"]
     assert parse_track_spec(previous) == candidate
 
 

@@ -1,8 +1,10 @@
 import hashlib
+from dataclasses import replace
 
 import pytest
 
 from miner.submit import PrivateModelSubmission, model_source_fields
+from scoring.spec import PromotionSpec
 from validator.production.commitment import canonical_json
 from validator.queue import ChainPosition, ChallengeState
 from validator.tournament import (
@@ -10,8 +12,10 @@ from validator.tournament import (
     MatchOutcome,
     canonical_score_gain,
     historical_champion,
+    promotion_context,
     recorded_match,
     resolve_tournament,
+    tenure_threshold,
     validate_match_document,
 )
 
@@ -120,6 +124,115 @@ def resolve(items: list[dict], *, history=(), minimum_gain=0.01):
         initial_champion=genesis(),
         historical_matches=history,
     )
+
+
+@pytest.mark.parametrize(("elapsed", "expected"), [
+    (0, 0.003), (302400000, 0.002), (604800000, 0.001), (900000000, 0.001),
+    (-1, 0.003),
+])
+def test_tenure_threshold_uses_original_chain_time(elapsed, expected):
+    policy = PromotionSpec("veda-exact-tenure-v1", 0.001, 604800)
+    assert tenure_threshold(policy, initial_gain=0.003, established_ms=1000,
+                            submitted_ms=1000 + elapsed) == expected
+
+
+def tenure_challenge(sequence, incumbent, *, gain, submitted_ms, established_ms=1000):
+    policy = PromotionSpec("veda-exact-tenure-v1", 0.001, 604800)
+    row = challenge(sequence, f"tenure-{sequence}", score=0.8,
+                    incumbent_score=0.7, paired_gain=gain)
+    # The new policy has exactly one real stage, never a synthetic full result.
+    row["stages"] = row["stages"][:1]
+    row["evaluation_batch"] = row["stages"][0]["evaluation_batch"]
+    row["score_block"] = row["stages"][0]["score_block"]
+    row["stages"][0]["promotion"] = promotion_context(
+        policy, initial_gain=0.003, incumbent=incumbent, established_ms=established_ms,
+        submission_block=row["block_height"], submitted_ms=submitted_ms,
+    )
+    return row
+
+
+def resolve_tenure(rows, history=(), *, track_id="track"):
+    return resolve_tournament(
+        rows, track_id=track_id, track_spec_digest="ab" * 32, netuid=7,
+        minimum_gain=0.003, minimum_exact_gain=0.003,
+        initial_champion=replace(genesis(), tenure_block=100), historical_matches=history,
+        promotion=PromotionSpec("veda-exact-tenure-v1", 0.001, 604800),
+    )
+
+
+@pytest.mark.parametrize("elapsed,gain,won", [
+    (0, 0.003, False), (0, 0.003000001, True),
+    (302400000, 0.002, False), (302400000, 0.002000001, True),
+    (604800000, 0.001, False), (604800000, 0.001000001, True),
+])
+def test_exact_tenure_strict_boundary_and_private_winner_reader(elapsed, gain, won):
+    row = tenure_challenge(1, replace(genesis(), tenure_block=100), gain=gain,
+                           submitted_ms=1000 + elapsed)
+    row.update(model_source_fields(None, None, PrivateModelSubmission("ef" * 32, "ab" * 32)))
+    result = resolve_tenure([row])
+    record = result.matches[0]
+    assert record.outcome == (MatchOutcome.CHALLENGER_WON if won
+                              else MatchOutcome.CHAMPION_RETAINED)
+    assert record.document["minimum_gain"] == row["stages"][0]["promotion"]["minimum_gain"]
+    assert len(record.document["evaluation"]["stages"]) == 1
+    assert (record.document["evaluation"]["model_object"] is not None) == won
+    historical = recorded_match(record.document, netuid=7)
+    cold = historical_champion((historical,), genesis())
+    assert cold.tenure_block == (row["score_block"] if won else 100)
+    validate_match_document(
+        record.document, sequence=1, track_id="track", track_spec_digest="ab" * 32,
+        netuid=7, minimum_gain=0.003, minimum_exact_gain=0.003,
+        incumbent=replace(genesis(), tenure_block=100),
+        promotion=PromotionSpec("veda-exact-tenure-v1", 0.001, 604800),
+    )
+    delayed = {**row, "score_block": 5000,
+               "stages": [{**row["stages"][0], "score_block": 5000}]}
+    assert resolve_tenure([delayed]).matches[0].outcome == record.outcome
+
+
+def test_retained_scores_and_maintenance_do_not_reset_tenure():
+    baseline = replace(genesis(), tenure_block=100)
+    first = tenure_challenge(1, baseline, gain=0.001, submitted_ms=1000)
+    history = tuple(recorded_match(r.document, netuid=7) for r in resolve_tenure([first]).matches)
+    carried = historical_champion(history, replace(genesis(), position=ChainPosition(999, 0, 0)))
+    assert carried.tenure_block == 100
+    later = tenure_challenge(2, carried, gain=0.00100001, submitted_ms=604801000)
+    result = resolve_tenure([later], history, track_id="maintenance")
+    assert result.matches[0].outcome == MatchOutcome.CHALLENGER_WON
+    assert result.champion.tenure_block == later["score_block"]
+    reset = tenure_challenge(3, result.champion, gain=0.002, submitted_ms=604802000,
+                             established_ms=604802000)
+    assert reset["stages"][0]["promotion"]["minimum_gain"] == 0.003
+    reset_history = (*history, recorded_match(result.matches[0].document, netuid=7))
+    after_reset = resolve_tenure([reset], reset_history, track_id="next-maintenance")
+    assert after_reset.matches[0].outcome == (
+        MatchOutcome.CHAMPION_RETAINED
+    )
+    assert canonical_json(history[0].document) == canonical_json(
+        resolve_tenure([first]).matches[0].document,
+    )
+
+
+def test_old_dual_stage_winner_remains_original_fact_under_new_policy():
+    previous = resolve([challenge(1, "old-winner", score=0.8, incumbent_score=0.7)])
+    original = canonical_json(previous.matches[0].document)
+    history = tuple(recorded_match(row.document, netuid=7) for row in previous.matches)
+    result = resolve_tenure([], history)
+    assert result.champion.hotkey == "old-winner"
+    assert result.champion.tenure_block == history[0].document["decided_block"]
+    assert canonical_json(history[0].document) == original
+
+
+def test_failed_challenge_does_not_restart_the_incumbent_term():
+    first = tenure_challenge(1, replace(genesis(), tenure_block=100), gain=0.001,
+                             submitted_ms=1000)
+    failed = challenge(2, "invalid-model", state=ChallengeState.PARTICIPANT_FAILED,
+                       error_code="INVALID_MODEL")
+    result = resolve_tenure([first, failed])
+    assert result.champion.tenure_block == 100
+    assert result.champion.score == 0.7
+    history = tuple(recorded_match(row.document, netuid=7) for row in result.matches)
+    assert historical_champion(history, genesis()).tenure_block == 100
 
 
 def test_hf_match_bytes_are_unchanged_when_private_sources_are_supported():

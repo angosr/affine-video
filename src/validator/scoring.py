@@ -227,6 +227,11 @@ class PairedTrackEvaluator:
     def batch_ready(self, task: LeasedChallenge) -> bool:
         """Distinguish expected producer lag from an evaluation failure."""
 
+        if (getattr(self.track, "promotion", None) is not None
+                and task.state is ChallengeState.CONFIRMING):
+            raise TemporaryScoringError(
+                "SCORING_POLICY_MISMATCH", "exact-only policy has no full stage",
+            )
         if self.batch_source is None:
             return True
         record = self.store.public_challenge(task.challenge_id)
@@ -250,12 +255,32 @@ class PairedTrackEvaluator:
             minimum_exact_gain=self.track.scoring.minimum_frontier_gain,
             initial_champion=genesis_champion(self.track),
             historical_matches=self.historical_matches,
+            promotion=self.track.promotion,
         )
         incumbent = tournament.champion
         incumbent_task = self._incumbent_task(incumbent, snapshot["challenges"])
         if task.state is ChallengeState.CONFIRMING:
             return self._confirm(task, incumbent_task)
         batch = self._batch(task)
+        decision = {}
+        if self.track.promotion is not None:
+            from validator.tournament import promotion_context
+
+            try:
+                if incumbent.tenure_block is None:
+                    raise RuntimeError("original champion establishment is unavailable")
+                binding = self.batch_source.stage_binding(task.challenge_id, confirmation=False)
+                decision = {"promotion": promotion_context(
+                    self.track.promotion, initial_gain=self.track.scoring.minimum_frontier_gain,
+                    incumbent=incumbent,
+                    established_ms=self.batch_source.block_timestamp_ms(incumbent.tenure_block),
+                    submission_block=task.position.block,
+                    submitted_ms=binding["cache_allocation"]["submission_timestamp_ms"],
+                )}
+            except Exception as exc:
+                raise TemporaryScoringError(
+                    "CHAMPION_TENURE_UNAVAILABLE", "original champion chain clock is unavailable",
+                ) from exc
         evaluator = FilePairedEvaluator(
             self.track,
             str(batch.path),
@@ -274,13 +299,14 @@ class PairedTrackEvaluator:
             paired.score,
             {
                 **paired.metrics,
+                **decision,
                 **self.batch_source.stage_binding(task.challenge_id, confirmation=False),
                 "cache_sha256": batch.sha256,
                 "cache_generated_block": batch.generated_block,
                 "cache_plan_digest": batch.plan_digest,
                 "cache_seed_block_hash": batch.seed_block_hash,
                 "requires_confirmation": (
-                    paired.metrics["paired_gain_lower_bound"]
+                    self.track.promotion is None and paired.metrics["paired_gain_lower_bound"]
                     > self.track.scoring.minimum_frontier_gain
                 ),
             },
@@ -330,6 +356,8 @@ class PairedTrackEvaluator:
         challenger: LeasedChallenge,
         incumbent: LeasedChallenge,
     ) -> StageOutcome:
+        if getattr(self.track, "promotion", None) is not None:
+            raise TemporaryScoringError("SCORING_POLICY_MISMATCH", "full-video is disabled")
         if self.batch_source is None or self.confirmation_pool is None:
             raise TemporaryScoringError(
                 "CONFIRMATION_BATCH_UNAVAILABLE",

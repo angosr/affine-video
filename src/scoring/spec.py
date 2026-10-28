@@ -154,6 +154,15 @@ class ScoringSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class PromotionSpec:
+    """Exact-only rule; the full-video fields remain original scientific metadata."""
+
+    format: str
+    minimum_gain: float
+    decay_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
 class TrackSpec:
     track_id: str
     netuid: int
@@ -169,6 +178,7 @@ class TrackSpec:
     scoring: ScoringSpec
     full_video: FullVideoSpec
     digest: str
+    promotion: PromotionSpec | None = None
 
     @property
     def source_commitment_documents(self) -> tuple[dict[str, str], ...]:
@@ -180,6 +190,8 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
 
     document = asdict(spec)
     document.pop("digest")
+    if spec.promotion is None:
+        document.pop("promotion")
     document["model"]["selector"] = {
         "num_layers": spec.model.selector.num_layers,
         "num_heads": spec.model.selector.num_heads,
@@ -224,6 +236,18 @@ def load_track_spec(path: str | Path) -> TrackSpec:
 def parse_track_spec(raw: Any) -> TrackSpec:
     """Validate every score-affecting field and compute its canonical hash."""
 
+    promotion = None
+    if isinstance(raw, dict) and "promotion" in raw:
+        policy = _object(raw["promotion"], {"format", "minimum_gain", "decay_seconds"},
+                         "promotion policy")
+        if (policy["format"] != "veda-exact-tenure-v1"
+                or type(policy["decay_seconds"]) is not int
+                or policy["decay_seconds"] != 604800
+                or isinstance(policy["minimum_gain"], bool)
+                or policy["minimum_gain"] != 0.001):
+            raise TrackSpecError("unsupported exact tenure promotion policy")
+        promotion = PromotionSpec(**policy)
+        raw = {key: value for key, value in raw.items() if key != "promotion"}
     root = _object(
         raw,
         {
@@ -267,6 +291,12 @@ def parse_track_spec(raw: Any) -> TrackSpec:
         "full_video": _parse_full_video(root["full_video"]),
     }
     values["scoring"] = _parse_scoring(root["scoring"], values["model"].selector)
+    values["promotion"] = promotion
+    if promotion is not None and (
+        values["scoring"].minimum_frontier_gain != 0.003
+        or values["scoring"].match_confidence != 0.9975
+    ):
+        raise TrackSpecError("exact tenure policy requires gain 0.003 and confidence 0.9975")
     values["source_commitments"] = _parse_source_commitments(
         root["source_commitments"],
         expected_root=values["source_pool_merkle_root"],

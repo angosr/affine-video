@@ -527,6 +527,8 @@ class ReadyBatchSource:
     ) -> bool:
         """CAS-claim available inventory for the current leased, admitted FIFO stage."""
 
+        if confirmation and self.track.promotion is not None:
+            raise RuntimeError("full-video inventory is disabled by the exact tenure policy")
         stage = "CONFIRMING" if confirmation else "SCORING"
         admission = self.objects.get_optional(self._admission_name(challenge_id))
         if admission is None:
@@ -555,7 +557,7 @@ class ReadyBatchSource:
         return claim is not None
 
     def eligible_submission(self, task: object) -> bool:
-        """Admission needs both independent stages before the original submission.
+        """Require the original-S inventory needed by this track's scoring policy.
 
         This reads only authoritative metadata, never GPU availability or payload
         bytes. A temporarily lost original cache is not a new non-admission.
@@ -564,12 +566,18 @@ class ReadyBatchSource:
         eligible = [plan for _, plan in self._plans()
                     if Inventory.eligible(plan, task.position.block, stamp,
                                            self.track.cache.disclosure_delay_seconds)]
+        if self.track.promotion is not None:
+            return bool(eligible)
         return any(
             first.inventory_slot != second.inventory_slot and not {
                 proof.leaf.source_family_id for proof in first.source_proofs
             }.intersection(proof.leaf.source_family_id for proof in second.source_proofs)
             for first in eligible for second in eligible
         )
+
+    def block_timestamp_ms(self, block: int) -> int:
+        """Read the original chain clock; missing old facts must defer, never reset tenure."""
+        return _submission_timestamp_ms(block)
 
     def stage_binding(self, challenge_id: str, *, confirmation: bool) -> dict[str, object]:
         plan = self._allocated_plan(challenge_id, confirmation=confirmation)

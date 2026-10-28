@@ -628,6 +628,97 @@ def ready_for_scoring(store: ChallengeStore) -> str:
     return identifier
 
 
+@pytest.mark.parametrize("missing_clock", [False, True, "origin"])
+def test_tenure_exact_finishes_once_and_preserves_context_on_restart(
+    tmp_path, monkeypatch, missing_clock,
+):
+    from scoring.spec import parse_track_spec
+    from tests.scoring.test_spec import valid_spec
+
+    raw = valid_spec()
+    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.001,
+                        "decay_seconds": 604800}
+    raw["scoring"].update(minimum_frontier_gain=0.003, match_confidence=0.9975,
+                           bootstrap_resamples=4000)
+    raw["full_video"]["minimum_gain"] = 0.003
+    track = parse_track_spec(raw)
+    clocks = []
+
+    from tests.validator.test_tournament import challenge as old_challenge
+    from validator.tournament import genesis_champion, resolve_tournament
+
+    legacy = replace(track, track_id="legacy", track_start_block=80, promotion=None)
+    prior = old_challenge(1, "old-loser", score=0.7, incumbent_score=0.7)
+    prior["block_height"] = 90
+    prior["score_block"] = prior["stages"][0]["score_block"] = 99
+    prior["evaluation_batch"]["generated_block"] = 95
+    history = resolve_tournament(
+        [prior], track_id="legacy", track_spec_digest=legacy.digest, netuid=legacy.netuid,
+        minimum_gain=0.003, initial_champion=genesis_champion(legacy),
+    ).matches
+
+    def block_time(block):
+        clocks.append(block)
+        if missing_clock:
+            raise RuntimeError("old chain clock unavailable")
+        return 1000
+
+    source = SimpleNamespace(
+        claim_ready=lambda *_args, **_kwargs: True,
+        stage_binding=lambda *_args, **_kwargs: {
+            "cache_allocation": {"submission_timestamp_ms": 302401000},
+        },
+        block_timestamp_ms=block_time,
+    )
+    monkeypatch.setattr(PairedTrackEvaluator, "_restore_challenger",
+                        lambda _self, task, _rows: task)
+    monkeypatch.setattr(PairedTrackEvaluator, "_incumbent_task",
+                        lambda *_args: sample_task())
+    monkeypatch.setattr(PairedTrackEvaluator, "_batch", lambda *_args: SimpleNamespace(
+        path=tmp_path, sha256="ab" * 32, generated_block=80,
+        plan_digest="cd" * 32, seed_block_hash="0x" + "ab" * 32,
+    ))
+    monkeypatch.setattr(scoring_module, "IsolatedEvaluator", lambda *_args, **_kwargs:
+                        lambda _task: StageOutcome(0.8, {
+                            "incumbent_score": 0.7, "paired_gain_lower_bound": 0.0021,
+                        }))
+    path = tmp_path / "validator.db"
+    with ChallengeStore(path) as store:
+        identifier = ready_for_scoring(store)
+        evaluator = PairedTrackEvaluator(
+            track, store, tmp_path, tmp_path, tmp_path / "baseline", "unused", 1,
+            batch_source=source,
+            historical_matches=() if missing_clock == "origin" else history,
+        )
+        if missing_clock:
+            lease = store.claim_next_scoring("worker", lease_ms=1000,
+                                             ready_through_block=120, now_ms=20)
+            with pytest.raises(TemporaryScoringError, match="chain clock"):
+                evaluator(lease)
+            assert store.public_challenge(identifier)["stages"] == []
+            if missing_clock == "origin":
+                assert clocks == []  # Never query a new/current block in place of the old origin.
+            return
+        outcome = process_next_scoring(
+            store, worker_id="worker", current_finalized_block=120,
+            evaluator=evaluator, settings=ScoringSettings(), now_ms=20,
+        )
+        assert outcome.state is ChallengeState.SUCCEEDED
+        assert process_next_scoring(
+            store, worker_id="worker", current_finalized_block=120,
+            evaluator=evaluator, settings=ScoringSettings(), now_ms=21,
+        ) is None
+        original = store.public_challenge(identifier)
+    with ChallengeStore(path) as cold:
+        restored = cold.public_challenge(identifier)
+    assert restored == original
+    assert len(restored["stages"]) == 1
+    context = restored["stages"][0]["promotion"]
+    assert context["minimum_gain"] == 0.002
+    assert context["submission_timestamp_ms"] == 302401000
+    assert clocks == [80]
+
+
 @pytest.mark.parametrize("stage", ["exact", "confirmation"])
 @pytest.mark.parametrize("damaged_side", ["challenger", "incumbent"])
 def test_admitted_model_read_failure_does_not_eliminate_challenger(

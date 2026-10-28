@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from enum import StrEnum
 from math import isfinite
 from typing import Any
 
 from miner.submit import PrivateModelSubmission, model_source_fields, private_model_source
-from scoring.spec import TrackSpec
+from scoring.spec import PromotionSpec, TrackSpec
 from validator.queue import TERMINAL_STATES, ChainPosition, ChallengeState
 
 
@@ -32,6 +32,8 @@ class Champion:
     uid: int | None = None
     source: str = "MINER"
     private_submission: PrivateModelSubmission | None = None
+    # Derived from authenticated genesis/winner facts, not score observations.
+    tenure_block: int | None = field(default=None, compare=False)
 
     def public(self) -> dict[str, Any]:
         return {
@@ -119,6 +121,32 @@ def canonical_score_gain(score: float, frontier: float) -> float:
     return float(Decimal(str(score)) - Decimal(str(frontier)))
 
 
+def tenure_threshold(policy: PromotionSpec, *, initial_gain: float, established_ms: int,
+                     submitted_ms: int) -> float:
+    for stamp in (established_ms, submitted_ms):
+        if type(stamp) is not int or stamp <= 0:
+            raise ValueError("tenure requires original chain timestamps")
+    elapsed = min(max(submitted_ms - established_ms, 0), policy.decay_seconds * 1000)
+    return float(Decimal(str(initial_gain)) - (
+        Decimal(str(initial_gain)) - Decimal(str(policy.minimum_gain))
+    ) * Decimal(elapsed) / Decimal(policy.decay_seconds * 1000))
+
+
+def promotion_context(policy: PromotionSpec, *, initial_gain: float, incumbent: Champion,
+                      established_ms: int, submission_block: int,
+                      submitted_ms: int) -> dict[str, Any]:
+    if incumbent.tenure_block is None:
+        raise ValueError("authenticated champion establishment block is unavailable")
+    return {
+        "format": policy.format, "champion_id": incumbent.challenge_id,
+        "established_block": incumbent.tenure_block,
+        "established_timestamp_ms": established_ms,
+        "submission_block": submission_block, "submission_timestamp_ms": submitted_ms,
+        "minimum_gain": tenure_threshold(policy, initial_gain=initial_gain,
+                                        established_ms=established_ms, submitted_ms=submitted_ms),
+    }
+
+
 def genesis_champion(track: TrackSpec) -> Champion:
     """Return the code-defined UID0 champion that exists without an on-chain commit."""
 
@@ -132,6 +160,9 @@ def genesis_champion(track: TrackSpec) -> Champion:
         position=ChainPosition(track.track_start_block, 0, 0),
         uid=initial.uid,
         source="VEDA_BASELINE",
+        # A new rules release must recover the original baseline establishment;
+        # its own start is not a new seven-day term.
+        tenure_block=track.track_start_block if track.promotion is None else None,
     )
 
 
@@ -175,6 +206,7 @@ def validate_match_document(
     minimum_gain: float,
     minimum_exact_gain: float | None = None,
     incumbent: Champion,
+    promotion: PromotionSpec | None = None,
 ) -> MatchRecord:
     """Strictly validate one stored match and its link to the previous champion."""
 
@@ -188,6 +220,7 @@ def validate_match_document(
         minimum_gain=minimum_gain,
         minimum_exact_gain=minimum_gain if minimum_exact_gain is None else minimum_exact_gain,
         incumbent=incumbent,
+        promotion=promotion,
     )
     if dict(record.document) != dict(document):
         raise ValueError("stored match is not the canonical tournament decision")
@@ -204,6 +237,7 @@ def resolve_tournament(
     minimum_exact_gain: float | None = None,
     initial_champion: Champion,
     historical_matches: tuple[MatchRecord, ...] = (),
+    promotion: PromotionSpec | None = None,
 ) -> Tournament:
     """Resolve the contiguous terminal prefix in finalized submission order."""
 
@@ -289,6 +323,7 @@ def resolve_tournament(
             minimum_gain=minimum_gain,
             minimum_exact_gain=exact_gain,
             incumbent=champion,
+            promotion=promotion,
         )
         matches.append(record)
         if state is ChallengeState.SUCCEEDED:
@@ -373,9 +408,28 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
             raise ValueError("historical scored model identity is missing")
         if _integer(challenge["model_size_bytes"], "historical model size") == 0:
             raise ValueError("historical model is empty")
+        stages = _evaluation_stages(challenge["stages"])
+        if stages and "promotion" in stages[0]:
+            context = stages[0]["promotion"]
+            expected = promotion_context(
+                PromotionSpec("veda-exact-tenure-v1", 0.001, 604800), initial_gain=0.003,
+                incumbent=replace(before, tenure_block=context.get("established_block")),
+                established_ms=context.get("established_timestamp_ms"),
+                submission_block=position.block,
+                submitted_ms=context.get("submission_timestamp_ms"),
+            )
+            won = _gain(challenge["paired_gain_lower_bound"], "historical gain") > expected[
+                "minimum_gain"
+            ]
+            if (len(stages) != 1 or context != expected
+                    or document["minimum_gain"] != expected["minimum_gain"]
+                    or (outcome is MatchOutcome.CHALLENGER_WON) != won):
+                raise ValueError("historical exact tenure decision is inconsistent")
     if outcome is MatchOutcome.CHALLENGER_WON:
         if (state is not ChallengeState.SUCCEEDED or score is None
-                or len(_evaluation_stages(challenge["stages"])) != 2
+                or (len(_evaluation_stages(challenge["stages"])) != 2
+                    and not (len(challenge["stages"]) == 1
+                             and "promotion" in challenge["stages"][0]))
                 or after != Champion(challenge["challenge_id"], challenge["hotkey"],
                                      challenge["repo_id"], challenge["revision"], score, position,
                                      private_submission=private)):
@@ -420,7 +474,7 @@ def historical_champion(matches: tuple[MatchRecord, ...], baseline: Champion) ->
         baseline.uid, baseline.source,
     ):
         raise ValueError("historical ledger does not start with the official baseline")
-    incumbent = first
+    incumbent = replace(first, tenure_block=first.position.block)
     sequences: dict[str, int] = {}
     seen = set()
     for match in matches:
@@ -431,7 +485,19 @@ def historical_champion(matches: tuple[MatchRecord, ...], baseline: Champion) ->
             raise ValueError("historical match prefix or champion link is inconsistent")
         sequences[track_id] = expected_sequence
         seen.add(match.challenge_id)
-        incumbent = match.champion_after
+        if "promotion" in (match.document["evaluation"].get("stages") or [{}])[0]:
+            context = match.document["evaluation"]["stages"][0]["promotion"]
+            expected = promotion_context(
+                PromotionSpec("veda-exact-tenure-v1", 0.001, 604800), initial_gain=0.003,
+                incumbent=incumbent, established_ms=context["established_timestamp_ms"],
+                submission_block=match.document["submission"]["block_height"],
+                submitted_ms=context["submission_timestamp_ms"],
+            )
+            if context != expected or match.document["minimum_gain"] != expected["minimum_gain"]:
+                raise ValueError("historical tenure context differs from original champion")
+        tenure = (match.document["decided_block"] if match.outcome is MatchOutcome.CHALLENGER_WON
+                  else incumbent.tenure_block)
+        incumbent = replace(match.champion_after, tenure_block=tenure)
     return incumbent
 
 
@@ -445,6 +511,7 @@ def _resolve_match(
     minimum_gain: float,
     minimum_exact_gain: float,
     incumbent: Champion,
+    promotion: PromotionSpec | None = None,
 ) -> tuple[MatchRecord, Champion]:
     identifier = _required_string(challenge, "challenge_id")
     submission_id = _required_string(challenge, "submission_id")
@@ -515,10 +582,25 @@ def _resolve_match(
         if not stages:
             raise ValueError("successful challenge is missing its exact stage")
         exact_stage = stages[0]
+        if promotion is not None:
+            if len(stages) != 1 or "promotion" not in exact_stage:
+                raise ValueError("exact tenure policy requires one original exact stage")
+            context = exact_stage["promotion"]
+            expected = promotion_context(
+                promotion, initial_gain=minimum_exact_gain, incumbent=incumbent,
+                established_ms=context.get("established_timestamp_ms"),
+                submission_block=position.block,
+                submitted_ms=context.get("submission_timestamp_ms"),
+            )
+            allocation = (exact_stage.get("evaluation_batch") or {}).get("allocation")
+            if (context != expected or (allocation is not None and
+                    allocation["submission_timestamp_ms"] != expected["submission_timestamp_ms"])):
+                raise ValueError("promotion context differs from original submission and champion")
+            minimum_gain = minimum_exact_gain = expected["minimum_gain"]
         exact_gain = exact_stage.get("paired_gain_lower_bound")
         if exact_gain is None:
             raise ValueError("exact stage is missing its paired gain")
-        if len(stages) == 1 and exact_gain > minimum_exact_gain:
+        if promotion is None and len(stages) == 1 and exact_gain > minimum_exact_gain:
             raise ValueError("an exact-stage promotion requires full-video confirmation")
         if len(stages) == 2:
             confirmation = stages[1]
@@ -540,11 +622,12 @@ def _resolve_match(
         ):
             raise ValueError("final score does not match the last completed stage")
         cleared_both_stages = (
-            len(stages) == 2 and exact_gain > minimum_exact_gain and score_gain > minimum_gain
+            (promotion is not None and score_gain > minimum_gain)
+            or (len(stages) == 2 and exact_gain > minimum_exact_gain and score_gain > minimum_gain)
         )
         if cleared_both_stages:
             outcome = MatchOutcome.CHALLENGER_WON
-            incumbent = candidate
+            incumbent = replace(candidate, tenure_block=score_block)
         else:
             outcome = MatchOutcome.CHAMPION_RETAINED
             incumbent = replace(incumbent, score=incumbent_score)
@@ -779,6 +862,10 @@ def _evaluation_stages(
             "score_block": score_block,
             "stage": stage,
         }
+        if "promotion" in row:
+            if not isinstance(row["promotion"], Mapping):
+                raise ValueError("promotion context must be an object")
+            document["promotion"] = dict(row["promotion"])
         if row.get("evaluation_batch") is not None:
             batch = _evaluation_batch(
                 row["evaluation_batch"],

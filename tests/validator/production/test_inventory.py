@@ -318,6 +318,28 @@ def test_time_rpc_failure_cannot_prune_or_invent_non_admission(
         source.eligible_submission(SimpleNamespace(position=SimpleNamespace(block=200)))
 
 
+def test_exact_tenure_admits_one_original_ready_without_confirmation_inventory(
+    inventory_case, tmp_path, monkeypatch,
+):
+    case = inventory_case
+    raw = track_spec_dict(case.track)
+    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.001,
+                        "decay_seconds": 604800}
+    raw["scoring"].update(minimum_frontier_gain=0.003, match_confidence=0.9975,
+                           bootstrap_resamples=4000)
+    raw["full_video"]["minimum_gain"] = 0.003
+    case.track = parse_track_spec(raw)
+    source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
+    plan = make_plan(case, 101)
+    monkeypatch.setattr(source, "_plans", lambda: (("single", plan),))
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms", lambda b: b * 1000)
+    assert source.eligible_submission(SimpleNamespace(position=SimpleNamespace(block=200)))
+    assert not source.eligible_submission(SimpleNamespace(position=SimpleNamespace(block=101)))
+    with pytest.raises(RuntimeError, match="full-video inventory is disabled"):
+        source.claim_ready("ab" * 32, confirmation=True, file_sha256="cd" * 32,
+                           model_digest="ef" * 32, submission_block=200)
+
+
 def test_confirmation_uses_independent_half_even_when_already_generated(inventory_case):
     case = inventory_case
     plans = (make_plan(case, 101), make_plan(case, 102), make_plan(case, 103, 1))

@@ -208,6 +208,7 @@ def build_public_artifacts(
         netuid=track.netuid,
         minimum_gain=track.full_video.minimum_gain,
         minimum_exact_gain=track.scoring.minimum_frontier_gain,
+        promotion=track.promotion,
         initial_champion=initial,
         historical_matches=historical_matches,
     )
@@ -343,6 +344,7 @@ def build_genesis_artifacts(
         netuid=track.netuid,
         minimum_gain=track.full_video.minimum_gain,
         minimum_exact_gain=track.scoring.minimum_frontier_gain,
+        promotion=track.promotion,
         initial_champion=genesis_champion(track),
         historical_matches=historical_matches,
     )
@@ -799,6 +801,14 @@ class S3Repository:
             try:
                 track = parse_track_spec(track_document["spec"])
                 model_objects = {}
+                incumbent = genesis_champion(track)
+                if artifacts.runtime_manifest is not None:
+                    competition = artifacts.runtime_manifest[1]
+                    if (self.release_approval is not None
+                            and self.release_approval.competition_manifest is not None):
+                        competition = self.release_approval.competition_manifest
+                    history = await asyncio.to_thread(self._load_history, track, competition)
+                    incumbent = historical_champion(history, incumbent)
                 for sequence, (name, payload) in enumerate(artifacts.matches, start=1):
                     document = _decode_canonical_object(payload, name)
                     match = validate_match_document(
@@ -806,8 +816,10 @@ class S3Repository:
                         track_spec_digest=track.digest, netuid=track.netuid,
                         minimum_gain=track.full_video.minimum_gain,
                         minimum_exact_gain=track.scoring.minimum_frontier_gain,
-                        incumbent=Champion.from_public(document["incumbent_before"]),
+                        promotion=track.promotion,
+                        incumbent=incumbent,
                     )
+                    incumbent = match.champion_after
                     if name != match.object_name:
                         raise ValueError("public model match name is invalid")
                     evaluation = match.document["evaluation"]
@@ -844,6 +856,7 @@ class S3Repository:
                     track_id=track.track_id, track_spec_digest=track.digest, netuid=track.netuid,
                     minimum_gain=track.full_video.minimum_gain,
                     minimum_exact_gain=track.scoring.minimum_frontier_gain,
+                    promotion=track.promotion,
                     initial_champion=genesis_champion(track), historical_matches=history,
                 )
                 if artifacts.summary != _json_bytes(
@@ -1253,6 +1266,7 @@ class S3Repository:
                     netuid=track.netuid,
                     minimum_gain=track.full_video.minimum_gain,
                     minimum_exact_gain=track.scoring.minimum_frontier_gain,
+                    promotion=track.promotion,
                     incumbent=incumbent,
                 )
             except ValueError as exc:
@@ -1273,6 +1287,7 @@ class S3Repository:
             netuid=track.netuid,
             minimum_gain=track.full_video.minimum_gain,
             minimum_exact_gain=track.scoring.minimum_frontier_gain,
+            promotion=track.promotion,
             initial_champion=genesis_champion(track),
             historical_matches=history,
         )
@@ -1352,6 +1367,7 @@ class S3Repository:
                     netuid=track.netuid,
                     minimum_gain=track.full_video.minimum_gain,
                     minimum_exact_gain=track.scoring.minimum_frontier_gain,
+                    promotion=track.promotion,
                     incumbent=incumbent,
                 )
             except ValueError as exc:
@@ -1925,7 +1941,7 @@ def _status_document(
         # commitments, never arbitrary metric payloads (prompts/seeds/cases).
         stages = [{key: stage[key] for key in (
             "stage", "score", "score_block", "incumbent_score", "paired_gain_lower_bound",
-            "evaluation_batch",
+            "evaluation_batch", "promotion",
         ) if key in stage} for stage in challenge.get("stages", [])]
         latest_score = stages[-1]["score"] if stages else None
         active_rows.append(

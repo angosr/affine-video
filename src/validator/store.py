@@ -1932,8 +1932,10 @@ class ChallengeStore:
                     for index, stage in enumerate(stages):
                         batch = stage.get("evaluation_batch")
                         metrics = {}
+                        if "promotion" in stage:
+                            metrics["promotion"] = stage["promotion"]
                         if batch is not None:
-                            metrics = {
+                            metrics.update({
                                 "incumbent_score": stage["incumbent_score"],
                                 "paired_gain_lower_bound": stage["paired_gain_lower_bound"],
                                 "cache_sha256": batch["sha256"],
@@ -1950,7 +1952,7 @@ class ChallengeStore:
                                     )
                                     if key in batch
                                 },
-                            }
+                            })
                         self._connection.execute(
                             """
                             INSERT INTO stage_scores (
@@ -2091,6 +2093,8 @@ class ChallengeStore:
                 "score_block": stage["score_block"],
                 "created_at_ms": stage["created_at_ms"],
             }
+            if "promotion" in stage_metrics:
+                document["promotion"] = stage_metrics["promotion"]
             if "cache_sha256" in stage_metrics:
                 document["evaluation_batch"] = {
                     "sha256": stage_metrics["cache_sha256"],

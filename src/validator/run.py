@@ -544,11 +544,12 @@ async def run_evaluator(
             public_base_url=PUBLIC_STORAGE_URL,
         )
         retry_store = PrivateRetryStore(objects, track_spec_digest=track.digest)
-        confirmation_pool = ConfirmationWorkerPool(
-            data_config,
-            track,
-            timeout_seconds=scoring_timeout_seconds,
-        )
+        if track.promotion is None:
+            confirmation_pool = ConfirmationWorkerPool(
+                data_config,
+                track,
+                timeout_seconds=scoring_timeout_seconds,
+            )
     scoring_settings = ScoringSettings(
         lease_ms=ceil(scoring_timeout_seconds * 2 * 1000) + 60_000,
         alert=alert,

@@ -15,6 +15,11 @@
     "inventory_target_batches": 4,
     "storage_dtype": "float16"
   },
+  "promotion": {
+    "format": "veda-exact-tenure-v1",
+    "minimum_gain": 0.001,
+    "decay_seconds": 604800
+  },
   "full_video": {
     "black_frame_threshold": 0.01,
     "feature_model_sha256": "1f542c569f5e8912e30a156da860faff22a4ec08b4c432fb3cbbabded40dc016",

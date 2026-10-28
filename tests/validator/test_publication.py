@@ -1559,6 +1559,80 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
     assert len(restored) == (cache_state != "valid")
 
 
+@pytest.mark.parametrize("gain,won", [(0.002, False), (0.00200001, True)])
+def test_exact_tenure_private_result_publication_and_cold_reader(tmp_path, gain, won):
+    from tests.validator.test_tournament import tenure_challenge
+    from validator.tournament import genesis_champion
+
+    raw = valid_spec()
+    raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": 0.001,
+                        "decay_seconds": 604800}
+    raw["scoring"].update(minimum_frontier_gain=0.003, match_confidence=0.9975,
+                           bootstrap_resamples=4000)
+    raw["full_video"]["minimum_gain"] = 0.003
+    track = parse_track_spec(raw)
+    # One authenticated old baseline fact; the new track start is not its tenure.
+    legacy = replace(track, track_id="legacy", track_start_block=80, promotion=None)
+    old = scored_challenge(1, "old-loser", score=0.7, incumbent_score=0.7)
+    old["block_height"] = 90
+    old["score_block"] = old["stages"][0]["score_block"] = 99
+    old["evaluation_batch"]["generated_block"] = 95
+    history = resolve_tournament(
+        [old], track_id=legacy.track_id, track_spec_digest=legacy.digest, netuid=legacy.netuid,
+        minimum_gain=0.003, initial_champion=genesis_champion(legacy),
+    ).matches
+    historical_body = canonical_json(history[0].document)
+    manifest = ArtifactManifest((Artifact(
+        HISTORICAL_MATCHES_PREFIX + history[0].object_name,
+        hashlib.sha256(historical_body).hexdigest(), len(historical_body), history[0].object_name,
+    ),))
+    raw["artifact_manifest_sha256"] = manifest.digest
+    track = parse_track_spec(raw)
+    model = tmp_path / "synthetic-model"
+    model.write_bytes(b"synthetic model bytes; not a GPU or real miner test")
+    digest = hashlib.sha256(model.read_bytes()).hexdigest()
+    from validator.tournament import historical_champion
+    item = tenure_challenge(1, historical_champion(history, genesis_champion(track)),
+                            gain=gain, submitted_ms=302401000)
+    item.update(file_sha256=digest, model_size_bytes=model.stat().st_size)
+    item.update(model_source_fields(None, None, PrivateModelSubmission("ef" * 32, digest)))
+    store = SimpleNamespace(
+        chain_cursor=lambda: (1000, "0x" + "12" * 32),
+        public_snapshot=lambda: {"challenges": [item]},
+        active_competitors=lambda _mapping: [], legacy_excluded_hotkeys=lambda: frozenset(),
+        model_path=lambda _identifier: str(model),
+    )
+    chain = WeightChainState(1000, {track.initial_champion.hotkey: 0, item["hotkey"]: 4},
+                             1, 1.0, 10, {})
+    artifacts = build_public_artifacts(
+        store, track, chain, version_key=0,
+        historical_matches=history, runtime_manifest=manifest.encode(),
+    )
+    document = json.loads(artifacts.matches[0][1])
+    assert document["minimum_gain"] == 0.002
+    assert document["outcome"] == ("CHALLENGER_WON" if won else "CHAMPION_RETAINED")
+    assert len(document["evaluation"]["stages"]) == 1
+    client = MemoryS3()
+    client.objects["isolated/tenure/" + history[0].object_name] = historical_body
+    publisher = S3Repository(client, bucket="test", prefix="isolated/tenure")
+    asyncio.run(publisher.publish(artifacts))
+    order = [call["Key"] for call in client.calls]
+    model_keys = [key for key in order if "/models/" in key]
+    if won:
+        assert model_keys
+        assert max(order.index(key) for key in model_keys) < order.index(
+            "isolated/tenure/" + artifacts.matches[0][0],
+        )
+    else:
+        assert not model_keys and document["evaluation"]["model_object"] is None
+    cold = S3Repository(client, bucket="test", prefix="isolated/tenure")
+    recovered = asyncio.run(cold.recover(track))
+    assert recovered.matches[0].document == document
+    assert recovered.matches[0].champion_after.hotkey == (
+        item["hotkey"] if won else track.initial_champion.hotkey
+    )
+
+
 def test_failed_private_model_has_public_result_without_payload_and_cold_recovers(tmp_path):
     from validator.queue import ChallengeState
 
