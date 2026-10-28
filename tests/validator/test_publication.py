@@ -1914,7 +1914,13 @@ def test_loader_reconciles_fixed_path_cutover_without_parsing_previous_scoring_s
             asyncio.run(repository.load(track))
 
 
-def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_path) -> None:
+@pytest.mark.parametrize("reuse_data_identity", [False, True])
+def test_restart_verifies_disclosed_batches_without_restoring_private_files(
+    tmp_path, reuse_data_identity,
+) -> None:
+    from scoring.spec import data_spec_logical_name, track_spec_dict
+    from tests.scoring.test_spec import rules_for_data
+    from validator.production.commitment import Artifact
     leaves = tuple(
         SourceLeaf(
             "production",
@@ -1940,6 +1946,10 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
     )
     pool = SourcePool((*leaves, audit))
     raw_track = valid_spec()
+    data_manifest = ArtifactManifest((
+        Artifact("weights/teacher", "ab" * 32, 1, "artifacts/model"),
+    ))
+    raw_track["artifact_manifest_sha256"] = data_manifest.digest
     raw_track["source_pool_merkle_root"] = pool.root
     raw_track["source_commitments"] = {
         "production": {
@@ -2102,6 +2112,31 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(tmp_
                    for key in client.objects)
 
     restarted = S3Repository(client, bucket="public-data", prefix="tracks/test")
+    if reuse_data_identity:
+        rule_document = rules_for_data(track)
+        provisional = parse_track_spec(rule_document)
+        origin = canonical_json(track_spec_dict(track))
+        runtime = ArtifactManifest(tuple(sorted((*data_manifest.artifacts, Artifact(
+            data_spec_logical_name(provisional), track.digest, len(origin),
+            "artifacts/" + track.digest,
+        )), key=lambda a: a.logical_name)))
+        rule_document["artifact_manifest_sha256"] = runtime.digest
+        rules = parse_track_spec(rule_document)
+        client.objects["tracks/test/artifacts/" + track.digest] = origin
+        client.objects[f"tracks/test/runtime/{runtime.digest}/manifest.json"] = runtime.encode()
+        client.objects[f"tracks/test/runtime/{data_manifest.digest}/manifest.json"] = (
+            data_manifest.encode()
+        )
+        resolved = restarted._load_data_track(rules)
+        assert resolved == track and rules.digest != resolved.digest
+        assert restarted._load_batch_disclosures(resolved, (match,)) == frozenset({
+            ready.plan_digest,
+        })
+        original_body = client.objects["tracks/test/artifacts/" + track.digest]
+        client.objects["tracks/test/artifacts/" + track.digest] = origin + b" "
+        with pytest.raises(PublicArtifactError, match="unavailable or changed"):
+            restarted._load_data_track(rules)
+        client.objects["tracks/test/artifacts/" + track.digest] = original_body
     assert restarted._load_batch_disclosures(track, (match,)) == frozenset(
         {ready.plan_digest}
     )

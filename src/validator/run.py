@@ -273,7 +273,7 @@ async def _publish_due_batch(
     due = await asyncio.to_thread(source.due_plan_digests, now_ms)
     if not due:
         return None
-    retries = PrivateRetryStore(source.objects, track_spec_digest=source.track.digest)
+    retries = PrivateRetryStore(source.objects, track_spec_digest=source.data_track.digest)
     published = None
     for digest in due:
         attempt = await asyncio.to_thread(
@@ -290,7 +290,7 @@ async def _publish_due_batch(
             if disclosure is None:
                 raise RuntimeError("disclosure became unavailable after reserving its attempt")
             await publisher.publish_disclosure(
-                disclosure, track=source.track, now_ms=now_ms, deadline=deadline,
+                disclosure, track=source.data_track, now_ms=now_ms, deadline=deadline,
             )
             await asyncio.to_thread(source.record_disclosed, digest)
         except BaseException as exc:
@@ -509,17 +509,20 @@ async def run_evaluator(
     retry_store = None
     if data_config is not None:
         scoring_device = data_config.validate_evaluation_device(scoring_device)
+        data_track, data_manifest_payload = data_config.data_binding(
+            track, runtime_manifest_payload,
+        )
         objects = PrivateObjectStore.from_evaluator_environment(
             bucket=data_config.storage_bucket,
-            prefix=f"{data_config.storage_prefix}/tracks/{track.digest}",
+            prefix=f"{data_config.storage_prefix}/tracks/{data_track.digest}",
         )
         objects.verify_conditional_writes()
         stored_manifest = objects.get(ARTIFACT_MANIFEST_OBJECT).body
-        if stored_manifest != competition_manifest_payload:
-            raise ValueError("private competition manifest differs from the verified local binding")
+        if stored_manifest != data_manifest_payload:
+            raise ValueError("private data manifest differs from the verified original binding")
         competition = ArtifactManifest.decode(stored_manifest)
-        if competition.digest != track.artifact_manifest_sha256:
-            raise ValueError("artifact manifest does not match the track commitment")
+        if competition.digest != data_track.artifact_manifest_sha256:
+            raise ValueError("artifact manifest does not match the original data commitment")
         manifest = ArtifactManifest.decode(runtime_manifest_payload)
         _require_production_release(track, runtime_manifest_payload, publisher)
         hidden_artifacts = tuple(
@@ -537,6 +540,7 @@ async def run_evaluator(
         )
         batch_source = ReadyBatchSource(
             track=track,
+            data_track=data_track,
             objects=objects,
             cache_dir=cache_dir,
             batch_dir=data_config.work_dir / "content",

@@ -179,6 +179,7 @@ class TrackSpec:
     full_video: FullVideoSpec
     digest: str
     promotion: PromotionSpec | None = None
+    data_spec_sha256: str | None = None
 
     @property
     def source_commitment_documents(self) -> tuple[dict[str, str], ...]:
@@ -192,6 +193,8 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
     document.pop("digest")
     if spec.promotion is None:
         document.pop("promotion")
+    if spec.data_spec_sha256 is None:
+        document.pop("data_spec_sha256")
     document["model"]["selector"] = {
         "num_layers": spec.model.selector.num_layers,
         "num_heads": spec.model.selector.num_heads,
@@ -220,6 +223,44 @@ def track_spec_dict(spec: TrackSpec) -> dict[str, Any]:
     return document
 
 
+def data_contract_digest(spec: TrackSpec) -> str:
+    """Commit data semantics, independently of rules and executable packaging.
+
+    Keep geometry, source commitments, schedule, routes/budgets, cache encoding,
+    disclosure age and model identities. Only explicitly non-data policy fields
+    are excluded; a new field remains protected by default.
+    """
+    document = track_spec_dict(spec)
+    for name in ("track_id", "track_start_block", "artifact_manifest_sha256",
+                 "promotion", "data_spec_sha256"):
+        document.pop(name, None)
+    document["initial_champion"].pop("score")
+    for name in ("inventory_target_batches", "inventory_max_bytes"):
+        document["cache"].pop(name)
+    for name in ("minimum_frontier_gain", "match_confidence", "bootstrap_resamples",
+                 "bootstrap_seed"):
+        document["scoring"].pop(name)
+    document["full_video"].pop("minimum_gain")
+    return hashlib.sha256(_canonical_json(document)).hexdigest()
+
+
+def data_spec_logical_name(spec: TrackSpec) -> str:
+    if spec.data_spec_sha256 is None:
+        raise TrackSpecError("track has no separate data specification")
+    return f"evidence/system-panel/data/{spec.data_spec_sha256}/track.json"
+
+
+def validate_data_track(rules: TrackSpec, data: TrackSpec) -> None:
+    """Accept exactly one pinned original data identity, never a digest bypass."""
+    if rules is data and getattr(rules, "data_spec_sha256", None) is None:
+        return
+    expected = rules.data_spec_sha256 or rules.digest
+    if data.digest != expected or (rules.data_spec_sha256 and data.data_spec_sha256):
+        raise TrackSpecError("data specification differs from its committed origin")
+    if data_contract_digest(rules) != data_contract_digest(data):
+        raise TrackSpecError("rules and original inventory have incompatible data contracts")
+
+
 def load_track_spec(path: str | Path) -> TrackSpec:
     """Load one JSON spec, rejecting duplicate keys before validation."""
 
@@ -236,6 +277,10 @@ def load_track_spec(path: str | Path) -> TrackSpec:
 def parse_track_spec(raw: Any) -> TrackSpec:
     """Validate every score-affecting field and compute its canonical hash."""
 
+    data_spec_sha256 = None
+    if isinstance(raw, dict) and "data_spec_sha256" in raw:
+        data_spec_sha256 = _digest(raw["data_spec_sha256"], "data specification SHA-256")
+        raw = {key: value for key, value in raw.items() if key != "data_spec_sha256"}
     promotion = None
     if isinstance(raw, dict) and "promotion" in raw:
         policy = _object(raw["promotion"], {"format", "minimum_gain", "decay_seconds"},
@@ -292,6 +337,7 @@ def parse_track_spec(raw: Any) -> TrackSpec:
     }
     values["scoring"] = _parse_scoring(root["scoring"], values["model"].selector)
     values["promotion"] = promotion
+    values["data_spec_sha256"] = data_spec_sha256
     if promotion is not None and (
         values["scoring"].minimum_frontier_gain != 0.003
         or values["scoring"].match_confidence != 0.9975

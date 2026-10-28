@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from scoring.spec import parse_track_spec, track_spec_dict
-from tests.scoring.test_spec import valid_spec
+from tests.scoring.test_spec import rules_for_data, valid_spec
 from tests.validator.test_store import submission_at
 from validator.production.batches import ReadyBatchSource
 from validator.production.commitment import (
@@ -143,6 +143,76 @@ def test_runtime_update_reuses_original_ready_and_claim_without_rebinding(invent
     assert case.objects._client.objects == before
     assert tuple(plan.encode() for plan in plans) == encoded
     assert all(plan.completed_at_ms == (plan.generation_block + 1) * 1000 for plan in plans)
+
+
+def test_new_rules_keep_all_four_ready_seals_and_original_allocation_authority(
+    inventory_case, tmp_path, monkeypatch,
+):
+    from validator.production import batches as batches_module
+    from validator.queue import ChainPosition
+
+    case = inventory_case
+    raw = track_spec_dict(case.track)
+    raw["cache"].update(inventory_target_batches=4, inventory_max_bytes=512 * 1024**3)
+    case.track = parse_track_spec(raw)
+    plans = tuple(make_plan(case, 101 + index, index % 2) for index in range(4))
+    for plan in plans:
+        case.objects.create_plan(f"plans/{plan.generation_block}.json", plan.encode())
+    previous = claim(Inventory(case.objects, case.track.digest), plans)
+    before = {name: case.objects.get(name).body for name in
+              case.objects.list_names("plans/") if name != ALLOCATION_OBJECT}
+    rules = parse_track_spec(rules_for_data(case.track))
+    source = ReadyBatchSource(track=rules, data_track=case.track, objects=case.objects,
+                             cache_dir=tmp_path)
+    task = SimpleNamespace(challenge_id="d4" * 32, submission_id="e5" * 32, hotkey="miner",
+                           repo_id="owner/model", revision="12" * 20,
+                           position=ChainPosition(200, 0, 0))
+    case.objects.create_plan(source._admission_name(task.challenge_id), canonical_json({
+        "format": "veda-admission-model-v1", **source._admission_identity(task),
+        "file_sha256": "b2" * 32, "model_digest": "c3" * 32, "size_bytes": 100,
+        "submission_timestamp_ms": 200_000,
+    }))
+    monkeypatch.setattr(batches_module, "_submission_timestamp_ms", lambda block: block * 1000)
+    assert source.eligible_submission(task)
+    assert source.claim_ready(task.challenge_id, confirmation=False, file_sha256="b2" * 32,
+                              model_digest="c3" * 32, submission_block=200)
+    with pytest.raises(RuntimeError, match="disabled"):
+        source.claim_ready(task.challenge_id, confirmation=True, file_sha256="b2" * 32,
+                           model_digest="c3" * 32, submission_block=200)
+    cold = ReadyBatchSource(track=rules, data_track=case.track, objects=case.objects,
+                           cache_dir=tmp_path / "cold")
+    _, authority = cold.inventory.read()
+    assert authority["track_spec_digest"] == case.track.digest
+    assert authority["claims"][0] == previous
+    assert len(authority["claims"]) == 2
+    assert cold.stage_binding(task.challenge_id, confirmation=False) == source.stage_binding(
+        task.challenge_id, confirmation=False,
+    )
+    task.state, task.file_sha256 = ChallengeState.SCORING, "b2" * 32
+    plan = cold._allocated_plan(task.challenge_id, confirmation=False)
+    metrics = {**cold.stage_binding(task.challenge_id, confirmation=False),
+               "cache_generated_block": plan.generation_block,
+               "cache_plan_digest": plan.plan_digest,
+               "cache_seed_block_hash": plan.block_hash, "cache_sha256": plan.exact.sha256}
+    cold.archive_stage(task, StageOutcome(.8, metrics), 210)
+    assert source.restore_stage(task).score == .8
+    archived = json.loads(case.objects.get(source._stage_name(task.challenge_id, "SCORING")).body)
+    assert archived["track_spec_digest"] == rules.digest
+    assert metrics["cache_ready_sha256"] == hashlib.sha256(plan.encode()).hexdigest()
+    original = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path / "old")
+    assert original.due_plan_digests(10**12) == cold.due_plan_digests(10**12)
+    assert [p.encode() for _, p in cold._plans()] == [p.encode() for p in plans]
+    assert {name: case.objects.get(name).body for name in before} == before
+    assert cold.inventory_status(plans)["max_bytes"] == 768 * 1024**3
+    coordinator = PlanCoordinator(track=rules, data_track=case.track, store=SimpleNamespace(
+        finalized_block_hash=lambda _block: None,
+    ), objects=case.objects, source_pool=case.pool)
+    assert coordinator.create_next(now_ms=110_000, finalized_head=(110, "ab" * 32)) is None
+    assert tuple(p for _, _, p in coordinator.plans()) == plans
+    replacement = coordinator.create_next(disk_bytes=512 * 1024**3, now_ms=10**12,
+                                           finalized_head=(110, "ab" * 32))
+    assert replacement is not None and replacement.track_spec_digest == case.track.digest
+    assert {name: case.objects.get(name).body for name in before} == before
 
 
 @pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])

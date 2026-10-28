@@ -58,6 +58,74 @@ def test_config_fixes_formal_producer_gpu_assignment(tmp_path) -> None:
     )
 
 
+def bound_data_configuration(tmp_path):
+    from scoring.spec import data_spec_logical_name, parse_track_spec, track_spec_dict
+    from tests.scoring.test_spec import rules_for_data, valid_spec
+
+    asset = Artifact("weights/teacher", "ab" * 32, 1, "artifacts/teacher")
+    original = ArtifactManifest((asset,))
+    raw = valid_spec()
+    raw["artifact_manifest_sha256"] = original.digest
+    raw["cache"].update(inventory_target_batches=4, inventory_max_bytes=512 * 1024**3)
+    data = parse_track_spec(raw)
+    body = canonical_json(track_spec_dict(data))
+    rules = parse_track_spec(rules_for_data(data))
+    runtime = ArtifactManifest(tuple(sorted((asset, Artifact(
+        data_spec_logical_name(rules), data.digest, len(body), "artifacts/" + data.digest,
+    )), key=lambda a: a.logical_name)))
+    raw = track_spec_dict(rules)
+    raw["artifact_manifest_sha256"] = runtime.digest
+    rules = parse_track_spec(raw)
+    value = document(tmp_path)
+    value.update(data_track_spec=str(tmp_path / "data-track.json"),
+                 data_competition_manifest=str(tmp_path / "data-manifest.json"))
+    for path, payload in ((value["track_spec"], canonical_json(track_spec_dict(rules))),
+                          (value["data_track_spec"], body),
+                          (value["data_competition_manifest"], original.encode()),
+                          (value["competition_manifest"], runtime.encode()),
+                          (value["artifact_manifest"], runtime.encode())):
+        from pathlib import Path
+        Path(path).write_bytes(payload)
+    path = tmp_path / "producer.json"
+    path.write_text(json.dumps(value))
+    return rules, data, load_producer_config(path), runtime, original
+
+
+def test_data_binding_reuses_original_spec_manifest_and_work(tmp_path):
+    rules, data, config, runtime, original = bound_data_configuration(tmp_path)
+    before = config.data_track_spec.read_bytes(), config.data_competition_manifest.read_bytes()
+    assert config.data_binding(rules, runtime.encode()) == (data, original.encode())
+    assert config.work_dir == tmp_path / "work"
+    assert before == (config.data_track_spec.read_bytes(),
+                      config.data_competition_manifest.read_bytes())
+    assert rules.cache.inventory_max_bytes == 768 * 1024**3
+    assert data.cache.inventory_max_bytes == 512 * 1024**3
+
+
+@pytest.mark.parametrize("damage", ["asset", "origin", "manifest", "missing_paths", "unbound"])
+def test_data_binding_rejects_unproved_data_origin(tmp_path, damage):
+    from scoring.spec import parse_track_spec, track_spec_dict
+    rules, data, config, runtime, original = bound_data_configuration(tmp_path)
+    if damage == "asset":
+        runtime = ArtifactManifest(tuple(replace(a, sha256="ff" * 32)
+                                         if a.logical_name == "weights/teacher" else a
+                                         for a in runtime.artifacts))
+    elif damage == "origin":
+        raw = track_spec_dict(rules)
+        raw["data_spec_sha256"] = "ff" * 32
+        rules = parse_track_spec(raw)
+    elif damage == "manifest":
+        config.data_competition_manifest.write_bytes(ArtifactManifest((Artifact(
+            "weights/other", "ff" * 32, 1, "artifacts/other",
+        ),)).encode())
+    elif damage == "missing_paths":
+        config = replace(config, data_track_spec=None)
+    else:
+        rules = data
+    with pytest.raises(ValueError):
+        config.data_binding(rules, runtime.encode())
+
+
 def test_config_rejects_gpu_or_path_escape(tmp_path) -> None:
     value = document(tmp_path)
     value["gpu_ids"] = [0, 1, 2, 3]

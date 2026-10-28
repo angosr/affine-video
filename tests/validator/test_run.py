@@ -69,7 +69,8 @@ def test_optional_cleanup_failure_does_not_block_durable_disclosure(failure, cap
         raise OSError("optional filesystem reclamation unavailable")
 
     source = SimpleNamespace(
-        track=track, objects=objects, protected_plan_digests=protection, prune_disclosed=prune,
+        track=track, data_track=track, objects=objects,
+        protected_plan_digests=protection, prune_disclosed=prune,
         due_plan_digests=lambda _now: (digest,),
         public_disclosure=lambda *_a, **_k: "original-bound-disclosure",
         record_disclosed=lambda key: calls.append(("record", key)),
@@ -108,7 +109,8 @@ def test_disclosure_success_cannot_hide_another_batch_failure(monkeypatch, cold)
     def new_source():
         objects = PrivateObjectStore(client, bucket="test", prefix="test")
         source = SimpleNamespace(
-            track=track, objects=objects, protected_plan_digests=lambda *_a: frozenset(),
+            track=track, data_track=track, objects=objects,
+            protected_plan_digests=lambda *_a: frozenset(),
             prune_disclosed=lambda _p: 0, public_disclosure=lambda digest, **_kw: digest,
             _plan_by_digest=lambda digest: SimpleNamespace(
                 plan_digest=digest, exact=SimpleNamespace(sha256="ef" * 32),
@@ -168,7 +170,8 @@ def test_disclosure_cooldown_is_not_a_successful_observation():
     retry.disclosure_attempt(digest, now_ms=run_module.time.time_ns() // 1_000_000, lease_ms=60_000)
     before = objects.get(f"retry_state/disclosures/{digest}.json")
     source = SimpleNamespace(
-        track=track, objects=objects, protected_plan_digests=lambda *_a: frozenset(),
+        track=track, data_track=track, objects=objects,
+        protected_plan_digests=lambda *_a: frozenset(),
         prune_disclosed=lambda _p: 0, due_plan_digests=lambda _now: (digest,),
     )
     assert asyncio.run(run_module._publish_due_batch(

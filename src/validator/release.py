@@ -7,7 +7,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from scoring.spec import TrackSpec
+from scoring.spec import (
+    TrackSpec,
+    data_contract_digest,
+    data_spec_logical_name,
+    parse_track_spec,
+    validate_data_track,
+)
 from validator import system_matches
 from validator.production.commitment import ArtifactManifest, decode_canonical_json
 from validator.system_matches import (
@@ -79,6 +85,13 @@ class ReleaseApproval:
             or result.get("runtime_contract_sha256") != _evidence_runtime_digest(runtime_manifest)
         ):
             raise ValueError("release acceptance differs from active scoring or runtime contracts")
+        if track.data_spec_sha256 is not None:
+            origin = artifacts.get(data_spec_logical_name(track))
+            if (origin is None or origin.sha256 != track.data_spec_sha256
+                    or origin.object_key != f"artifacts/{track.data_spec_sha256}"
+                    or result.get("data_spec_sha256") != track.data_spec_sha256
+                    or result.get("data_contract_sha256") != data_contract_digest(track)):
+                raise ValueError("release acceptance does not bind the original data contract")
         if manifest.digest != competition.digest and (
             result.get("track_spec_digest") != track.digest
             or result.get("competition_manifest_sha256") != competition.digest
@@ -122,7 +135,7 @@ class ReleaseApproval:
         """Describe the verified running release, not a new competition identity."""
         self.verify(track, runtime_manifest)
         result = decode_canonical_json(self.acceptance)
-        return {
+        identity = {
             "track_spec_digest": track.digest,
             "competition_manifest_sha256": track.artifact_manifest_sha256,
             "artifact_manifest_sha256": hashlib.sha256(runtime_manifest).hexdigest(),
@@ -131,6 +144,42 @@ class ReleaseApproval:
             "source_sha256": result.get("source_sha256"),
             "environment_sha256": result.get("environment_sha256"),
         }
+        if track.data_spec_sha256 is not None:
+            identity.update(data_spec_sha256=track.data_spec_sha256,
+                            data_contract_sha256=result["data_contract_sha256"])
+        return identity
+
+
+def verify_data_binding(
+    track: TrackSpec, runtime_manifest: bytes, data_spec: bytes | None,
+    data_manifest: bytes,
+) -> TrackSpec:
+    """Authenticate one original data specification without rewriting any plan."""
+    from scoring.spec import track_spec_dict
+    from validator.production.commitment import canonical_json
+
+    data = track if data_spec is None else parse_track_spec(decode_canonical_json(data_spec))
+    validate_data_track(track, data)
+    original = ArtifactManifest.decode(data_manifest)
+    runtime = ArtifactManifest.decode(runtime_manifest)
+    if original.digest != data.artifact_manifest_sha256:
+        raise ValueError("original data manifest differs from its specification")
+    if tuple(a for a in original.artifacts if not _is_release_packaging(a.logical_name)) != tuple(
+        a for a in runtime.artifacts if not _is_release_packaging(a.logical_name)
+    ):
+        raise ValueError("runtime changes original data assets")
+    if track.data_spec_sha256 is not None:
+        if data_spec is None or data_spec != canonical_json(track_spec_dict(data)):
+            raise ValueError("original data specification is not canonical")
+        origin = next((a for a in runtime.artifacts
+                       if a.logical_name == data_spec_logical_name(track)), None)
+        if (origin is None or origin.sha256 != data.digest
+                or origin.object_key != f"artifacts/{data.digest}"
+                or origin.size_bytes != len(data_spec)):
+            raise ValueError("manifest does not bind the original data specification")
+    elif data_spec is not None:
+        raise ValueError("data origin is not committed by the active rules")
+    return data
 
 
 def verify_competition_manifest(

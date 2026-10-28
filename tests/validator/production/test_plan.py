@@ -958,6 +958,7 @@ def test_producer_continues_at_arbitrary_heights_and_releases_workers(
         validator_database=database, work_dir=tmp_path, poll_seconds=0.01,
     )
     service.track = SimpleNamespace(digest=plan.track_spec_digest)
+    service.rule_track = service.track
     service.objects = objects
     service.pool = None
     service.alert = None
@@ -1039,6 +1040,7 @@ def test_producer_cooldown_survives_host_loss_and_recovers_without_reset(
         validator_database="unused.db", poll_seconds=0.01, work_dir=tmp_path,
     )
     service.track = SimpleNamespace(digest=plan.track_spec_digest)
+    service.rule_track = service.track
     service.objects = AttemptObjects(durable)
     service.pool = None
     service.alert = None
@@ -1179,6 +1181,7 @@ def test_producer_scheduling_failures_alert_and_resume_the_same_plan(
         validator_database="unused.db", poll_seconds=0.01, work_dir=tmp_path,
     )
     service.track = SimpleNamespace(digest=plan.track_spec_digest)
+    service.rule_track = service.track
     service.objects = AttemptObjects()
     service.pool = None
     service.alert = lambda *args: alerts.append(args)
@@ -1409,6 +1412,7 @@ def test_producer_worker_startup_failure_is_counted_and_alerted(monkeypatch, tmp
         validator_database="unused.db", poll_seconds=0.01, work_dir=tmp_path,
     )
     service.track = SimpleNamespace(digest=plan.track_spec_digest)
+    service.rule_track = service.track
     service.objects = objects
     service.pool = None
     service.alert = lambda event, details: alerts.append((event, details))

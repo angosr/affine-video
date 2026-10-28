@@ -31,7 +31,7 @@ from scoring.cache import (
     validate_exact_cache_references,
     write_exact_cache_batch,
 )
-from scoring.spec import TrackSpec, load_track_spec
+from scoring.spec import TrackSpec, load_track_spec, validate_data_track
 from validator.alerts import webhook_alerter
 from validator.production.batches import ready_objects
 from validator.production.commitment import (
@@ -146,7 +146,10 @@ class PlanCoordinator:
         store: ChallengeStore,
         objects: PrivateObjectStore,
         source_pool: SourcePool,
+        data_track: TrackSpec | None = None,
     ) -> None:
+        data_track = track if data_track is None else data_track
+        validate_data_track(track, data_track)
         if source_pool.root != track.source_pool_merkle_root:
             raise ValueError("source pool does not match the track commitment")
         expected_commitments = tuple(
@@ -159,7 +162,8 @@ class PlanCoordinator:
         )
         if source_pool.public_commitments() != expected_commitments:
             raise ValueError("source pool differs from the public selection index")
-        self.track = track
+        self.track = data_track
+        self.cache_policy = track.cache
         self.store = store
         self.objects = objects
         self.source_pool = source_pool
@@ -206,10 +210,11 @@ class PlanCoordinator:
                           + max(1, self.track.cache.disclosure_delay_seconds * 500) > now_ms)]
         counts = [sum(plan.inventory_slot == slot for plan in available) for slot in (0, 1)]
         slot = min((0, 1), key=lambda value: (counts[value], value))
-        if counts[slot] >= self.track.cache.inventory_target_batches // 2:
+        if counts[slot] >= self.cache_policy.inventory_target_batches // 2:
             return None
         # Reserve scratch + canonical content + assembly space before starting a unit.
-        if disk_bytes + 3 * self.track.cache.exact_max_bytes > self.track.cache.inventory_max_bytes:
+        if (disk_bytes + 3 * self.track.cache.exact_max_bytes
+                > self.cache_policy.inventory_max_bytes):
             return None
         # An in-flight item is completed before another reservation is made.
         if any(plan.state == "PLANNED" for _, _, plan in existing):
@@ -355,7 +360,9 @@ class ProducerService:
         if attempt_timeout_seconds <= 0:
             raise ValueError("producer attempt timeout must be positive")
         self.config = config
-        self.track = load_track_spec(config.track_spec)
+        self.rule_track = load_track_spec(config.track_spec)
+        runtime = config.artifact_manifest.read_bytes()
+        self.track, data_manifest = config.data_binding(self.rule_track, runtime)
         self.objects = PrivateObjectStore.from_environment(
             bucket=config.storage_bucket,
             prefix=f"{config.storage_prefix}/tracks/{self.track.digest}",
@@ -364,19 +371,19 @@ class ProducerService:
         source_pool_payload = self.objects.ensure_bootstrap(
             SOURCE_POOL_OBJECT, config.source_pool
         )
-        competition = config.competition_payload(self.track)
+        competition = config.competition_payload(self.rule_track)
         if self.objects.ensure_bootstrap(
-            ARTIFACT_MANIFEST_OBJECT, config.competition_manifest,
-        ) != competition:
-            raise ValueError("private competition manifest differs from its track commitment")
-        runtime = config.artifact_manifest.read_bytes()
-        verify_competition_manifest(self.track, runtime, competition)
+            ARTIFACT_MANIFEST_OBJECT,
+            config.data_competition_manifest or config.competition_manifest,
+        ) != data_manifest:
+            raise ValueError("private data manifest differs from its original commitment")
+        verify_competition_manifest(self.rule_track, runtime, competition)
         self.manifest = ArtifactManifest.decode(runtime)
         image = config.verify_manifest(self.manifest)
         ReleaseApproval(
-            self.track.digest, config.artifact_path(ACCEPTANCE_LOGICAL_NAME).read_bytes(),
+            self.rule_track.digest, config.artifact_path(ACCEPTANCE_LOGICAL_NAME).read_bytes(),
             competition,
-        ).verify(self.track, runtime, image_id=image["image_id"])
+        ).verify(self.rule_track, runtime, image_id=image["image_id"])
         self.pool = load_bound_source_pool(
             source_pool_payload,
             config.artifact_path(config.runtime.source_binding).read_bytes(),
@@ -406,14 +413,15 @@ class ProducerService:
                         ),
                         ChallengeStore(
                             self.config.validator_database,
-                            track_spec_digest=self.track.digest,
+                            track_spec_digest=self.rule_track.digest,
                         ) as store,
                     ):
                         coordinator = PlanCoordinator(
-                            track=self.track,
+                            track=self.rule_track,
                             store=store,
                             objects=self.objects,
                             source_pool=self.pool,
+                            data_track=self.track,
                         )
                         created = coordinator.create_next(
                             disk_bytes=_disk_bytes(self.config.work_dir),

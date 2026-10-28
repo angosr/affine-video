@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from scoring.spec import TrackSpec, parse_track_spec, track_spec_dict
+from scoring.spec import TrackSpec, data_spec_logical_name, parse_track_spec, track_spec_dict
 from validator.chunks import (
     ChunkManifest,
     build_chunk_manifest,
@@ -38,7 +38,12 @@ from validator.production.plan import (
     validate_source_selection_sequence,
 )
 from validator.queue import TERMINAL_STATES
-from validator.release import PRODUCTION_TRACK_ID, ReleaseApproval, require_release_approval
+from validator.release import (
+    PRODUCTION_TRACK_ID,
+    ReleaseApproval,
+    require_release_approval,
+    verify_data_binding,
+)
 from validator.s3 import client_config, is_missing, is_precondition_failed
 from validator.store import ChallengeStore
 from validator.system_matches import (
@@ -832,6 +837,11 @@ class S3Repository:
             except (KeyError, TypeError, ValueError) as exc:
                 raise PublicArtifactError("public model publication violates its match") from exc
         if artifacts.runtime_manifest is not None:
+            track = parse_track_spec(track_document["spec"])
+            if track.data_spec_sha256 is not None:
+                await asyncio.to_thread(
+                    self._stage_data_origin, track, artifacts.runtime_manifest[1],
+                )
             await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
         for artifact in artifacts.files:
             await asyncio.to_thread(self._put_file_immutable, artifact)
@@ -1205,8 +1215,74 @@ class S3Repository:
     def _load(self, track: TrackSpec, runtime_manifest: bytes | None = None) -> PublicLedger:
         ledger = self._recover(track, runtime_manifest)
         self._verify_model_archives(ledger.matches)
-        disclosures = self._load_batch_disclosures(track, ledger.matches)
+        data_track = self._load_data_track(track, runtime_manifest)
+        disclosures = self._load_batch_disclosures(data_track, ledger.matches)
         return replace(ledger, disclosed_plan_digests=disclosures)
+
+    def _stage_data_origin(self, track: TrackSpec, runtime_manifest: bytes) -> None:
+        """Preserve the pinned original public spec before changing public pointers.
+
+        Only the small original specification is materialized as a bound artifact;
+        no plan, READY, claim, model or disclosure record is relabelled or copied.
+        """
+        manifest = ArtifactManifest.decode(runtime_manifest)
+        origin = next((a for a in manifest.artifacts
+                       if a.logical_name == data_spec_logical_name(track)), None)
+        if origin is None or origin.object_key != f"artifacts/{track.data_spec_sha256}":
+            raise PublicArtifactError("data origin artifact is not bound to its fixed key")
+        body = self._get_optional(origin.object_key)
+        if body is None:
+            pointer = self._get_optional("track.json")
+            if pointer is None:
+                raise PublicArtifactError("original data specification must exist before cutover")
+            previous = _decode_track_document(pointer)
+            data = parse_track_spec(previous["spec"])
+            if (previous["track_spec_digest"] != data.digest
+                    or data.digest != track.data_spec_sha256):
+                raise PublicArtifactError("previous public pointer is not the pinned data origin")
+            body = _json_bytes(previous["spec"])
+        data = parse_track_spec(_decode_canonical_object(body, origin.logical_name))
+        original = self._get_optional(f"runtime/{data.artifact_manifest_sha256}/manifest.json")
+        if original is None or len(body) != origin.size_bytes:
+            raise PublicArtifactError("original data manifest is unavailable")
+        try:
+            verify_data_binding(track, runtime_manifest, body, original)
+        except ValueError as exc:
+            raise PublicArtifactError("published data origin differs from its contract") from exc
+        self._put_immutable(origin.object_key, body)
+
+    def _load_data_track(
+        self, track: TrackSpec, runtime_manifest: bytes | None = None,
+    ) -> TrackSpec:
+        """Read the single manifest-pinned original data contract, never a fallback pool."""
+        if track.data_spec_sha256 is None:
+            return track
+        if runtime_manifest is None:
+            runtime_manifest = self._get_optional(
+                f"runtime/{track.artifact_manifest_sha256}/manifest.json",
+            )
+        if runtime_manifest is None:
+            raise PublicArtifactError("data origin requires its verified competition manifest")
+        if hashlib.sha256(runtime_manifest).hexdigest() != track.artifact_manifest_sha256:
+            raise PublicArtifactError("data origin manifest differs from its rule commitment")
+        manifest = ArtifactManifest.decode(runtime_manifest)
+        origin = next((a for a in manifest.artifacts
+                       if a.logical_name == data_spec_logical_name(track)), None)
+        if (origin is None or origin.sha256 != track.data_spec_sha256
+                or origin.object_key != f"artifacts/{track.data_spec_sha256}"):
+            raise PublicArtifactError("data origin is missing from the committed manifest")
+        body = self._get_optional(origin.object_key)
+        if (body is None or hashlib.sha256(body).hexdigest() != origin.sha256
+                or len(body) != origin.size_bytes):
+            raise PublicArtifactError("original data specification is unavailable or changed")
+        try:
+            data = parse_track_spec(_decode_canonical_object(body, origin.logical_name))
+            original = self._get_optional(f"runtime/{data.artifact_manifest_sha256}/manifest.json")
+            if original is None:
+                raise ValueError("original data manifest is unavailable")
+            return verify_data_binding(track, runtime_manifest, body, original)
+        except ValueError as exc:
+            raise PublicArtifactError("public data contract is incompatible") from exc
 
     def _recover(self, track: TrackSpec, runtime_manifest: bytes | None = None) -> PublicLedger:
         history = self._load_history(track, runtime_manifest)

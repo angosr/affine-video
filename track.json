@@ -1,5 +1,6 @@
 {
   "artifact_manifest_sha256": "3fddfcdf70d9151ca0af16ca157d1b5669be2dd9d2e89177266877f341cf3169",
+  "data_spec_sha256": "4e405540e88443dd21541f305d75821c1b3707129c6651dea842e9d1b485c1aa",
   "base_model": {
     "repo_id": "MiniMaxAI/MiniMax-H3",
     "revision": "42ed227ee7df40d41602854ae760620d6eb651fe"

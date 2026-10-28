@@ -46,6 +46,25 @@ class ProducerConfig:
     evaluation_gpu_ids: tuple[int, ...]
     poll_seconds: float
     runtime: RuntimeConfig
+    data_track_spec: Path | None = None
+    data_competition_manifest: Path | None = None
+
+    def data_binding(self, track: Any, runtime_manifest: bytes) -> tuple[Any, bytes]:
+        """Verify the one immutable data origin and its unchanged asset contract."""
+        from validator.release import verify_data_binding
+
+        separated = track.data_spec_sha256 is not None
+        if separated != (self.data_track_spec is not None
+                         and self.data_competition_manifest is not None):
+            raise ValueError("separate data identity requires its original spec and manifest")
+        if not separated and (self.data_track_spec or self.data_competition_manifest):
+            raise ValueError("uncommitted data origin paths are forbidden")
+        payload = (self.data_competition_manifest if separated
+                   else self.competition_manifest).read_bytes()
+        data = verify_data_binding(track, runtime_manifest,
+                                   self.data_track_spec.read_bytes() if separated else None,
+                                   payload)
+        return data, payload
 
     def artifact_path(self, logical_name: str) -> Path:
         """Resolve a manifest-owned path without permitting root escape."""
@@ -220,6 +239,13 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
         raise ValueError("producer configuration cannot be read") from exc
     except json.JSONDecodeError as exc:
         raise ValueError("producer configuration is not valid JSON") from exc
+    origin = {}
+    if isinstance(value, dict):
+        origin = {key: value[key] for key in ("data_track_spec", "data_competition_manifest")
+                  if key in value}
+        if origin and len(origin) != 2:
+            raise ValueError("both original data paths are required")
+        value = {key: item for key, item in value.items() if key not in origin}
     root = _object(
         value,
         {
@@ -284,6 +310,10 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
     ):
         raise ValueError("producer poll_seconds must be finite and positive")
     config = ProducerConfig(
+        data_track_spec=None if not origin else _path(origin["data_track_spec"], "data_track_spec"),
+        data_competition_manifest=(None if not origin else _path(
+            origin["data_competition_manifest"], "data_competition_manifest",
+        )),
         track_spec=_path(root["track_spec"], "track_spec"),
         validator_database=_path(root["validator_database"], "validator_database"),
         source_pool=_path(root["source_pool"], "source_pool"),

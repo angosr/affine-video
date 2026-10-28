@@ -26,7 +26,7 @@ from scoring.cache import (
 )
 from scoring.exact import GLOBAL_SEGMENT, REFERENCE_SEGMENT, TARGET_SEGMENT
 from scoring.model import ValidatedModel
-from scoring.spec import TrackSpec
+from scoring.spec import TrackSpec, validate_data_track
 from validator.admission import RejectedAdmission
 from validator.chunks import check_deadline
 from validator.download import DownloadedModel, download_chunked_file
@@ -138,8 +138,11 @@ class ReadyBatchSource:
         batch_dir: str | Path | None = None,
         validation_device: str | None = None,
         public_base_url: str | None = None,
+        data_track: TrackSpec | None = None,
     ) -> None:
         self.track = track
+        self.data_track = track if data_track is None else data_track
+        validate_data_track(track, self.data_track)
         self.objects = objects
         self.cache_dir = Path(cache_dir)
         self.content = LocalBatchStore(
@@ -148,7 +151,7 @@ class ReadyBatchSource:
         self.validation_device = validation_device
         self.public_base_url = public_base_url
         self._validated_exact: set[str] = set()
-        self.inventory = Inventory(objects, track.digest)
+        self.inventory = Inventory(objects, self.data_track.digest)
 
     def _materialize(self, plan: BatchPlan, item: ReadyObject, destination: Path) -> Path:
         try:
@@ -454,7 +457,7 @@ class ReadyBatchSource:
                 validate_exact_cache(
                     path,
                     expected_sha256=batch.sha256,
-                    expected_track_spec_digest=self.track.digest,
+                    expected_track_spec_digest=self.data_track.digest,
                     max_bytes=self.track.cache.exact_max_bytes,
                     head_dim=self.track.model.selector.head_dim,
                     tile_size=128,
@@ -466,16 +469,16 @@ class ReadyBatchSource:
                     query_tiles_per_case=self.track.scoring.query_tiles_per_case,
                     dense_device=self.validation_device,
                 )
-            _validate_plan_case_binding(path, plan, self.track)
+            _validate_plan_case_binding(path, plan, self.data_track)
         except (OSError, CacheLoadError, ValueError) as exc:
             raise RuntimeError("restored exact batch is invalid") from exc
         if (
             batch.sha256 != plan.exact.sha256
             or batch.generated_block != plan.generation_block
             or batch.plan_digest != plan.plan_digest
-            or batch.track_spec_digest != self.track.digest
+            or batch.track_spec_digest != self.data_track.digest
             or batch.seed_block_hash.lower() != plan.block_hash.lower()
-            or batch.artifact_manifest_sha256 != self.track.artifact_manifest_sha256
+            or batch.artifact_manifest_sha256 != self.data_track.artifact_manifest_sha256
             or batch.source_pool_merkle_root != self.track.source_pool_merkle_root
             or batch.source_proofs != tuple(proof.document() for proof in plan.source_proofs)
             or batch.dense_references
@@ -848,7 +851,7 @@ class ReadyBatchSource:
     def _validate_plan(self, name: str, plan: BatchPlan) -> None:
         if name != f"{PLANS_NAMESPACE}/{plan.generation_block}.json":
             raise RuntimeError("private plan key disagrees with its generation block")
-        if plan.track_spec_digest != self.track.digest:
+        if plan.track_spec_digest != self.data_track.digest:
             raise RuntimeError("private plan belongs to another track")
         commitment_digests = tuple(item.sha256 for item in self.track.source_commitments)
         if any(
@@ -861,7 +864,7 @@ class ReadyBatchSource:
         ):
             raise RuntimeError("private plan source proof is invalid")
         rebuilt = build_plan(
-            track_spec_digest=self.track.digest,
+            track_spec_digest=self.data_track.digest,
             generation_block=plan.generation_block,
             block_hash=plan.block_hash,
             secret=plan.secret,

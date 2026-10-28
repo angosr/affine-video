@@ -12,10 +12,80 @@ from scoring.spec import (
     VEDA_REPO_ID,
     VEDA_REVISION,
     TrackSpecError,
+    data_contract_digest,
     load_track_spec,
     parse_track_spec,
     track_spec_dict,
+    validate_data_track,
 )
+
+
+def rules_for_data(data):
+    raw = track_spec_dict(data)
+    raw.update(track_id=data.track_id + "-rules", track_start_block=data.track_start_block + 1000,
+               data_spec_sha256=data.digest, promotion={
+                   "format": "veda-exact-tenure-v1", "minimum_gain": .002, "decay_seconds": 604800,
+               })
+    raw["scoring"].update(minimum_frontier_gain=.003, match_confidence=.9975,
+                          bootstrap_resamples=10000)
+    raw["full_video"]["minimum_gain"] = .003
+    raw["cache"].update(inventory_target_batches=4, inventory_max_bytes=768 * 1024**3)
+    return raw
+
+
+def test_rule_changes_preserve_the_pinned_data_contract_and_old_spec_bytes():
+    data = parse_track_spec(valid_spec())
+    original = track_spec_dict(data)
+    rules = parse_track_spec(rules_for_data(data))
+    validate_data_track(rules, data)
+    assert rules.digest != data.digest
+    assert data_contract_digest(rules) == data_contract_digest(data)
+    assert track_spec_dict(data) == original and "data_spec_sha256" not in original
+    with pytest.raises(TrackSpecError, match="origin"):
+        validate_data_track(rules, rules)
+
+
+def test_repository_rules_explicitly_pin_an_existing_data_origin():
+    track = load_track_spec(Path(__file__).resolve().parents[2] / "track.json")
+    assert track.data_spec_sha256 is not None and track.data_spec_sha256 != track.digest
+    assert track.promotion is not None and track.promotion.minimum_gain == .002
+    assert track.cache.inventory_max_bytes == 768 * 1024**3
+
+
+@pytest.mark.parametrize("section,key,value", [
+    ("model", "max_bytes", 2048),
+    ("cache", "disclosure_delay_seconds", 1801),
+    ("cache", "exact_max_bytes", 1_000_001),
+    ("scoring", "query_tiles_per_case", 3),
+    ("scoring", "rollouts_per_stratum", 5),
+    ("base_model", "revision", "99" * 20),
+])
+def test_data_origin_rejects_incompatible_consumption(section, key, value):
+    data = parse_track_spec(valid_spec())
+    raw = rules_for_data(data)
+    raw[section][key] = value
+    with pytest.raises(TrackSpecError, match="incompatible"):
+        validate_data_track(parse_track_spec(raw), data)
+
+
+def test_data_origin_rejects_different_budget_geometry_and_source_commitments():
+    data = parse_track_spec(valid_spec())
+    for field in ("budget", "geometry", "sources", "encoding"):
+        raw = rules_for_data(data)
+        if field == "budget":
+            raw["scoring"]["budgets"][0]["calibrated_cost"] = .9
+        elif field == "geometry":
+            raw["model"]["selector"]["head_dim"] = 4
+        elif field == "sources":
+            raw["source_commitments"]["production"]["all"][0] = "ff" * 32
+            raw["source_pool_merkle_root"] = source_merkle_root([
+                *raw["source_commitments"]["production"]["all"],
+                *raw["source_commitments"]["audit"]["all"],
+            ])
+        else:
+            raw["cache"]["storage_dtype"] = "float32"
+        with pytest.raises(TrackSpecError):
+            validate_data_track(parse_track_spec(raw), data)
 
 
 def valid_spec() -> dict:

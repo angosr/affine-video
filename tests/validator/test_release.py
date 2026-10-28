@@ -110,6 +110,51 @@ def rebind_acceptance(candidate, result):
     return track, manifest.encode(), ReleaseApproval(track.digest, acceptance)
 
 
+@pytest.mark.parametrize("damage", [None, "data_spec_sha256", "data_contract_sha256"])
+def test_new_rules_approval_binds_original_data_identity(approved_candidate, damage):
+    from scoring.spec import data_contract_digest, data_spec_logical_name
+    from tests.scoring.test_spec import rules_for_data
+
+    data, original, old_approval = approved_candidate
+    rules = parse_track_spec(rules_for_data(data))
+    origin = canonical_json(track_spec_dict(data))
+    manifest = ArtifactManifest(tuple(sorted((*ArtifactManifest.decode(original).artifacts,
+        Artifact(data_spec_logical_name(rules), data.digest, len(origin),
+                 "artifacts/" + data.digest),
+    ), key=lambda a: a.logical_name)))
+    result = json.loads(old_approval.acceptance)
+    result.update(evidence_contract_sha256=matches._evidence_contract_digest(rules),
+                  runtime_contract_sha256=matches._evidence_runtime_digest(manifest.encode()),
+                  data_spec_sha256=data.digest, data_contract_sha256=data_contract_digest(data))
+    if damage is not None:
+        result.pop(damage)
+    rules, runtime, approval = rebind_acceptance((rules, manifest.encode(), old_approval), result)
+    if damage is None:
+        approval.verify(rules, runtime)
+        assert approval.public_identity(rules, runtime)["data_spec_sha256"] == data.digest
+        assert release.verify_data_binding(rules, runtime, origin, original) == data
+        client = MemoryS3()
+        client.objects["tracks/main/track.json"] = canonical_json({
+            "track_spec_digest": data.digest, "spec": track_spec_dict(data),
+        })
+        client.objects[f"tracks/main/runtime/{data.artifact_manifest_sha256}/manifest.json"] = (
+            original
+        )
+        publisher = S3Repository(client, bucket="test", prefix="tracks/main",
+                                 release_approval=approval)
+        artifacts = build_genesis_artifacts(rules, chain(rules), version_key=0,
+                                            runtime_manifest=runtime, release_approval=approval)
+        asyncio.run(publisher.publish(artifacts))
+        assert client.objects["tracks/main/artifacts/" + data.digest] == origin
+        # Once the old mutable pointer is replaced, cold recovery still resolves
+        # exactly the same data origin through its immutable artifact.
+        cold = S3Repository(client, bucket="test", prefix="tracks/main")
+        assert cold._load_data_track(rules) == data
+    else:
+        with pytest.raises(ValueError, match="original data contract"):
+            approval.verify(rules, runtime)
+
+
 def chain(track):
     return WeightChainState(99, {track.initial_champion.hotkey: 0}, 1, 1.0, 0, {})
 
@@ -261,6 +306,8 @@ def test_producer_runtime_update_does_not_replace_competition_bootstrap(
         track_spec=track_path, storage_bucket="private", storage_prefix="evaluation",
         source_pool=tmp_path / "pool", competition_manifest=competition_path,
         competition_payload=lambda _track: approval.competition_manifest,
+        data_binding=lambda _track, _runtime: (track, approval.competition_manifest),
+        data_competition_manifest=None,
         artifact_manifest=runtime_path, verify_manifest=verify,
         artifact_path=lambda name: acceptance_path if name == release.ACCEPTANCE_LOGICAL_NAME
         else binding_path,
