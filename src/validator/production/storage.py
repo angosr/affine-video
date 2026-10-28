@@ -352,25 +352,33 @@ class PrivateObjectStore:
             denied_prefixes.append(
                 chunk_object_name(name, "part-00000").rsplit("/", 1)[0] + "/"
             )
-        for name in denied_objects:
-            try:
-                self.get(name)
-            except Exception as exc:
-                if _is_access_denied(exc):
-                    continue
-                raise StorageError(
-                    f"evaluator hidden-object denial could not be verified: {name}"
-                ) from exc
-            raise StorageError(f"evaluator credentials can read a hidden object: {name}")
-        for prefix in denied_prefixes:
-            try:
-                self.list_names(prefix)
-            except Exception as exc:
-                if not _is_access_denied(exc):
+        clients = (self._client,) if self._client is self._write_client else (
+            self._client, self._write_client,
+        )
+        for client in clients:
+            # Reuse checked reads without mutating the shared store's live clients.
+            probe = PrivateObjectStore(
+                client, bucket=self._bucket, prefix=self._prefix, credential_role="evaluator",
+            )
+            for name in denied_objects:
+                try:
+                    probe.get(name)
+                except Exception as exc:
+                    if _is_access_denied(exc):
+                        continue
+                    raise StorageError(
+                        f"evaluator hidden-object denial could not be verified: {name}"
+                    ) from exc
+                raise StorageError(f"evaluator credentials can read a hidden object: {name}")
+            for prefix in denied_prefixes:
+                try:
+                    probe.list_names(prefix)
+                except Exception as exc:
+                    if _is_access_denied(exc):
+                        continue
                     raise StorageError(
                         f"evaluator hidden-prefix denial could not be verified: {prefix}"
                     ) from exc
-            else:
                 raise StorageError(f"evaluator credentials can list a hidden prefix: {prefix}")
 
     def __getstate__(self) -> dict[str, Any]:

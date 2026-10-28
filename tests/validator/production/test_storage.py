@@ -315,6 +315,80 @@ def test_evaluator_boundary_rejects_readable_noninitial_hidden_chunk() -> None:
         store.verify_evaluator_boundary((artifact,))
 
 
+@pytest.mark.parametrize(("leak", "shared_client"), [
+    ("bootstrap/source_pool.json", False),
+    ("source-pool/assets/hidden", False),
+    ("source-pool/assets/hidden.parts/part-00000", False),
+    ("source-pool/assets/hidden.parts/part-00001", False),
+    ("source-pool", False),
+    ("source-pool/assets/hidden.parts", False),
+    (None, False),
+    (None, True),
+])
+def test_evaluator_boundary_checks_each_distinct_capability(leak, shared_client) -> None:
+    root = "tracks/abc/"
+    object_names = [
+        "bootstrap/source_pool.json",
+        "source-pool/assets/hidden",
+        "source-pool/assets/hidden.parts/part-00000",
+        "source-pool/assets/hidden.parts/part-00001",
+    ]
+    prefixes = ["source-pool", "source-pool/assets/hidden.parts"]
+
+    class CapabilityS3(MemoryS3):
+        def __init__(self, readable):
+            super().__init__()
+            self.readable = readable
+            self.calls = []
+
+        def deny(self):
+            error = RuntimeError("denied")
+            error.response = {
+                "Error": {"Code": "AccessDenied"},
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+            }
+            raise error
+
+        def get_object(self, *, Bucket, Key):
+            self.calls.append(("get", Bucket, Key))
+            assert store._client is read_client
+            assert store._write_client is write_client
+            if self.readable is not None and Key == root + self.readable:
+                return {"Body": io.BytesIO(b"hidden"), "ETag": '"etag"'}
+            self.deny()
+
+        def list_objects_v2(self, *, Bucket, Prefix, **_kwargs):
+            self.calls.append(("list", Bucket, Prefix))
+            assert store._client is read_client
+            assert store._write_client is write_client
+            if self.readable is not None and Prefix == root + self.readable:
+                return {"Contents": [], "IsTruncated": False}
+            self.deny()
+
+    read_client = CapabilityS3(None)
+    write_client = read_client if shared_client else CapabilityS3(leak)
+    store = PrivateObjectStore(
+        read_client, write_client=write_client, bucket="private", prefix="tracks/abc",
+        credential_role="evaluator",
+    )
+    artifact = Artifact("hidden.bin", "0" * 64, chunks.CHUNK_BYTES + 1,
+                        "source-pool/assets/hidden")
+    if leak is not None:
+        kind = "list a hidden prefix" if leak in prefixes else "read a hidden object"
+        with pytest.raises(StorageError, match=kind):
+            store.verify_evaluator_boundary((artifact,))
+    else:
+        store.verify_evaluator_boundary((artifact,))
+    expected = [("get", "private", root + name) for name in object_names]
+    expected += [("list", "private", root + prefix) for prefix in prefixes]
+    assert read_client.calls == expected
+    if not shared_client:
+        if leak is not None:
+            operation = "list" if leak in prefixes else "get"
+            expected = expected[:expected.index((operation, "private", root + leak)) + 1]
+        assert write_client.calls == expected
+
+
 def test_injected_store_client_cannot_be_serialized() -> None:
     store = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
 
