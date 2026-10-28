@@ -212,7 +212,10 @@ def test_repository_four_batch_inventory_requires_a_new_spec_binding() -> None:
     candidate = load_track_spec(Path(__file__).resolve().parents[2] / "track.json")
     assert candidate.cache.inventory_target_batches == 4
     assert candidate.cache.exact_max_bytes == 16 * 1024**3
-    assert candidate.cache.inventory_max_bytes == 512 * 1024**3
+    assert candidate.cache.inventory_max_bytes == 768 * 1024**3
+    old_capacity = track_spec_dict(candidate)
+    old_capacity["cache"]["inventory_max_bytes"] = 512 * 1024**3
+    assert parse_track_spec(old_capacity).digest != candidate.digest
     reserve = 3 * candidate.cache.inventory_target_batches * candidate.cache.exact_max_bytes
     assert reserve == 192 * 1024**3
     assert reserve <= candidate.cache.inventory_max_bytes

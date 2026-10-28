@@ -11,7 +11,7 @@
     "exact_max_bytes": 17179869184,
     "format": "veda-exact-cache-v2",
     "generator": "veda-private-rollout-v1",
-    "inventory_max_bytes": 549755813888,
+    "inventory_max_bytes": 824633720832,
     "inventory_target_batches": 4,
     "storage_dtype": "float16"
   },
