@@ -30,6 +30,7 @@ from validator.scan import ChainCommitment, submission_from_commitment
 from validator.store import ChallengeStore
 from validator.uploads import (
     CREDENTIAL_TTL,
+    MODEL_RETENTION_MS,
     CloudflareR2Tokens,
     MailboxControl,
     OwnerMailboxControl,
@@ -60,6 +61,11 @@ class StagingS3(MemoryS3):
 
     def close(self):
         pass
+
+    def copy_object(self, *, Bucket, Key, CopySource):
+        self.events.append("champion-copy")
+        return self.put_object(Bucket=Bucket, Key=Key,
+                               Body=self.objects[(CopySource["Bucket"], CopySource["Key"])][0])
 
 
 class Tokens:
@@ -106,6 +112,7 @@ def setup(tmp_path, monkeypatch):
                 publish_mailbox=lambda name, body: mailbox.__setitem__(name, body),
             ),
         )
+        uploads.submission_timestamp = lambda _block: NOW * 1000
         model = tmp_path / "prepared.safetensors"
         model.write_bytes(save({"selector.weight": np.ones((2, 2), dtype=np.float32)},
                                metadata={"hotkey": KEY.ss58_address}))
@@ -162,7 +169,9 @@ def test_automatic_mailbox_r2_ready_original_admission_archive_and_cold_restore(
         objects=PrivateObjectStore(MemoryS3(), bucket="archive", prefix="fixture"),
         cache_dir=ctx.root / "archive",
     )
-    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms", lambda _b: 1000)
+    archive.private_uploads = ctx.uploads
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms",
+                        lambda _b: NOW * 1000)
     settings = AdmissionSettings(
         cache_dir=ctx.root / "cache", max_model_bytes=10000, tensor_schema=SCHEMA,
         private_download=ctx.uploads.download, archive=archive.archive_model,
@@ -176,8 +185,11 @@ def test_automatic_mailbox_r2_ready_original_admission_archive_and_cold_restore(
     assert before["state"] == ChallengeState.SCORING
     assert before["block_height"] == 200
     assert before["private_upload"]["manifest_sha256"] == reference.manifest_sha256
-    # Original archive is sufficient even after all R2 bytes disappear.
-    ctx.uploads.staging.objects.clear()
+    # Only original small references reach MinIO; R2 remains the formal model body.
+    assert not any(".parts/" in name for _bucket, name in archive.objects._client.objects)
+    ctx.model.unlink()
+    for path in (ctx.root / "cache").glob("*.safetensors"):
+        path.unlink()
     def forbidden(*_args, **_kwargs):
         pytest.fail("cold restoration must not redownload/reupload/re-evaluate")
     with ChallengeStore(ctx.root / "cold.db") as cold:
@@ -191,6 +203,210 @@ def test_automatic_mailbox_r2_ready_original_admission_archive_and_cold_restore(
         assert result.status is AdmissionStatus.ACCEPTED
         assert cold.public_challenge(identifier)["private_upload"] == before["private_upload"]
         assert cold.public_challenge(identifier)["file_sha256"] == reference.file_sha256
+
+
+def admit_retained(ctx, monkeypatch):
+    reference = transfer(ctx)
+    identifier, record = submit(ctx, reference)
+    archive = ReadyBatchSource(
+        track=SimpleNamespace(digest="cc" * 32),
+        objects=PrivateObjectStore(MemoryS3(), bucket="archive", prefix="fixture"),
+        cache_dir=ctx.root / "archive",
+    )
+    archive.private_uploads = ctx.uploads
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms",
+                        lambda _b: NOW * 1000)
+    result = process_next_admission(
+        ctx.store, worker_id="original", current_finalized_block=200, now_ms=10,
+        settings=AdmissionSettings(cache_dir=ctx.root / "cache", max_model_bytes=10000,
+                                   tensor_schema=SCHEMA, private_download=ctx.uploads.download,
+                                   archive=archive.archive_model,
+                                   restore=archive.restore_admission),
+    )
+    assert result.status is AdmissionStatus.ACCEPTED
+    ctx.uploads.current_champion = lambda _store: None
+    return reference, identifier, record, archive
+
+
+def test_retained_r2_never_copies_model_payload_to_minio_and_cold_restores(setup, monkeypatch):
+    ctx = setup
+    # Any MinIO payload I/O, including a readback, is an application failure.
+    monkeypatch.setattr(PrivateObjectStore, "put_content",
+                        lambda *_a, **_k: pytest.fail("private MinIO payload copy"))
+    monkeypatch.setattr(PrivateObjectStore, "download_content",
+                        lambda *_a, **_k: pytest.fail("private MinIO payload readback"))
+    reference, identifier, original, archive = admit_retained(ctx, monkeypatch)
+    before = ctx.store.public_challenge(identifier)
+    _, record = ctx.uploads._read(reference.upload_id)
+    model = record["model_reference"]
+    assert model["retain_until_ms"] == NOW * 1000 + MODEL_RETENTION_MS
+    assert model["submission_block"] == original.position.block == 200
+    assert model["file_sha256"] == reference.file_sha256
+    assert len(archive.objects._client.objects) == 2  # model reference + admission, no parts
+    cached = ctx.root / "cache" / f"{reference.file_sha256}.safetensors"
+    cached.unlink()
+    restored = archive.restore_model(reference.file_sha256, ctx.model.stat().st_size)
+    assert restored.read_bytes() == ctx.model.read_bytes()
+    assert ctx.store.public_challenge(identifier) == before
+    assert ctx.uploads._read(reference.upload_id)[1]["model_reference"] == model
+
+
+def test_r2_retention_is_from_original_s_and_pins_admitted_work_after_thirty_days(
+    setup, monkeypatch,
+):
+    ctx = setup
+    reference, identifier, _original, archive = admit_retained(ctx, monkeypatch)
+    deadline = NOW + MODEL_RETENTION_MS // 1000
+    assert ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                      finalized_timestamp=deadline - 1, now=deadline - 1) == 0
+    # model_digest is populated, but an admitted in-flight task still pins its body.
+    assert ctx.store.public_challenge(identifier)["model_digest"] is not None
+    assert ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                      finalized_timestamp=deadline + 1, now=deadline + 1) == 0
+    ctx.store.transition(identifier, ChallengeState.PARTICIPANT_FAILED,
+                         error_code="MODEL_RUNTIME_INVALID", occurred_at_ms=20)
+    model = json.loads(archive.objects.get(f"models/{reference.file_sha256}.safetensors").body)
+    assert model["retain_until_ms"] == deadline * 1000
+    assert ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                      finalized_timestamp=deadline, now=deadline) == 2
+    assert ctx.uploads._read(reference.upload_id)[1]["cleanup"] == "done"
+
+
+def test_r2_current_champion_is_pinned_and_permanent_archive_cold_restores(
+    setup, monkeypatch,
+):
+    ctx = setup
+    reference, identifier, _original, archive = admit_retained(ctx, monkeypatch)
+    ctx.store.transition(identifier, ChallengeState.PARTICIPANT_FAILED,
+                         error_code="MODEL_RUNTIME_INVALID", occurred_at_ms=20)
+    # GC consumes the already-resolved champion reference, not this synthetic stage state.
+    ctx.uploads.current_champion = lambda _store: reference
+    after = NOW + MODEL_RETENTION_MS // 1000 + 1
+    assert ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                      finalized_timestamp=after, now=after) == 0
+    archive.archive_champion(reference.file_sha256, ctx.model.stat().st_size)
+    assert "champion-copy" in ctx.events
+    count = ctx.events.count("champion-copy")
+    archive.archive_champion(reference.file_sha256, ctx.model.stat().st_size)
+    assert ctx.events.count("champion-copy") == count
+    ctx.uploads.current_champion = lambda _store: None
+    assert ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                      finalized_timestamp=after, now=after) == 2
+    restored = archive.restore_model(reference.file_sha256, ctx.model.stat().st_size)
+    assert restored.read_bytes() == ctx.model.read_bytes()
+    assert all(not key.startswith("uploads/v1/")
+               for _bucket, key in ctx.uploads.staging.objects)
+    assert any(key.startswith("champions/v1/")
+               for _bucket, key in ctx.uploads.staging.objects)
+
+
+def test_r2_formal_retention_survives_cold_db_and_refuses_new_write_permission(
+    setup, monkeypatch,
+):
+    from copy import copy
+
+    ctx = setup
+    reference, _identifier, _record, _archive = admit_retained(ctx, monkeypatch)
+    ctx.store.advance_chain_cursor(201, "cd" * 32)
+    ctx.uploads.registration = lambda _h: (9, 201)
+    activate(ctx, block=201)
+    count = ctx.events.count("mint")
+    with pytest.raises(ValueError, match="write permissions"):
+        ctx.uploads.issue_pending(now=NOW + 1)
+    assert ctx.events.count("mint") == count
+    with ChallengeStore(ctx.root / "empty.db") as store:
+        store.advance_chain_cursor(201, "cd" * 32)
+        cold = copy(ctx.uploads)
+        cold.store = store
+        after = NOW + MODEL_RETENTION_MS // 1000 + 1
+        assert cold.reclaim_expired(store=store, finalized_block=201,
+                                    finalized_timestamp=after, now=after) == 0
+    assert ctx.uploads._read(reference.upload_id)[1]["model_reference"] is not None
+
+
+def test_r2_reference_and_original_retention_clock_cannot_be_rebound(setup, monkeypatch):
+    from validator.production.commitment import canonical_json
+
+    ctx = setup
+    reference, _identifier, _record, archive = admit_retained(ctx, monkeypatch)
+    with pytest.raises(ValueError, match="original S"):
+        ctx.uploads.bind_submission(reference, hotkey=KEY.ss58_address, submission_block=201,
+                                    submission_timestamp_ms=(NOW + 1) * 1000)
+    name = f"models/{reference.file_sha256}.safetensors"
+    stored = archive.objects.get(name)
+    altered = json.loads(stored.body)
+    altered["model_digest"] = "ef" * 32
+    archive.objects.replace_plan(name, canonical_json(altered), etag=stored.etag)
+    with pytest.raises(RuntimeError, match="original retention"):
+        archive.restore_model(reference.file_sha256, ctx.model.stat().st_size)
+
+
+def test_r2_formal_schema_rejection_still_retains_bytes_for_thirty_days(setup, monkeypatch):
+    from scoring.model import ModelValidationError
+
+    ctx = setup
+    reference = transfer(ctx)
+    identifier, _record = submit(ctx, reference)
+
+    def invalid(*_args, **_kwargs):
+        raise ModelValidationError("INVALID_MODEL", "synthetic schema rejection")
+
+    result = process_next_admission(
+        ctx.store, worker_id="original", current_finalized_block=200, now_ms=10,
+        settings=AdmissionSettings(cache_dir=ctx.root / "cache", max_model_bytes=10000,
+                                   tensor_schema=SCHEMA, private_download=ctx.uploads.download),
+        model_validator=invalid,
+    )
+    assert result.status is AdmissionStatus.FAILED
+    row = ctx.store.public_challenge(identifier)
+    assert row["state"] == ChallengeState.PARTICIPANT_FAILED and row["model_digest"] is None
+    before = NOW + MODEL_RETENTION_MS // 1000 - 1
+    assert ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
+                                      finalized_timestamp=before, now=before) == 0
+    assert ctx.uploads._read(reference.upload_id)[1]["formal_submission"][
+        "submission_block"
+    ] == 200
+
+
+def test_failed_r2_champion_copy_never_marks_a_durable_archive(setup, monkeypatch):
+    ctx = setup
+    reference, _identifier, _record, archive = admit_retained(ctx, monkeypatch)
+
+    def interrupted(**_kwargs):
+        raise OSError("copy interrupted")
+
+    copy_object = ctx.uploads.staging.copy_object
+    monkeypatch.setattr(ctx.uploads.staging, "copy_object", interrupted)
+    with pytest.raises(OSError, match="copy interrupted"):
+        archive.archive_champion(reference.file_sha256, ctx.model.stat().st_size)
+    assert ctx.uploads._read(reference.upload_id)[1].get("champion_archive") is None
+    monkeypatch.setattr(ctx.uploads.staging, "copy_object", copy_object)
+    archive.archive_champion(reference.file_sha256, ctx.model.stat().st_size)
+    assert ctx.uploads._read(reference.upload_id)[1]["champion_archive"].startswith("champions/")
+
+
+def test_existing_private_minio_archive_is_preserved_without_recopy(setup, monkeypatch):
+    from scoring.model import validate_model
+
+    ctx = setup
+    reference = transfer(ctx)
+    identifier, _record = submit(ctx, reference)
+    archive = ReadyBatchSource(track=SimpleNamespace(digest="cc" * 32),
+                               objects=PrivateObjectStore(MemoryS3(), bucket="a", prefix="old"),
+                               cache_dir=ctx.root / "archive")
+    archive.objects.put_content(ctx.model, sha256=reference.file_sha256,
+                                 object_name=f"models/{reference.file_sha256}.safetensors")
+    task = SimpleNamespace(challenge_id=identifier, submission_id="ab" * 32,
+                           repo_id=None, revision=None, private_submission=reference,
+                           position=ChainPosition(200, 1, 1), hotkey=KEY.ss58_address)
+    before = dict(archive.objects._client.objects)
+    monkeypatch.setattr(archive.objects, "put_content",
+                        lambda *_a, **_k: pytest.fail("old private body recopied"))
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms", lambda _b: NOW)
+    archive.archive_model(task, ctx.model, validate_model(ctx.model, schema=SCHEMA,
+                          max_bytes=10000, expected_hotkey=KEY.ss58_address))
+    assert all(archive.objects._client.objects[key] == value for key, value in before.items())
+    assert ctx.uploads._read(reference.upload_id)[1].get("model_reference") is None
 
 
 @pytest.mark.parametrize("crypto_type", [1])
@@ -379,7 +595,8 @@ def test_gc_pins_original_ready_until_archive_then_exactly_cleans_only_its_prefi
         Bucket="affinemodel", Key="uploads/v1/another/part", Body=b"keep",
     )
     assert ctx.uploads.reclaim_expired(store=ctx.store, finalized_block=200,
-                                      finalized_timestamp=now, now=now) == 2
+                                      finalized_timestamp=NOW + MODEL_RETENTION_MS // 1000,
+                                      now=NOW + MODEL_RETENTION_MS // 1000) == 2
     assert ctx.store.public_challenge(identifier) == original
     assert ctx.uploads.staging.objects[("affinemodel", "uploads/v1/another/part")][0] == b"keep"
 

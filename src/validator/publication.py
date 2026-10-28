@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from miner.submit import private_model_source
 from scoring.spec import TrackSpec, data_spec_logical_name, parse_track_spec, track_spec_dict
 from validator.chunks import (
     ChunkManifest,
@@ -108,6 +109,7 @@ class PublicFile:
     path: Path | None
     sha256: str
     restore: Callable[[], Path] | None = None
+    before_publish: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +179,7 @@ def build_public_artifacts(
     version_key: int,
     match_limit: int | None = None,
     model_resolver: Callable[[str, int], Path] | None = None,
+    private_winner_archive: Callable[[str, int], None] | None = None,
     runtime_manifest: bytes | None = None,
     release_approval: ReleaseApproval | None = None,
     system_matches: tuple[tuple[str, bytes], ...] = (),
@@ -302,6 +305,12 @@ def build_public_artifacts(
                 None if model_resolver is None else partial(
                     model_resolver,
                     evaluation["file_sha256"],
+                    evaluation["model_size_bytes"],
+                ),
+                None if (private_winner_archive is None
+                         or private_model_source(match.document["submission"]) is None
+                         or match.document["outcome"] != "CHALLENGER_WON") else partial(
+                    private_winner_archive, evaluation["file_sha256"],
                     evaluation["model_size_bytes"],
                 ),
             )
@@ -844,6 +853,8 @@ class S3Repository:
                 )
             await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
         for artifact in artifacts.files:
+            if artifact.before_publish is not None:
+                await asyncio.to_thread(artifact.before_publish)
             await asyncio.to_thread(self._put_file_immutable, artifact)
         await self._stage_system_matches(artifacts)
         for name, payload in artifacts.matches:

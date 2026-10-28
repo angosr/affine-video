@@ -554,11 +554,13 @@ class ChallengeStore:
 
     def upload_is_referenced(
         self, hotkey: str, *, reference: PrivateModelSubmission, finalized_block: int,
+        include_admitted: bool = False,
     ) -> bool:
         """Staging GC uses the original scan and admission/archive facts, not a TTL ledger.
 
-        Production registers model_digest only AFTER successful original archive.
-        Until then an in-flight submission pins its staging, including retry/blocked.
+        Legacy MinIO archives release staging after admission. A retained R2 model
+        also pins admitted in-flight work, including retry/blocked. Retention and
+        champion references are checked by the same existing upload GC caller.
         """
         self._connection.execute("BEGIN")
         try:
@@ -572,7 +574,8 @@ class ChallengeStore:
                 "WHERE s.hotkey=? AND s.netuid=120 AND s.payload=?",
                 (hotkey, reference.encode()),
             ).fetchall()
-            return any(row["model_digest"] is None and row["state"] not in TERMINAL_STATES
+            return any((include_admitted or row["model_digest"] is None)
+                       and row["state"] not in TERMINAL_STATES
                        for row in rows)
         finally:
             self._connection.rollback()

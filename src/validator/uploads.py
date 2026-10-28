@@ -28,14 +28,38 @@ from validator.chunks import ChunkManifest, verify_chunked_content
 from validator.download import DownloadedModel, ModelDownloadError
 from validator.production.commitment import canonical_json, decode_canonical_json
 from validator.production.storage import (
+    PreconditionFailed,
     PrivateObjectStore,
     _environment_client,
     _validated_endpoint,
+    is_precondition_failed,
 )
 from validator.store import ChallengeStore
 
 CREDENTIAL_TTL = 3600
 MAX_MANIFEST_BYTES = 64 * 1024
+MODEL_RETENTION_MS = 30 * 86400 * 1000
+MODEL_REFERENCE_FORMAT = "veda-r2-model-reference-v1"
+
+
+def decode_model_reference(payload: bytes) -> dict:
+    """The original model slot may hold a fixed R2 body reference, never a URL/key."""
+    row = decode_canonical_json(payload)
+    if (not isinstance(row, dict) or set(row) != {
+        "format", "hotkey", "private_upload", "file_sha256", "model_digest", "size_bytes",
+        "submission_block", "submission_timestamp_ms", "retain_until_ms",
+    } or row["format"] != MODEL_REFERENCE_FORMAT):
+        raise ValueError("private model reference is invalid")
+    reference = private_model_source(row)
+    if (reference is None or reference.manifest_sha256 is None
+            or reference.file_sha256 != row["file_sha256"]
+            or not isinstance(row["hotkey"], str) or not row["hotkey"]
+            or not re.fullmatch(r"[a-f0-9]{64}", str(row["model_digest"]))
+            or any(type(row[key]) is not int or row[key] <= 0
+                   for key in ("size_bytes", "submission_block", "submission_timestamp_ms"))
+            or row["retain_until_ms"] != row["submission_timestamp_ms"] + MODEL_RETENTION_MS):
+        raise ValueError("private model reference identity is invalid")
+    return row
 
 
 def ed25519_verify(hotkey: str, message: bytes, signature: bytes) -> bool:
@@ -74,6 +98,30 @@ def _read_upload_record(objects: PrivateObjectStore, genesis_hash: str, upload_i
             or upload_registration_id(genesis_hash, record.get("hotkey", "")) != upload_id
             or type(record.get("expires_at")) is not int):
         raise ValueError("private upload record is invalid")
+    if "model_reference" in record:
+        model = decode_model_reference(canonical_json(record["model_reference"]))
+        if (model["hotkey"] != record["hotkey"]
+                or model["private_upload"]["upload_id"] != upload_id
+                or model["file_sha256"] != record.get("file_sha256")
+                or model["private_upload"]["manifest_sha256"] != record.get("manifest_sha256")
+                or model["size_bytes"] != record.get("size_bytes")):
+            raise ValueError("retained model differs from its sealed upload")
+    formal = record.get("formal_submission")
+    if formal is not None and (
+        not isinstance(formal, dict) or set(formal) != {
+            "submission_block", "submission_timestamp_ms", "retain_until_ms",
+        } or any(type(formal[key]) is not int or formal[key] <= 0 for key in formal)
+        or formal["retain_until_ms"] != formal["submission_timestamp_ms"] + MODEL_RETENTION_MS
+        or ("model_reference" in record and any(
+            record["model_reference"][key] != formal[key] for key in formal
+        ))
+    ):
+        raise ValueError("private retention differs from original formal submission")
+    if record.get("champion_archive") is not None and (
+        "model_reference" not in record
+        or record["champion_archive"] != f"champions/v1/{record.get('file_sha256')}/"
+    ):
+        raise ValueError("private champion archive is invalid")
     retry = record.get("issue_retry")
     if retry is not None and (
         not isinstance(retry, dict) or set(retry) != {"attempts", "retry_after", "error"}
@@ -445,6 +493,10 @@ class PrivateUploads:
         self.registration, self.control = registration, control
         self._gc_after = ""
         self._issue_after = ""
+        self.current_champion: (
+            Callable[[ChallengeStore], PrivateModelSubmission | None] | None
+        ) = None
+        self.submission_timestamp: Callable[[int], int] | None = None
 
     @classmethod
     def from_environment(cls, *, store: ChallengeStore, max_bytes: int) -> PrivateUploads | None:
@@ -612,6 +664,11 @@ class PrivateUploads:
         if unpublished:
             self.republish_mailbox(upload_id)
             return
+        if record.get("model_reference") is not None:
+            if record.get("activation_request") is not None:
+                self._replace(stored, {k: v for k, v in record.items()
+                                       if k != "activation_request"})
+            raise ValueError("admitted R2 body cannot receive new miner write permissions")
         pending = record.get("activation_request")
         rows = [row for row in self.store.public_snapshot()["challenges"]
                 if row["hotkey"] == record["hotkey"]]
@@ -673,7 +730,8 @@ class PrivateUploads:
             raise RuntimeError("private upload authority is unavailable") from exc
         if record is None or record["hotkey"] != hotkey or reference.manifest_sha256 is None:
             raise ValueError("ready does not identify an original private registration")
-        if record.get("cleanup") == "pending" or record["state"] == "ISSUING":
+        if ((record.get("cleanup") == "pending" and not record.get("champion_archive"))
+                or record["state"] == "ISSUING"):
             raise RuntimeError("private upload lifecycle is not ready for admission")
         if record.get("file_sha256") is not None and (
             record["file_sha256"] != reference.file_sha256
@@ -733,11 +791,18 @@ class PrivateUploads:
 
     def download(
         self, reference: PrivateModelSubmission, *, hotkey: str, cache_dir: str | Path,
-        max_bytes: int,
+        max_bytes: int, submission_block: int | None = None,
     ) -> DownloadedModel:
-        """Revoke first, verify bytes once, then original ADMISSION/schema/archive."""
+        """Revoke first, verify bytes, then original ADMISSION/schema and small binding."""
         try:
             record = self._seal_ready(reference, hotkey)
+            if submission_block is not None:
+                if self.submission_timestamp is None:
+                    raise RuntimeError("original submission clock is unavailable")
+                self.bind_submission(
+                    reference, hotkey=hotkey, submission_block=submission_block,
+                    submission_timestamp_ms=self.submission_timestamp(submission_block),
+                )
         except ValueError as exc:
             raise ModelDownloadError("PRIVATE_UPLOAD_BINDING_MISMATCH",
                                      "private ready binding is invalid") from exc
@@ -749,10 +814,11 @@ class PrivateUploads:
             raise ModelDownloadError("MODEL_TOO_LARGE", "private source exceeds byte limit")
         manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
         target = Path(cache_dir) / f"{reference.file_sha256}.safetensors"
+        prefix = record.get("champion_archive") or f"{self.prefix}/{reference.upload_id}/"
 
         def open_part(name: str):
             return self.staging.get_object(
-                Bucket=self.bucket, Key=f"{self.prefix}/{reference.upload_id}/{name}",
+                Bucket=self.bucket, Key=prefix + name,
             )["Body"]
 
         temporary = None
@@ -789,6 +855,140 @@ class PrivateUploads:
                                                  temporary=True) from exc
         return DownloadedModel(target, reference.file_sha256, manifest.size, None, None)
 
+    def bind_submission(self, reference, *, hotkey, submission_block, submission_timestamp_ms):
+        """Retain even rejected formal bytes for 30 days from the original chain S."""
+        self._seal_ready(reference, hotkey)
+        formal = {"submission_block": submission_block,
+                  "submission_timestamp_ms": submission_timestamp_ms,
+                  "retain_until_ms": submission_timestamp_ms + MODEL_RETENTION_MS}
+        if any(type(value) is not int or value <= 0 for value in formal.values()):
+            raise ValueError("original submission retention clock is invalid")
+        for _ in range(16):
+            stored, record = self._read(reference.upload_id)
+            if (record.get("cleanup") in {"pending", "done"}
+                    or record["state"] != "SEALED" or record["parent_token_id"] is not None):
+                raise RuntimeError("formal model retention awaits original sealed fence")
+            previous = record.get("formal_submission")
+            if previous is not None:
+                if previous != formal:
+                    raise ValueError("formal model cannot change original S or retention deadline")
+                return
+            try:
+                self._replace(stored, {**record, "formal_submission": formal})
+                return
+            except PreconditionFailed:
+                continue
+        raise RuntimeError("formal model retention CAS contention")
+
+    def retain_model(
+        self, reference: PrivateModelSubmission, *, hotkey: str, model_digest: str,
+        size_bytes: int, submission_block: int, submission_timestamp_ms: int,
+    ) -> dict:
+        """Pin the verified body in the existing upload CAS before admission commits."""
+        record = self._seal_ready(reference, hotkey)
+        self.bind_submission(reference, hotkey=hotkey, submission_block=submission_block,
+                             submission_timestamp_ms=submission_timestamp_ms)
+        model = decode_model_reference(canonical_json({
+            "format": MODEL_REFERENCE_FORMAT, "hotkey": hotkey,
+            "private_upload": {"upload_id": reference.upload_id,
+                               "file_sha256": reference.file_sha256,
+                               "manifest_sha256": reference.manifest_sha256},
+            "file_sha256": reference.file_sha256, "model_digest": model_digest,
+            "size_bytes": size_bytes, "submission_block": submission_block,
+            "submission_timestamp_ms": submission_timestamp_ms,
+            "retain_until_ms": submission_timestamp_ms + MODEL_RETENTION_MS,
+        }))
+        if size_bytes != record["size_bytes"]:
+            raise ValueError("retained model length differs from sealed bytes")
+        for _ in range(16):
+            stored, record = self._read(reference.upload_id)
+            if record.get("cleanup") in {"pending", "done"}:
+                raise RuntimeError("private model body is being reclaimed")
+            if (record["state"] != "SEALED" or record["parent_token_id"] is not None
+                    or record.get("file_sha256") != reference.file_sha256
+                    or record.get("manifest_sha256") != reference.manifest_sha256):
+                raise RuntimeError("private model retention awaits original sealed write fence")
+            if record.get("model_reference") is not None:
+                if record["model_reference"] != model:
+                    raise ValueError("retained model cannot change its original submission")
+                return model
+            try:
+                self._replace(stored, {**record, "model_reference": model})
+                return model
+            except PreconditionFailed:
+                continue
+        raise RuntimeError("private model retention CAS contention")
+
+    def archive_champion(self, model: dict) -> None:
+        """Only a resolved private winner calls this before public payload/match staging."""
+        model = decode_model_reference(canonical_json(model))
+        reference = private_model_source(model)
+        record = self._seal_ready(reference, model["hotkey"])
+        if record.get("model_reference") != model:
+            raise ValueError("champion differs from its admitted model")
+        manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
+        prefix = f"champions/v1/{reference.file_sha256}/"
+        if record.get("champion_archive") == prefix:
+            existing = self.staging.get_object(Bucket=self.bucket, Key=prefix + "manifest.json")
+            with existing["Body"] as body:
+                if body.read(MAX_MANIFEST_BYTES + 1) != manifest.encode():
+                    raise ValueError("private champion manifest changed")
+            return
+        try:
+            with self.staging.get_object(Bucket=self.bucket, Key=prefix + "manifest.json")[
+                "Body"
+            ] as body:
+                if body.read(MAX_MANIFEST_BYTES + 1) != manifest.encode():
+                    raise ValueError("private champion manifest conflicts")
+        except Exception as exc:
+            from validator.s3 import is_missing
+
+            if not isinstance(exc, KeyError) and not is_missing(exc):
+                raise
+            for part in manifest.parts:
+                self.staging.copy_object(
+                    Bucket=self.bucket, Key=prefix + part.name,
+                    CopySource={"Bucket": self.bucket,
+                                "Key": f"{self.prefix}/{reference.upload_id}/{part.name}"},
+                )
+        verify_chunked_content(
+            manifest, lambda name: self.staging.get_object(
+                Bucket=self.bucket, Key=prefix + name,
+            )["Body"],
+        )
+        try:
+            self.staging.put_object(Bucket=self.bucket, Key=prefix + "manifest.json",
+                                    Body=manifest.encode(), IfNoneMatch="*")
+        except Exception as exc:
+            if not is_precondition_failed(exc):
+                raise
+            with self.staging.get_object(Bucket=self.bucket, Key=prefix + "manifest.json")[
+                "Body"
+            ] as body:
+                if body.read(MAX_MANIFEST_BYTES + 1) != manifest.encode():
+                    raise ValueError("private champion manifest conflicts") from exc
+        for _ in range(16):
+            stored, record = self._read(reference.upload_id)
+            if record.get("model_reference") != model:
+                raise ValueError("champion model binding changed")
+            if record.get("champion_archive") == prefix:
+                return
+            try:
+                self._replace(stored, {**record, "champion_archive": prefix})
+                return
+            except PreconditionFailed:
+                continue
+        raise RuntimeError("private champion CAS contention")
+
+    def restore_model_reference(self, model: dict, *, cache_dir: str | Path) -> Path:
+        model = decode_model_reference(canonical_json(model))
+        reference = private_model_source(model)
+        _, record = self._read(reference.upload_id)
+        if record is None or record.get("model_reference") != model:
+            raise RuntimeError("R2 model reference differs from original retention")
+        return self.download(reference, hotkey=model["hotkey"], cache_dir=cache_dir,
+                             max_bytes=model["size_bytes"]).path
+
     def reclaim_expired(
         self, *, store: ChallengeStore, finalized_block: int,
         finalized_timestamp: int, now: int,
@@ -810,9 +1010,22 @@ class PrivateUploads:
                           if row["hotkey"] == record["hotkey"]
                           and (private := row.get("private_upload")) is not None
                           and private["upload_id"] == record["upload_id"]]
+            model = record.get("model_reference")
+            formal = record.get("formal_submission")
+            if (formal is not None
+                    and min(now, finalized_timestamp) * 1000 < formal["retain_until_ms"]):
+                continue
+            if model is not None:
+                if (min(now, finalized_timestamp) * 1000 < model["retain_until_ms"]
+                        or not references or self.current_champion is None):
+                    continue
+                champion = self.current_champion(store)
+                if champion is not None and champion.upload_id == record["upload_id"]:
+                    continue
             if any(store.upload_is_referenced(
                 record["hotkey"], reference=PrivateModelSubmission(**private),
                 finalized_block=finalized_block,
+                include_admitted=model is not None,
             ) for private in references):
                 continue
             if not references:

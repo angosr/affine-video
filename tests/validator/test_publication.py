@@ -1559,8 +1559,12 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
     assert len(restored) == (cache_state != "valid")
 
 
-@pytest.mark.parametrize("gain,won", [(0.0025, False), (0.00250001, True)])
-def test_exact_tenure_private_result_publication_and_cold_reader(tmp_path, gain, won):
+@pytest.mark.parametrize("gain,won,archive_failure", [
+    (0.0025, False, False), (0.00250001, True, False), (0.00250001, True, True),
+])
+def test_exact_tenure_private_result_publication_and_cold_reader(
+    tmp_path, gain, won, archive_failure,
+):
     from tests.validator.test_tournament import tenure_challenge
     from validator.tournament import genesis_champion
 
@@ -1604,9 +1608,20 @@ def test_exact_tenure_private_result_publication_and_cold_reader(tmp_path, gain,
     )
     chain = WeightChainState(1000, {track.initial_champion.hotkey: 0, item["hotkey"]: 4},
                              1, 1.0, 10, {})
+    champion_archives = []
+
+    def archive_champion(sha256, size_bytes):
+        assert sha256 == digest and size_bytes == model.stat().st_size
+        assert not any("/models/" in call["Key"] or "/matches/" in call["Key"]
+                       for call in client.calls)
+        champion_archives.append(sha256)
+        if archive_failure:
+            raise OSError("R2 champion copy temporarily unavailable")
+
     artifacts = build_public_artifacts(
         store, track, chain, version_key=0,
         historical_matches=history, runtime_manifest=manifest.encode(),
+        private_winner_archive=archive_champion,
     )
     document = json.loads(artifacts.matches[0][1])
     assert document["minimum_gain"] == 0.0025
@@ -1615,7 +1630,15 @@ def test_exact_tenure_private_result_publication_and_cold_reader(tmp_path, gain,
     client = MemoryS3()
     client.objects["isolated/tenure/" + history[0].object_name] = historical_body
     publisher = S3Repository(client, bucket="test", prefix="isolated/tenure")
+    if archive_failure:
+        with pytest.raises(OSError, match="R2 champion"):
+            asyncio.run(publisher.publish(artifacts))
+        assert champion_archives == [digest]
+        assert not any("/models/" in call["Key"] or "/matches/" in call["Key"]
+                       or call["Key"].endswith("/weights.json") for call in client.calls)
+        return
     asyncio.run(publisher.publish(artifacts))
+    assert champion_archives == ([digest] if won else [])
     order = [call["Key"] for call in client.calls]
     model_keys = [key for key in order if "/models/" in key]
     if won:

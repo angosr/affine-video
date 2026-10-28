@@ -798,6 +798,7 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
                 source = evaluator.batch_source
                 source._plans = lambda: ()
                 source.track = case.track
+                source.data_track = case.track
                 source.objects = PrivateObjectStore(PrivateMemoryS3(), bucket="test", prefix="test")
                 source.due_plan_digests = lambda _now: ("ab" * 32,)
                 source.public_disclosure = lambda *_a, **_k: object()

@@ -65,7 +65,7 @@ from validator.scoring import (
     verify_initial_champion,
 )
 from validator.store import MAX_PUBLICATION_FAILURES, ChallengeStore, LeasedChallenge
-from validator.tournament import MatchRecord
+from validator.tournament import MatchRecord, genesis_champion, resolve_tournament
 from validator.uploads import PrivateUploads
 from validator.weights import (
     WeightReceipt,
@@ -584,6 +584,21 @@ async def run_evaluator(
             if track.netuid != DEFAULT_NETUID or batch_source is None:
                 raise ValueError("private upload admission requires SN120 and its models archive")
             admission_settings = replace(admission_settings, private_download=uploads.download)
+            batch_source.private_uploads = uploads
+            uploads.submission_timestamp = batch_source.block_timestamp_ms
+
+            def current_private_champion(query_store):
+                tournament = resolve_tournament(
+                    query_store.public_snapshot()["challenges"], track_id=track.track_id,
+                    track_spec_digest=track.digest, netuid=track.netuid,
+                    minimum_gain=track.full_video.minimum_gain,
+                    minimum_exact_gain=track.scoring.minimum_frontier_gain,
+                    initial_champion=genesis_champion(track),
+                    historical_matches=historical_matches, promotion=track.promotion,
+                )
+                return tournament.champion.private_submission
+
+            uploads.current_champion = current_private_champion
         store.reserve_uid_zero(
             track.initial_champion.hotkey,
             track_start_block=track.track_start_block,
@@ -872,6 +887,10 @@ async def run_evaluator(
                                         "model_resolver": (
                                             None if batch_source is None
                                             else batch_source.restore_model
+                                        ),
+                                        "private_winner_archive": (
+                                            None if batch_source is None
+                                            else batch_source.archive_champion
                                         ),
                                         "runtime_manifest": runtime_manifest_payload,
                                         "system_matches": system_matches,

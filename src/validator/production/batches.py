@@ -25,10 +25,10 @@ from scoring.cache import (
     validate_exact_cache,
 )
 from scoring.exact import GLOBAL_SEGMENT, REFERENCE_SEGMENT, TARGET_SEGMENT
-from scoring.model import ValidatedModel
+from scoring.model import ValidatedModel, model_file_sha256
 from scoring.spec import TrackSpec, validate_data_track
 from validator.admission import RejectedAdmission
-from validator.chunks import check_deadline
+from validator.chunks import ChunkManifest, check_deadline
 from validator.download import DownloadedModel, download_chunked_file
 from validator.production.commitment import canonical_json, verify_source_proof
 from validator.production.inventory import ALLOCATION_OBJECT, Inventory
@@ -55,6 +55,7 @@ from validator.production.storage import (
     StorageError,
 )
 from validator.queue import TERMINAL_STATES
+from validator.uploads import MODEL_REFERENCE_FORMAT, decode_model_reference
 
 
 def _submission_timestamp_ms(block: int) -> int:
@@ -152,6 +153,7 @@ class ReadyBatchSource:
         self.public_base_url = public_base_url
         self._validated_exact: set[str] = set()
         self.inventory = Inventory(objects, self.data_track.digest)
+        self.private_uploads = None
 
     def _materialize(self, plan: BatchPlan, item: ReadyObject, destination: Path) -> Path:
         try:
@@ -212,18 +214,37 @@ class ReadyBatchSource:
 
         if Path(path).stat().st_size != validated.size_bytes:
             raise RuntimeError("validated selector size changed before archival")
-        self.objects.put_content(
-            path,
-            sha256=validated.file_sha256,
-            object_name=f"{MODELS_NAMESPACE}/{validated.file_sha256}.safetensors",
-        )
+        submitted_ms = _submission_timestamp_ms(task.position.block)
+        private = getattr(task, "private_submission", None)
+        name = f"{MODELS_NAMESPACE}/{validated.file_sha256}.safetensors"
+        existing = self.objects.get_optional(name) if private is not None else None
+        if private is not None and (existing is None or json.loads(existing.body).get(
+            "format"
+        ) == MODEL_REFERENCE_FORMAT):
+            if self.private_uploads is None:
+                raise RuntimeError("private R2 retention is not configured")
+            if model_file_sha256(path) != validated.file_sha256:
+                raise RuntimeError("validated private model changed before retention")
+            model = self.private_uploads.retain_model(
+                private, hotkey=task.hotkey, model_digest=validated.model_digest,
+                size_bytes=validated.size_bytes, submission_block=task.position.block,
+                submission_timestamp_ms=submitted_ms,
+            )
+            self.objects.create_plan(name, _json(model))
+        elif private is not None:
+            legacy = ChunkManifest.decode(existing.body)
+            if legacy.sha256 != validated.file_sha256 or legacy.size != validated.size_bytes:
+                raise RuntimeError("existing private archive differs from admitted model")
+        else:
+            # HF keeps its original payload archive. Old private archives are not recopied.
+            self.objects.put_content(path, sha256=validated.file_sha256, object_name=name)
         document = {
             "format": "veda-admission-model-v1",
             **self._admission_identity(task),
             "file_sha256": validated.file_sha256,
             "model_digest": validated.model_digest,
             "size_bytes": validated.size_bytes,
-            "submission_timestamp_ms": _submission_timestamp_ms(task.position.block),
+            "submission_timestamp_ms": submitted_ms,
         }
         self.objects.create_plan(
             self._admission_name(task.challenge_id),
@@ -330,12 +351,33 @@ class ReadyBatchSource:
         )
 
     def restore_model(self, sha256: str, size_bytes: int) -> Path:
+        stored = self.objects.get_optional(f"{MODELS_NAMESPACE}/{sha256}.safetensors")
+        if stored is not None and json.loads(stored.body).get("format") == MODEL_REFERENCE_FORMAT:
+            model = decode_model_reference(stored.body)
+            if (model["file_sha256"] != sha256 or model["size_bytes"] != size_bytes
+                    or self.private_uploads is None):
+                raise RuntimeError("private R2 model reference differs or is unavailable")
+            return self.private_uploads.restore_model_reference(
+                model, cache_dir=self.cache_dir / "models",
+            )
         return self.objects.download_content(
             f"{MODELS_NAMESPACE}/{sha256}.safetensors",
             self.cache_dir / "models" / f"{sha256}.safetensors",
             sha256=sha256,
             size_bytes=size_bytes,
         )
+
+    def archive_champion(self, sha256: str, size_bytes: int) -> None:
+        stored = self.objects.get_optional(f"{MODELS_NAMESPACE}/{sha256}.safetensors")
+        if stored is None:
+            raise RuntimeError("winning model reference is unavailable")
+        if json.loads(stored.body).get("format") != MODEL_REFERENCE_FORMAT:
+            return  # Do not migrate old archives or HF models.
+        model = decode_model_reference(stored.body)
+        if (model["file_sha256"] != sha256 or model["size_bytes"] != size_bytes
+                or self.private_uploads is None):
+            raise RuntimeError("winning R2 model reference differs")
+        self.private_uploads.archive_champion(model)
 
     def archive_stage(self, task: object, result: object, score_block: int) -> None:
         """Persist a scored nonterminal stage before changing local tournament state."""

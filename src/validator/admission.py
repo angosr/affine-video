@@ -214,6 +214,7 @@ def process_next_admission(
                     downloaded = settings.private_download(
                         task.private_submission, hotkey=task.hotkey,
                         cache_dir=settings.cache_dir, max_bytes=settings.max_model_bytes,
+                        submission_block=task.position.block,
                     )
                 else:
                     downloaded = downloader(
