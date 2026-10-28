@@ -105,10 +105,11 @@ class Inventory:
         plans: tuple[BatchPlan, ...], submission_block: int, disclosure_delay_seconds: int,
         submission_timestamp_ms: int,
     ) -> dict[str, Any] | None:
-        """Bind the newest eligible READY at the original on-chain submission.
+        """Bind the earliest-expiring unpublished READY eligible at submission.
 
         A batch is reusable, not consumed by a claim. Late scanning, retries and
         publication never move the submission boundary or substitute newer data.
+        A durable claim is reused before considering disclosure or pool ordering.
         """
         if stage not in _STAGES or any(not _digest(value) for value in (
             challenge_id, file_sha256, model_digest,
@@ -121,7 +122,7 @@ class Inventory:
         ordered = tuple(sorted(plans, key=lambda plan: (
             plan.completed_at_ms or -1, plan.completed_block or -1,
             plan.generation_block, plan.plan_digest,
-        ), reverse=True))
+        )))
         if len({plan.plan_digest for plan in ordered}) != len(ordered):
             raise ValueError("inventory repeats a plan")
         by_digest = {plan.plan_digest: plan for plan in ordered}
@@ -159,6 +160,8 @@ class Inventory:
                         proof.leaf.source_family_id for proof in plan.source_proofs
                     )
                 ):
+                    continue
+                if self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is not None:
                     continue
                 row = {
                     "ordinal": len(claims) + 1, "challenge_id": challenge_id, "stage": stage,

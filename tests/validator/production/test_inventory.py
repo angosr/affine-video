@@ -341,7 +341,7 @@ def test_preproduced_archive_survives_cold_db_without_bulk(inventory_case, tmp_p
         claim(source.inventory, plans, task.challenge_id)
         if stage is ChallengeState.CONFIRMING:
             claim(source.inventory, plans, task.challenge_id, "CONFIRMING")
-        plan = plans[stage is ChallengeState.SCORING]
+        plan = plans[stage is ChallengeState.CONFIRMING]
         metrics = {
             **source.stage_binding(task.challenge_id,
                                    confirmation=stage is ChallengeState.CONFIRMING),
@@ -385,28 +385,91 @@ def test_preproduced_archive_survives_cold_db_without_bulk(inventory_case, tmp_p
         case.objects.replace_plan(name, stored.body, etag=case.objects.get(name).etag)
 
 
+def test_overlap_uses_oldest_unpublished_ready_without_changing_seals(inventory_case):
+    case = inventory_case
+    old = tuple(make_plan(case, block, index % 2) for index, block in enumerate(range(101, 105)))
+    fresh = tuple(make_plan(case, block, index % 2)
+                  for index, block in enumerate(range(43301, 43305)))
+    plans = old + fresh
+    sealed = {plan.plan_digest: plan.encode() for plan in plans}
+    inventory = Inventory(case.objects, case.track.digest)
+    for identifier, supplied in (("a1" * 32, tuple(reversed(plans))), ("a2" * 32, plans)):
+        row = claim(inventory, supplied, identifier=identifier,
+                    submission_block=50000, disclosure_delay_seconds=86400)
+        assert row["plan_digest"] == old[0].plan_digest
+        assert row["ready_sha256"] == hashlib.sha256(sealed[old[0].plan_digest]).hexdigest()
+        assert row["submission_block"] == 50000
+        assert row["submission_timestamp_ms"] == 50_000_000
+    assert {plan.plan_digest: plan.encode() for plan in plans} == sealed
+
+
+@pytest.mark.parametrize("disclosed_index,selected_index", [(1, 2), (2, 1)])
+def test_new_claim_skips_expired_disclosed_incomplete_and_after_submission_plans(
+    inventory_case, disclosed_index, selected_index,
+):
+    case = inventory_case
+    plans = (make_plan(case, 101), make_plan(case, 102, 1), make_plan(case, 103),
+             make_plan(case, 1902, 1), make_plan(case, 100, ready=False))
+    disclosed = plans[disclosed_index]
+    case.objects.create_plan(f"disclosed/{disclosed.plan_digest}.json", canonical_json({
+        "plan_digest": disclosed.plan_digest, "exact_sha256": disclosed.exact.sha256,
+    }))
+    row = claim(Inventory(case.objects, case.track.digest), tuple(reversed(plans)),
+                submission_block=1902)
+    assert row["plan_digest"] == plans[selected_index].plan_digest
+
+
+def test_earliest_expiry_ties_are_stable_across_input_order(inventory_case):
+    case = inventory_case
+    plans = tuple(replace(make_plan(case, block, slot), completed_at_ms=150_000,
+                          completed_block=150)
+                  for block, slot in ((101, 0), (101, 1), (102, 0)))
+    expected = min(plans, key=lambda plan: (plan.generation_block, plan.plan_digest))
+    inventory = Inventory(case.objects, case.track.digest)
+    for identifier, supplied in (("a1" * 32, plans), ("a2" * 32, tuple(reversed(plans)))):
+        assert claim(inventory, supplied, identifier=identifier)["plan_digest"] == (
+            expected.plan_digest
+        )
+
+
+def test_old_policy_claim_survives_new_priority_disclosure_and_cold_retry(inventory_case):
+    case = inventory_case
+    old, newest = make_plan(case, 101), make_plan(case, 43301, 1)
+    inventory = Inventory(case.objects, case.track.digest)
+    original = claim(inventory, (newest,), submission_block=50000,
+                     disclosure_delay_seconds=86400)
+    stored = case.objects.get(ALLOCATION_OBJECT)
+    case.objects.create_plan(f"disclosed/{newest.plan_digest}.json", canonical_json({
+        "plan_digest": newest.plan_digest, "exact_sha256": newest.exact.sha256,
+    }))
+    cold = Inventory(case.objects, case.track.digest)
+    assert claim(cold, (old, newest), submission_block=50000,
+                 disclosure_delay_seconds=86400) == original
+    assert case.objects.get(ALLOCATION_OBJECT) == stored
+
+
 def test_claim_is_fifo_idempotent_model_bound_and_cold_recoverable(inventory_case):
     case = inventory_case
     plans = (make_plan(case, 101), make_plan(case, 102, 1))
     inventory = Inventory(case.objects, case.track.digest)
     first = claim(inventory, tuple(reversed(plans)))
-    assert first["plan_digest"] == plans[1].plan_digest
+    assert first["plan_digest"] == plans[0].plan_digest
     assert claim(Inventory(case.objects, case.track.digest), plans) == first
     assert len(inventory.read()[1]["claims"]) == 1
     with pytest.raises(RuntimeError, match="original admission"):
         claim(inventory, plans, file_sha256="dd" * 32)
     second = claim(inventory, plans, identifier="a2" * 32)
-    assert second["plan_digest"] == plans[1].plan_digest
-    assert claim(inventory, plans, identifier="a3" * 32)["plan_digest"] == plans[1].plan_digest
+    assert second["plan_digest"] == plans[0].plan_digest
+    assert claim(inventory, plans, identifier="a3" * 32)["plan_digest"] == plans[0].plan_digest
     assert {row["plan_digest"] for row in inventory.read()[1]["claims"]} == {
-        plans[1].plan_digest,
+        plans[0].plan_digest,
     }
     with pytest.raises(RuntimeError, match="original admission"):
         claim(inventory, plans, submission_block=201)
 
 
 @pytest.mark.parametrize("submission,selected", [
-    (102, None), (103, 101), (104, 102), (1902, 102), (1903, None),
+    (102, None), (103, 101), (104, 101), (1902, 102), (1903, None),
 ])
 def test_eligibility_uses_real_completion_and_original_submission(
     inventory_case, submission, selected,
@@ -437,13 +500,13 @@ def test_local_byte_loss_cannot_resample_the_original_pool(inventory_case, tmp_p
     plans = (make_plan(case, 101), make_plan(case, 102, 1))
     inventory = Inventory(case.objects, case.track.digest)
     original = claim(inventory, plans, submission_block=200)
-    assert original["plan_digest"] == plans[1].plan_digest
+    assert original["plan_digest"] == plans[0].plan_digest
     reader = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
     with pytest.raises(RuntimeError, match="unavailable"):
-        reader.content.get(sha256=plans[1].exact.sha256, size_bytes=plans[1].exact.size_bytes)
+        reader.content.get(sha256=plans[0].exact.sha256, size_bytes=plans[0].exact.size_bytes)
     assert claim(inventory, plans, submission_block=200) == original
     later = claim(inventory, plans, identifier="a2" * 32, submission_block=251)
-    assert later["plan_digest"] == plans[1].plan_digest
+    assert later["plan_digest"] == plans[0].plan_digest
     assert set(inventory.read()[1]) == {"format", "track_spec_digest", "claims"}
 
 
@@ -515,10 +578,10 @@ def test_confirmation_uses_independent_half_even_when_already_generated(inventor
         claim(inventory, plans, stage="CONFIRMING")
     exact = claim(inventory, plans)
     confirmation = claim(inventory, plans, stage="CONFIRMING")
-    assert exact["plan_digest"] == plans[2].plan_digest
-    assert confirmation["plan_digest"] == plans[1].plan_digest
+    assert exact["plan_digest"] == plans[0].plan_digest
+    assert confirmation["plan_digest"] == plans[2].plan_digest
     assert not {p.leaf.source_family_id for p in plans[2].source_proofs} & {
-        p.leaf.source_family_id for p in plans[1].source_proofs
+        p.leaf.source_family_id for p in plans[0].source_proofs
     }
     assert claim(inventory, plans, stage="CONFIRMING") == confirmation
 
@@ -528,10 +591,10 @@ def test_claimed_bytes_are_never_relabelled(inventory_case):
     plans = (make_plan(case, 101), make_plan(case, 102, 1))
     inventory = Inventory(case.objects, case.track.digest)
     row = claim(inventory, plans)
-    assert row["plan_digest"] == plans[1].plan_digest
-    changed = replace(plans[1], exact=replace(plans[1].exact, sha256="dd" * 32))
+    assert row["plan_digest"] == plans[0].plan_digest
+    changed = replace(plans[0], exact=replace(plans[0].exact, sha256="dd" * 32))
     with pytest.raises(RuntimeError, match="immutable READY"):
-        claim(inventory, (plans[0], changed))
+        claim(inventory, (changed, plans[1]))
 
 
 def test_cas_race_cannot_double_claim_or_discard_a_winning_claim(inventory_case, monkeypatch):
@@ -550,7 +613,7 @@ def test_cas_race_cannot_double_claim_or_discard_a_winning_claim(inventory_case,
 
     monkeypatch.setattr(case.objects, "create_plan", race)
     row = claim(inventory, plans)
-    assert row["plan_digest"] == plans[1].plan_digest
+    assert row["plan_digest"] == plans[0].plan_digest
     assert [r["ordinal"] for r in inventory.read()[1]["claims"]] == [1, 2]
 
 
@@ -680,7 +743,7 @@ def test_claim_lost_response_keeps_original_allocation(inventory_case, monkeypat
         claim(inventory, plans)
     before = case.objects.get(ALLOCATION_OBJECT)
     assert claim(Inventory(case.objects, case.track.digest), plans)["plan_digest"] == (
-        plans[1].plan_digest
+        plans[0].plan_digest
     )
     assert case.objects.get(ALLOCATION_OBJECT) == before
     assert len(inventory.read()[1]["claims"]) == 1
@@ -701,11 +764,11 @@ def test_same_stage_cas_race_reuses_only_the_original_claim(inventory_case, monk
         return create(name, payload)
 
     monkeypatch.setattr(case.objects, "create_plan", race)
-    assert claim(inventory, plans)["plan_digest"] == plans[1].plan_digest
+    assert claim(inventory, plans)["plan_digest"] == plans[0].plan_digest
     assert len(inventory.read()[1]["claims"]) == 1
 
 
-def test_expiry_blocks_new_submissions_but_not_late_original_claims(inventory_case):
+def test_disclosure_blocks_new_claims_but_not_durable_original_claims(inventory_case):
     case = inventory_case
     plan = make_plan(case, 101)
     inventory = Inventory(case.objects, case.track.digest)
@@ -715,7 +778,7 @@ def test_expiry_blocks_new_submissions_but_not_late_original_claims(inventory_ca
     }))
     assert claim(inventory, (plan,), identifier="a2" * 32,
                  submission_block=1902) is None
-    assert claim(inventory, (plan,), identifier="a3" * 32)["plan_digest"] == plan.plan_digest
+    assert claim(inventory, (plan,), identifier="a3" * 32) is None
     assert claim(inventory, (plan,)) == original
 
 
