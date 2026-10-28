@@ -24,7 +24,7 @@ from miner.submit import (
     upload_registration_id,
 )
 from scoring.model import model_file_sha256
-from validator.chunks import ChunkManifest, build_chunk_manifest, read_part, verify_chunked_content
+from validator.chunks import ChunkManifest, verify_chunked_content
 from validator.download import DownloadedModel, ModelDownloadError
 from validator.production.commitment import canonical_json, decode_canonical_json
 from validator.production.storage import (
@@ -927,45 +927,6 @@ class PrivateUploads:
         if record.get("model_reference") != model:
             raise ValueError("champion differs from its admitted model")
         manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
-        self._write_champion(model, manifest, lambda part, prefix: self.staging.copy_object(
-            Bucket=self.bucket, Key=prefix + part.name,
-            CopySource={"Bucket": self.bucket,
-                        "Key": f"{self.prefix}/{reference.upload_id}/{part.name}"},
-        ))
-
-    def archive_legacy_champion(self, model: dict, restore: Callable[[], Path]) -> None:
-        """Continue an authenticated old private win after its staging was cleaned.
-
-        The caller checks the original winning match against immutable admission.
-        Never reissue upload permissions, clear cleanup, or replace the old archive.
-        """
-        model = decode_model_reference(canonical_json(model))
-        reference = private_model_source(model)
-        _, record = self._read(reference.upload_id)
-        if (record is None or record["state"] != "SEALED"
-                or record["parent_token_id"] is not None
-                or record["hotkey"] != model["hotkey"]
-                or record.get("file_sha256") != reference.file_sha256
-                or record.get("manifest_sha256") != reference.manifest_sha256
-                or record.get("size_bytes") != model["size_bytes"]
-                or record.get("model_reference") not in (None, model)):
-            raise ValueError("legacy champion differs from its sealed upload")
-        if record.get("champion_archive") is not None:
-            self.archive_champion(model)
-            return
-        manifest = ChunkManifest.decode(canonical_json(record["manifest"]))
-        path = restore()
-        if (manifest.sha256 != model["file_sha256"] or manifest.size != model["size_bytes"]
-                or build_chunk_manifest(path) != manifest):
-            raise ValueError("legacy champion bytes differ from the original signed manifest")
-        self._write_champion(model, manifest, lambda part, prefix: self.staging.put_object(
-            Bucket=self.bucket, Key=prefix + part.name,
-            Body=read_part(path, int(part.name.removeprefix("part-")), part.size),
-        ))
-
-    def _write_champion(self, model: dict, manifest: ChunkManifest, copy_part) -> None:
-        reference = private_model_source(model)
-        _, record = self._read(reference.upload_id)
         prefix = f"champions/v1/{reference.file_sha256}/"
         if record.get("champion_archive") == prefix:
             existing = self.staging.get_object(Bucket=self.bucket, Key=prefix + "manifest.json")
@@ -985,7 +946,11 @@ class PrivateUploads:
             if not isinstance(exc, KeyError) and not is_missing(exc):
                 raise
             for part in manifest.parts:
-                copy_part(part, prefix)
+                self.staging.copy_object(
+                    Bucket=self.bucket, Key=prefix + part.name,
+                    CopySource={"Bucket": self.bucket,
+                                "Key": f"{self.prefix}/{reference.upload_id}/{part.name}"},
+                )
         verify_chunked_content(
             manifest, lambda name: self.staging.get_object(
                 Bucket=self.bucket, Key=prefix + name,
@@ -1004,23 +969,12 @@ class PrivateUploads:
                     raise ValueError("private champion manifest conflicts") from exc
         for _ in range(16):
             stored, record = self._read(reference.upload_id)
-            if (record["state"] != "SEALED" or record["parent_token_id"] is not None
-                    or record["hotkey"] != model["hotkey"]
-                    or record.get("file_sha256") != reference.file_sha256
-                    or record.get("manifest_sha256") != reference.manifest_sha256
-                    or record.get("size_bytes") != model["size_bytes"]
-                    or record.get("model_reference") not in (None, model)):
+            if record.get("model_reference") != model:
                 raise ValueError("champion model binding changed")
-            formal = {key: model[key] for key in (
-                "submission_block", "submission_timestamp_ms", "retain_until_ms",
-            )}
-            if record.get("formal_submission") not in (None, formal):
-                raise ValueError("champion cannot change its original submission clock")
             if record.get("champion_archive") == prefix:
                 return
             try:
-                self._replace(stored, {**record, "model_reference": model,
-                                       "formal_submission": formal, "champion_archive": prefix})
+                self._replace(stored, {**record, "champion_archive": prefix})
                 return
             except PreconditionFailed:
                 continue

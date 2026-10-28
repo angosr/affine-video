@@ -16,7 +16,7 @@ from pathlib import Path
 import bittensor as bt
 import numpy as np
 
-from miner.submit import model_source_fields, private_model_source
+from miner.submit import model_source_fields
 from scoring.cache import (
     CacheLoadError,
     ExactCacheBatch,
@@ -55,7 +55,7 @@ from validator.production.storage import (
     StorageError,
 )
 from validator.queue import TERMINAL_STATES
-from validator.uploads import MODEL_REFERENCE_FORMAT, MODEL_RETENTION_MS, decode_model_reference
+from validator.uploads import MODEL_REFERENCE_FORMAT, decode_model_reference
 
 
 def _submission_timestamp_ms(block: int) -> int:
@@ -367,54 +367,12 @@ class ReadyBatchSource:
             size_bytes=size_bytes,
         )
 
-    def archive_champion(
-        self, sha256: str, size_bytes: int, *, winner: Mapping[str, object] | None = None,
-    ) -> None:
+    def archive_champion(self, sha256: str, size_bytes: int) -> None:
         stored = self.objects.get_optional(f"{MODELS_NAMESPACE}/{sha256}.safetensors")
         if stored is None:
             raise RuntimeError("winning model reference is unavailable")
         if json.loads(stored.body).get("format") != MODEL_REFERENCE_FORMAT:
-            if winner is None:
-                return  # Existing callers never infer a private winner from its file alone.
-            submission, evaluation = winner["submission"], winner["evaluation"]
-            private = private_model_source(submission)
-            if private is None:
-                return  # HF archives remain unchanged.
-            if (winner["outcome"] != "CHALLENGER_WON" or evaluation["state"] != "SUCCEEDED"
-                    or evaluation["file_sha256"] != sha256
-                    or evaluation["model_size_bytes"] != size_bytes
-                    or self.private_uploads is None):
-                raise RuntimeError("legacy archive requires an authenticated private winning match")
-            legacy = ChunkManifest.decode(stored.body)
-            if legacy.sha256 != sha256 or legacy.size != size_bytes:
-                raise RuntimeError("legacy champion archive identity differs")
-            admitted = self.objects.get(self._admission_name(winner["challenge_id"]))
-            admission = json.loads(admitted.body)
-            timestamp = admission.get("submission_timestamp_ms")
-            expected = {
-                "format": "veda-admission-model-v1",
-                "track_spec_digest": winner["track_spec_digest"],
-                "challenge_id": winner["challenge_id"], "submission_id": winner["submission_id"],
-                "hotkey": submission["hotkey"],
-                **model_source_fields(None, None, private),
-                "submission_block": submission["block_height"],
-                "file_sha256": sha256, "model_digest": evaluation["model_digest"],
-                "size_bytes": size_bytes, "submission_timestamp_ms": timestamp,
-            }
-            if (_json(expected) != admitted.body or type(timestamp) is not int or timestamp <= 0):
-                raise RuntimeError("legacy champion differs from its original admission")
-            model = decode_model_reference(_json({
-                "format": MODEL_REFERENCE_FORMAT, "hotkey": submission["hotkey"],
-                "private_upload": expected["private_upload"], "file_sha256": sha256,
-                "model_digest": evaluation["model_digest"], "size_bytes": size_bytes,
-                "submission_block": submission["block_height"],
-                "submission_timestamp_ms": timestamp,
-                "retain_until_ms": timestamp + MODEL_RETENTION_MS,
-            }))
-            self.private_uploads.archive_legacy_champion(
-                model, lambda: self.restore_model(sha256, size_bytes),
-            )
-            return
+            return  # Do not migrate old archives or HF models.
         model = decode_model_reference(stored.body)
         if (model["file_sha256"] != sha256 or model["size_bytes"] != size_bytes
                 or self.private_uploads is None):

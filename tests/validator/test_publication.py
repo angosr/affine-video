@@ -1610,9 +1610,8 @@ def test_exact_tenure_private_result_publication_and_cold_reader(
                              1, 1.0, 10, {})
     champion_archives = []
 
-    def archive_champion(sha256, size_bytes, *, winner):
+    def archive_champion(sha256, size_bytes):
         assert sha256 == digest and size_bytes == model.stat().st_size
-        assert winner["outcome"] == "CHALLENGER_WON"
         assert not any("/models/" in call["Key"] or "/matches/" in call["Key"]
                        for call in client.calls)
         champion_archives.append(sha256)
