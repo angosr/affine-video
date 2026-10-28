@@ -215,6 +215,103 @@ def test_new_rules_keep_all_four_ready_seals_and_original_allocation_authority(
     assert {name: case.objects.get(name).body for name in before} == before
 
 
+def test_rule_upgrade_never_moves_original_ready_clock_or_submission_window(
+    inventory_case, tmp_path, monkeypatch,
+):
+    from validator.production import batches as batches_module
+    from validator.production.storage import ARTIFACT_MANIFEST_OBJECT
+
+    case = inventory_case
+    manifest = ArtifactManifest((Artifact("weights/teacher", "ab" * 32, 1, "artifacts/model"),))
+    raw = track_spec_dict(case.track)
+    raw["artifact_manifest_sha256"] = manifest.digest
+    raw["cache"].update(disclosure_delay_seconds=86400, inventory_target_batches=4,
+                         inventory_max_bytes=512 * 1024**3)
+    case.track = parse_track_spec(raw)
+    case.objects.create_plan(ARTIFACT_MANIFEST_OBJECT, manifest.encode())
+    original = ReadyBatchSource(track=case.track, objects=case.objects,
+                                cache_dir=tmp_path / "old", batch_dir=tmp_path / "content")
+    plans, content = [], {}
+    for index in range(4):
+        payload = f"original immutable cache {index}".encode()
+        path = tmp_path / f"original-{index}.npz"
+        path.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        original.content.put(path, sha256=digest, size_bytes=len(payload))
+        plan = replace(make_plan(case, 101 + index, index % 2), exact=ReadyObject(
+            f"exact/{digest}.npz", digest, len(payload),
+        ))
+        case.objects.create_plan(f"plans/{plan.generation_block}.json", plan.encode())
+        plans.append(plan)
+        content[digest] = payload
+    plans = tuple(plans)
+    sealed = {plan.plan_digest: plan.encode() for plan in plans}
+    bootstrap = case.objects.get(ARTIFACT_MANIFEST_OBJECT).body
+    rules = parse_track_spec(rules_for_data(case.track))
+    upgrade_ms = max(plan.completed_at_ms for plan in plans) + 60_000
+    monkeypatch.setattr(batches_module.time, "time_ns", lambda: upgrade_ms * 1_000_000)
+    upgraded = ReadyBatchSource(track=rules, data_track=case.track, objects=case.objects,
+                                cache_dir=tmp_path / "new", batch_dir=tmp_path / "content")
+    assert upgraded.objects is original.objects
+    assert upgraded.objects._prefix == original.objects._prefix
+    assert upgraded.data_track.digest == case.track.digest != rules.digest
+    assert upgraded.data_track.artifact_manifest_sha256 == manifest.digest
+    assert (rules.cache.disclosure_delay_seconds
+            == case.track.cache.disclosure_delay_seconds == 86400)
+    for index, plan in enumerate(plans):
+        c, r = plan.completed_at_ms, plan.completed_at_ms + 86_400_000
+        assert plan.completed_at_ms != upgrade_ms
+        assert plan.inventory_slot == index % 2
+        assert hashlib.sha256(upgraded._plan_by_digest(plan.plan_digest).encode()).hexdigest() == (
+            hashlib.sha256(sealed[plan.plan_digest]).hexdigest()
+        )
+        for block, stamp, eligible in (
+            (plan.completed_block, c + 1, False),
+            (plan.completed_block + 1, c, False),
+            (plan.completed_block + 1, c + 1, True),
+            (plan.completed_block + 1, r - 1, True),
+            (plan.completed_block + 1, r, False),
+            (plan.completed_block + 1, r + 1, False),
+        ):
+            assert Inventory.eligible(plan, block, stamp, 86400) is eligible
+            identifier = hashlib.sha256(f"{index}:{block}:{stamp}".encode()).hexdigest()
+            result = claim(upgraded.inventory, (plan,), identifier=identifier,
+                           submission_block=block, submission_timestamp_ms=stamp,
+                           disclosure_delay_seconds=rules.cache.disclosure_delay_seconds)
+            assert (result is not None) is eligible
+            if result is not None:
+                # Upgrade/restart/admission after R cannot move the original S.
+                monkeypatch.setattr(batches_module.time, "time_ns",
+                                    lambda expiry=r: (expiry + 3_600_000) * 1_000_000)
+                assert claim(upgraded.inventory, (plan,), identifier=identifier,
+                             submission_block=block, submission_timestamp_ms=stamp,
+                             disclosure_delay_seconds=86400) == result
+        for now in (r - 1, r, r + 1):
+            expected = tuple(p.plan_digest for p in plans
+                             if p.completed_at_ms + 86_400_000 <= now)
+            assert upgraded.due_plan_digests(now) == original.due_plan_digests(now) == expected
+        restored = upgraded.content.get(sha256=plan.exact.sha256, size_bytes=plan.exact.size_bytes)
+        assert restored.read_bytes() == content[plan.exact.sha256]
+        assert hashlib.sha256(restored.read_bytes()).hexdigest() == plan.exact.sha256
+    assert {p.plan_digest: p.encode() for _, p in upgraded._plans()} == sealed
+    assert case.objects.get(ARTIFACT_MANIFEST_OBJECT).body == bootstrap == manifest.encode()
+    kwargs = {"objects": case.objects, "source_pool": case.pool,
+              "store": SimpleNamespace(finalized_block_hash=lambda _block: None)}
+    before_upgrade = PlanCoordinator(track=case.track, **kwargs)
+    after_upgrade = PlanCoordinator(track=rules, data_track=case.track, **kwargs)
+    half_life = min(plan.completed_at_ms for plan in plans) + 43_200_000
+    for now in (upgrade_ms, half_life - 1):
+        assert before_upgrade.create_next(now_ms=now, finalized_head=(110, "ab" * 32)) is None
+        assert after_upgrade.create_next(now_ms=now, finalized_head=(110, "ab" * 32)) is None
+    replacement = after_upgrade.create_next(now_ms=half_life, finalized_head=(110, "ab" * 32))
+    assert replacement is not None and replacement.state == "PLANNED"
+    assert replacement.track_spec_digest == case.track.digest
+    assert replacement.inventory_slot == plans[0].inventory_slot
+    assert sum(p.state == "PLANNED" for _, _, p in after_upgrade.plans()) == 1
+    assert {p.plan_digest: p.encode() for _, p in upgraded._plans()
+            if p.plan_digest in sealed} == sealed
+
+
 @pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
 def test_preproduced_archive_survives_cold_db_without_bulk(inventory_case, tmp_path, stage):
     case = inventory_case
