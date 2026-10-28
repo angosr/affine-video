@@ -179,7 +179,7 @@ def build_public_artifacts(
     version_key: int,
     match_limit: int | None = None,
     model_resolver: Callable[[str, int], Path] | None = None,
-    private_winner_archive: Callable[[str, int], None] | None = None,
+    private_winner_archive: Callable[..., None] | None = None,
     runtime_manifest: bytes | None = None,
     release_approval: ReleaseApproval | None = None,
     system_matches: tuple[tuple[str, bytes], ...] = (),
@@ -311,7 +311,7 @@ def build_public_artifacts(
                          or private_model_source(match.document["submission"]) is None
                          or match.document["outcome"] != "CHALLENGER_WON") else partial(
                     private_winner_archive, evaluation["file_sha256"],
-                    evaluation["model_size_bytes"],
+                    evaluation["model_size_bytes"], winner=match.document,
                 ),
             )
     return PublicArtifacts(

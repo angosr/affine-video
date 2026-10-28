@@ -16,6 +16,7 @@ from miner.submit import (
     PrivateModelSubmission,
     UploadActivation,
     activation_message,
+    model_source_fields,
     upload_registration_id,
 )
 from miner.upload import decrypt_mailbox, upload_file
@@ -407,6 +408,119 @@ def test_existing_private_minio_archive_is_preserved_without_recopy(setup, monke
                           max_bytes=10000, expected_hotkey=KEY.ss58_address))
     assert all(archive.objects._client.objects[key] == value for key, value in before.items())
     assert ctx.uploads._read(reference.upload_id)[1].get("model_reference") is None
+
+
+def legacy_private_winner(ctx, monkeypatch):
+    from scoring.model import validate_model
+
+    reference = transfer(ctx)
+    identifier, original = submit(ctx, reference)
+    ctx.uploads._seal_ready(reference, KEY.ss58_address)
+    validated = validate_model(ctx.model, schema=SCHEMA, max_bytes=10000,
+                               expected_hotkey=KEY.ss58_address)
+    archive = ReadyBatchSource(track=SimpleNamespace(digest="cc" * 32),
+                               objects=PrivateObjectStore(MemoryS3(), bucket="a", prefix="old"),
+                               cache_dir=ctx.root / "archive")
+    archive.private_uploads = ctx.uploads
+    name = f"models/{reference.file_sha256}.safetensors"
+    archive.objects.put_content(ctx.model, sha256=reference.file_sha256, object_name=name)
+    task = SimpleNamespace(challenge_id=identifier, submission_id=original.submission_id,
+                           repo_id=None, revision=None, private_submission=reference,
+                           position=original.position, hotkey=KEY.ss58_address)
+    monkeypatch.setattr("validator.production.batches._submission_timestamp_ms",
+                        lambda _b: NOW * 1000)
+    archive.archive_model(task, ctx.model, validated)
+    # This fixture represents an old winner whose original staging was already removed.
+    for bucket, key in list(ctx.uploads.staging.objects):
+        ctx.uploads.staging.delete_object(Bucket=bucket, Key=key)
+    stored, record = ctx.uploads._read(reference.upload_id)
+    ctx.uploads._replace(stored, {**record, "cleanup": "done"})
+    cached = archive.cache_dir / "models" / f"{reference.file_sha256}.safetensors"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(ctx.model.read_bytes())
+    winner = {"outcome": "CHALLENGER_WON", "track_spec_digest": "cc" * 32,
+              "challenge_id": identifier, "submission_id": original.submission_id,
+              "submission": {"hotkey": KEY.ss58_address,
+                             **model_source_fields(None, None, reference), "block_height": 200},
+              "evaluation": {"state": "SUCCEEDED", "file_sha256": reference.file_sha256,
+                             "model_size_bytes": validated.size_bytes,
+                             "model_digest": validated.model_digest}}
+    return reference, archive, winner, cached
+
+
+def test_existing_cleaned_private_winner_continues_to_r2_without_reupload_or_new_s(
+    setup, monkeypatch,
+):
+    from validator.production.commitment import canonical_json
+
+    ctx = setup
+    reference, archive, winner, _cached = legacy_private_winner(ctx, monkeypatch)
+    original_objects = dict(archive.objects._client.objects)
+    original_challenge = ctx.store.public_challenge(winner["challenge_id"])
+    issued = ctx.events.count("mint")
+    monkeypatch.setattr(archive.objects, "_open_content_part",
+                        lambda *_a: pytest.fail("must reuse original validated local model"))
+    archive.archive_champion(reference.file_sha256, winner["evaluation"]["model_size_bytes"],
+                              winner=winner)
+    _, record = ctx.uploads._read(reference.upload_id)
+    assert record["cleanup"] == "done" and record["generation"] == 1
+    assert record["parent_token_id"] is None and ctx.events.count("mint") == issued
+    assert record["champion_archive"] == f"champions/v1/{reference.file_sha256}/"
+    assert record["formal_submission"]["submission_block"] == 200
+    assert record["formal_submission"]["retain_until_ms"] == NOW * 1000 + MODEL_RETENTION_MS
+    assert ctx.store.public_challenge(winner["challenge_id"]) == original_challenge
+    assert archive.objects._client.objects == original_objects  # never rewrite old archives
+    assert all(not key.startswith("uploads/") for _bucket, key in ctx.uploads.staging.objects)
+    restored = ctx.uploads.restore_model_reference(record["model_reference"],
+                                                    cache_dir=ctx.root / "cold-champion")
+    assert restored.read_bytes() == ctx.model.read_bytes()
+    before = canonical_json(record)
+    monkeypatch.setattr(archive, "restore_model", lambda *_a: pytest.fail("repeat bulk read"))
+    archive.archive_champion(reference.file_sha256, winner["evaluation"]["model_size_bytes"],
+                              winner=winner)
+    assert canonical_json(ctx.uploads._read(reference.upload_id)[1]) == before
+
+
+@pytest.mark.parametrize("change", ["loss", "hotkey", "submission", "model", "bytes"])
+def test_legacy_champion_continuation_refuses_unbound_facts(setup, monkeypatch, change):
+    ctx = setup
+    reference, archive, winner, cached = legacy_private_winner(ctx, monkeypatch)
+    if change == "loss":
+        winner["outcome"] = "CHAMPION_RETAINED"
+    elif change == "hotkey":
+        winner["submission"]["hotkey"] = SIGNER.ss58_address
+    elif change == "submission":
+        winner["submission"]["block_height"] += 1
+    elif change == "model":
+        winner["evaluation"]["model_digest"] = "ef" * 32
+    else:
+        cached.write_bytes(b"not the originally admitted selector")
+        monkeypatch.setattr(archive.objects, "download_content", lambda *_a, **_k: cached)
+    with pytest.raises((ValueError, RuntimeError)):
+        archive.archive_champion(reference.file_sha256, winner["evaluation"]["model_size_bytes"],
+                                  winner=winner)
+    assert not ctx.uploads.staging.objects
+    assert ctx.uploads._read(reference.upload_id)[1].get("model_reference") is None
+
+
+def test_legacy_champion_interrupted_r2_write_can_resume_without_rebinding(setup, monkeypatch):
+    ctx = setup
+    reference, archive, winner, _cached = legacy_private_winner(ctx, monkeypatch)
+    put = ctx.uploads.staging.put_object
+
+    def interrupted(**_kwargs):
+        raise OSError("champion destination interrupted")
+
+    monkeypatch.setattr(ctx.uploads.staging, "put_object", interrupted)
+    with pytest.raises(OSError, match="interrupted"):
+        archive.archive_champion(reference.file_sha256, winner["evaluation"]["model_size_bytes"],
+                                  winner=winner)
+    _, record = ctx.uploads._read(reference.upload_id)
+    assert record["cleanup"] == "done" and record.get("model_reference") is None
+    monkeypatch.setattr(ctx.uploads.staging, "put_object", put)
+    archive.archive_champion(reference.file_sha256, winner["evaluation"]["model_size_bytes"],
+                              winner=winner)
+    assert ctx.uploads._read(reference.upload_id)[1]["champion_archive"].startswith("champions/")
 
 
 @pytest.mark.parametrize("crypto_type", [1])
