@@ -218,6 +218,7 @@ class ProducerConfig:
             if (
                 not entries
                 or any(not item.isdecimal() for item in entries)
+                or len({int(item) for item in entries}) != len(entries)
                 or ordinal >= len(entries)
             ):
                 raise ValueError(
@@ -225,7 +226,7 @@ class ProducerConfig:
                 )
             physical = int(entries[ordinal])
         if physical not in self.evaluation_gpu_ids:
-            raise ValueError("formal scoring_device must resolve to physical GPU 0 or 1")
+            raise ValueError("formal scoring_device must resolve to a configured evaluation GPU")
         return device
 
 
@@ -288,19 +289,16 @@ def load_producer_config(path: str | Path) -> ProducerConfig:
         "producer runtime",
     )
     gpu_ids = root["gpu_ids"]
-    if (
-        not isinstance(gpu_ids, list)
-        or any(type(value) is not int for value in gpu_ids)
-        or tuple(gpu_ids) != (2, 3, 4, 5)
-    ):
-        raise ValueError("formal producer gpu_ids must be exactly [2,3,4,5]")
     evaluation_gpu_ids = root["evaluation_gpu_ids"]
-    if (
-        not isinstance(evaluation_gpu_ids, list)
-        or any(type(value) is not int for value in evaluation_gpu_ids)
-        or tuple(evaluation_gpu_ids) != (0, 1)
-    ):
-        raise ValueError("formal evaluator evaluation_gpu_ids must be exactly [0,1]")
+    for name, devices in (("gpu_ids", gpu_ids), ("evaluation_gpu_ids", evaluation_gpu_ids)):
+        if (
+            not isinstance(devices, list) or not devices
+            or any(type(value) is not int or value < 0 for value in devices)
+            or len(set(devices)) != len(devices)
+        ):
+            raise ValueError(f"{name} must be a nonempty list of unique nonnegative GPU IDs")
+    if set(gpu_ids) & set(evaluation_gpu_ids):
+        raise ValueError("producer and evaluation GPU assignments must not overlap")
     poll_seconds = root["poll_seconds"]
     if (
         isinstance(poll_seconds, bool)

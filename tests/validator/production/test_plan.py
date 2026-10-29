@@ -645,6 +645,55 @@ def test_local_work_directory_allows_only_one_producer(tmp_path) -> None:
         pass
 
 
+@pytest.mark.parametrize("gpu_ids", [(2, 3, 4, 5), (0, 1)])
+def test_worker_pool_uses_only_configured_gpus_and_preserves_plan_order(monkeypatch, gpu_ids):
+    result = queue.Queue()
+    task_queues = [queue.Queue() for _ in gpu_ids]
+    queues = iter([result, *task_queues])
+    started = []
+    config, track = SimpleNamespace(gpu_ids=gpu_ids), object()
+
+    class Process:
+        def __init__(self, *, target, args, name):
+            assert target is production_service._worker_loop
+            gpu, received_config, received_track, tasks, output = args
+            assert received_config is config and received_track is track and output is result
+            assert tasks is task_queues[len(started)]
+            assert name == f"veda-producer-gpu-{gpu}"
+            started.append(gpu)
+
+        def start(self):
+            pass  # Never start a process, import CUDA, or call the worker target.
+
+        def join(self, *, timeout):
+            pass
+
+        def is_alive(self):
+            return False
+
+    context = SimpleNamespace(Queue=lambda: next(queues), Process=Process)
+
+    def get_context(method):
+        assert method == "spawn"
+        return context
+
+    monkeypatch.setattr(production_service.multiprocessing, "get_context", get_context)
+    worker = WorkerPool(config, track)
+    plan = SimpleNamespace(rollouts=tuple(SimpleNamespace(rollout_id=str(i)) for i in range(9)))
+    expected = tuple(UnitResult(r.rollout_id, "shard", "video", "latent", 1, 0)
+                     for r in plan.rollouts)
+    for item in reversed(expected):
+        result.put(("ok", item))
+    try:
+        assert worker.run(plan) == expected
+        assert tuple(started) == gpu_ids
+        for index, tasks in enumerate(task_queues):
+            assigned = [tasks.get_nowait() for _ in range(tasks.qsize())]
+            assert assigned == [(plan, rollout) for rollout in plan.rollouts[index::len(gpu_ids)]]
+    finally:
+        worker.close()
+
+
 def test_worker_pool_has_a_plan_wall_clock_ceiling() -> None:
     plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,

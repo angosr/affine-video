@@ -41,21 +41,48 @@ def document(tmp_path):
     }
 
 
-def test_config_fixes_formal_producer_gpu_assignment(tmp_path) -> None:
+@pytest.mark.parametrize(("producer_gpus", "evaluation_gpus"), [
+    ([2, 3, 4, 5], [0, 1]),
+    ([0, 1], [2]),
+])
+def test_config_preserves_configured_gpu_assignment(
+    tmp_path, producer_gpus, evaluation_gpus,
+) -> None:
     value = document(tmp_path)
+    value.update(gpu_ids=producer_gpus, evaluation_gpu_ids=evaluation_gpus)
     path = tmp_path / "producer.json"
     path.write_text(json.dumps(value), encoding="utf-8")
 
     config = load_producer_config(path)
 
-    assert config.gpu_ids == (2, 3, 4, 5)
-    assert config.evaluation_gpu_ids == (0, 1)
+    assert config.gpu_ids == tuple(producer_gpus)
+    assert config.evaluation_gpu_ids == tuple(evaluation_gpus)
     assert config.artifact_path(config.runtime.adapter).is_relative_to(
         config.artifact_root.resolve()
     )
     assert config.evaluator_artifact_path(config.runtime.adapter).is_relative_to(
         config.evaluator_artifact_root.resolve()
     )
+
+
+@pytest.mark.parametrize("field", ["gpu_ids", "evaluation_gpu_ids"])
+@pytest.mark.parametrize("invalid", [[], [-1], [1, 1], [True], [0.0], ["0"], None])
+def test_config_rejects_invalid_gpu_assignment(tmp_path, field, invalid):
+    value = document(tmp_path)
+    value[field] = invalid
+    path = tmp_path / "producer.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match=field):
+        load_producer_config(path)
+
+
+def test_config_rejects_overlapping_gpu_roles(tmp_path):
+    value = document(tmp_path)
+    value.update(gpu_ids=[0, 1], evaluation_gpu_ids=[1, 2])
+    path = tmp_path / "producer.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="overlap"):
+        load_producer_config(path)
 
 
 def bound_data_configuration(tmp_path):
@@ -131,7 +158,7 @@ def test_config_rejects_gpu_or_path_escape(tmp_path) -> None:
     value["gpu_ids"] = [0, 1, 2, 3]
     path = tmp_path / "producer.json"
     path.write_text(json.dumps(value), encoding="utf-8")
-    with pytest.raises(ValueError, match="exactly"):
+    with pytest.raises(ValueError, match="overlap"):
         load_producer_config(path)
 
     value = document(tmp_path)
@@ -155,11 +182,11 @@ def test_config_resolves_only_formal_physical_evaluation_gpus(tmp_path, monkeypa
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert config.validate_evaluation_device("cuda:0") == "cuda:0"
     assert config.validate_evaluation_device("cuda:1") == "cuda:1"
-    with pytest.raises(ValueError, match="physical GPU 0 or 1"):
+    with pytest.raises(ValueError, match="configured evaluation GPU"):
         config.validate_evaluation_device("cuda:6")
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,0,1")
-    with pytest.raises(ValueError, match="physical GPU 0 or 1"):
+    with pytest.raises(ValueError, match="configured evaluation GPU"):
         config.validate_evaluation_device("cuda:0")
     assert config.validate_evaluation_device("cuda:1") == "cuda:1"
     assert config.validate_evaluation_device("cuda:2") == "cuda:2"
@@ -171,6 +198,37 @@ def test_config_resolves_only_formal_physical_evaluation_gpus(tmp_path, monkeypa
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     with pytest.raises(ValueError, match="verifiable physical"):
         config.validate_evaluation_device("cuda:0")
+
+
+def test_config_single_evaluation_gpu_device_mapping(tmp_path, monkeypatch):
+    value = document(tmp_path)
+    value.update(gpu_ids=[0, 1], evaluation_gpu_ids=[2])
+    path = tmp_path / "producer.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    config = load_producer_config(path)
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert config.validate_evaluation_device("cuda:2") == "cuda:2"
+    for device in ("cuda:0", "cuda:1", "cuda:3"):
+        with pytest.raises(ValueError, match="configured evaluation GPU"):
+            config.validate_evaluation_device(device)
+    for device in (None, "cpu", "cuda", "cuda:-1"):
+        with pytest.raises(ValueError, match="explicit CUDA ordinal"):
+            config.validate_evaluation_device(device)
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    assert config.validate_evaluation_device("cuda:0") == "cuda:0"
+    with pytest.raises(ValueError, match="verifiable physical"):
+        config.validate_evaluation_device("cuda:1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2")
+    assert config.validate_evaluation_device("cuda:2") == "cuda:2"
+    for device in ("cuda:0", "cuda:1"):
+        with pytest.raises(ValueError, match="configured evaluation GPU"):
+            config.validate_evaluation_device(device)
+    for visible in ("2,2", "02,2", "2,-1", "2,GPU-opaque", ""):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+        with pytest.raises(ValueError, match="verifiable physical"):
+            config.validate_evaluation_device("cuda:0")
 
 
 def test_evaluator_artifact_selection_excludes_hidden_source_inputs(tmp_path) -> None:
