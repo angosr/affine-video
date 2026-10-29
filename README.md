@@ -12,9 +12,9 @@ entire subnet's weight. UID0 starts as champion using the official VEDA selector
 ## What to train
 
 Improve the selector's query/key projections so it picks useful attention blocks under the
-track's fixed block budgets. Scoring combines attention quality and calibrated cost; a candidate
-must also preserve full-video quality to replace the champion. Submitting the unchanged reference
-weights does not establish an improvement.
+track's fixed block budgets. Current promotion uses the paired exact attention-quality/cost
+comparison; full-video confirmation is disabled. Submitting the unchanged reference weights
+does not establish an improvement.
 
 The reference repository contains the full video checkpoint, **not a ready-to-submit competition
 file**. Export only the selector projections described below. Training methods and datasets are
@@ -126,9 +126,12 @@ archiving, confirmed by the `SCORING` state.
    Confidence bounds group correlated cases by video
    rather than treating all 384 cases as independent.
    Confidence is specified per comparison, not as a lifetime false-promotion guarantee.
-4. Passing the attention-quality/cost gate leads to complete eight-step video inference on
-   source-independent data at all three budgets. Only a challenger exceeding the frozen
-   paired improvement thresholds in both stages becomes champion. Ties retain the champion.
+4. Only a challenger whose exact paired lower confidence bound strictly exceeds the applicable
+   threshold becomes champion. Confidence is 0.9975. The threshold decreases linearly from
+   0.003 to 0.002 over the incumbent's first seven continuous days, then stays at 0.002.
+   Incumbent tenure and the threshold are locked at the original finalized submission's chain
+   time; losing challenges and maintenance do not restart tenure. A true winner starts a new
+   tenure. Equality retains the incumbent. No full-video stage or second batch is requested.
 5. Results are published in queue order without waiting for raw evaluation data publication.
    Raw inputs follow the live track's fixed delay from actual data completion; immediate results
    contain scores and non-revealing commitments, not prompts or reconstruction seeds.
