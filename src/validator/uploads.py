@@ -14,7 +14,10 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from subprocess import Popen
 
 from miner.submit import (
     PrivateModelSubmission,
@@ -318,7 +321,7 @@ class MailboxControl:
 
 
 class OwnerMailboxControl:
-    """Fixed RPC over the EXISTING attached owner's SSH stdin/stdout, not a listener.
+    """Fixed operations over the managed production owner's pipes, not a listener.
 
     Control's attach wrapper answers only issue/revoke/publish. A lock keeps
     ADMISSION and bounded cleanup responses on the same single owner channel.
@@ -359,36 +362,28 @@ class OwnerMailboxControl:
             return response["result"]
 
 
-def attach_evaluator(*, container: str, control: MailboxControl) -> int:
-    """Production owner attaches ONE local container using the same stdio protocol."""
-    import json
-    import subprocess
+def attach_evaluator(*, start_evaluator: Callable[[], Popen[str]], control: MailboxControl) -> int:
+    """Serve one native child for its entire lifetime, using the original stdio frames.
 
-    if re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", container) is None:
-        raise ValueError("owner container name is invalid")
-    environment = {name: value for name, value in os.environ.items()
-                   if name in {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL"}}
-    # Pin the local daemon, ignoring any inherited remote Docker context/host.
-    docker = ["docker", "--host=unix:///var/run/docker.sock"]
+    The trusted production owner supplies a fixed launcher, not a command from a
+    mailbox frame. It must drop UID/GID/supplementary groups, close inherited FDs,
+    pass an explicit worker-only environment and create a new session. Deployment
+    must also enforce secret-file isolation and whole-tree cleanup on owner death.
+    Pipes cannot be reattached: stop/reap the old owner and child before replacement.
+    """
+    import json
+    import signal
+    import subprocess
+    from contextlib import suppress
+
+    process = start_evaluator()
+    owned_group = False
     try:
-        state = subprocess.run(
-            [*docker, "inspect", "--format", "{{.State.Running}}", container],
-            capture_output=True, text=True, check=True, timeout=15, env=environment,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError("owner cannot inspect its local evaluator") from exc
-    if state not in {"true", "false"}:
-        raise RuntimeError("owner received an invalid local container state")
-    # Reconnect never restarts a running writer. No shell, SSH, or new container.
-    command = ([*docker, "attach", "--sig-proxy=false", container] if state == "true"
-               else [*docker, "start", "--attach", "--interactive", container])
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace", bufsize=1,
-        env=environment,
-    )
-    try:
+        if os.getpgid(process.pid) != process.pid or os.getsid(process.pid) != process.pid:
+            raise ValueError("evaluator must have its own process session")
+        owned_group = True
+        if process.stdin is None or process.stdout is None:
+            raise ValueError("evaluator requires private stdin/stdout pipes")
         while line := process.stdout.readline(262145):
             if len(line) > 262144:
                 raise RuntimeError("owner attach response exceeds its bound")
@@ -410,19 +405,33 @@ def attach_evaluator(*, container: str, control: MailboxControl) -> int:
             process.stdin.flush()
         return process.wait()
     finally:
-        if process.poll() is None:
+        if owned_group:
+            # Include spawned scoring workers, even if the direct child exited first.
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        elif process.poll() is None:
+            # An invalid launcher must never cause a signal to the owner's group.
             process.terminate()
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        process.stdin.close()
-        process.stdout.close()
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                stream.close()
 
 
-def attach_from_environment(*, container: str) -> int:
-    """Production owner only; secrets/config paths never enter Docker argv/env."""
+def attach_from_environment(*, start_evaluator: Callable[[], Popen[str]]) -> int:
+    """Initialize owner-only control before invoking the fixed, isolated child launcher."""
     import stat
 
     from bittensor.wallet import Keypair
@@ -460,7 +469,7 @@ def attach_from_environment(*, container: str) -> int:
         authority = _environment_client(
             endpoint, profile_name=os.environ["EVALUATOR_PRIVATE_READ_PROFILE"],
         )
-        return attach_evaluator(container=container, control=MailboxControl(
+        return attach_evaluator(start_evaluator=start_evaluator, control=MailboxControl(
             tokens=CloudflareR2Tokens(match[1], management_token, match[2] or "default"),
             signer=signer, publish_mailbox=publisher.publish_mailbox, endpoint=endpoint,
             bucket=bucket,

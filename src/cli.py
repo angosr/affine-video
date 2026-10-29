@@ -90,10 +90,6 @@ def _parser() -> argparse.ArgumentParser:
 
     evaluator = modules.add_parser("evaluator", help="operate evaluation and data production")
     evaluator_commands = evaluator.add_subparsers(dest="command", required=True)
-    attach = evaluator_commands.add_parser(
-        "attach", help="control owner: attach one evaluator and answer fixed mailbox operations",
-    )
-    attach.add_argument("--container", required=True)
     produce = evaluator_commands.add_parser("produce", help="produce private evaluation batches")
     produce.add_argument("--config", required=True)
     produce.add_argument("--once", action="store_true")
@@ -278,16 +274,6 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
 
 
 def _run_evaluator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
-    if arguments.command == "attach":
-        from validator.uploads import attach_from_environment
-
-        try:
-            code = attach_from_environment(container=arguments.container)
-        except (OSError, RuntimeError, KeyError, ValueError):
-            parser.exit(1, "error: evaluator control owner could not attach\n")
-        if code:
-            parser.exit(code, "error: evaluator owner Docker attach exited\n")
-        return
     if arguments.command == "policy":
         from validator.production.commitment import canonical_json
         from validator.production.storage import evaluator_iam_policy, verify_evaluator_iam_policy

@@ -948,7 +948,7 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
     monkeypatch.setenv("Token_value", "fixture-storage-token-not-manager")
     if bad_seed == "missing-manager":
         monkeypatch.delenv("CLOUDFLARE_CONTROL_API_TOKEN")
-    closed, clients, attached = [], [], []
+    closed, clients, attached, launched = [], [], [], []
     ctx.uploads.objects._bucket = "affinemodel"
     authority = ctx.uploads.objects._client
     monkeypatch.setattr(authority, "close", lambda: closed.append("authority"), raising=False)
@@ -963,8 +963,12 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
         assert (access, secret) == ("fixture-public-access", "fixture-public-secret")
         return public
 
-    def attach(*, container, control):
-        assert container == "veda-evaluator"
+    def start():
+        launched.append(True)
+        return "fixture-managed-process"
+
+    def attach(*, start_evaluator, control):
+        assert start_evaluator() == "fixture-managed-process"
         assert control.tokens._token == "fixture-control-token"
         assert control.signer.ss58_address == SIGNER.ss58_address
         assert control.objects._client is authority
@@ -980,17 +984,17 @@ def test_control_environment_keeps_seed_and_management_local_and_cas_readonly(
     monkeypatch.setattr("validator.uploads.attach_evaluator", attach)
     if bad_seed == "missing-manager":
         with pytest.raises(KeyError) as failure:
-            attach_from_environment(container="veda-evaluator")
+            attach_from_environment(start_evaluator=start)
         assert failure.value.args == ("CLOUDFLARE_CONTROL_API_TOKEN",)
-        assert clients == [] and attached == []
+        assert clients == [] and attached == [] and launched == []
     elif bad_seed:
         with pytest.raises((ValueError, OSError)):
-            attach_from_environment(container="veda-evaluator")
-        assert clients == [] and attached == []
+            attach_from_environment(start_evaluator=start)
+        assert clients == [] and attached == [] and launched == []
     else:
-        assert attach_from_environment(container="veda-evaluator") == 0
+        assert attach_from_environment(start_evaluator=start) == 0
         assert clients == ["https://public.example", ENDPOINT]
-        assert closed == ["authority", "public"] and attached == [True]
+        assert closed == ["authority", "public"] and attached == [True] and launched == [True]
 
 
 def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(
@@ -1008,35 +1012,28 @@ def test_existing_owner_attach_never_sends_temporary_plaintext_back_to_gpu(
 
     incoming = Input()
     outgoing = io.StringIO("VEDA_MAILBOX_REQUEST " + json.dumps(request) + "\n")
-    observed = []
-    environments = []
+    launched = []
     monkeypatch.setenv("CLOUDFLARE_CONTROL_API_TOKEN", "fixture-control-secret")
     monkeypatch.setenv("Token_value", "fixture-storage-token")
-    monkeypatch.setenv("DOCKER_HOST", "tcp://not-a-production-daemon.invalid:1234")
     monkeypatch.setenv("AWS_CONFIG_FILE", "/fixture/owner-only-config")
     monkeypatch.setenv("EVALUATOR_PRIVATE_READ_PROFILE", "fixture-owner-role")
-    monkeypatch.setattr("subprocess.run", lambda *_a, **_k: SimpleNamespace(stdout="true\n"))
+    monkeypatch.setattr("os.getpgid", lambda _pid: 1234)
+    monkeypatch.setattr("os.getsid", lambda _pid: 1234)
+    monkeypatch.setattr("os.killpg", lambda *_a: None)
 
-    def process(argv, **kwargs):
-        observed.append(argv)
-        environments.append(kwargs["env"])
-        return SimpleNamespace(stdin=incoming, stdout=outgoing, wait=lambda: 0, poll=lambda: 0)
+    def start():
+        launched.append(True)
+        return SimpleNamespace(pid=1234, stdin=incoming, stdout=outgoing,
+                               wait=lambda **_k: 0, poll=lambda: 0)
 
-    monkeypatch.setattr("subprocess.Popen", process)
-    assert attach_evaluator(container="veda-evaluator",
+    assert attach_evaluator(start_evaluator=start,
                             control=ctx.uploads.control) == 0
     response = json.loads(incoming.saved)
     assert response["id"] == request["id"]
     assert "fixture-secret" not in incoming.saved and "fixture-session" not in incoming.saved
     assert "access_key_id" not in incoming.saved
     assert set(response["result"]) == {"parent_token_id", "retire_parent", "expires_at", "mailbox"}
-    assert observed == [["docker", "--host=unix:///var/run/docker.sock",
-                         "attach", "--sig-proxy=false", "veda-evaluator"]]
-    assert "CLOUDFLARE_CONTROL_API_TOKEN" not in environments[0]
-    assert "Token_value" not in environments[0]
-    assert "DOCKER_HOST" not in environments[0]
-    assert "AWS_CONFIG_FILE" not in environments[0]
-    assert "EVALUATOR_PRIVATE_READ_PROFILE" not in environments[0]
+    assert launched == [True]
     captured = capsys.readouterr()
     assert not captured.out and not captured.err  # No request/response frames in journal output.
 
@@ -1048,21 +1045,31 @@ def test_owner_actual_subprocess_pipes_without_listener(setup, monkeypatch, caps
     ctx = setup
     activate(ctx)
     _, record = ctx.uploads._read(upload_registration_id(GENESIS, KEY.ss58_address))
-    real_popen = subprocess.Popen
     program = (
-        "import json,sys; from validator.uploads import OwnerMailboxControl; "
+        "import json,os,sys; from validator.uploads import OwnerMailboxControl; "
+        "assert 'CLOUDFLARE_CONTROL_API_TOKEN' not in os.environ; "
+        "assert 'VEDA_UPLOAD_SIGNING_SEED_FILE' not in os.environ; "
         "r=OwnerMailboxControl().handle('issue',json.loads(sys.argv[1])); "
         "assert set(r)=={'parent_token_id','retire_parent','expires_at','mailbox'}; "
         "assert 'secret_access_key' not in json.dumps(r); print('OWNER_PIPE_OK')"
     )
 
-    def child(_argv, **kwargs):
-        return real_popen([sys.executable, "-c", program, json.dumps(record)], **kwargs)
+    monkeypatch.setenv("CLOUDFLARE_CONTROL_API_TOKEN", "fixture-management-secret")
+    monkeypatch.setenv("VEDA_UPLOAD_SIGNING_SEED_FILE", "/owner-only/seed")
+    launched = []
 
-    monkeypatch.setattr(subprocess, "Popen", child)
-    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout="true\n"))
-    assert attach_evaluator(container="veda-evaluator",
+    def child():
+        process = subprocess.Popen(
+            [sys.executable, "-c", program, json.dumps(record)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
+            env={"PATH": "/usr/bin:/bin"}, close_fds=True, start_new_session=True,
+        )
+        launched.append(process)
+        return process
+
+    assert attach_evaluator(start_evaluator=child,
                             control=ctx.uploads.control) == 0
+    assert len(launched) == 1 and launched[0].returncode == 0
     captured = capsys.readouterr()
     assert not captured.out  # Protocol frames are consumed, business output is stderr only.
     output = captured.err
@@ -1587,43 +1594,107 @@ def test_malformed_owner_response_is_infrastructure_not_a_miner_binding_error(mo
         OwnerMailboxControl().handle("revoke", {})
 
 
-@pytest.mark.parametrize("running", [False, True])
-def test_owner_reconnect_attaches_without_restarting_running_writer(
-    setup, tmp_path, monkeypatch, capsys, running,
-):
-    docker = tmp_path / "docker"
-    docker.write_text(
-        '#!/bin/sh\n[ "$1" = --host=unix:///var/run/docker.sock ] || exit 99\nshift\n'
-        'if [ "$1" = inspect ]; then echo '
-        + ("true" if running else "false") + '; else printf "%s\\n" "$*"; fi\n',
-    )
-    docker.chmod(0o700)
-    monkeypatch.setenv("PATH", str(tmp_path) + ":/usr/bin:/bin")
-    # Execute the real local argv with a fixture binary, never a Docker daemon.
-    assert attach_evaluator(container="veda-evaluator",
-                            control=setup.uploads.control) == 0
-    expected = ("attach --sig-proxy=false veda-evaluator" if running
-                else "start --attach --interactive veda-evaluator")
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_native_owner_returns_child_exit_without_relaunch(setup, capsys, exit_code):
+    import subprocess
+    import sys
+
+    launched = []
+
+    def start():
+        process = subprocess.Popen(
+            [sys.executable, "-c", f"print('BUSINESS_LOG'); raise SystemExit({exit_code})"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            env={"PATH": "/usr/bin:/bin"}, close_fds=True, start_new_session=True,
+        )
+        launched.append(process)
+        return process
+
+    assert attach_evaluator(start_evaluator=start, control=setup.uploads.control) == exit_code
+    assert len(launched) == 1
+    assert launched[0].stdin.closed and launched[0].stdout.closed
     captured = capsys.readouterr()
-    assert not captured.out and captured.err.strip() == expected
+    assert captured.out == "" and captured.err == "BUSINESS_LOG\n"
 
 
-@pytest.mark.parametrize("state", ["missing", "timeout", "invalid"])
-def test_local_owner_inspect_failure_never_starts_a_writer(setup, monkeypatch, state):
+def test_native_owner_launch_failure_does_not_retry_or_touch_control(setup):
+    launched = []
+
+    def start():
+        launched.append(True)
+        raise PermissionError("fixture child credential drop failed")
+
+    with pytest.raises(PermissionError):
+        attach_evaluator(start_evaluator=start, control=setup.uploads.control)
+    assert launched == [True] and setup.events == []
+
+
+def test_native_owner_closes_group_even_when_direct_child_already_exited(setup, monkeypatch):
+    import signal
+
+    signals = []
+    process = SimpleNamespace(pid=1234, stdin=io.StringIO(), stdout=io.StringIO(),
+                              poll=lambda: 0, wait=lambda **_kw: 0)
+    monkeypatch.setattr("os.getpgid", lambda _pid: 1234)
+    monkeypatch.setattr("os.getsid", lambda _pid: 1234)
+    monkeypatch.setattr("os.killpg", lambda pid, sig: signals.append((pid, sig)))
+    assert attach_evaluator(start_evaluator=lambda: process, control=setup.uploads.control) == 0
+    assert signals == [(1234, signal.SIGTERM), (1234, signal.SIGKILL)]
+    assert process.stdin.closed and process.stdout.closed
+
+
+@pytest.mark.parametrize("fault", ["oversize", "broken-pipe", "interrupt", "missing-pipe"])
+def test_native_owner_failure_reaps_owned_process_group(setup, monkeypatch, fault):
+    import signal
     import subprocess
 
-    def inspect(argv, **kwargs):
-        assert argv == ["docker", "--host=unix:///var/run/docker.sock", "inspect", "--format",
-                        "{{.State.Running}}", "veda-evaluator"]
-        assert kwargs["timeout"] == 15
-        if state == "missing":
-            raise subprocess.CalledProcessError(1, argv)
-        if state == "timeout":
-            raise subprocess.TimeoutExpired(argv, 15)
-        return SimpleNamespace(stdout="not a valid container state\n")
+    events = []
 
-    monkeypatch.setattr(subprocess, "run", inspect)
-    monkeypatch.setattr(subprocess, "Popen",
-                        lambda *_a, **_k: pytest.fail("inspection must precede any start/attach"))
-    with pytest.raises(RuntimeError, match="local"):
-        attach_evaluator(container="veda-evaluator", control=setup.uploads.control)
+    class Output(io.StringIO):
+        def readline(self, *_args):
+            if fault == "interrupt":
+                raise KeyboardInterrupt
+            return super().readline(*_args)
+
+    class Input(io.StringIO):
+        def write(self, text):
+            if fault == "broken-pipe":
+                raise BrokenPipeError
+            return super().write(text)
+
+    output = Output("x" * 262145 if fault == "oversize" else "VEDA_MAILBOX_REQUEST {}\n")
+    process = SimpleNamespace(pid=1234, stdin=Input(), stdout=output, poll=lambda: None)
+    if fault == "missing-pipe":
+        process.stdout = None
+
+    def wait(**kwargs):
+        events.append(("wait", kwargs))
+        if kwargs.get("timeout"):
+            raise subprocess.TimeoutExpired("fixture child", kwargs["timeout"])
+        return -signal.SIGKILL
+
+    process.wait = wait
+    monkeypatch.setattr("os.getpgid", lambda _pid: 1234)
+    monkeypatch.setattr("os.getsid", lambda _pid: 1234)
+    monkeypatch.setattr("os.killpg", lambda pid, sig: events.append((pid, sig)))
+    error = {"oversize": RuntimeError, "broken-pipe": BrokenPipeError,
+             "interrupt": KeyboardInterrupt, "missing-pipe": ValueError}[fault]
+    with pytest.raises(error):
+        attach_evaluator(start_evaluator=lambda: process, control=setup.uploads.control)
+    assert events == [(1234, signal.SIGTERM), ("wait", {"timeout": 10}),
+                      (1234, signal.SIGKILL), ("wait", {})]
+    assert process.stdin.closed and output.closed == (fault != "missing-pipe")
+
+
+def test_native_owner_rejects_shared_session_without_signalling_owners_group(setup, monkeypatch):
+    events = []
+    process = SimpleNamespace(
+        pid=1234, stdin=io.StringIO(), stdout=io.StringIO(), poll=lambda: None,
+        terminate=lambda: events.append("terminate"), wait=lambda **_kw: events.append("wait"),
+    )
+    monkeypatch.setattr("os.getpgid", lambda _pid: 999)
+    monkeypatch.setattr("os.getsid", lambda _pid: 999)
+    monkeypatch.setattr("os.killpg", lambda *_a: pytest.fail("never signal an unowned group"))
+    with pytest.raises(ValueError, match="session"):
+        attach_evaluator(start_evaluator=lambda: process, control=setup.uploads.control)
+    assert events == ["terminate", "wait"]
