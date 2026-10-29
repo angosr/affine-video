@@ -24,4 +24,5 @@ evidence/system-panel/acceptance/*
 !evidence/system-panel/operations/
 evidence/system-panel/operations/*
 !evidence/system-panel/operations/preserve_runtime_assets.py
+!evidence/system-panel/operations/prepare_native_deployment.py
 
