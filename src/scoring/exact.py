@@ -368,7 +368,16 @@ def validate_dense_reference(
     *,
     device: str | None = None,
 ) -> tuple[float, float, float]:
-    """Require stored dense bytes to be the canonical result for frozen Q/K/V."""
+    """Check stored dense semantics, not cross-device identity of FP16 encodings.
+
+    The unchanged canonical path computes in FP32 then rounds to FP16. Nearby
+    FP32 results on opposite sides of a rounding midpoint can therefore occupy
+    adjacent FP16 bins. Allow the sum of their local half-bin widths, not a
+    hardware-specific measured maximum, promotion threshold or global atol.
+    This is a conservative storage-resolution policy, not a universal bound on
+    FP32 attention error. Archive SHA/manifest verification remains bit-exact;
+    this function never substitutes the recomputed tensor for the stored one.
+    """
 
     _validate_case_data(case)
     expected = canonical_dense_reference(
@@ -384,6 +393,8 @@ def validate_dense_reference(
         raise ValueError("exact dense reference must use canonical float16 storage")
     observed = observed_storage.astype(np.float32)
     expected_float = expected.astype(np.float32)
+    if not np.isfinite(expected_float).all():
+        raise ValueError("recomputed exact dense reference must be finite")
     valid = np.arange(observed.shape[1])[None, :] < np.asarray(
         case.query_valid_counts
     )[:, None]
@@ -395,12 +406,26 @@ def validate_dense_reference(
         expected_float[valid].reshape(-1),
         epsilon=case.epsilon,
     )
-    if not np.array_equal(observed_storage.view(np.uint16), expected.view(np.uint16)):
+    allowance = _float16_rounding_radius(observed) + _float16_rounding_radius(expected_float)
+    if (np.any(np.abs(observed[valid] - expected_float[valid]) > allowance[valid])
+            or np.any(observed[~valid] != 0)):
         raise ValueError(
             "exact dense reference diverges from its Q/K/V: "
             f"max_abs={maximum:.9g}, mean_abs={mean:.9g}, relative={relative:.9g}"
         )
     return maximum, mean, relative
+
+
+def _float16_rounding_radius(values: np.ndarray) -> np.ndarray:
+    """Half an FP16 bin: precision 11; subnormal spacing is exactly 2**-24.
+
+    Clamp magnitudes to the smallest normal before frexp so zero/subnormals
+    receive radius 2**-25. Unlike nextafter(max, inf), this stays finite at 65504.
+    At exponent boundaries each operand contributes its own bin width.
+    """
+    storage = np.finfo(np.float16)
+    _, exponent = np.frexp(np.maximum(np.abs(values), storage.tiny))
+    return np.ldexp(np.ones_like(values), exponent - storage.nmant - 2)
 
 
 def canonical_dense_reference(

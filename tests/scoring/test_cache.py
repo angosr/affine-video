@@ -142,6 +142,42 @@ def test_cache_rejects_rehashed_dense_values_that_do_not_match_qkv(tmp_path) -> 
         validate_exact_cache(batch.path, **validation_arguments(batch))
 
 
+def test_hardware_reference_rounding_keeps_original_archive_and_scoring_dense(
+    tmp_path, monkeypatch,
+):
+    import scoring.exact as module
+
+    batch = write_batch(tmp_path)
+    before = batch.path.read_bytes()
+    canonical = module.canonical_dense_reference
+    with ExactCacheReader(batch.path, expected_sha256=batch.sha256, max_bytes=1_000_000) as reader:
+        original_dense = [case.dense.tobytes() for case in reader]
+
+    def alternate(*args, **kwargs):
+        assert kwargs.pop("device") == "cuda:0"  # A CPU fixture, not an actual CUDA call.
+        dense = canonical(*args, **kwargs)
+        return np.nextafter(dense, np.full_like(dense, np.inf))
+
+    monkeypatch.setattr(module, "canonical_dense_reference", alternate)
+    validate_exact_cache(batch.path, **validation_arguments(batch), dense_device="cuda:0")
+    assert batch.path.read_bytes() == before
+    assert hashlib.sha256(before).hexdigest() == batch.sha256
+    with ExactCacheReader(batch.path, expected_sha256=batch.sha256, max_bytes=1_000_000) as reader:
+        assert [case.dense.tobytes() for case in reader] == original_dense
+
+
+def test_one_bin_dense_change_still_requires_the_exact_original_archive_sha(tmp_path):
+    batch = write_batch(tmp_path)
+    with np.load(batch.path, allow_pickle=False) as archive:
+        arrays = {name: archive[name].copy() for name in archive.files}
+    dense = arrays["case_000000_dense"]
+    dense.flat[0] = np.nextafter(dense.flat[0], np.float16(np.inf))
+    altered = tmp_path / "altered.npz"
+    np.savez(altered, **arrays)
+    with pytest.raises(CacheLoadError, match="SHA-256"):
+        validate_exact_cache(altered, **validation_arguments(batch))
+
+
 
 
 def test_written_file_digest_matches_batch_identity(tmp_path) -> None:
