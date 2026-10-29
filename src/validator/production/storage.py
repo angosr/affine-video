@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 import tempfile
 import uuid
 from contextlib import suppress
@@ -230,6 +231,11 @@ class LocalBatchStore:
                 or hashlib.file_digest(handle, "sha256").hexdigest() != sha256
             ):
                 raise StorageError("completed batch content disagrees with its descriptor")
+            # Only verified completed payloads enter this shared store. Hardlinks
+            # preserve NamedTemporaryFile's 0600, so seal with group read only.
+            # Deployment supplies the shared GID/directories; never chown old data.
+            if stat.S_IMODE(os.fstat(handle.fileno()).st_mode) != 0o640:
+                os.fchmod(handle.fileno(), 0o640)
             os.fsync(handle.fileno())
         try:
             os.link(source, destination)
@@ -252,6 +258,7 @@ class LocalBatchStore:
                     with source.open("rb") as handle:
                         shutil.copyfileobj(handle, output, 1024 * 1024)
                     output.flush()
+                    os.fchmod(output.fileno(), 0o640)
                     os.fsync(output.fileno())
                 with suppress(FileExistsError):
                     os.link(temporary, destination)

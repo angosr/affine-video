@@ -1,7 +1,9 @@
 import hashlib
 import io
 import json
+import os
 import pickle
+import stat
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -854,6 +856,86 @@ def test_local_batch_content_is_shared_without_s3_and_detects_corruption(tmp_pat
     sealed.write_bytes(b"other")
     with pytest.raises(StorageError, match="SHA-256"):
         evaluator.get(sha256=digest, size_bytes=5)
+
+
+def test_local_batch_seals_actual_0600_cache_as_group_readable_without_copy(tmp_path, monkeypatch):
+    from tests.scoring.test_cache import write_batch
+
+    previous = os.umask(0o077)
+    try:
+        batch = write_batch(tmp_path / "batch")
+        before = batch.path.stat()
+        assert stat.S_IMODE(before.st_mode) == 0o600  # Actual NamedTemporaryFile chain.
+        monkeypatch.setattr(storage_module.shutil, "copyfileobj",
+                            lambda *_a, **_k: pytest.fail("same-device seal must not copy bytes"))
+        sealed = LocalBatchStore(tmp_path / "content").put(
+            batch.path, sha256=batch.sha256, size_bytes=before.st_size,
+        )
+    finally:
+        os.umask(previous)
+    after = sealed.stat()
+    assert stat.S_IMODE(after.st_mode) == 0o640
+    assert (after.st_ino, after.st_gid, after.st_uid) == (
+        before.st_ino, before.st_gid, before.st_uid,
+    )
+    assert hashlib.sha256(sealed.read_bytes()).hexdigest() == batch.sha256
+    view = LocalBatchStore(tmp_path / "content").materialize(
+        tmp_path / "eval/batch.npz", sha256=batch.sha256, size_bytes=before.st_size,
+    )
+    assert view.is_symlink() and view.resolve() == sealed.resolve()
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o660])
+def test_local_batch_new_seal_has_no_group_write_or_world_access(tmp_path, mode):
+    source = tmp_path / "complete"
+    source.write_bytes(b"body")
+    source.chmod(mode)
+    sealed = LocalBatchStore(tmp_path / "content").put(
+        source, sha256=hashlib.sha256(b"body").hexdigest(), size_bytes=4,
+    )
+    assert sealed.stat().st_ino == source.stat().st_ino
+    assert stat.S_IMODE(sealed.stat().st_mode) == 0o640
+
+
+def test_local_batch_existing_cross_device_fallback_also_seals_0640(tmp_path, monkeypatch):
+    import errno
+
+    source = tmp_path / "complete"
+    source.write_bytes(b"body")
+    source.chmod(0o600)
+    real_link = os.link
+
+    def cross_device(path, destination):
+        if Path(path) == source:
+            raise OSError(errno.EXDEV, "fixture cross-device link")
+        return real_link(path, destination)
+
+    monkeypatch.setattr(os, "link", cross_device)
+    sealed = LocalBatchStore(tmp_path / "content").put(
+        source, sha256=hashlib.sha256(b"body").hexdigest(), size_bytes=4,
+    )
+    assert stat.S_IMODE(sealed.stat().st_mode) == 0o640
+    assert sealed.read_bytes() == b"body"
+
+
+def test_local_batch_already_shared_source_needs_no_permission_mutation(tmp_path, monkeypatch):
+    source = tmp_path / "complete"
+    source.write_bytes(b"body")
+    source.chmod(0o640)
+    store = LocalBatchStore(tmp_path / "content")
+    digest = hashlib.sha256(b"body").hexdigest()
+    store.put(source, sha256=digest, size_bytes=4)
+    monkeypatch.setattr(os, "fchmod", lambda *_a: pytest.fail("already shared, no owner chmod"))
+    assert store.put(source, sha256=digest, size_bytes=4).read_bytes() == b"body"
+
+
+def test_local_batch_rejected_source_is_not_made_group_readable(tmp_path):
+    source = tmp_path / "wrong"
+    source.write_bytes(b"body")
+    source.chmod(0o600)
+    with pytest.raises(StorageError, match="descriptor"):
+        LocalBatchStore(tmp_path / "content").put(source, sha256="00" * 32, size_bytes=4)
+    assert stat.S_IMODE(source.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("age_after_verification_ns", [0, 2_000_000_000])
