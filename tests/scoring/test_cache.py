@@ -138,8 +138,37 @@ def test_cache_rejects_rehashed_dense_values_that_do_not_match_qkv(tmp_path) -> 
         sample_cache={"index_sha256": "78" * 32},
     )
 
-    with pytest.raises(CacheLoadError, match="dense reference"):
+    with pytest.raises(CacheLoadError, match="dense reference") as failure:
         validate_exact_cache(batch.path, **validation_arguments(batch))
+    assert "exact dense reference diverges from its Q/K/V: max_abs=" in str(failure.value)
+    assert isinstance(failure.value.__cause__, ValueError)
+
+
+@pytest.mark.parametrize("error,expected", [
+    (ValueError("exact case arrays must be finite"), "exact case arrays must be finite"),
+    (PermissionError(13, "secret /private/model VEDA_MAILBOX_REQUEST"), "OSError errno=13"),
+    (ValueError("secret /private/model VEDA_MAILBOX_REQUEST"), "ValueError"),
+    (ValueError("exact dense reference diverges from its Q/K/V: "
+                "max_abs=1, mean_abs=2, relative=3 SECRET"), "ValueError"),
+])
+def test_dense_failure_diagnostic_is_safe(tmp_path, monkeypatch, error, expected):
+    import scoring.cache as module
+
+    batch = write_batch(tmp_path)
+
+    def fail(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(module, "validate_dense_reference", fail)
+    with pytest.raises(CacheLoadError) as failure:
+        validate_exact_cache(batch.path, **validation_arguments(batch))
+    assert str(failure.value) == (
+        "cache dense reference is inconsistent with its Q/K/V: " + expected
+    )
+    assert failure.value.__cause__ is error
+    assert "secret" not in str(failure.value)
+    assert "SECRET" not in str(failure.value)
+    assert "VEDA_MAILBOX_REQUEST" not in str(failure.value)
 
 
 def test_hardware_reference_rounding_keeps_original_archive_and_scoring_dense(

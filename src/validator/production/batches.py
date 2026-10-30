@@ -21,6 +21,7 @@ from scoring.cache import (
     CacheLoadError,
     ExactCacheBatch,
     ExactCacheReader,
+    cache_validation_reason,
     inspect_exact_cache_batch,
     validate_exact_cache,
 )
@@ -493,9 +494,11 @@ class ReadyBatchSource:
             raise RuntimeError("READY plan omitted its exact object")
         destination = self.cache_dir / f"{plan.generation_block}-{plan.exact.sha256}.npz"
         path = self._materialize(plan, plan.exact, destination)
+        validation_stage = "inspect"
         try:
             batch = inspect_exact_cache_batch(path, max_bytes=self.track.cache.exact_max_bytes)
             if validate_dense and batch.sha256 not in self._validated_exact:
+                validation_stage = "validate"
                 validate_exact_cache(
                     path,
                     expected_sha256=batch.sha256,
@@ -511,9 +514,13 @@ class ReadyBatchSource:
                     query_tiles_per_case=self.track.scoring.query_tiles_per_case,
                     dense_device=self.validation_device,
                 )
+            validation_stage = "plan_binding"
             _validate_plan_case_binding(path, plan, self.data_track)
         except (OSError, CacheLoadError, ValueError) as exc:
-            raise RuntimeError("restored exact batch is invalid") from exc
+            raise RuntimeError(
+                f"restored exact batch is invalid [stage={validation_stage}]: "
+                + cache_validation_reason(exc)
+            ) from exc
         if (
             batch.sha256 != plan.exact.sha256
             or batch.generated_block != plan.generation_block

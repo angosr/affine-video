@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -23,6 +24,58 @@ from scoring.spec import EXACT_CACHE_FORMAT
 
 class CacheLoadError(ValueError):
     """Raised when a frozen scoring cache is missing, changed, or malformed."""
+
+
+def cache_validation_reason(error: BaseException) -> str:
+    """Expose bounded cache diagnostics, never arbitrary exception text or paths."""
+
+    for _ in range(4):
+        if error.__cause__ is None:
+            break
+        error = error.__cause__
+    if isinstance(error, OSError):
+        return f"OSError errno={error.errno}" if type(error.errno) is int else "OSError"
+    if type(error) not in (CacheLoadError, ValueError, TypeError, KeyError):
+        return "unclassified cache error"
+    message = str(error)
+    safe_messages = {
+        "cache SHA-256 does not match",
+        "cache is not readable",
+        "cache is not a readable NPZ archive",
+        "cache archive contains duplicate members",
+        "cache decoded size exceeds the track limit",
+        "cache metadata cannot be read",
+        "cache belongs to a different track specification",
+        "cache case count does not match the cross design",
+        "cache route sample does not match the track",
+        "cache does not cover every scoring stratum",
+        "cache step sample count does not match the track",
+        "cache rollout count does not match the track",
+        "cache cases do not form the complete cross design",
+        "cache archive members do not match its metadata",
+        "cache Q/K array headers are invalid",
+        "cache K array header is invalid",
+        "cache Q/K storage dtype is invalid",
+        "cache V/dense array headers are invalid",
+        "cache mask array headers are invalid",
+        "cache selected inputs conflict with the frozen READY plan",
+        "cache cases do not match the frozen batch plan",
+        "cache case metadata conflicts with the frozen batch plan",
+        "cache query sample conflicts with the frozen batch plan",
+        "cache query masks conflict with selected query tiles",
+        "exact case Q/K/V/dense shapes are incompatible",
+        "exact case arrays must be finite",
+        "exact dense reference must use canonical float16 storage",
+        "canonical dense input Q/K/V must use float16 storage",
+        "recomputed exact dense reference must be finite",
+    }
+    number = r"[0-9]{1,16}(?:\.[0-9]{0,16})?(?:e[+-]?[0-9]{1,3})?"
+    if message in safe_messages or (len(message) <= 256 and re.fullmatch(
+        rf"exact dense reference diverges from its Q/K/V: "
+        rf"max_abs={number}, mean_abs={number}, relative={number}", message,
+    )):
+        return message
+    return type(error).__name__
 
 
 _ARRAY_FIELDS = (
@@ -412,7 +465,10 @@ def _validate_dense_references(
     except CacheLoadError:
         raise
     except (OSError, KeyError, TypeError, ValueError) as exc:
-        raise CacheLoadError("cache dense reference is inconsistent with its Q/K/V") from exc
+        raise CacheLoadError(
+            "cache dense reference is inconsistent with its Q/K/V: "
+            + cache_validation_reason(exc)
+        ) from exc
 
 
 def _load_case(archive: Any, index: int, case: Mapping[str, Any]) -> ExactCase:

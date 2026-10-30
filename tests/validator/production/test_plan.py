@@ -1898,6 +1898,73 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
         source._restore_exact(inconsistent_ready)
 
 
+@pytest.mark.parametrize("phase,error,expected", [
+    ("inspect", CacheLoadError("cache SHA-256 does not match"),
+     "cache SHA-256 does not match"),
+    ("inspect", PermissionError(13, "secret /private/model"), "OSError errno=13"),
+    ("validate", ValueError("exact dense reference diverges from its Q/K/V: "
+                            "max_abs=0.00390625, mean_abs=2e-07, relative=9e-11"),
+     "exact dense reference diverges from its Q/K/V: "
+     "max_abs=0.00390625, mean_abs=2e-07, relative=9e-11"),
+    ("plan_binding", CacheLoadError("cache query masks conflict with selected query tiles"),
+     "cache query masks conflict with selected query tiles"),
+    ("validate", ValueError("secret VEDA_MAILBOX_REQUEST /private/model"), "ValueError"),
+])
+def test_restore_exact_diagnostic_reaches_original_scoring_retry(
+    tmp_path, monkeypatch, phase, error, expected,
+):
+    from validator.scoring import PairedTrackEvaluator, TemporaryScoringError
+
+    validated = set()
+    source = SimpleNamespace(
+        cache_dir=tmp_path,
+        track=SimpleNamespace(cache=SimpleNamespace(exact_max_bytes=10),
+                              model=SimpleNamespace(selector=SimpleNamespace(head_dim=2)),
+                              scoring=scoring()),
+        data_track=SimpleNamespace(digest="ab" * 32),
+        _validated_exact=validated,
+        validation_device=None,
+        _materialize=lambda *_args: tmp_path / "unused.npz",
+    )
+    plan = SimpleNamespace(exact=SimpleNamespace(sha256="12" * 32), generation_block=120,
+                           selected_routes=("route-0", "route-1"))
+    visited = []
+
+    def step(name):
+        def run(*_args, **_kwargs):
+            visited.append(name)
+            if name == phase:
+                if phase == "validate":
+                    try:
+                        raise error
+                    except ValueError as cause:
+                        raise CacheLoadError("cache dense reference is inconsistent") from cause
+                raise error
+            return SimpleNamespace(sha256="12" * 32)
+        return run
+
+    monkeypatch.setattr(batches_module, "inspect_exact_cache_batch", step("inspect"))
+    monkeypatch.setattr(batches_module, "validate_exact_cache", step("validate"))
+    monkeypatch.setattr(batches_module, "_validate_plan_case_binding", step("plan_binding"))
+    source.exact_batch = lambda _id: ReadyBatchSource._restore_exact(source, plan)
+    with pytest.raises(TemporaryScoringError) as failure:
+        PairedTrackEvaluator._batch(SimpleNamespace(batch_source=source),
+                                    SimpleNamespace(challenge_id="34" * 32))
+    assert failure.value.code == "SCORING_CACHE_UNAVAILABLE"
+    assert str(failure.value) == (
+        f"restored exact batch is invalid [stage={phase}]: {expected}"
+    )
+    assert visited[-1] == phase
+    assert not validated
+    assert "secret" not in str(failure.value)
+    assert "/private/model" not in str(failure.value)
+    assert "VEDA_MAILBOX_REQUEST" not in str(failure.value)
+    cause = failure.value
+    while cause.__cause__ is not None:
+        cause = cause.__cause__
+    assert cause is error
+
+
 def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_path) -> None:
     pool = SourcePool(tuple(proof(index).leaf for index in range(8)))
     track = SimpleNamespace(
