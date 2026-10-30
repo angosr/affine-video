@@ -1733,14 +1733,20 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(
 
 @pytest.mark.parametrize("dense_mutation", ["plus100", "lsb", "signed_zero"])
 def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
-    tmp_path, dense_mutation
+    tmp_path, monkeypatch, dense_mutation
 ) -> None:
-    pool = SourcePool(tuple(proof(index).leaf for index in range(2)))
+    pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
+    selected_sources = select_source_proofs(
+        pool, commitments=source_commitments(pool), partition="production",
+        strata=("16:9@37",), sources_per_stratum=2,
+        batch_seed=generation_seed("ab" * 32, "0x" + "cd" * 32, "a5" * 32),
+        inventory_slot=0, excluded_source_digests=frozenset(),
+    )
     planned = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest="ab" * 32,
         generation_block=120,
         block_hash="0x" + "cd" * 32,
-        source_proofs=tuple(pool.proof(f"source-{index}") for index in range(2)),
+        source_proofs=selected_sources,
         scoring=scoring(),
         available_routes=("route-0", "route-1", "route-2"),
     )
@@ -1770,10 +1776,10 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
             sigma=step.sigma,
             tile_plan_hash="45" * 32,
             query_tile_ids=selected,
-            q=np.zeros((4, 2, 2), dtype=np.float32),
-            k=np.zeros((6, 2, 2), dtype=np.float32),
-            v=np.zeros((6, 2, 2), dtype=np.float32),
-            dense=np.zeros((4, 2, 2), dtype=np.float32),
+            q=np.zeros((4, 128, 2), dtype=np.float32),
+            k=np.zeros((6, 128, 2), dtype=np.float32),
+            v=np.zeros((6, 128, 2), dtype=np.float32),
+            dense=np.zeros((4, 128, 2), dtype=np.float32),
             query_valid_counts=valid[list(selected)],
             key_valid_counts=valid,
             key_segments=segments,
@@ -1817,9 +1823,13 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
         digest=planned.track_spec_digest,
         artifact_manifest_sha256="34" * 32,
         source_pool_merkle_root=pool.root,
-        cache=SimpleNamespace(exact_max_bytes=10_000_000),
+        source_commitments=source_commitments(pool),
+        track_start_block=100,
+        cache=SimpleNamespace(exact_max_bytes=10_000_000, disclosure_delay_seconds=1800),
         scoring=scoring(),
-        model=SimpleNamespace(selector=SimpleNamespace(head_dim=2)),
+        model=SimpleNamespace(selector=SimpleNamespace(
+            head_dim=2, routes=("route-0", "route-1", "route-2"),
+        )),
     )
     batch = write(tmp_path / "valid", cases)
     ready = planned.ready(
@@ -1887,15 +1897,45 @@ def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
 
     source = ReadyBatchSource(
         track=track,
-        objects=object(),
+        objects=PrivateObjectStore(MemoryS3(), bucket="private", prefix="evaluation"),
         cache_dir=tmp_path / "restored-inconsistent",
     )
     source.content.put(
         inconsistent.path, sha256=inconsistent.sha256,
         size_bytes=inconsistent.path.stat().st_size,
     )
-    with pytest.raises(RuntimeError, match="restored exact batch is invalid"):
-        source._restore_exact(inconsistent_ready)
+    # Rehashed replacement bytes cannot substitute the original READY SHA.
+    monkeypatch.setattr(source, "_materialize", lambda *_args: inconsistent.path)
+    with pytest.raises(RuntimeError, match="cache SHA-256 does not match"):
+        source._restore_exact(ready)
+    assert inconsistent_ready.exact.sha256 != ready.exact.sha256
+
+    # Trusted consumption must not recompute dense on the consumer's device.
+    import scoring.cache as cache_module
+
+    monkeypatch.setattr(cache_module, "validate_dense_reference",
+                        lambda *_a, **_k: pytest.fail("consumer recomputed dense"))
+    monkeypatch.setattr(source, "_materialize", lambda *_args: batch.path)
+    original_bytes, original_plan = batch.path.read_bytes(), ready.encode()
+    restored = source._restore_exact(ready)
+    assert restored.sha256 == ready.exact.sha256
+    assert batch.path.read_bytes() == original_bytes
+    assert ready.encode() == original_plan
+
+    # Authentication remains the original authority/claim path, not a caller flag.
+    source.objects.create_plan("plans/120.json", ready.encode())
+    with pytest.raises(RuntimeError, match="no allocated hidden inventory"):
+        source.exact_batch("a1" * 32)
+    source.inventory.claim(
+        challenge_id="a1" * 32, stage="SCORING", file_sha256="b2" * 32,
+        model_digest="c3" * 32, plans=(ready,), submission_block=200,
+        submission_timestamp_ms=200_000, disclosure_delay_seconds=1800,
+    )
+    authority = source.objects.get("plans/allocations.json").body
+    assert source.exact_batch("a1" * 32).sha256 == ready.exact.sha256
+    assert source.objects.get("plans/allocations.json").body == authority
+    assert source.objects.get("plans/120.json").body == original_plan
+    assert batch.path.read_bytes() == original_bytes
 
 
 @pytest.mark.parametrize("phase,error,expected", [
@@ -1915,15 +1955,12 @@ def test_restore_exact_diagnostic_reaches_original_scoring_retry(
 ):
     from validator.scoring import PairedTrackEvaluator, TemporaryScoringError
 
-    validated = set()
     source = SimpleNamespace(
         cache_dir=tmp_path,
         track=SimpleNamespace(cache=SimpleNamespace(exact_max_bytes=10),
                               model=SimpleNamespace(selector=SimpleNamespace(head_dim=2)),
                               scoring=scoring()),
         data_track=SimpleNamespace(digest="ab" * 32),
-        _validated_exact=validated,
-        validation_device=None,
         _materialize=lambda *_args: tmp_path / "unused.npz",
     )
     plan = SimpleNamespace(exact=SimpleNamespace(sha256="12" * 32), generation_block=120,
@@ -1944,7 +1981,7 @@ def test_restore_exact_diagnostic_reaches_original_scoring_retry(
         return run
 
     monkeypatch.setattr(batches_module, "inspect_exact_cache_batch", step("inspect"))
-    monkeypatch.setattr(batches_module, "validate_exact_cache", step("validate"))
+    monkeypatch.setattr(batches_module, "validate_exact_cache_structure", step("validate"))
     monkeypatch.setattr(batches_module, "_validate_plan_case_binding", step("plan_binding"))
     source.exact_batch = lambda _id: ReadyBatchSource._restore_exact(source, plan)
     with pytest.raises(TemporaryScoringError) as failure:
@@ -1955,7 +1992,6 @@ def test_restore_exact_diagnostic_reaches_original_scoring_retry(
         f"restored exact batch is invalid [stage={phase}]: {expected}"
     )
     assert visited[-1] == phase
-    assert not validated
     assert "secret" not in str(failure.value)
     assert "/private/model" not in str(failure.value)
     assert "VEDA_MAILBOX_REQUEST" not in str(failure.value)

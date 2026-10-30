@@ -544,7 +544,6 @@ async def run_evaluator(
             objects=objects,
             cache_dir=cache_dir,
             batch_dir=data_config.work_dir / "content",
-            validation_device=scoring_device,
             public_base_url=PUBLIC_STORAGE_URL,
         )
         retry_store = PrivateRetryStore(objects, track_spec_digest=track.digest)

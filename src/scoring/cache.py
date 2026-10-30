@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 from numpy.lib.format import read_array_header_1_0, read_array_header_2_0, read_magic
 
-from scoring.exact import ExactCase, validate_dense_reference
+from scoring.exact import ExactCase, _validate_case_data, validate_dense_reference
 from scoring.spec import EXACT_CACHE_FORMAT
 
 
@@ -361,6 +361,38 @@ def validate_exact_cache(
 ) -> None:
     """Validate the complete cross design and every stored dense reference."""
 
+    cases = validate_exact_cache_structure(
+        path, expected_sha256=expected_sha256,
+        expected_track_spec_digest=expected_track_spec_digest, max_bytes=max_bytes,
+        head_dim=head_dim, tile_size=tile_size, routes=routes, strata=strata,
+        sampled_route_count=sampled_route_count, rollouts_per_stratum=rollouts_per_stratum,
+        sampled_step_count=sampled_step_count, query_tiles_per_case=query_tiles_per_case,
+    )
+    _validate_dense_references(Path(path), cases, device=dense_device)
+
+
+def validate_exact_cache_structure(
+    path: str | Path,
+    *,
+    expected_sha256: str,
+    expected_track_spec_digest: str,
+    max_bytes: int,
+    head_dim: int,
+    tile_size: int,
+    routes: tuple[str, ...],
+    strata: Mapping[str, float],
+    sampled_route_count: int,
+    rollouts_per_stratum: int,
+    sampled_step_count: int,
+    query_tiles_per_case: int,
+) -> list[dict[str, Any]]:
+    """Check identity and complete structure, without recomputing stored dense.
+
+    Consumption additionally requires an authority-authenticated READY plan and
+    claim. This function alone does not authenticate a producer or certify QKV
+    semantics; untrusted inputs must still use validate_exact_cache.
+    """
+
     cache_path = _verify_archive(path, expected_sha256, max_bytes)
     metadata = _read_metadata(cache_path)
     if metadata["track_spec_digest"] != expected_track_spec_digest:
@@ -407,7 +439,20 @@ def validate_exact_cache(
             )
         if set(archive.namelist()) != expected_names:
             raise CacheLoadError("cache archive members do not match its metadata")
-    _validate_dense_references(cache_path, cases, device=dense_device)
+    with np.load(cache_path, allow_pickle=False) as archive:
+        for index, metadata in enumerate(cases):
+            case = _load_case(archive, index, metadata)
+            _validate_case_data(case)
+            if (np.any(case.query_valid_counts <= 0)
+                    or np.any(case.query_valid_counts > tile_size)
+                    or np.any(case.key_valid_counts <= 0)
+                    or np.any(case.key_valid_counts > tile_size)):
+                raise CacheLoadError("cache tile valid counts are incompatible")
+            valid = np.arange(tile_size)[None, :] < case.query_valid_counts[:, None]
+            if np.any(case.dense[~valid] != 0):
+                raise CacheLoadError("cache dense padding must be zero")
+            del case
+    return cases
 
 
 def validate_exact_cache_references(

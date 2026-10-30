@@ -23,7 +23,7 @@ from scoring.cache import (
     ExactCacheReader,
     cache_validation_reason,
     inspect_exact_cache_batch,
-    validate_exact_cache,
+    validate_exact_cache_structure,
 )
 from scoring.exact import GLOBAL_SEGMENT, REFERENCE_SEGMENT, TARGET_SEGMENT
 from scoring.model import ValidatedModel, model_file_sha256
@@ -138,7 +138,6 @@ class ReadyBatchSource:
         objects: PrivateObjectStore,
         cache_dir: str | Path,
         batch_dir: str | Path | None = None,
-        validation_device: str | None = None,
         public_base_url: str | None = None,
         data_track: TrackSpec | None = None,
     ) -> None:
@@ -150,9 +149,7 @@ class ReadyBatchSource:
         self.content = LocalBatchStore(
             self.cache_dir / "content" if batch_dir is None else batch_dir
         )
-        self.validation_device = validation_device
         self.public_base_url = public_base_url
-        self._validated_exact: set[str] = set()
         self.inventory = Inventory(objects, self.data_track.digest)
         self.private_uploads = None
 
@@ -489,7 +486,9 @@ class ReadyBatchSource:
         plan = self._allocated_plan(challenge_id, confirmation=False)
         return self._restore_exact(plan)
 
-    def _restore_exact(self, plan: BatchPlan, *, validate_dense: bool = True) -> ExactCacheBatch:
+    def _restore_exact(self, plan: BatchPlan) -> ExactCacheBatch:
+        """Consume the original bytes of an authority-authenticated READY plan."""
+
         if plan.exact is None:
             raise RuntimeError("READY plan omitted its exact object")
         destination = self.cache_dir / f"{plan.generation_block}-{plan.exact.sha256}.npz"
@@ -497,23 +496,21 @@ class ReadyBatchSource:
         validation_stage = "inspect"
         try:
             batch = inspect_exact_cache_batch(path, max_bytes=self.track.cache.exact_max_bytes)
-            if validate_dense and batch.sha256 not in self._validated_exact:
-                validation_stage = "validate"
-                validate_exact_cache(
-                    path,
-                    expected_sha256=batch.sha256,
-                    expected_track_spec_digest=self.data_track.digest,
-                    max_bytes=self.track.cache.exact_max_bytes,
-                    head_dim=self.track.model.selector.head_dim,
-                    tile_size=128,
-                    routes=plan.selected_routes,
-                    strata=self.track.scoring.stratum_weight_map,
-                    sampled_route_count=self.track.scoring.sampled_route_count,
-                    rollouts_per_stratum=self.track.scoring.rollouts_per_stratum,
-                    sampled_step_count=self.track.scoring.sampled_step_count,
-                    query_tiles_per_case=self.track.scoring.query_tiles_per_case,
-                    dense_device=self.validation_device,
-                )
+            validation_stage = "validate"
+            validate_exact_cache_structure(
+                path,
+                expected_sha256=plan.exact.sha256,
+                expected_track_spec_digest=self.data_track.digest,
+                max_bytes=self.track.cache.exact_max_bytes,
+                head_dim=self.track.model.selector.head_dim,
+                tile_size=128,
+                routes=plan.selected_routes,
+                strata=self.track.scoring.stratum_weight_map,
+                sampled_route_count=self.track.scoring.sampled_route_count,
+                rollouts_per_stratum=self.track.scoring.rollouts_per_stratum,
+                sampled_step_count=self.track.scoring.sampled_step_count,
+                query_tiles_per_case=self.track.scoring.query_tiles_per_case,
+            )
             validation_stage = "plan_binding"
             _validate_plan_case_binding(path, plan, self.data_track)
         except (OSError, CacheLoadError, ValueError) as exc:
@@ -536,8 +533,6 @@ class ReadyBatchSource:
             or batch.sample_cache != plan.sample_cache.document()
         ):
             raise RuntimeError("restored exact batch conflicts with its READY plan")
-        if validate_dense:
-            self._validated_exact.add(batch.sha256)
         return batch
 
     def confirmation_batch(self, challenge_id: str) -> ConfirmationBatch:
@@ -696,7 +691,7 @@ class ReadyBatchSource:
         if now_ms < plan.completed_at_ms + self.track.cache.disclosure_delay_seconds * 1000:
             return None
         assert plan.exact is not None
-        exact = self._restore_exact(plan, validate_dense=False)
+        exact = self._restore_exact(plan)
         files = [
             DisclosureFile(
                 f"batches/{plan.exact.sha256}/manifest.json",

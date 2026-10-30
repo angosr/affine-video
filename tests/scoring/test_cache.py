@@ -10,6 +10,7 @@ from scoring.cache import (
     assemble_exact_cache_batch,
     inspect_exact_cache_batch,
     validate_exact_cache,
+    validate_exact_cache_structure,
     write_exact_cache_batch,
 )
 from scoring.evaluate import reference_attention
@@ -205,6 +206,56 @@ def test_one_bin_dense_change_still_requires_the_exact_original_archive_sha(tmp_
     np.savez(altered, **arrays)
     with pytest.raises(CacheLoadError, match="SHA-256"):
         validate_exact_cache(altered, **validation_arguments(batch))
+
+
+def test_ready_structure_never_recomputes_dense_or_rewrites_original_bytes(tmp_path, monkeypatch):
+    import scoring.cache as module
+
+    batch = write_batch(tmp_path)
+    original = batch.path.read_bytes()
+    calls = []
+
+    def other_device(*_args, **_kwargs):
+        calls.append(True)
+        raise ValueError("exact dense reference diverges from its Q/K/V: "
+                         "max_abs=1, mean_abs=1, relative=1")
+
+    monkeypatch.setattr(module, "validate_dense_reference", other_device)
+    validate_exact_cache_structure(batch.path, **validation_arguments(batch))
+    assert calls == []
+    assert batch.path.read_bytes() == original
+    with ExactCacheReader(batch.path, expected_sha256=batch.sha256, max_bytes=1_000_000) as reader:
+        assert [case.dense.tobytes() for case in reader]
+    # The untrusted/generation API still runs the original dense verifier.
+    with pytest.raises(CacheLoadError, match="exact dense reference diverges"):
+        validate_exact_cache(batch.path, **validation_arguments(batch))
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("corruption", ["sha", "dtype", "shape", "finite", "counts", "padding"])
+def test_ready_structure_rejects_unbound_or_malformed_arrays(tmp_path, corruption):
+    batch = write_batch(tmp_path)
+    with np.load(batch.path, allow_pickle=False) as archive:
+        arrays = {name: archive[name].copy() for name in archive.files}
+    if corruption == "dtype":
+        arrays["case_000000_dense"] = arrays["case_000000_dense"].astype(np.float32)
+    elif corruption == "shape":
+        arrays["case_000000_q"] = arrays["case_000000_q"][:, :1]
+    elif corruption == "finite":
+        arrays["case_000000_dense"].flat[0] = np.nan
+    elif corruption == "counts":
+        arrays["case_000000_key_valid_counts"].flat[0] = 0
+    elif corruption == "padding":
+        arrays["case_000000_query_valid_counts"].flat[0] = 1
+        arrays["case_000000_dense"][0, 1] = 1
+    changed = tmp_path / "changed.npz"
+    np.savez(changed, **arrays)
+    arguments = validation_arguments(batch)
+    arguments["expected_sha256"] = (
+        "00" * 32 if corruption == "sha" else hashlib.sha256(changed.read_bytes()).hexdigest()
+    )
+    with pytest.raises((CacheLoadError, ValueError)):
+        validate_exact_cache_structure(changed, **arguments)
 
 
 
