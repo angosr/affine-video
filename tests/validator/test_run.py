@@ -747,7 +747,7 @@ def test_worker_setup_failure_alerts_and_does_not_poison_next_task(pending_evalu
 @pytest.mark.parametrize("benchmark_refresh", [
     "normal", "slow", "error", "inventory_slow", "inventory_error",
     "disclosure_slow", "disclosure_error", "inventory_recovery", "disclosure_recovery",
-    "disclosure_multibatch_recovery", "disclosure_cold_recovery",
+    "disclosure_multibatch_recovery", "disclosure_cold_recovery", "disclosure_fenced",
 ])
 def test_evaluator_loop_publishes_while_worker_owns_its_connection(
     pending_evaluation, monkeypatch, tmp_path, benchmark_refresh,
@@ -819,6 +819,8 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
                 "ready_batches": 4, "producing_batches": 0, "target_batches": 2,
                 "disclosure_pending_batches": 1, "disclosure_observed_at_ns": 50,
             }
+            if benchmark_refresh == "disclosure_fenced":
+                evaluator.inventory_status["disclosure_error"] = "DATA_DISCLOSURE_FAILURE"
             evaluator.batch_source = SimpleNamespace(
                 _plans=inventory_plans, inventory_status=lambda _plans: {
                     "allocated_stages": [], "observed_at_ns": 200, "ready_batches": 5,
@@ -865,7 +867,23 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
 
         monkeypatch.setattr(run_module, "PairedTrackEvaluator", evaluator_factory)
         if benchmark_refresh.startswith("disclosure_"):
-            if multibatch:
+            if benchmark_refresh == "disclosure_fenced":
+                from validator.production.retries import PrivateRetryStore
+
+                original_disclose = run_module._publish_due_batch
+
+                async def fenced_disclosure(source, *args, **kwargs):
+                    benchmark_calls.append(benchmark_refresh)
+                    retry = PrivateRetryStore(source.objects, track_spec_digest=case.track.digest)
+                    retry.disclosure_attempt(
+                        "ab" * 32, now_ms=run_module.time.time_ns() // 1_000_000, lease_ms=60_000,
+                    )
+                    result = await original_disclose(source, *args, **kwargs)
+                    assert result is False
+                    return result
+
+                monkeypatch.setattr(run_module, "_publish_due_batch", fenced_disclosure)
+            elif multibatch:
                 original_disclose = run_module._publish_due_batch
 
                 async def observe_disclosure(*args, **kwargs):
@@ -883,6 +901,7 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
                     if len(benchmark_calls) == 1:
                         raise OSError("public bulk upload unavailable")
                     if len(benchmark_calls) == 2:
+                        assert await asyncio.to_thread(metadata_error_seen.wait, 5)
                         return False  # Durable cooldown is not a successful retry.
                     assert await asyncio.to_thread(metadata_error_seen.wait, 5)
                     return "ab" * 32
@@ -1002,10 +1021,13 @@ def test_evaluator_loop_publishes_while_worker_owns_its_connection(
                 and status["inventory"].get("disclosure_error") is None
                 and status["inventory"].get("disclosure_observed_at_ns", 0) > 50
             )
+        elif benchmark_refresh == "disclosure_fenced":
+            metadata_ready = status["inventory"].get("disclosure_error") is None
+            assert status["inventory"]["disclosure_observed_at_ns"] == 50
         elif benchmark_refresh in {"disclosure_error", "disclosure_recovery"}:
             errors = [row for row in metadata_snapshots if row.get("disclosure_error")]
             metadata_ready = bool(errors)
-            if len(benchmark_calls) >= 2 and status.get("inventory", {}).get("disclosure_error"):
+            if status.get("inventory", {}).get("disclosure_error"):
                 assert status["inventory"]["disclosure_observed_at_ns"] == 50
                 metadata_error_seen.set()
             if recovering:

@@ -786,10 +786,9 @@ async def run_evaluator(
                     if alert is not None and newly_failed:
                         alert("DATA_DISCLOSURE_FAILURE", {"error": str(exc)[:500]})
                 else:
+                    inventory["disclosure_error"] = None
                     if outcome is not False:
-                        inventory.update(
-                            disclosure_error=None, disclosure_observed_at_ns=time.time_ns(),
-                        )
+                        inventory["disclosure_observed_at_ns"] = time.time_ns()
                 evaluator.inventory_status = inventory
                 disclosure_task = None
             cursor = store.chain_cursor()
