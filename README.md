@@ -225,9 +225,10 @@ original retry projection, with observation time/source retained; they are not p
 complete private pool or of payload availability. A live upload lease is not a known failure.
 The operator API `ReadyBatchSource.waive_disclosure` authenticates an original due READY plan
 and records an explicit decision in its existing disclosure retry CAS. It preserves attempts,
-errors and clocks, refuses an unexpired attempt fence, and suppresses subsequent automatic
-work and overdue reporting. A waiver never creates a disclosure receipt or permits deletion
-of the original data. Its reason stays private; an actual public receipt remains authoritative.
+errors and clocks, and suppresses subsequent automatic work and overdue reporting. It does
+not cancel an upload already in flight or retract its bytes. A waiver never creates a
+disclosure receipt or permits deletion of the original data. Its reason stays private;
+an actual public receipt remains authoritative.
 
 ## Watch the competition
 

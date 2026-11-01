@@ -331,8 +331,8 @@ class PrivateRetryStore:
     def waive_disclosure(self, plan_digest: str, *, now_ms: int, reason: str) -> None:
         """Explicit operator decision in the same CAS row, preserving attempt/error history.
 
-        An unexpired fence must settle first: this operation cannot retract bytes
-        already being uploaded by another process. It never creates a receipt.
+        This stops future automatic work, not an upload already in flight. It
+        neither retracts bytes nor creates a receipt; a real receipt still wins.
         """
         if (not _digest(plan_digest) or type(now_ms) is not int or now_ms < 0
                 or not isinstance(reason, str) or not reason.strip() or len(reason) > 256
@@ -346,8 +346,6 @@ class PrivateRetryStore:
                 if row["operator_waiver"]["reason"] != reason:
                     raise RuntimeError("disclosure already has a different operator decision")
                 return  # A lost response/restart must not replace the original decision time.
-            if row is not None and row["retry_after_ms"] > now_ms:
-                raise RuntimeError("disclosure has an unexpired attempt fence")
             document = dict(row) if row is not None else {
                 "format": "veda-disclosure-retry-v1", "track_spec_digest": self.track_spec_digest,
                 "plan_digest": plan_digest, "attempt": 0, "retry_after_ms": 0, "error": None,

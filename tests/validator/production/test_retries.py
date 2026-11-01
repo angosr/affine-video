@@ -82,8 +82,6 @@ def test_disclosure_projection_distinguishes_upload_failure_and_expired_fence():
     assert retry.disclosure_status(digest, now_ms=0)["state"] == "OVERDUE"
     retry.disclosure_attempt(digest, now_ms=100, lease_ms=100)
     assert retry.disclosure_status(digest, now_ms=101)["state"] == "UPLOADING"
-    with pytest.raises(RuntimeError, match="unexpired attempt fence"):
-        retry.waive_disclosure(digest, now_ms=199, reason="Operator decision")
     assert retry.disclosure_status(digest, now_ms=200)["state"] == "OVERDUE"
     retry.disclosure_attempt(digest, now_ms=200, lease_ms=100,
                              completed_attempt=1, error="prior network failure")
@@ -92,7 +90,32 @@ def test_disclosure_projection_distinguishes_upload_failure_and_expired_fence():
     assert retry.disclosure_status(digest, now_ms=60_201)["state"] == "FAILED"
 
 
-def test_disclosure_waiver_cas_race_cannot_cancel_a_new_attempt(monkeypatch):
+@pytest.mark.parametrize("failed", [False, True])
+def test_disclosure_waiver_stops_future_work_during_upload_or_cooldown(failed):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retry = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    digest = "ab" * 32
+    name = f"{RETRY_STATE_NAMESPACE}/disclosures/{digest}.json"
+    retry.disclosure_attempt(digest, now_ms=100, lease_ms=1000)
+    if failed:
+        retry.disclosure_attempt(digest, now_ms=101, lease_ms=1000,
+                                 completed_attempt=1, error="prior failure")
+    before = json.loads(objects.get(name).body)
+    assert before["retry_after_ms"] > 102
+    retry.waive_disclosure(digest, now_ms=102, reason="Operator decision")
+    sealed = objects.get(name)
+    after = json.loads(sealed.body)
+    assert {key: after[key] for key in before} == before
+    assert after["operator_waiver"]["decided_at_ms"] == 102
+    cold = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    assert cold.disclosure_attempt(digest, now_ms=10**12, lease_ms=1000) is None
+    assert cold.disclosure_attempt(digest, now_ms=103, lease_ms=1000,
+                                  completed_attempt=1, error=None) is None
+    assert objects.get(name) == sealed
+    assert objects.get_optional(f"disclosed/{digest}.json") is None
+
+
+def test_disclosure_waiver_cas_race_preserves_the_attempt_that_reserved_first(monkeypatch):
     objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
     retry = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
     digest = "ab" * 32
@@ -107,9 +130,44 @@ def test_disclosure_waiver_cas_race_cannot_cancel_a_new_attempt(monkeypatch):
         return create(name, payload)
 
     monkeypatch.setattr(objects, "create_plan", reserve_first)
-    with pytest.raises(RuntimeError, match="unexpired attempt fence"):
-        retry.waive_disclosure(digest, now_ms=10, reason="Operator decision")
-    assert retry.disclosure_status(digest, now_ms=11)["state"] == "UPLOADING"
+    retry.waive_disclosure(digest, now_ms=10, reason="Operator decision")
+    name = f"{RETRY_STATE_NAMESPACE}/disclosures/{digest}.json"
+    sealed = objects.get(name)
+    row = json.loads(sealed.body)
+    assert row["attempt"] == 1 and row["retry_after_ms"] == 110 and row["error"] is None
+    assert row["operator_waiver"] == {"decided_at_ms": 10, "reason": "Operator decision"}
+    assert retry.disclosure_status(digest, now_ms=11)["state"] == "WAIVED"
+    assert retry.disclosure_attempt(digest, now_ms=12, lease_ms=100,
+                                    completed_attempt=1, error=None) is None
+    assert objects.get(name) == sealed
+
+
+@pytest.mark.parametrize("operation", ["reserve", "completion"])
+def test_disclosure_waiver_cas_winner_cannot_be_overwritten_by_old_writer(
+    monkeypatch, operation,
+):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retry = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    digest = "ab" * 32
+    name = f"{RETRY_STATE_NAMESPACE}/disclosures/{digest}.json"
+    retry.disclosure_attempt(digest, now_ms=100, lease_ms=100)
+    before = json.loads(objects.get(name).body)
+    replace_plan = objects.replace_plan
+    raced = False
+
+    def waive_first(key, payload, *, etag):
+        nonlocal raced
+        if not raced:
+            raced = True
+            retry.waive_disclosure(digest, now_ms=200, reason="Operator decision")
+        return replace_plan(key, payload, etag=etag)
+
+    monkeypatch.setattr(objects, "replace_plan", waive_first)
+    kwargs = {} if operation == "reserve" else {"completed_attempt": 1, "error": "late failure"}
+    assert retry.disclosure_attempt(digest, now_ms=200, lease_ms=100, **kwargs) is None
+    after = json.loads(objects.get(name).body)
+    assert {key: after[key] for key in before} == before
+    assert after["operator_waiver"] == {"decided_at_ms": 200, "reason": "Operator decision"}
 
 
 def test_disclosure_waiver_lost_ack_preserves_the_original_decision(monkeypatch):
