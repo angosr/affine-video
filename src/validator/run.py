@@ -88,6 +88,7 @@ DEFAULT_NETUID = PRODUCTION_NETUID
 DEFAULT_MECHID = 1
 _LOG = logging.getLogger(__name__)
 _DATA_REFRESH_SECONDS = 30.0
+_AUDIT_RECEIPT_READS_PER_PASS = 8
 
 
 class ArtifactRepository(Protocol):
@@ -104,9 +105,9 @@ class ArtifactRepository(Protocol):
         self, payload: bytes, *, track: TrackSpec, now_ms: int,
     ) -> bool: ...
 
-    async def score_audit_published(
-        self, reference: dict[str, Any], *, track: TrackSpec, now_ms: int,
-    ) -> bool: ...
+    async def score_audit_published(self, reference: dict[str, Any]) -> bool: ...
+
+    def score_audit_confirmed(self, reference: dict[str, Any]) -> bool: ...
 
     async def recover(
         self, track: TrackSpec, *, runtime_manifest: bytes | None = None,
@@ -338,7 +339,8 @@ async def _publish_due_score_audit(
     source: ReadyBatchSource, publisher: ArtifactRepository, *,
     challenges: list[dict[str, object]], now_ms: int,
 ) -> None:
-    """At most one new small audit per existing disclosure pass, including late stages."""
+    """Bound cold receipt reads and one unfinished audit in the existing disclosure pass."""
+    checked = 0
     for challenge in challenges:
         if challenge["state"] != "SUCCEEDED":
             continue
@@ -347,11 +349,16 @@ async def _publish_due_score_audit(
             audit = None if reference is None else reference.get("public_audit")
             if audit is None or now_ms < audit["not_before_ms"]:
                 continue
-            if await publisher.score_audit_published(reference, track=source.track, now_ms=now_ms):
+            if publisher.score_audit_confirmed(reference):
+                continue
+            if checked >= _AUDIT_RECEIPT_READS_PER_PASS:
+                return
+            checked += 1
+            if await publisher.score_audit_published(reference):
                 continue
             payload = await asyncio.to_thread(source.public_stage_audit, reference, now_ms=now_ms)
-            if await publisher.publish_score_audit(payload, track=source.track, now_ms=now_ms):
-                return
+            await publisher.publish_score_audit(payload, track=source.track, now_ms=now_ms)
+            return
 
 
 async def _reclaim_private_uploads(

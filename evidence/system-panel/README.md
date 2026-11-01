@@ -74,7 +74,13 @@ the latter first obtains the ledger through `S3Repository.load`. The public stag
 does not point readers at a credential-protected cells file: the existing disclosure pass
 uploads actual small public JSON bytes, with at most one new audit per pass. Errors use that
 same loop and its existing error reporting; an existing public object is reused before any
-private read. Late scoring still publishes its audit when bulk data was disclosed earlier.
+private read. Each pass checks at most eight uncached public receipts by their sealed byte
+SHA and size, then continues in later passes through the existing in-process immutable cache.
+Warm receipts require no network. Receipt lookup proves object bytes exist; it does not
+reauthorize a match or rewalk its history. The one unfinished publication still uses the
+original R/match/weights fence checks, and a not-yet-committed match ends that pass without
+reading further private stages. There is no persisted scan cursor or additional retry state.
+Late scoring still publishes its audit when bulk data was disclosed earlier.
 Audit uploads never write the four mutable competition pointers.
 
 This is a source-and-CPU candidate, not a deployed or real-miner evidence receipt. Production

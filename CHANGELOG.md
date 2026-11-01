@@ -9,6 +9,8 @@
   Missing historical cells, execution identity or first-allocation observations stay unknown.
 - Reuse public audit receipts before reading private stage inputs. Candidate input evidence
   records complete observed enumeration and original plan facts, not a globally atomic pool.
+- Bound cold public receipt checks per disclosure pass; warm history uses only the existing
+  confirmed-byte cache and one unfinished audit is processed without a new retry ledger.
 - Document each evidence authority, consumer, disclosure boundary and cleanup condition in
   the existing operations guide; remove the superseded set-only case check and duplicate
   SQLite evidence bodies after successful immutable stage archival.

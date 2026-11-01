@@ -761,14 +761,88 @@ def test_public_audit_disclosure_requires_r_match_fence_and_is_idempotent(audit_
     from validator.run import _publish_due_score_audit
 
     cold = S3Repository(client, bucket="public", prefix="test")
+    original_get = cold._get_optional
+    receipt_reads = []
+
+    def receipt_only(name):
+        assert name == case.reference["public_audit"]["object"]
+        receipt_reads.append(name)
+        return original_get(name)
+
+    monkeypatch.setattr(cold, "_get_optional", receipt_only)
     monkeypatch.setattr(case.source, "public_stage_audit",
                         lambda *_a, **_k: pytest.fail("redundant private stage read"))
     asyncio.run(_publish_due_score_audit(case.source, cold, challenges=[case.item],
                                         now_ms=case.due))
+    assert len(receipt_reads) == 1  # Cold receipt verifies bytes without rewalking match history.
     monkeypatch.setattr(cold, "_get_optional",
                         lambda *_a: pytest.fail("confirmed audit should use its existing cache"))
     asyncio.run(_publish_due_score_audit(case.source, cold, challenges=[case.item],
                                         now_ms=case.due))
+    assert len(receipt_reads) == 1
+    client.objects["test/" + case.reference["public_audit"]["object"]] = b"corrupt receipt"
+    with pytest.raises(PublicArtifactError, match="receipt differs"):
+        asyncio.run(S3Repository(client, bucket="public", prefix="test").score_audit_published(
+            case.reference))
+
+
+def test_cold_audit_receipt_scan_is_bounded_and_progresses_without_a_cursor():
+    from validator.run import _publish_due_score_audit
+
+    confirmed, reads = set(), []
+
+    class Publisher:
+        def score_audit_confirmed(self, reference):
+            return reference["object"] in confirmed
+
+        async def score_audit_published(self, reference, **_kwargs):
+            reads.append(reference["object"])
+            confirmed.add(reference["object"])
+            return True
+
+        async def publish_score_audit(self, *_a, **_k):
+            pytest.fail("already public history started a new upload")
+
+    challenges = [{"state": "SUCCEEDED", "stages": [{"stage_evidence": {
+        "object": str(i), "public_audit": {"not_before_ms": 1},
+    }}]} for i in range(20)]
+    source = SimpleNamespace(track=None, public_stage_audit=lambda *_a, **_k:
+                             pytest.fail("already public history read private evidence"))
+    publisher = Publisher()
+    for expected in (8, 16, 20, 20):
+        asyncio.run(_publish_due_score_audit(source, publisher, challenges=challenges, now_ms=2))
+        assert len(reads) == expected
+    assert len(set(reads)) == 20  # Warm cache skips all old objects without network IO.
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_one_unfinished_audit_per_pass_even_before_match_commits(committed):
+    from validator.run import _publish_due_score_audit
+
+    calls = []
+
+    class Publisher:
+        def score_audit_confirmed(self, _reference):
+            return False
+
+        async def score_audit_published(self, *_a, **_k):
+            calls.append("receipt")
+            return False
+
+        async def publish_score_audit(self, *_a, **_k):
+            calls.append("publish")
+            return committed
+
+    def read(*_a, **_k):
+        calls.append("private")
+        return b"sealed original"
+
+    source = SimpleNamespace(track=None, public_stage_audit=read)
+    item = {"state": "SUCCEEDED", "stages": [{"stage_evidence": {
+        "public_audit": {"not_before_ms": 1},
+    }}]}
+    asyncio.run(_publish_due_score_audit(source, Publisher(), challenges=[item] * 10, now_ms=2))
+    assert calls == ["receipt", "private", "publish"]
 
 
 @pytest.mark.parametrize("failure", [None, "audit", "bulk"])
@@ -790,6 +864,9 @@ def test_existing_disclosure_loop_bounds_late_audits_and_bulk_failures_are_indep
     )
 
     class Publisher:
+        def score_audit_confirmed(self, *_a):
+            return False
+
         async def score_audit_published(self, *_a, **_k):
             return False
 
