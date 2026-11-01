@@ -16,6 +16,9 @@ pins data origin `4e405540e88443dd21541f305d75821c1b3707129c6651dea842e9d1b485c1
 Earlier repository templates remain historical Git versions. Synchronizing this file does
 not change live rules, start, data or runtime identity; application release tags identify
 the installed application commit, independently of later configuration/documentation commits.
+Use `git show track-a971c2714bf1:track.json` to read the tagged rules. That configuration
+tag targets the synchronization commit; `release-2026-11-01-1b95e40` targets the installed
+application commit. Neither tag authenticates unrecorded historical execution details.
 
 ## What to train
 
@@ -226,7 +229,7 @@ Full audit resolves each historical match's original rules once from
 rules are reported in `unavailable_score_audits`, never replaced with today's spec.
 `verify-match --track` accepts this same immutable spec or the original track envelope.
 
-The [2026-11-01 native release](CHANGELOG.md) (`a3d3957`) reports `disclosure_overdue` plan
+The [2026-11-01 native release](CHANGELOG.md) (`1b95e40`) reports `disclosure_overdue` plan
 digests separately from `disclosure_in_progress`.
 These are operational observations from match-bound deadlines and the public inventory's
 original retry projection, with observation time/source retained; they are not proof of a
@@ -237,6 +240,9 @@ errors and clocks, and suppresses subsequent automatic work and overdue reportin
 not cancel an upload already in flight or retract its bytes. A waiver never creates a
 disclosure receipt or permits deletion of the original data. Its reason stays private;
 an actual public receipt remains authoritative.
+A pass with no known durable failure clears a stale error even while due uploads remain
+fenced. This does not claim upload completion or refresh the successful disclosure
+observation time; an actual exception still reports failure.
 
 ## Watch the competition
 

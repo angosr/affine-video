@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-11-01 — Native deployment of 1b95e40
+
+Operator-reported acceptance: application commit
+`1b95e4065e808c436f37b3da159e86b0cb363eb8`, native installation.
+Annotated application tag: `release-2026-11-01-1b95e40`.
+
+| Installed identity | SHA-256 |
+| --- | --- |
+| Application source | `a442ae584a4829b70060e18725948af2e7f62bc6f0e3be836663d96f5c36d203` |
+| Native dependency lock | `46f9b58ddbf8c8c3e70b2004e2597742fe0786aa7c88449377c9f9cc7d6a99c0` |
+| Runtime manifest | `28a0d9aba7024e2a6dacac33adcb64f67faa9d45408e2e949df4def58c0d3eb3` |
+| Accepted release | `b8e1f26602618cdd57d73d238520fe229647dc1e6e03ea033e6ef2c6bcc03762` |
+| Computational dependency environment | `760c0f5eb73df2da4916caade6bcff625416eee7f52167cb2f5a8dfe55d7bf16` |
+
+Public status/summary/weights advanced together to block 9411221 with this runtime identity,
+ACCEPTING, 12 successful challenges, 12 stages, eight READY batches and UID643 weight 1.
+The stale disclosure failure scalar was cleared. Original operator decisions and their
+timestamps survived the owner restart; no disclosure completion or successful observation
+time was fabricated.
+
+- Clear a stale disclosure error after a pass returns without a known durable failure,
+  including a fenced `False` result. Update the successful observation time only for a
+  non-`False` result; actual exceptions retain failure reporting.
+
+The published rule-navigation tag `track-a971c2714bf1` targets configuration synchronization
+commit `99219e44cf23ea2df9c5f31c08f40c755fd1e737`; its `track.json` is the original
+`a971c2714bf145f1953674492990207a6a61eecf61c093c487e179c114c24b63` specification.
+The application tag targets the installed source commit, whose `track.json` has those same
+bytes. The r10 rules, data origin, original submissions, allocations, C/R clocks, confidence
+0.9975 and single-exact promotion are unchanged. E2/E3/E16 retain their original frozen
+source and hardware identities. OCI remains package provenance, not a new native Engine.
+Seed/chain anchors and statistical recalibration are not claimed as completed. Natural
+VDA2 admission, new v2 plans and new per-match evidence still require observation; historical
+missing evidence is not filled in by this maintenance.
+
 ## 2026-11-01 — Native deployment of a3d3957
 
 Operator-reported acceptance: application commit
