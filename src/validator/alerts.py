@@ -11,6 +11,7 @@ import httpx
 LOGGER = logging.getLogger(__name__)
 
 _PUBLIC_REASONS = {
+    "MODEL_FILE_HASH_MISMATCH": "The HF file does not match its submitted SHA-256.",
     "BASELINE_DUPLICATE": "Model tensors match the official baseline.",
     "EXACT_DUPLICATE": "Model tensors match an earlier admitted model.",
     "REFERENCE_DUPLICATE": "The pinned repository revision was already submitted.",

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Bound automatic infrastructure retries by the existing budget; preserve blocked tasks,
+  original data-scoped operator recovery and FIFO, with no automatic public blocked retry ETA.
+- Preserve the original VDA1 wire format and add opt-in VDA2 HF file commitments within
+  the existing 128-byte payload limit. Bind the declaration through the original task,
+  admission, archives, public match and authenticated recovery before assigning model ownership.
+- Use the original admission retry CAS for a fixed ten-minute HF publication wait starting
+  at the first actual anonymous metadata 401/403/404 observation. Waiting preserves the infrastructure
+  failure budget, original submission and FIFO; reset and recovery retain the original clock.
+  CDN payload errors after successful anonymous metadata retain infrastructure retry semantics.
+- These source changes are not deployed. The dated installed identity below remains the
+  last operator-reported baseline; historical results and missing evidence are not rewritten.
+
 ## 2026-11-01 — Native deployment of 63ca340
 
 Operator-reported acceptance: application commit

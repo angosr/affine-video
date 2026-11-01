@@ -190,6 +190,8 @@ def verify_public_score_audit(payload: bytes, match_payload: bytes, track: Any, 
     incumbent = match["incumbent_before"]
     private = incumbent.get("private_upload")
     expected_incumbent = (private["file_sha256"] if private else
+                          incumbent["declared_file_sha256"]
+                          if "declared_file_sha256" in incumbent else
                           track.initial_champion.evaluation_file_sha256
                           if incumbent["challenge_id"] == "genesis" else None)
     if expected_incumbent is not None and evidence["incumbent_sha256"] != expected_incumbent:

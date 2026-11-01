@@ -105,6 +105,40 @@ def test_invalid_transition_writes_nothing(tmp_path) -> None:
         assert len(store.challenge_events(identifier)) == 1
 
 
+@pytest.mark.parametrize("chain_digest", ["ab" * 32, "ff" * 32, None])
+def test_vda2_public_match_cold_restore_authenticates_original_chain_declaration(
+    tmp_path, chain_digest,
+):
+    from tests.validator.test_tournament import challenge, resolve
+
+    item = challenge(1, "hk1", score=0.8, incumbent_score=0.7)
+    original = submission_at(item["block_height"], hotkey=item["hotkey"])
+    original = replace(original, repo_id=item["repo_id"], revision=item["revision"],
+                       payload=ModelSubmission(item["repo_id"], item["revision"],
+                                               chain_digest).encode())
+    item.update(submission_id=original.submission_id,
+                challenge_id=challenge_id(original.submission_id),
+                declared_file_sha256="ab" * 32)
+    match = resolve([item]).matches[0]
+    with ChallengeStore(tmp_path / "vda2-cold.db") as store:
+        if chain_digest != "ab" * 32:
+            with pytest.raises(RuntimeError, match="finalized chain input"):
+                store.restore_public_matches(
+                    (match,), submissions={original.submission_id: original},
+                )
+            assert store.public_snapshot()["challenges"] == []
+        else:
+            assert store.restore_public_matches(
+                (match,), submissions={original.submission_id: original},
+            ) == 1
+            row = store.public_challenge(item["challenge_id"])
+            assert row["declared_file_sha256"] == row["file_sha256"] == "ab" * 32
+            assert row["block_height"] == original.position.block
+            before = store.public_challenge(item["challenge_id"])
+            assert store.restore_public_matches((match,)) == 1
+            assert store.public_challenge(item["challenge_id"]) == before
+
+
 def test_state_survives_reopen(tmp_path) -> None:
     path = tmp_path / "validator.db"
     with ChallengeStore(path) as store:

@@ -447,7 +447,9 @@ def audit_case(tmp_path, monkeypatch, request, plan_inputs_case):
     scoring = track.scoring
     plan = make_plan(inventory_case, 95)
     design = [CaseDesign(**row) for row in plan_case_order(plan)]
-    has_claim, won = request.param if isinstance(request.param, tuple) else (request.param, True)
+    parameters = request.param if isinstance(request.param, tuple) else (request.param, True)
+    has_claim, won = parameters[:2]
+    vda2 = len(parameters) == 3 and parameters[2]
     b = [.65] * len(design)
     a = [.75 + i / 1000 for i in range(len(design))] if won else b[:]
     weights = scoring.stratum_weight_map, scoring.step_window_weight_map
@@ -470,6 +472,8 @@ def audit_case(tmp_path, monkeypatch, request, plan_inputs_case):
                             submitted_ms=200_000)
     item.update(challenge_id="34" * 32, submission_id="45" * 32, file_sha256="12" * 32,
                 final_score=paired.challenger_score, incumbent_score=paired.incumbent_score)
+    if vda2:
+        item["declared_file_sha256"] = item["file_sha256"]
     batch = {"sha256": plan.exact.sha256, "plan_digest": plan.plan_digest,
              "seed_block_hash": plan.block_hash, "generated_block": 95,
              "completed_block": plan.completed_block, "completed_at_ms": plan.completed_at_ms,
@@ -510,6 +514,7 @@ def audit_case(tmp_path, monkeypatch, request, plan_inputs_case):
     task = SimpleNamespace(challenge_id=item["challenge_id"], submission_id=item["submission_id"],
                            hotkey=item["hotkey"], repo_id=item["repo_id"],
                            revision=item["revision"],
+                           declared_file_sha256=item.get("declared_file_sha256"),
                            file_sha256=item["file_sha256"], state=ChallengeState.SCORING,
                            position=ChainPosition(item["block_height"], 0, 0))
     reference = source.archive_stage(task, StageOutcome(paired.challenger_score, metrics),
@@ -525,6 +530,29 @@ def audit_case(tmp_path, monkeypatch, request, plan_inputs_case):
     return SimpleNamespace(track=track, source=source, reference=reference, item=item,
                            record=record, payload=payload, due=due, raw=raw,
                            has_claim_evidence=has_claim, task=task, metrics=metrics, plan=plan)
+
+
+@pytest.mark.parametrize("audit_case", [(True, True, True)], indirect=True)
+def test_vda2_public_score_audit_and_verify_match_share_original_declaration(
+    audit_case, tmp_path, capsys,
+):
+    from cli import main
+
+    case = audit_case
+    assert case.record.document["submission"]["declared_file_sha256"] == "12" * 32
+    before = case.source.objects.get(case.reference["object"]).body
+    result = verify_public_score_audit(
+        case.payload, canonical_json(case.record.document), case.track,
+    )
+    assert result["gain_lower_bound"] == case.record.score_gain
+    paths = [tmp_path / name for name in ("rule.json", "match.json", "score-audit.json")]
+    for path, body in zip(paths, (canonical_json(case.raw), canonical_json(case.record.document),
+                                  case.payload), strict=True):
+        path.write_bytes(body)
+    main(["verify-match", "--track", str(paths[0]), "--match", str(paths[1]),
+          "--artifact", str(paths[2])])
+    assert json.loads(capsys.readouterr().out)["gain_lower_bound"] == case.record.score_gain
+    assert case.source.objects.get(case.reference["object"]).body == before
 
 
 def test_public_cpu_audit_is_bound_to_actual_match_and_preserves_original_stage(audit_case):

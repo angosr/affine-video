@@ -29,8 +29,9 @@ def test_only_explicit_supported_sources_reach_wallet_or_chain(
         ))
 
 
-def test_commitment_info_uses_runtime_raw_length_variant() -> None:
-    payload = ModelSubmission("owner/model", "12" * 20).encode()
+@pytest.mark.parametrize("sha", [None, "ab" * 32])
+def test_commitment_info_uses_runtime_raw_length_variant(sha) -> None:
+    payload = ModelSubmission("o/" + "r" * 69 if sha else "owner/model", "12" * 20, sha).encode()
 
     info = commitment_info(payload)
     call = bt.calls.Commitments.set_commitment(netuid=7, info=info)
@@ -51,6 +52,7 @@ def test_commitment_info_enforces_runtime_limit() -> None:
 @pytest.mark.parametrize("submission,netuid", [
     (ModelSubmission("owner/model", "12" * 20), 7),
     (PrivateModelSubmission("ab" * 32, "cd" * 32, "ef" * 32), 120),
+    (ModelSubmission("o/" + "r" * 69, "12" * 20, "ab" * 32), 120),
 ])
 def test_submit_model_signs_with_hotkey_and_waits_for_finalization(
     monkeypatch, submission, netuid,

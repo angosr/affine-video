@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,10 +36,13 @@ _MAX_PART_BYTES = 48 * 1024 * 1024
 
 
 class ModelDownloadError(RuntimeError):
-    def __init__(self, code: str, message: str, *, temporary: bool = False) -> None:
+    def __init__(self, code: str, message: str, *, temporary: bool = False,
+                 http_status: int | None = None, http_observed_at_ms: int | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.temporary = temporary
+        self.http_status = http_status
+        self.http_observed_at_ms = http_observed_at_ms
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,14 +359,24 @@ def download_public_model(
             timeout=timeout_seconds,
             token=False,
         )
-    except (RepositoryNotFoundError, GatedRepoError) as exc:
-        raise ModelDownloadError(
-            "REPOSITORY_UNAVAILABLE", "repository is not anonymously readable"
-        ) from exc
-    except RevisionNotFoundError as exc:
-        raise ModelDownloadError("REVISION_NOT_FOUND", "revision does not exist") from exc
     except HfHubHTTPError as exc:
-        raise _metadata_http_failure(exc.response.status_code) from exc
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if type(status) is not int:
+            raise ModelDownloadError(
+                "DOWNLOAD_TEMPORARY_FAILURE", "HF response status is unavailable", temporary=True,
+            ) from exc
+        failure = _metadata_http_failure(status)
+        if not failure.temporary and isinstance(
+            exc, (RepositoryNotFoundError, GatedRepoError, RevisionNotFoundError),
+        ):
+            revision_missing = isinstance(exc, RevisionNotFoundError)
+            raise ModelDownloadError(
+                "REVISION_NOT_FOUND" if revision_missing else "REPOSITORY_UNAVAILABLE",
+                "revision does not exist" if revision_missing else
+                "repository is not anonymously readable",
+                http_status=status, http_observed_at_ms=failure.http_observed_at_ms,
+            ) from exc
+        raise failure from exc
     except HubTransportError as exc:
         raise ModelDownloadError(
             "DOWNLOAD_TEMPORARY_FAILURE",
@@ -465,6 +479,8 @@ def download_public_model(
                     f"model file request returned HTTP {response.status_code} "
                     "after anonymous metadata verification",
                     temporary=True,
+                    http_status=response.status_code,
+                    http_observed_at_ms=time.time_ns() // 1_000_000,
                 )
             content_length = response.headers.get("content-length")
             if content_length is not None and int(content_length) > max_bytes:
@@ -560,18 +576,26 @@ def download_public_model(
 
 
 def _metadata_http_failure(status_code: int) -> ModelDownloadError:
+    observed = time.time_ns() // 1_000_000
     if status_code in (401, 403):
         return ModelDownloadError(
-            "REPOSITORY_UNAVAILABLE", "repository is not anonymously readable"
+            "REPOSITORY_UNAVAILABLE", "repository is not anonymously readable",
+            http_status=status_code,
+            http_observed_at_ms=observed,
         )
     if status_code == 404:
-        return ModelDownloadError("MODEL_FILE_MISSING", f"{MODEL_FILENAME} is missing")
+        return ModelDownloadError("MODEL_FILE_MISSING", f"{MODEL_FILENAME} is missing",
+                                  http_status=status_code, http_observed_at_ms=observed)
     if status_code == 429 or status_code >= 500 or status_code in (408, 425):
         return ModelDownloadError(
-            "DOWNLOAD_TEMPORARY_FAILURE", "Hugging Face is temporarily unavailable", temporary=True
+            "DOWNLOAD_TEMPORARY_FAILURE", "Hugging Face is temporarily unavailable", temporary=True,
+            http_status=status_code,
+            http_observed_at_ms=observed,
         )
     return ModelDownloadError(
-        "REPOSITORY_UNAVAILABLE", f"Hugging Face rejected the download ({status_code})"
+        "REPOSITORY_UNAVAILABLE", f"Hugging Face rejected the download ({status_code})",
+        http_status=status_code,
+        http_observed_at_ms=observed,
     )
 
 

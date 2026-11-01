@@ -592,6 +592,7 @@ def test_payload_access_failure_rechecks_metadata_before_retry(
     )
     with pytest.raises(ModelDownloadError) as first:
         download_public_model("owner/model", "12" * 20, **arguments)
+    assert first.value.http_status == status
     assert first.value.temporary is True
     assert first.value.code == "DOWNLOAD_TEMPORARY_FAILURE"
     assert not list(tmp_path.iterdir())
@@ -633,7 +634,40 @@ def test_anonymous_metadata_failure_keeps_its_admission_classification(
         )
     assert caught.value.code == code
     assert caught.value.temporary is temporary
+    assert caught.value.http_status == status
     assert client.called is False
+
+
+@pytest.mark.parametrize("error_name", [
+    "RepositoryNotFoundError", "GatedRepoError", "RevisionNotFoundError",
+])
+@pytest.mark.parametrize("status", [None, 400, 401, 403, 404])
+def test_sdk_http_exceptions_preserve_actual_status_without_guessing(
+    tmp_path, error_name, status,
+):
+    from huggingface_hub import errors
+
+    class DeniedApi:
+        def model_info(self, *_args, **kwargs):
+            assert kwargs["token"] is False
+            response = httpx.Response(status or 400,
+                                      request=httpx.Request("GET", "https://hf.test"))
+            error = getattr(errors, error_name)("not available", response=response)
+            if status is None:
+                error.response = None  # A missing response is not evidence of HTTP 404.
+            raise error
+
+    with pytest.raises(ModelDownloadError) as caught:
+        download_public_model("owner/model", "12" * 20, cache_dir=tmp_path, max_bytes=10,
+                              api=DeniedApi(), http_client=FakeClient())
+    assert caught.value.http_status == status
+    if status is None:
+        assert caught.value.code == "DOWNLOAD_TEMPORARY_FAILURE" and caught.value.temporary
+        assert caught.value.http_observed_at_ms is None
+    else:
+        assert caught.value.code == ("REVISION_NOT_FOUND" if error_name == "RevisionNotFoundError"
+                                     else "REPOSITORY_UNAVAILABLE")
+        assert not caught.value.temporary
 
 
 @pytest.mark.parametrize(

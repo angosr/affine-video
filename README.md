@@ -70,22 +70,30 @@ uv run veda miner prepare \
 This copies tensor values unchanged and sets ownership metadata. It refuses to overwrite an
 existing output. **It does not check the complete tensor schema or competition eligibility.**
 
-### 3. Upload to Hugging Face
+### 3. Stage an immutable Hugging Face revision
+
+The SHA-bound VDA2 workflow below is an unreleased candidate; check the
+[changelog](CHANGELOG.md) and live runtime before using it on-chain.
+Upload to an existing private repository and keep it private until the chain commitment
+is finalized:
 
 ```bash
 uv run hf auth login
 uv run hf upload YOUR_ACCOUNT/YOUR_MODEL selector.safetensors selector.safetensors
 ```
 
-Ensure the repository is public when your finalized submission reaches FIFO admission.
-Uploading to an existing private repository does not make it public. Changing hotkey
-metadata does not change the duplicate-model fingerprint.
+Changing hotkey metadata does not change the duplicate-model fingerprint.
 
 Obtain the upload's **complete 40-character commit SHA** from the repository's commit history.
 Use that immutable revision, not `main`, a tag or a shortened hash. Do not modify the selected
 file after choosing the revision.
+Compute the complete SHA-256 of the prepared file, including its hotkey metadata:
 
-### 4. Commit on-chain
+```bash
+sha256sum selector.safetensors
+```
+
+### 4. Commit on-chain, then make that revision public
 
 **Each hotkey has one VEDA evaluation opportunity; maintenance does not reset it.** A malformed
 submission, invalid model or lost challenge consumes that opportunity. Only an explicit
@@ -96,6 +104,7 @@ submission. Ordinary infrastructure retries are not permission to submit a repla
 uv run veda miner commit \
   --repo-id YOUR_ACCOUNT/YOUR_MODEL \
   --revision YOUR_40_CHARACTER_COMMIT_SHA \
+  --file-sha256 YOUR_64_CHARACTER_FILE_SHA256 \
   --wallet-name YOUR_WALLET \
   --hotkey YOUR_HOTKEY_NAME
 ```
@@ -106,10 +115,24 @@ this checks submission fields, not the model or eligibility. The command sends o
 not automatically retry. If a transaction's outcome is uncertain, inspect its chain status
 before submitting again.
 
-When FIFO admission reaches your submission, the pinned HF revision and file must be
-anonymously downloadable or the challenge fails. Admission can start as soon as the
-commitment is finalized. Keep the repository public through admission and durable
-archiving, confirmed by the `SCORING` state.
+After finalization, make that same repository/revision anonymously readable without
+changing the file. The first actual anonymous metadata HTTP 401/403/404 observation starts one fixed
+10-minute publication window. During that wait, no infrastructure failure budget is spent;
+the original task is checked again at the deadline. Restarting, retrying or operator recovery
+does not extend the window. Time alone does not reject a model: a later actual 401/403/404
+after the deadline can fail the submission, while 429/5xx/timeouts remain infrastructure
+failures under the original retry budget. Missing historical observation times stay unknown.
+Once anonymous metadata succeeds, a CDN payload access error remains an infrastructure
+failure, including 401/403/404 after the publication deadline.
+Keep the revision public through admission and durable archiving, confirmed by `SCORING`.
+
+Supplying `--file-sha256` selects VDA2: repository IDs are at most 71 ASCII bytes and the
+payload is at most 128 bytes. The declared SHA must match the downloaded file before model
+ownership is registered. Omitting this option preserves VDA1's original bytes, 96-byte
+repository limit and 121-byte payload limit; existing miners and submissions need no
+resubmission. The publication wait applies to future HF observations in either format;
+historical outcomes and missing observation times are not rewritten.
+Private uploads, VDU/VDR and the public weight format are unchanged.
 
 ## Evaluation and rewards
 

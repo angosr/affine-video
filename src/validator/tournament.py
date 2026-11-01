@@ -9,7 +9,12 @@ from enum import StrEnum
 from math import isfinite
 from typing import Any
 
-from miner.submit import PrivateModelSubmission, model_source_fields, private_model_source
+from miner.submit import (
+    PrivateModelSubmission,
+    declared_model_sha256,
+    model_source_fields,
+    private_model_source,
+)
 from scoring.spec import PromotionSpec, TrackSpec
 from validator.queue import TERMINAL_STATES, ChainPosition, ChallengeState
 from validator.reproducibility import validate_stage_reference
@@ -35,12 +40,14 @@ class Champion:
     private_submission: PrivateModelSubmission | None = None
     # Derived from authenticated genesis/winner facts, not score observations.
     tenure_block: int | None = field(default=None, compare=False)
+    declared_file_sha256: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {
             "challenge_id": self.challenge_id,
             "hotkey": self.hotkey,
-            **model_source_fields(self.repo_id, self.revision, self.private_submission),
+            **model_source_fields(self.repo_id, self.revision, self.private_submission,
+                                  declared_file_sha256=self.declared_file_sha256),
             "score": self.score,
             "uid": self.uid,
             "source": self.source,
@@ -57,7 +64,8 @@ class Champion:
             "block_height", "extrinsic_index", "event_index",
         }
         if (not isinstance(value, Mapping)
-                or set(value) not in (fields, fields | {"private_upload"})):
+                or set(value) not in (fields, fields | {"private_upload"},
+                                      fields | {"declared_file_sha256"})):
             raise ValueError("recorded champion fields are invalid")
         private = private_model_source(value)
         result = cls(
@@ -67,10 +75,12 @@ class Champion:
             _score(value["score"], "champion score"), _position(value),
             _optional_integer(value["uid"], "champion uid"), _required_string(value, "source"),
             private,
+            declared_file_sha256=declared_model_sha256(value),
         )
         if ((result.challenge_id == "genesis") != (result.source == "VEDA_BASELINE")
                 or (result.source == "VEDA_BASELINE" and result.uid != 0)
-                or (result.source == "VEDA_BASELINE" and private is not None)
+                or (result.source == "VEDA_BASELINE" and (
+                    private is not None or result.declared_file_sha256 is not None))
                 or (result.source == "MINER" and result.uid is not None)
                 or result.source not in {"VEDA_BASELINE", "MINER"}):
             raise ValueError("recorded champion source is invalid")
@@ -179,7 +189,8 @@ def challenge_from_match(document: Mapping[str, Any]) -> dict[str, Any]:
         "submission_id": document.get("submission_id"),
         "hotkey": submission.get("hotkey"),
         **model_source_fields(submission.get("repo_id"), submission.get("revision"),
-                              private_model_source(submission)),
+                              private_model_source(submission),
+                              declared_file_sha256=declared_model_sha256(submission)),
         "block_height": submission.get("block_height"),
         "extrinsic_index": submission.get("extrinsic_index"),
         "event_index": submission.get("event_index"),
@@ -281,6 +292,7 @@ def resolve_tournament(
                     record.challenge_id, record.hotkey, fact["repo_id"], fact["revision"],
                     _score(fact["final_score"], "historical score"), _position(fact),
                     private_submission=private_model_source(fact),
+                    declared_file_sha256=declared_model_sha256(fact),
                 ))
 
     for challenge in challenges:
@@ -297,7 +309,7 @@ def resolve_tournament(
             for key in ("submission_id", "hotkey", "repo_id", "revision", "state",
                         "file_sha256", "model_digest", "model_size_bytes", "final_score",
                         "score_block", "block_height", "extrinsic_index", "event_index",
-                        "private_upload"):
+                        "private_upload", "declared_file_sha256"):
                 if challenge.get(key) != expected.get(key):
                     raise ValueError("previous-track challenge conflicts with its immutable match")
             # Preserve completed facts and lifetime uniqueness, never re-label a
@@ -342,6 +354,7 @@ def resolve_tournament(
                 score,
                 position,
                 private_submission=private,
+                declared_file_sha256=declared_model_sha256(challenge),
             )
             leaderboard_candidates.append(candidate)
 
@@ -418,6 +431,10 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
     if (private is not None and challenge["file_sha256"] is not None
             and challenge["file_sha256"] != private.file_sha256):
         raise ValueError("historical private source differs from its recorded file")
+    declaration = declared_model_sha256(challenge)
+    if (state is ChallengeState.SUCCEEDED and declaration is not None
+            and declaration != challenge["file_sha256"]):
+        raise ValueError("historical HF declaration differs from its recorded file")
     if state is ChallengeState.SUCCEEDED:
         if any(_optional_digest(challenge[key], key) is None
                for key in ("file_sha256", "model_digest")):
@@ -448,7 +465,8 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
                              and "promotion" in challenge["stages"][0]))
                 or after != Champion(challenge["challenge_id"], challenge["hotkey"],
                                      challenge["repo_id"], challenge["revision"], score, position,
-                                     private_submission=private)):
+                                     private_submission=private,
+                                     declared_file_sha256=declaration)):
             raise ValueError("historical winner conflicts with its recorded model")
     elif outcome is MatchOutcome.CHAMPION_RETAINED:
         if (state is not ChallengeState.SUCCEEDED
@@ -485,9 +503,11 @@ def historical_champion(matches: tuple[MatchRecord, ...], baseline: Champion) ->
     first = Champion.from_public(matches[0].document["incumbent_before"])
     if (
         first.challenge_id, first.hotkey, first.repo_id, first.revision, first.uid, first.source,
+        first.declared_file_sha256,
     ) != (
         baseline.challenge_id, baseline.hotkey, baseline.repo_id, baseline.revision,
         baseline.uid, baseline.source,
+        baseline.declared_file_sha256,
     ):
         raise ValueError("historical ledger does not start with the official baseline")
     incumbent = replace(first, tenure_block=first.position.block)
@@ -540,6 +560,7 @@ def _resolve_match(
     revision = _optional_string(challenge.get("revision"), "revision")
     private = private_model_source(challenge)
     error_code = _optional_string(challenge.get("error_code"), "error_code")
+    declaration = declared_model_sha256(challenge)
     file_sha256 = _optional_digest(challenge.get("file_sha256"), "file_sha256")
     model_digest = _optional_digest(challenge.get("model_digest"), "model_digest")
     model_size_bytes = _optional_integer(challenge.get("model_size_bytes"), "model_size_bytes")
@@ -578,8 +599,10 @@ def _resolve_match(
         if file_sha256 is None or model_digest is None or model_size_bytes is None:
             raise ValueError("successful challenge is missing its model facts")
         score = _score(challenge.get("final_score"), "final_score")
+        if declaration is not None and declaration != file_sha256:
+            raise ValueError("HF declaration differs from its evaluated file")
         candidate = Champion(identifier, hotkey, repo_id, revision, score, position,
-                             private_submission=private)
+                             private_submission=private, declared_file_sha256=declaration)
         incumbent_score = _score(challenge.get("incumbent_score"), "incumbent_score")
         score_block = _integer(challenge["score_block"], "score_block")
         if score_block < position.block:
@@ -697,7 +720,7 @@ def _resolve_match(
         "submission_id": submission_id,
         "submission": {
             "hotkey": hotkey,
-            **model_source_fields(repo_id, revision, private),
+            **model_source_fields(repo_id, revision, private, declared_file_sha256=declaration),
             "block_height": position.block,
             "extrinsic_index": position.extrinsic_index,
             "event_index": position.event_index,

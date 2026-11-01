@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
-from miner.submit import PrivateModelSubmission, model_source_fields
+from miner.submit import PrivateModelSubmission, declared_model_sha256, model_source_fields
 from validator.production.commitment import canonical_json, decode_canonical_json
 from validator.production.storage import (
     RETRY_STATE_NAMESPACE,
     PreconditionFailed,
     PrivateObjectStore,
 )
-from validator.retries import RetryCheckpoint
+from validator.queue import ChallengeState
+from validator.retries import (
+    HF_PUBLICATION_GRACE_MS,
+    HF_PUBLICATION_WAIT,
+    PublicationGrace,
+    RetryCheckpoint,
+)
 
 _STAGES = frozenset({"ADMISSION", "SCORING", "CONFIRMING"})
 _STATES = frozenset({"ACTIVE", "DEFERRED", "BLOCKED"})
@@ -46,10 +52,14 @@ class _StoredRetry:
     error_code: str | None
     error_summary: str | None
     last_attempt: str | None
+    http_grace: PublicationGrace | None
 
     def checkpoint(self) -> RetryCheckpoint | None:
         if self.state == "ACTIVE":
-            return None
+            return (None if self.http_grace is None else RetryCheckpoint(
+                0, False, self.http_grace.deadline_ms, HF_PUBLICATION_WAIT,
+                "Waiting for anonymous HF publication", self.http_grace,
+            ))
         assert self.error_code is not None and self.error_summary is not None
         assert self.retry_after_ms is not None
         return RetryCheckpoint(
@@ -58,6 +68,7 @@ class _StoredRetry:
             self.retry_after_ms,
             self.error_code,
             self.error_summary,
+            self.http_grace,
         )
 
 
@@ -90,18 +101,21 @@ class PrivateRetryStore:
             raise ValueError("retry error identity cannot be empty")
         if retry_after_ms < 0 or max_attempts <= 0:
             raise ValueError("retry limits are invalid")
+        if type(task.attempts) is not int or task.attempts <= 0:
+            raise ValueError("retry lease ordinal must be positive")
         name = self._name(task.challenge_id, stage)
         attempt_token = hashlib.sha256(task.lease_token.encode()).hexdigest()
         for _ in range(8):
             stored = self.objects.get_optional(name)
             if stored is None:
                 current = None
-                attempts = 1
+                attempts = task.attempts
                 generation = 0
             else:
                 current = self._decode(stored.body, task=task, stage=stage)
                 checkpoint = current.checkpoint()
-                if current.last_attempt == attempt_token:
+                if (current.last_attempt == attempt_token
+                        and current.error_code != HF_PUBLICATION_WAIT):
                     if checkpoint is None:
                         raise RuntimeError("active retry state retained a failed attempt token")
                     return checkpoint
@@ -112,6 +126,8 @@ class PrivateRetryStore:
                     raise RuntimeError("durable retry budget requires an operator reset")
                 attempts = current.attempts + 1
                 generation = current.generation + 1
+            if attempts != task.attempts:
+                raise RuntimeError("durable retry ordinal disagrees with the active lease")
             blocked = attempts >= max_attempts
             document = self._document(
                 task,
@@ -123,6 +139,11 @@ class PrivateRetryStore:
                 error_code=code[:100],
                 error_summary=summary[:1000],
                 last_attempt=attempt_token,
+                **({"http_grace": current.document["http_grace"]}
+                   if current is not None and "http_grace" in current.document else
+                   {"http_grace": None} if current is None and stage == "ADMISSION"
+                   and getattr(task, "private_submission", None) is None
+                   and code != "HF_PUBLICATION_CLOCK_UNAVAILABLE" else {}),
             )
             payload = canonical_json(document)
             try:
@@ -134,6 +155,70 @@ class PrivateRetryStore:
                 continue
             checkpoint = self._decode(updated.body, task=task, stage=stage).checkpoint()
             assert checkpoint is not None
+            return checkpoint
+        raise RuntimeError("durable retry state changed repeatedly")
+
+    def record_publication_wait(
+        self, task: object, *, http_status: int, observed_at_ms: int, max_attempts: int,
+    ) -> RetryCheckpoint:
+        """Seal an HF publication wait in the original row without spending infra budget."""
+        if (task.state not in (ChallengeState.FETCHING, ChallengeState.VALIDATING)
+                or getattr(task, "private_submission", None) is not None or not task.repo_id
+                or http_status not in (401, 403, 404) or type(http_status) is not int
+                or type(observed_at_ms) is not int or observed_at_ms < 0 or max_attempts <= 0):
+            raise ValueError("HF publication observation is invalid")
+        name = self._name(task.challenge_id, "ADMISSION")
+        token = hashlib.sha256(task.lease_token.encode()).hexdigest()
+        for _ in range(8):
+            stored = self.objects.get_optional(name)
+            current = (None if stored is None else
+                       self._decode(stored.body, task=task, stage="ADMISSION"))
+            if current is not None:
+                if current.state == "BLOCKED" or current.attempts >= max_attempts:
+                    raise RuntimeError("durable retry budget requires an operator reset")
+                if "http_grace" not in current.document:
+                    raise RuntimeError("historical HF publication clock is unknown")
+                if current.last_attempt == token and current.error_code == HF_PUBLICATION_WAIT:
+                    checkpoint = current.checkpoint()
+                    assert checkpoint is not None
+                    return checkpoint
+            attempts = 0 if current is None else current.attempts
+            if task.attempts != attempts + 1:
+                raise RuntimeError("publication wait ordinal disagrees with the active lease")
+            grace = None if current is None else current.http_grace
+            if grace is None:
+                grace = PublicationGrace(observed_at_ms,
+                                         observed_at_ms + HF_PUBLICATION_GRACE_MS, http_status)
+            if observed_at_ms < grace.first_observed_at_ms:
+                raise RuntimeError("HF publication observation precedes its fixed clock")
+            checkpoint = RetryCheckpoint(attempts, False, grace.deadline_ms,
+                                         HF_PUBLICATION_WAIT, "Waiting for HF publication",
+                                         grace)
+            if current is not None and observed_at_ms >= grace.deadline_ms:
+                return checkpoint
+            payload = canonical_json(self._document(
+                task, "ADMISSION", attempts=attempts,
+                generation=0 if current is None else current.generation + 1,
+                state="DEFERRED", retry_after_ms=grace.deadline_ms,
+                error_code=HF_PUBLICATION_WAIT, error_summary=checkpoint.error_summary,
+                last_attempt=token, http_grace=asdict(grace),
+            ))
+            try:
+                if stored is None:
+                    self.objects.create_plan(name, payload)
+                else:
+                    self.objects.replace_plan(name, payload, etag=stored.etag)
+            except PreconditionFailed:
+                continue
+            except Exception:
+                # A lost PUT response is not an infrastructure failure when the same row
+                # proves this lease's exact publication wait was already committed.
+                committed = self.objects.get_optional(name)
+                if committed is None or committed.body != payload:
+                    raise
+                restored = self._decode(committed.body, task=task, stage="ADMISSION").checkpoint()
+                assert restored is not None
+                return restored
             return checkpoint
         raise RuntimeError("durable retry state changed repeatedly")
 
@@ -244,7 +329,8 @@ class PrivateRetryStore:
         challenge_id: str | None = None,
     ) -> _StoredRetry:
         value = decode_canonical_json(payload)
-        if not isinstance(value, dict) or set(value) not in (_FIELDS, _FIELDS | {"private_upload"}):
+        if (not isinstance(value, dict) or not set(value) >= _FIELDS
+                or set(value) - _FIELDS - {"private_upload", "http_grace", "declared_file_sha256"}):
             raise RuntimeError("durable retry state fields are invalid")
         private = None
         if "private_upload" in value:
@@ -281,6 +367,18 @@ class PrivateRetryStore:
             raise RuntimeError("durable retry state conflicts with its submission")
         if task is not None and private != getattr(task, "private_submission", None):
             raise RuntimeError("durable retry state conflicts with its private source")
+        declaration = declared_model_sha256(value)
+        if task is not None and declaration != getattr(task, "declared_file_sha256", None):
+            raise RuntimeError("durable retry state conflicts with its HF declaration")
+        grace = None
+        if "http_grace" in value:
+            if stage != "ADMISSION" or private is not None:
+                raise RuntimeError("HF publication clock requires an HF admission")
+            if value["http_grace"] is not None:
+                try:
+                    grace = PublicationGrace(**value["http_grace"])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("HF publication clock is invalid") from exc
         attempts = value["attempts"]
         generation = value["generation"]
         state = value["state"]
@@ -311,6 +409,10 @@ class PrivateRetryStore:
                 and summary is None
                 and last_attempt is None
             )
+        elif code == HF_PUBLICATION_WAIT:
+            valid_state = (state == "DEFERRED" and grace is not None
+                           and retry_after == grace.deadline_ms and attempts >= 0
+                           and summary is not None and last_attempt is not None)
         else:
             valid_state = (
                 attempts > 0
@@ -330,6 +432,7 @@ class PrivateRetryStore:
             code,
             summary,
             last_attempt,
+            grace,
         )
 
     def _document(
@@ -345,7 +448,8 @@ class PrivateRetryStore:
             "submission_id": task.submission_id,
             "hotkey": task.hotkey,
             **model_source_fields(task.repo_id, task.revision,
-                                  getattr(task, "private_submission", None)),
+                                  getattr(task, "private_submission", None),
+                                  declared_file_sha256=getattr(task, "declared_file_sha256", None)),
             "stage": self._stage(stage),
             **state,
         }

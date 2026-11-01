@@ -352,8 +352,17 @@ def test_private_ready_uses_same_hotkey_finalization_entry(monkeypatch, capsys):
     assert "repo_id" not in document and "revision" not in document
 
 
+def test_hf_vda2_is_opt_in_and_reports_its_chain_declaration(capsys):
+    main(["miner", "commit", "--repo-id", "owner/model", "--revision", "12" * 20,
+          "--file-sha256", "ab" * 32, "--dry-run"])
+    body = json.loads(capsys.readouterr().out)
+    assert body["payload_hex"].startswith(b"VDA2".hex())
+    assert body["declared_file_sha256"] == "ab" * 32
+    assert "file_sha256" not in body and body["payload_bytes"] == 68
+
+
 @pytest.mark.parametrize("arguments", [
-    ["--repo-id", "owner/model", "--revision", "12" * 20, "--file-sha256", "ab" * 32],
+    ["--repo-id", "owner/model", "--revision", "12" * 20, "--manifest-sha256", "ab" * 32],
     ["--upload-id", "ab" * 32, "--revision", "12" * 20, "--file-sha256", "cd" * 32],
     ["--upload-id", "ab" * 32],
     ["--upload-id", "ab" * 32, "--file-sha256", "cd" * 32, "--netuid", "7"],

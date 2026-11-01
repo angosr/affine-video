@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import save_file
 
+from miner.submit import ModelSubmission
 from scoring.model import TensorSpec
 from validator import download as download_module
 from validator.admission import (
@@ -50,6 +51,12 @@ def submission_at(block: int, hotkey: str, repo_id: str = "owner/model") -> Subm
         repo_id=repo_id,
         revision="12" * 20,
     )
+
+
+def hashed_submission_at(block: int, hotkey: str, digest: str = "ab" * 32) -> SubmissionRecord:
+    original = submission_at(block, hotkey)
+    return replace(original, payload=ModelSubmission(original.repo_id, original.revision,
+                                                     digest).encode())
 
 
 def model_downloader(path):
@@ -1343,6 +1350,452 @@ def test_slow_durable_admission_restore_cannot_expire_a_block(tmp_path, monkeypa
         )
         assert outcome is not None and outcome.status is AdmissionStatus.BLOCKED
         assert clock["ms"] == 7_201_000
+
+
+@pytest.mark.parametrize("http_status", [401, 403, 404])
+@pytest.mark.parametrize("first_time", [100, 1_000_000])
+def test_publication_grace_waits_without_infra_attempts_and_survives_reset(
+    tmp_path, http_status, first_time,
+):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ab" * 32)
+    configured = replace(settings(tmp_path), restore_retry=retries.restore,
+                         record_retry=retries.record_failure,
+                         record_publication_wait=retries.record_publication_wait)
+    calls = []
+
+    def unavailable(*_args, **_kwargs):
+        calls.append(http_status)
+        raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "not published",
+                                 http_status=http_status)
+
+    submission = hashed_submission_at(100, "hk1")
+    with ChallengeStore(tmp_path / "publication.db") as store:
+        identifier, _ = store.add_submission(submission, occurred_at_ms=1)
+        result = process_next_admission(store, worker_id="original", settings=configured,
+                                        current_finalized_block=200, now_ms=first_time,
+                                        downloader=unavailable)
+        assert result.status is AdmissionStatus.DEFERRED and result.code is None
+        assert store.get_challenge(identifier).attempts == 0
+        row = store.public_challenge(identifier)
+        assert row["error_code"] is None and row["retry_after_ms"] == first_time + 600_000
+        original = objects.get(f"retry_state/{identifier}/admission.json")
+        for elapsed in (30_000, 90_000, 210_000, 450_000, 599_999):
+            assert process_next_admission(store, worker_id="automatic", settings=configured,
+                                          current_finalized_block=200, now_ms=first_time + elapsed,
+                                          downloader=unavailable) is None
+        assert objects.get(f"retry_state/{identifier}/admission.json") == original
+    retries.reset(identifier, "ADMISSION")
+    # A cold database and ACTIVE operator checkpoint still carry the same clock.
+    with ChallengeStore(tmp_path / "publication-cold.db") as store:
+        assert store.add_submission(submission, occurred_at_ms=1)[0] == identifier
+        result = process_next_admission(store, worker_id="cold", settings=configured,
+                                        current_finalized_block=200, now_ms=first_time + 450_000,
+                                        downloader=unavailable)
+        assert result.status is AdmissionStatus.DEFERRED
+        assert store.get_challenge(identifier).attempts == 0
+        assert calls == [http_status]
+        expired = process_next_admission(store, worker_id="at-deadline", settings=configured,
+                                         current_finalized_block=200, now_ms=first_time + 600_000,
+                                         downloader=unavailable)
+        assert expired.status is AdmissionStatus.FAILED
+        assert calls == [http_status, http_status]
+        assert store.public_challenge(identifier)["block_height"] == 100
+    document = json.loads(objects.get(f"retry_state/{identifier}/admission.json").body)
+    assert document["http_grace"] == {
+        "first_observed_at_ms": first_time, "deadline_ms": first_time + 600_000,
+        "first_status": http_status,
+    }
+
+
+def test_publication_wait_preserves_existing_infra_budget_and_five_real_failures_block(tmp_path):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ab" * 32)
+    configured = replace(settings(tmp_path), restore_retry=retries.restore,
+                         record_retry=retries.record_failure,
+                         record_publication_wait=retries.record_publication_wait)
+
+    def infra(*_args, **_kwargs):
+        raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "HF server down",
+                                 temporary=True, http_status=500)
+
+    def unpublished(*_args, **_kwargs):
+        raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "not public", http_status=403)
+
+    model = tmp_path / "published.safetensors"
+    write_model(model, "hk1")
+    with ChallengeStore(tmp_path / "mixed.db") as store:
+        identifier, _ = store.add_submission(hashed_submission_at(
+            100, "hk1", hashlib.sha256(model.read_bytes()).hexdigest()), occurred_at_ms=1)
+        first = process_next_admission(store, worker_id="worker", settings=configured,
+                                       current_finalized_block=200, now_ms=100, downloader=infra)
+        assert first.status is AdmissionStatus.DEFERRED
+        waiting = process_next_admission(store, worker_id="worker", settings=configured,
+                                         current_finalized_block=200, now_ms=30_100,
+                                         downloader=unpublished)
+        assert waiting.status is AdmissionStatus.DEFERRED
+        assert store.get_challenge(identifier).attempts == 1
+        now = 630_100
+        for count in range(2, 6):
+            result = process_next_admission(store, worker_id="worker", settings=configured,
+                                            current_finalized_block=200, now_ms=now,
+                                            downloader=infra)
+            assert result.status is (AdmissionStatus.BLOCKED if count == 5
+                                     else AdmissionStatus.DEFERRED)
+            assert store.get_challenge(identifier).attempts == count
+            now = now + configured.retry_max_ms if count == 5 else (
+                store.public_challenge(identifier)["retry_after_ms"])
+        before = objects.get(f"retry_state/{identifier}/admission.json")
+        assert process_next_admission(store, worker_id="automatic", settings=configured,
+                                      current_finalized_block=200, now_ms=now,
+                                      downloader=unpublished) is None
+        assert objects.get(f"retry_state/{identifier}/admission.json") == before
+        retries.reset(identifier, "ADMISSION")
+        store.resume_blocked(identifier, occurred_at_ms=now)
+        accepted = process_next_admission(store, worker_id="operator", settings=configured,
+                                          current_finalized_block=200, now_ms=now + 1,
+                                          downloader=model_downloader(model))
+        assert accepted.status is AdmissionStatus.ACCEPTED
+        assert json.loads(objects.get(f"retry_state/{identifier}/admission.json").body)[
+            "http_grace"]["deadline_ms"] == 630_100
+
+
+@pytest.mark.parametrize("matches", [True, False])
+def test_vda2_actual_hash_precedes_archive_and_canonical_ownership(tmp_path, matches):
+    from miner.submit import ModelSubmission
+    from scoring.model import validate_model
+
+    path = tmp_path / "selector.safetensors"
+    write_model(path, "hk1")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    validated = validate_model(path, schema=SCHEMA, max_bytes=10_000, expected_hotkey="hk1")
+    declared = actual if matches else "ff" * 32
+    original = submission_at(100, "hk1")
+    original = replace(original, payload=ModelSubmission(original.repo_id, original.revision,
+                                                       declared).encode())
+    archived = []
+    with ChallengeStore(tmp_path / "vda2.db") as store:
+        identifier, _ = store.add_submission(original, occurred_at_ms=1)
+
+        def archive(task, _path, model):
+            assert store.model_owner(model.model_digest) is None
+            assert task.declared_file_sha256 == model.file_sha256 == actual
+            archived.append(task.challenge_id)
+
+        outcome = process_next_admission(
+            store, worker_id="worker", settings=replace(settings(tmp_path), archive=archive),
+            current_finalized_block=200, now_ms=10, downloader=model_downloader(path),
+        )
+        assert outcome.status is (AdmissionStatus.ACCEPTED if matches else AdmissionStatus.FAILED)
+        assert archived == ([identifier] if matches else [])
+        assert store.model_owner(validated.model_digest) == (identifier if matches else None)
+        row = store.public_challenge(identifier)
+        assert row["declared_file_sha256"] == declared and row["file_sha256"] == actual
+        if not matches:
+            assert row["error_code"] == "MODEL_FILE_HASH_MISMATCH"
+            other_path = tmp_path / "other.safetensors"
+            write_model(other_path, "hk2")
+            other = submission_at(101, "hk2")
+            other = replace(other, payload=ModelSubmission(
+                other.repo_id, other.revision, hashlib.sha256(other_path.read_bytes()).hexdigest(),
+            ).encode())
+            second, _ = store.add_submission(other, occurred_at_ms=11)
+            accepted = process_next_admission(
+                store, worker_id="later", settings=settings(tmp_path),
+                current_finalized_block=200, now_ms=12, downloader=model_downloader(other_path),
+            )
+            assert accepted.status is AdmissionStatus.ACCEPTED
+            assert store.model_owner(validated.model_digest) == second
+
+
+@pytest.mark.parametrize("status", [400, 429, 500, None])
+def test_nonqualifying_http_failure_does_not_start_publication_clock(tmp_path, status):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ab" * 32)
+    configured = replace(settings(tmp_path), restore_retry=retries.restore,
+                         record_retry=retries.record_failure,
+                         record_publication_wait=lambda *_a, **_k: pytest.fail("not wait"))
+
+    def unavailable(*_args, **_kwargs):
+        raise ModelDownloadError("REPOSITORY_UNAVAILABLE" if status == 400 else "SYSTEM_DOWN",
+                                 "HF unavailable", temporary=status != 400, http_status=status)
+
+    with ChallengeStore(tmp_path / "nonqualifying.db") as store:
+        identifier, _ = store.add_submission(hashed_submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(store, worker_id="worker", settings=configured,
+                                         current_finalized_block=200, now_ms=100,
+                                         downloader=unavailable)
+        assert outcome.status is (AdmissionStatus.FAILED if status == 400
+                                  else AdmissionStatus.DEFERRED)
+        if status != 400:
+            row = json.loads(objects.get(f"retry_state/{identifier}/admission.json").body)
+            assert row["attempts"] == 1 and row["http_grace"] is None
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+@pytest.mark.parametrize("prior_wait", [False, True])
+def test_cdn_access_error_remains_infra_even_after_the_publication_deadline(
+    tmp_path, status, prior_wait,
+):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ab" * 32)
+    configured = replace(settings(tmp_path), restore_retry=retries.restore,
+                         record_retry=retries.record_failure,
+                         record_publication_wait=retries.record_publication_wait)
+
+    def metadata_failure(*_args, **_kwargs):
+        raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "not public", http_status=403)
+
+    def cdn_failure(*_args, **_kwargs):
+        raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "CDN unavailable",
+                                 temporary=True, http_status=status)
+
+    with ChallengeStore(tmp_path / "cdn.db") as store:
+        identifier, _ = store.add_submission(hashed_submission_at(100, "hk1"), occurred_at_ms=1)
+        if prior_wait:
+            waiting = process_next_admission(
+                store, worker_id="first", settings=configured,
+                current_finalized_block=200, now_ms=100, downloader=metadata_failure,
+            )
+            assert waiting.status is AdmissionStatus.DEFERRED
+        result = process_next_admission(
+            store, worker_id="cdn", settings=configured,
+            current_finalized_block=200, now_ms=700_100, downloader=cdn_failure,
+        )
+        assert result.status is AdmissionStatus.DEFERRED
+        assert result.code == "DOWNLOAD_TEMPORARY_FAILURE"
+        row = json.loads(objects.get(f"retry_state/{identifier}/admission.json").body)
+        assert row["attempts"] == 1
+        assert row["http_grace"] == (
+            {"first_observed_at_ms": 100, "deadline_ms": 600_100, "first_status": 403}
+            if prior_wait else None
+        )
+        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_DEFERRED
+        assert store.public_challenge(identifier)["final_score"] is None
+
+
+@pytest.mark.parametrize("prior_infra", [False, True])
+def test_lost_publication_cas_response_preserves_clock_and_counts_only_real_infra(
+    tmp_path, monkeypatch, prior_infra,
+):
+    client = MemoryS3()
+    objects = PrivateObjectStore(client, bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ab" * 32)
+    configured = replace(settings(tmp_path), restore_retry=retries.restore,
+                         record_retry=retries.record_failure,
+                         record_publication_wait=retries.record_publication_wait)
+    put = client.put_object
+
+    def lost(**kwargs):
+        # Actual conditional MemoryS3 PUT commits before losing its response.
+        result = put(**kwargs)
+        if json.loads(kwargs["Body"]).get("http_grace") is not None:
+            raise OSError("lost committed response")
+        return result
+
+    monkeypatch.setattr(client, "put_object", lost)
+    calls = []
+
+    def unavailable(*_args, **_kwargs):
+        calls.append(True)
+        raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "not public", http_status=401)
+
+    with ChallengeStore(tmp_path / "lost-response.db") as store:
+        identifier, _ = store.add_submission(hashed_submission_at(100, "hk1"), occurred_at_ms=1)
+        if prior_infra:
+            def infra(*_args, **_kwargs):
+                raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "HF server down",
+                                         temporary=True, http_status=500)
+            failed = process_next_admission(
+                store, worker_id="infra", settings=configured,
+                current_finalized_block=200, now_ms=100, downloader=infra,
+            )
+            assert failed.status is AdmissionStatus.DEFERRED
+        first_time = 30_100 if prior_infra else 100
+        result = process_next_admission(store, worker_id="worker", settings=configured,
+                                        current_finalized_block=200, now_ms=first_time,
+                                        downloader=unavailable)
+        assert result.status is AdmissionStatus.DEFERRED
+        assert result.code is None
+        assert store.get_challenge(identifier).attempts == int(prior_infra)
+        later = process_next_admission(store, worker_id="worker", settings=configured,
+                                       current_finalized_block=200, now_ms=first_time + 30_000,
+                                       downloader=unavailable)
+        assert later is None
+        row = json.loads(objects.get(f"retry_state/{identifier}/admission.json").body)
+        assert row["attempts"] == int(prior_infra)
+        assert row["http_grace"]["deadline_ms"] == first_time + 600_000
+        assert store.get_challenge(identifier).attempts == int(prior_infra)
+        original = objects.get(f"retry_state/{identifier}/admission.json")
+    with ChallengeStore(tmp_path / "lost-response-cold.db") as cold:
+        cold.add_submission(hashed_submission_at(100, "hk1"), occurred_at_ms=1)
+        waiting = process_next_admission(
+            cold, worker_id="restart", settings=configured,
+            current_finalized_block=200, now_ms=first_time + 450_000, downloader=unavailable,
+        )
+        assert waiting.status is AdmissionStatus.DEFERRED and waiting.code is None
+        assert cold.get_challenge(identifier).attempts == int(prior_infra)
+        assert objects.get(f"retry_state/{identifier}/admission.json") == original
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize("hashed", [False, True])
+@pytest.mark.parametrize("status", [None, 401])
+@pytest.mark.parametrize("error_name", [
+    "RepositoryNotFoundError", "GatedRepoError", "RevisionNotFoundError",
+])
+def test_both_hf_formats_share_new_http_observations_without_changing_wire(
+    tmp_path, monkeypatch, hashed, status, error_name,
+):
+    from huggingface_hub import errors
+
+    monkeypatch.setattr(time, "time_ns", lambda: 100_000_000)
+    class DeniedApi:
+        def model_info(self, *_args, **kwargs):
+            assert kwargs["token"] is False
+            error = getattr(errors, error_name)(
+                "not available", response=httpx.Response(
+                    status or 400, request=httpx.Request("GET", "https://hf.test"),
+                ),
+            )
+            if status is None:
+                error.response = None
+            raise error
+
+    def download(repo_id, revision, **kwargs):
+        return download_module.download_public_model(repo_id, revision, api=DeniedApi(), **kwargs)
+
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ab" * 32)
+    configured = replace(settings(tmp_path), restore_retry=retries.restore,
+                         record_retry=retries.record_failure,
+                         record_publication_wait=retries.record_publication_wait)
+    with ChallengeStore(tmp_path / "sdk-legacy.db") as store:
+        original = submission_at(100, "hk1")
+        payload = ModelSubmission(original.repo_id, original.revision,
+                                  "ab" * 32 if hashed else None).encode()
+        original = replace(original, payload=payload)
+        identifier, _ = store.add_submission(original, occurred_at_ms=1)
+        outcome = process_next_admission(
+            store, worker_id="worker", settings=configured,
+            current_finalized_block=200, now_ms=100, downloader=download,
+        )
+        assert outcome.status is AdmissionStatus.DEFERRED
+        row = json.loads(objects.get(f"retry_state/{identifier}/admission.json").body)
+        assert row["attempts"] == (1 if status is None else 0)
+        assert row["http_grace"] == (None if status is None else {
+            "first_observed_at_ms": 100,
+            "deadline_ms": 600_100,
+            "first_status": 401,
+        })
+        assert store._connection.execute("SELECT payload FROM submissions").fetchone()[0] == payload
+        assert ("declared_file_sha256" in store.public_challenge(identifier)) is hashed
+
+
+def test_publication_cas_failure_before_write_reaches_budget_without_inventing_a_clock(
+    tmp_path, monkeypatch,
+):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ab" * 32)
+    configured = replace(settings(tmp_path), restore_retry=retries.restore,
+                         record_retry=retries.record_failure,
+                         record_publication_wait=retries.record_publication_wait,
+                         max_attempts=2)
+    create = objects.create_plan
+
+    def fail_publication_write(name, body):
+        if json.loads(body).get("http_grace") is not None:
+            raise OSError("write never reached authority")
+        return create(name, body)
+
+    monkeypatch.setattr(objects, "create_plan", fail_publication_write)
+    calls = []
+
+    def unavailable(*_args, **_kwargs):
+        calls.append(True)
+        raise ModelDownloadError("REPOSITORY_UNAVAILABLE", "not public", http_status=401)
+
+    with ChallengeStore(tmp_path / "failed-clock-write.db") as store:
+        identifier, _ = store.add_submission(hashed_submission_at(100, "hk1"), occurred_at_ms=1)
+        first = process_next_admission(
+            store, worker_id="first", settings=configured,
+            current_finalized_block=200, now_ms=100, downloader=unavailable,
+        )
+        assert first.status is AdmissionStatus.DEFERRED
+        row = json.loads(objects.get(f"retry_state/{identifier}/admission.json").body)
+        assert row["attempts"] == 1 and "http_grace" not in row
+        second = process_next_admission(
+            store, worker_id="cold", settings=configured,
+            current_finalized_block=200, now_ms=30_100, downloader=unavailable,
+        )
+        assert second.status is AdmissionStatus.BLOCKED
+        row = json.loads(objects.get(f"retry_state/{identifier}/admission.json").body)
+        assert row["attempts"] == 2 and "http_grace" not in row
+        assert process_next_admission(
+            store, worker_id="later", settings=configured,
+            current_finalized_block=200, now_ms=10**9, downloader=unavailable,
+        ) is None
+        assert len(calls) == 2
+        assert store.public_challenge(identifier)["final_score"] is None
+
+
+def test_publication_wait_checkpoint_cannot_bypass_an_exhausted_infra_budget(tmp_path):
+    from validator.retries import HF_PUBLICATION_WAIT, PublicationGrace, RetryCheckpoint
+
+    checkpoint = RetryCheckpoint(5, False, 600_100, HF_PUBLICATION_WAIT, "waiting",
+                                 PublicationGrace(100, 600_100, 403))
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("exhausted infrastructure budget cannot fetch or write another checkpoint")
+
+    configured = replace(settings(tmp_path), restore_retry=lambda *_args: checkpoint,
+                         record_retry=forbidden)
+    with ChallengeStore(tmp_path / "exhausted-wait.db") as store:
+        identifier, _ = store.add_submission(hashed_submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(store, worker_id="cold", settings=configured,
+                                         current_finalized_block=200, now_ms=700_000,
+                                         downloader=forbidden)
+        assert outcome.status is AdmissionStatus.BLOCKED
+        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_BLOCKED
+        assert process_next_admission(store, worker_id="restart", settings=configured,
+                                      current_finalized_block=200, now_ms=10**9,
+                                      downloader=forbidden) is None
+
+
+def test_publication_clock_is_observed_before_download_cleanup_not_extended_by_it(
+    tmp_path, monkeypatch,
+):
+    from validator.download import _metadata_http_failure
+
+    clock = {"ms": 100}
+    monkeypatch.setattr(time, "time_ns", lambda: clock["ms"] * 1_000_000)
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ab" * 32)
+    configured = replace(settings(tmp_path), restore_retry=retries.restore,
+                         record_retry=retries.record_failure,
+                         record_publication_wait=retries.record_publication_wait)
+
+    def delayed_cleanup(*_args, **_kwargs):
+        error = _metadata_http_failure(403)
+        clock["ms"] = 700_100
+        raise error
+
+    with ChallengeStore(tmp_path / "cleanup-clock.db") as store:
+        identifier, _ = store.add_submission(hashed_submission_at(100, "hk1"), occurred_at_ms=1)
+        result = process_next_admission(store, worker_id="worker", settings=configured,
+                                        current_finalized_block=200, downloader=delayed_cleanup)
+        assert result.status is AdmissionStatus.DEFERRED  # This response preceded the deadline.
+        row = json.loads(objects.get(f"retry_state/{identifier}/admission.json").body)
+        assert row["http_grace"]["first_observed_at_ms"] == 100
+        assert row["http_grace"]["deadline_ms"] == 600_100
+        assert store.get_challenge(identifier).attempts == 0
+
+        def fresh_failure(*_args, **_kwargs):
+            raise _metadata_http_failure(403)
+
+        expired = process_next_admission(store, worker_id="next", settings=configured,
+                                         current_finalized_block=200, downloader=fresh_failure)
+        assert expired.status is AdmissionStatus.FAILED  # A new actual post-deadline response.
 
 
 def test_disk_full_during_download_preparation_uses_durable_retry_ceiling(

@@ -619,6 +619,8 @@ async def run_evaluator(
         eligible=None if batch_source is None else batch_source.eligible_submission,
         restore_retry=None if retry_store is None else retry_store.restore,
         record_retry=None if retry_store is None else retry_store.record_failure,
+        record_publication_wait=(None if retry_store is None
+                                 else retry_store.record_publication_wait),
     )
 
     async with AsyncExitStack() as resources:

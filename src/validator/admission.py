@@ -21,6 +21,8 @@ from validator.download import (
 )
 from validator.queue import ChallengeState
 from validator.retries import (
+    HF_PUBLICATION_WAIT,
+    RetryCheckpoint,
     RetryRecorder,
     RetryRestore,
     persist_retry_failure,
@@ -63,6 +65,7 @@ class AdmissionSettings:
     restore: Callable[[object], DownloadedModel | RejectedAdmission | None] | None = None
     restore_retry: RetryRestore | None = None
     record_retry: RetryRecorder | None = None
+    record_publication_wait: Callable[..., RetryCheckpoint] | None = None
     eligible: Callable[[object], bool] | None = None
     private_download: Callable[..., DownloadedModel] | None = None
     baseline_model_digest: str | None = None
@@ -83,6 +86,8 @@ class AdmissionSettings:
             raise ValueError("retry base cannot exceed retry maximum")
         if (self.restore_retry is None) != (self.record_retry is None):
             raise ValueError("durable admission retry callbacks must be configured together")
+        if self.record_publication_wait is not None and self.restore_retry is None:
+            raise ValueError("HF publication waiting requires the original durable retry store")
         if self.baseline_model_digest is not None and (
             not isinstance(self.baseline_model_digest, str)
             or len(self.baseline_model_digest) != 64
@@ -141,7 +146,7 @@ def process_next_admission(
         return AdmissionOutcome(
             challenge_id,
             AdmissionStatus.BLOCKED if restored_retry.blocked else AdmissionStatus.DEFERRED,
-            restored_retry.error_code,
+            None if restored_retry.error_code == HF_PUBLICATION_WAIT else restored_retry.error_code,
         )
 
     downloaded = None
@@ -235,7 +240,56 @@ def process_next_admission(
                     "PRIVATE_UPLOAD_HASH_MISMATCH", "private source differs from its chain binding",
                     temporary=True,
                 )
+            if (task.declared_file_sha256 is not None
+                    and downloaded.file_sha256 != task.declared_file_sha256):
+                return _reject_participant(
+                    store, task, settings,
+                    RejectedAdmission("MODEL_FILE_HASH_MISMATCH",
+                                      "HF file differs from its VDA2 declaration",
+                                      current_finalized_block, downloaded.file_sha256,
+                                      downloaded.size_bytes),
+                    current_finalized_block=current_finalized_block, clock=clock,
+                )
         except ModelDownloadError as exc:
+            if (task.private_submission is None and not exc.temporary
+                    and type(exc.http_status) is int
+                    and exc.http_status in (401, 403, 404)):
+                observed_at = (exc.http_observed_at_ms if exc.http_observed_at_ms is not None
+                               else clock())
+                try:
+                    if settings.record_publication_wait is None:
+                        raise RuntimeError("durable HF publication waiting is unavailable")
+                    checkpoint = settings.record_publication_wait(
+                        task, http_status=exc.http_status, observed_at_ms=observed_at,
+                        max_attempts=settings.max_attempts,
+                    )
+                except Exception:
+                    error = ModelDownloadError(
+                        "HF_PUBLICATION_CLOCK_UNAVAILABLE",
+                        "HF publication clock cannot be verified",
+                        temporary=True,
+                    )
+                    status = _defer_or_fail(store, task, settings, clock(), error)
+                    return AdmissionOutcome(task.challenge_id, status, error.code)
+                if (checkpoint.attempts != task.attempts - 1 or checkpoint.http_grace is None
+                        or checkpoint.blocked or checkpoint.error_code != HF_PUBLICATION_WAIT):
+                    raise RuntimeError(
+                        "publication wait ordinal disagrees with the active lease",
+                    ) from None
+                if observed_at < checkpoint.http_grace.deadline_ms:
+                    store.wait_leased(
+                        task.challenge_id, task.lease_token,
+                        retry_after_ms=checkpoint.http_grace.deadline_ms,
+                        reason=HF_PUBLICATION_WAIT, occurred_at_ms=clock(),
+                    )
+                    return AdmissionOutcome(task.challenge_id, AdmissionStatus.DEFERRED)
+                return _reject_participant(
+                    store, task, settings,
+                    _observed_rejection(store, task, exc.code,
+                                        f"anonymous HF HTTP {exc.http_status} after grace",
+                                        current_finalized_block),
+                    current_finalized_block=current_finalized_block, clock=clock,
+                )
             if exc.temporary:
                 status = _defer_or_fail(
                     store,
@@ -292,6 +346,15 @@ def process_next_admission(
             settings,
             now_ms=clock(),
             summary=cache_error,
+        )
+
+    if task.declared_file_sha256 is not None and expected_file_sha256 != task.declared_file_sha256:
+        return _reject_participant(
+            store, task, settings,
+            _observed_rejection(store, task, "MODEL_FILE_HASH_MISMATCH",
+                                "HF file differs from its VDA2 declaration",
+                                current_finalized_block),
+            current_finalized_block=current_finalized_block, clock=clock,
         )
 
     try:

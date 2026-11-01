@@ -15,7 +15,12 @@ import httpx
 
 from miner.chain import submit_model
 from miner.prepare import prepare_model
-from miner.submit import ModelSubmission, PrivateModelSubmission, SubmissionFormatError
+from miner.submit import (
+    ModelSubmission,
+    PrivateModelSubmission,
+    SubmissionFormatError,
+    model_source_fields,
+)
 from monitor import fetch_status, render_status
 from scoring.spec import load_track_spec
 from validator.publication import S3Repository
@@ -66,7 +71,7 @@ def _parser() -> argparse.ArgumentParser:
         "--upload-id", help="private registration ID, paired with file and signed manifest SHA",
     )
     commit.add_argument("--revision")
-    commit.add_argument("--file-sha256", help="complete SHA-256 of the uploaded private model")
+    commit.add_argument("--file-sha256", help="file SHA-256 (HF VDA2 or private ready)")
     commit.add_argument("--manifest-sha256", help="complete SHA-256 of its signed ready manifest")
     commit.add_argument("--netuid", default=DEFAULT_NETUID, type=int)
     commit.add_argument("--network", default="finney")
@@ -256,11 +261,13 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
                       "file_sha256": submission.file_sha256,
                       "manifest_sha256": submission.manifest_sha256}
         else:
-            if (arguments.revision is None or arguments.file_sha256 is not None
-                    or arguments.manifest_sha256 is not None):
-                raise ValueError("HF source requires --revision and forbids --file-sha256")
-            submission = ModelSubmission(arguments.repo_id, arguments.revision)
-            source = {"repo_id": submission.repo_id, "revision": submission.revision}
+            if arguments.revision is None or arguments.manifest_sha256 is not None:
+                raise ValueError("HF source requires --revision and forbids --manifest-sha256")
+            submission = ModelSubmission(
+                arguments.repo_id, arguments.revision, arguments.file_sha256,
+            )
+            source = model_source_fields(submission.repo_id, submission.revision,
+                                         declared_file_sha256=submission.file_sha256)
         payload = submission.encode()
         if arguments.dry_run:
             output = {

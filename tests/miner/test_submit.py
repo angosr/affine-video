@@ -7,6 +7,8 @@ from miner.submit import (
     ModelSubmission,
     PrivateModelSubmission,
     SubmissionFormatError,
+    declared_model_sha256,
+    model_source_fields,
 )
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -27,6 +29,34 @@ def test_payload_bound_is_enforced() -> None:
     payload = ModelSubmission(f"{owner}/{repository}", REVISION).encode()
 
     assert len(payload) == MAX_PAYLOAD_BYTES == 121
+
+
+def test_vda2_exact_raw128_bound_preserves_legacy_golden_and_source_identity():
+    repo = "o/" + "r" * 69
+    model = ModelSubmission(repo, REVISION, "ab" * 32)
+    assert model.encode() == b"VDA2\x47" + repo.encode() + bytes.fromhex(REVISION + "ab" * 32)
+    assert len(model.encode()) == 128 and ModelSubmission.decode(model.encode()) == model
+    with pytest.raises(SubmissionFormatError, match="71-byte"):
+        ModelSubmission(repo + "x", REVISION, "ab" * 32)
+    legacy = ModelSubmission("o/" + "r" * 94, REVISION)
+    assert len(legacy.encode()) == 121 and ModelSubmission.decode(legacy.encode()) == legacy
+    assert legacy.encode() == b"VDA1\x60" + legacy.repo_id.encode() + bytes.fromhex(REVISION)
+    source = model_source_fields(repo, REVISION, declared_file_sha256=model.file_sha256)
+    assert declared_model_sha256(source) == model.file_sha256
+    assert "declared_file_sha256" not in model_source_fields(repo, REVISION)
+    with pytest.raises(SubmissionFormatError):
+        declared_model_sha256({**source, "declared_file_sha256": None})
+    with pytest.raises(SubmissionFormatError):
+        declared_model_sha256({**source, "private_upload": {}})
+
+
+@pytest.mark.parametrize("mutation", ["truncate", "extra", "length", "magic"])
+def test_vda2_rejects_noncanonical_payload(mutation):
+    raw = ModelSubmission("owner/model", REVISION, "ab" * 32).encode()
+    changed = {"truncate": raw[:-1], "extra": raw + b"x",
+               "length": raw[:4] + b"\x01" + raw[5:], "magic": b"VDA3" + raw[4:]}[mutation]
+    with pytest.raises(SubmissionFormatError):
+        ModelSubmission.decode(changed)
 
 
 @pytest.mark.parametrize(

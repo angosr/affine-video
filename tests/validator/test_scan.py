@@ -9,6 +9,18 @@ BLOCK_HASH = "0x" + "ab" * 32
 HOTKEY = "5C9ywXcKhSNrFY2ttziLTLNPZB9XPqGaKbLpvh6J6TuJyBQQ"
 
 
+def test_vda2_scanner_keeps_original_position_payload_and_declared_digest():
+    repo = "o/" + "r" * 69
+    raw = ModelSubmission(repo, "12" * 20, "ab" * 32).encode()
+    assert len(raw) == 128
+    block, events = fixture(raw)
+    found = extract_submissions(block_height=100, block_hash=BLOCK_HASH,
+                                block=block, events=events, netuid=7)
+    assert len(found) == 1 and found[0].payload == raw
+    assert found[0].declared_file_sha256 == "ab" * 32
+    assert found[0].repo_id == repo and found[0].position.block == 100
+
+
 def fixture(payload: bytes, *, netuid: int = 7) -> tuple[dict, list[dict]]:
     block = {
         "extrinsics": [

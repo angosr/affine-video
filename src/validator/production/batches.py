@@ -193,7 +193,8 @@ class ReadyBatchSource:
             "submission_id": task.submission_id,
             "hotkey": task.hotkey,
             **model_source_fields(task.repo_id, task.revision,
-                                  getattr(task, "private_submission", None)),
+                                  getattr(task, "private_submission", None),
+                                  declared_file_sha256=getattr(task, "declared_file_sha256", None)),
             "submission_block": task.position.block,
         }
 
@@ -218,6 +219,9 @@ class ReadyBatchSource:
     ) -> None:
         """Persist a validated selector and its challenge binding before scoring."""
 
+        if (getattr(task, "declared_file_sha256", None) is not None
+                and task.declared_file_sha256 != validated.file_sha256):
+            raise RuntimeError("validated model differs from its original HF declaration")
         if Path(path).stat().st_size != validated.size_bytes:
             raise RuntimeError("validated selector size changed before archival")
         submitted_ms = _submission_timestamp_ms(task.position.block)
@@ -350,6 +354,8 @@ class ReadyBatchSource:
             or not _digest(model_digest)
             or type(size_bytes) is not int
             or size_bytes <= 0
+            or (getattr(task, "declared_file_sha256", None) is not None
+                and file_sha256 != task.declared_file_sha256)
         ):
             raise RuntimeError("archived admission model conflicts with its challenge")
         path = self.restore_model(file_sha256, size_bytes)
@@ -395,6 +401,9 @@ class ReadyBatchSource:
     ) -> dict[str, object] | None:
         """Persist a scored nonterminal stage before changing local tournament state."""
 
+        if (getattr(task, "declared_file_sha256", None) is not None
+                and task.file_sha256 != task.declared_file_sha256):
+            raise RuntimeError("stage model differs from its original HF declaration")
         metrics = {key: value for key, value in result.metrics.items() if key != "stage_evidence"}
         name = self._stage_name(task.challenge_id, task.state.value)
         if self.objects.get_optional(name) is not None:
@@ -461,7 +470,8 @@ class ReadyBatchSource:
             "submission_id": task.submission_id,
             "hotkey": task.hotkey,
             **model_source_fields(task.repo_id, task.revision,
-                                  getattr(task, "private_submission", None)),
+                                  getattr(task, "private_submission", None),
+                                  declared_file_sha256=getattr(task, "declared_file_sha256", None)),
             "file_sha256": task.file_sha256,
             "stage": task.state.value,
             "score": result.score,
@@ -483,6 +493,9 @@ class ReadyBatchSource:
     def restore_stage(self, task: object) -> ArchivedStage | None:
         """Restore an exact immutable stage result after loss of local SQLite state."""
 
+        if (getattr(task, "declared_file_sha256", None) is not None
+                and task.file_sha256 != task.declared_file_sha256):
+            raise RuntimeError("stage model differs from its original HF declaration")
         stored = self.objects.get_optional(self._stage_name(task.challenge_id, task.state.value))
         if stored is None:
             return None
@@ -497,7 +510,8 @@ class ReadyBatchSource:
             "submission_id": task.submission_id,
             "hotkey": task.hotkey,
             **model_source_fields(task.repo_id, task.revision,
-                                  getattr(task, "private_submission", None)),
+                                  getattr(task, "private_submission", None),
+                                  declared_file_sha256=getattr(task, "declared_file_sha256", None)),
             "file_sha256": task.file_sha256,
             "stage": task.state.value,
         }

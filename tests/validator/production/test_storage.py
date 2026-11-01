@@ -36,7 +36,9 @@ def seed_legacy_stage(source, task, result, score_block):
         "format": "veda-stage-result-v1", "track_spec_digest": source.track.digest,
         "challenge_id": task.challenge_id, "submission_id": task.submission_id,
         "hotkey": task.hotkey, **model_source_fields(task.repo_id, task.revision,
-                                                    getattr(task, "private_submission", None)),
+                                                    getattr(task, "private_submission", None),
+                                                    declared_file_sha256=getattr(
+                                                        task, "declared_file_sha256", None)),
         "file_sha256": task.file_sha256, "stage": task.state.value, "score": result.score,
         "score_block": score_block, "metrics": result.metrics,
     }))

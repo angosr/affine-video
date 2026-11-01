@@ -13,10 +13,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from miner.submit import (
+    HASHED_MAGIC,
     PRIVATE_MAGIC,
     READY_MAGIC,
+    ModelSubmission,
     PrivateModelSubmission,
     SubmissionFormatError,
+    declared_model_sha256,
     model_source_fields,
     private_model_source,
 )
@@ -69,10 +72,23 @@ class SubmissionRecord:
             raise ValueError("repository and revision must either both exist or both be absent")
         if self.payload.startswith((PRIVATE_MAGIC, READY_MAGIC)) and self.repo_id is not None:
             raise ValueError("private sources must not masquerade as HF repositories")
+        if self.payload.startswith(HASHED_MAGIC):
+            try:
+                source = ModelSubmission.decode(self.payload)
+            except SubmissionFormatError:
+                if self.repo_id is not None:
+                    raise ValueError("malformed VDA2 cannot claim HF source fields") from None
+            else:
+                if (self.repo_id, self.revision) != (source.repo_id, source.revision):
+                    raise ValueError("HF source differs from its original VDA2 payload")
 
     @property
     def private_submission(self) -> PrivateModelSubmission | None:
         return _private_submission(self.payload)
+
+    @property
+    def declared_file_sha256(self) -> str | None:
+        return _declared_file_sha256(self.payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +148,7 @@ class LeasedChallenge:
     model_path: str | None
     file_sha256: str | None
     private_submission: PrivateModelSubmission | None = None
+    declared_file_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,7 +501,9 @@ class ChallengeStore:
                 "hotkey": row["hotkey"],
                 "submission_id": row["submission_id"],
                 **model_source_fields(row["repo_id"], row["revision"],
-                                      _private_submission(bytes(row["payload"]))),
+                                      _private_submission(bytes(row["payload"])),
+                                      declared_file_sha256=_declared_file_sha256(
+                                          bytes(row["payload"]))),
                 "block_height": row["block_height"],
                 "extrinsic_index": row["extrinsic_index"],
                 "event_index": row["event_index"],
@@ -939,7 +958,9 @@ class ChallengeStore:
         """Release a normal wait without consuming a failure attempt."""
 
         timestamp = _timestamp(occurred_at_ms)
-        if retry_after_ms <= timestamp:
+        if retry_after_ms < 0 or (
+            retry_after_ms <= timestamp and reason != "HF_PUBLICATION_WAIT"
+        ):
             raise ValueError("retry time must be in the future")
         if not reason:
             raise ValueError("wait reason cannot be empty")
@@ -1163,6 +1184,13 @@ class ChallengeStore:
             current = self._require_lease_locked(identifier, lease_token)
             if current is not ChallengeState.VALIDATING:
                 raise ValueError("challenge is not validating")
+            source = self._connection.execute(
+                "SELECT s.payload, c.file_sha256 FROM challenges c JOIN submissions s "
+                "USING(submission_id) WHERE c.challenge_id = ?", (identifier,),
+            ).fetchone()
+            declaration = _declared_file_sha256(bytes(source["payload"]))
+            if declaration is not None and declaration != source["file_sha256"]:
+                raise ValueError("model differs from its original HF declaration")
             owner = self._connection.execute(
                 """
                 SELECT o.challenge_id, c.state
@@ -1739,6 +1767,7 @@ class ChallengeStore:
                     if (record.netuid != document["netuid"]
                             or challenge_id(record.submission_id) != match.challenge_id
                             or record.private_submission != private_model_source(submission)
+                            or record.declared_file_sha256 != declared_model_sha256(submission)
                             or (record.hotkey, record.repo_id, record.revision,
                                 record.position.block, record.position.extrinsic_index,
                                 record.position.event_index) != (
@@ -1856,7 +1885,9 @@ class ChallengeStore:
                 )
                 if (actual_submission != expected_submission
                         or _private_submission(bytes(row["payload"]))
-                        != private_model_source(submission)):
+                        != private_model_source(submission)
+                        or _declared_file_sha256(bytes(row["payload"]))
+                        != declared_model_sha256(submission)):
                     raise RuntimeError("public match conflicts with its on-chain submission")
 
                 target = ChallengeState(evaluation["state"])
@@ -2184,7 +2215,8 @@ class ChallengeStore:
             "submission_id": row["submission_id"],
             "hotkey": row["hotkey"],
             **model_source_fields(row["repo_id"], row["revision"],
-                                  _private_submission(bytes(row["payload"]))),
+                                  _private_submission(bytes(row["payload"])),
+                                  declared_file_sha256=_declared_file_sha256(bytes(row["payload"]))),
             "block_height": row["block_height"],
             "extrinsic_index": row["extrinsic_index"],
             "event_index": row["event_index"],
@@ -2470,6 +2502,7 @@ class ChallengeStore:
                 model_path=row["model_path"],
                 file_sha256=row["file_sha256"],
                 private_submission=_private_submission(bytes(row["payload"])),
+                declared_file_sha256=_declared_file_sha256(bytes(row["payload"])),
             )
         except Exception:
             self._connection.rollback()
@@ -2527,6 +2560,13 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 def _private_submission(payload: bytes) -> PrivateModelSubmission | None:
     try:
         return PrivateModelSubmission.decode(payload)
+    except SubmissionFormatError:
+        return None
+
+
+def _declared_file_sha256(payload: bytes) -> str | None:
+    try:
+        return ModelSubmission.decode(payload).file_sha256
     except SubmissionFormatError:
         return None
 

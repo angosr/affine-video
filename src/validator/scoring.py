@@ -18,7 +18,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
-from miner.submit import private_model_source
+from miner.submit import declared_model_sha256, private_model_source
 from scoring.cache import (
     CacheLoadError,
     ExactCacheBatch,
@@ -448,6 +448,7 @@ class PairedTrackEvaluator:
         challenges: Sequence[Mapping[str, Any]],
     ) -> LeasedChallenge:
         private = getattr(incumbent, "private_submission", None)
+        declaration = getattr(incumbent, "declared_file_sha256", None)
         if incumbent.challenge_id == "genesis":
             path = self.initial_model_path
             expected_digest = self.track.initial_champion.model_digest
@@ -476,6 +477,12 @@ class PairedTrackEvaluator:
             expected_hotkey = incumbent.hotkey
             expected_sha256 = record["file_sha256"]
             expected_size = record["model_size_bytes"]
+            if (declared_model_sha256(record) != declaration
+                    or (declaration is not None and declaration != expected_sha256)):
+                raise TemporaryScoringError(
+                    "INCUMBENT_MODEL_UNAVAILABLE",
+                    "confirmed HF declaration conflicts with its file",
+                )
             if private is not None and (
                 private_model_source(record) != private or expected_sha256 != private.file_sha256
             ):
@@ -580,6 +587,7 @@ class PairedTrackEvaluator:
             model_path=str(path),
             file_sha256=validated.file_sha256,
             private_submission=private,
+            declared_file_sha256=declaration,
         )
 
     def _validate_incumbent_candidate(

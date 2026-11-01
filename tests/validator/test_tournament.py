@@ -127,6 +127,33 @@ def resolve(items: list[dict], *, history=(), minimum_gain=0.01):
     )
 
 
+def test_vda2_match_and_champion_preserve_declaration_and_reject_changed_actual():
+    from copy import deepcopy
+
+    item = challenge(1, "alice", score=0.8, incumbent_score=0.7)
+    item["declared_file_sha256"] = item["file_sha256"]
+    tournament = resolve([item])
+    match = tournament.matches[0]
+    assert match.document["submission"]["declared_file_sha256"] == item["file_sha256"]
+    assert Champion.from_public(tournament.champion.public()) == tournament.champion
+    assert historical_champion((match,), genesis()) == tournament.champion
+    recovered = validate_match_document(
+        match.document, sequence=1, track_id="track", track_spec_digest="ab" * 32,
+        netuid=7, minimum_gain=0.01, incumbent=genesis(),
+    )
+    assert recovered.document == match.document
+    wrong = deepcopy(match.document)
+    wrong["submission"]["declared_file_sha256"] = "ff" * 32
+    with pytest.raises(ValueError, match="HF declaration"):
+        validate_match_document(wrong, sequence=1, track_id="track", track_spec_digest="ab" * 32,
+                                netuid=7, minimum_gain=0.01, incumbent=genesis())
+    failed = challenge(2, "bob", state="PARTICIPANT_FAILED", error_code="MODEL_FILE_HASH_MISMATCH")
+    failed.update(declared_file_sha256="ff" * 32, file_sha256="ab" * 32, model_size_bytes=123)
+    failure = resolve([failed]).matches[0]
+    assert failure.document["submission"]["declared_file_sha256"] != (
+        failure.document["evaluation"]["file_sha256"])
+
+
 @pytest.mark.parametrize(("elapsed", "expected"), [
     (0, 0.003), (302400000, 0.0025), (604800000, 0.002), (900000000, 0.002),
     (-1, 0.003),

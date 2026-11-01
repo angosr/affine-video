@@ -1359,7 +1359,7 @@ def test_invalid_model_restore_cannot_publish_an_archive(tmp_path):
     assert name not in repository._confirmed_immutable
 
 
-@pytest.mark.parametrize("private", [False, True])
+@pytest.mark.parametrize("private", [False, True, "vda2"])
 def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path, private) -> None:
     track = parse_track_spec(valid_spec())
     model = tmp_path / "model.safetensors"
@@ -1397,9 +1397,14 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path, pr
             )
         ]
     }
-    reference = PrivateModelSubmission("ef" * 32, model_sha256, "cd" * 32) if private else None
+    reference = (PrivateModelSubmission("ef" * 32, model_sha256, "cd" * 32)
+                 if private is True else None)
     if reference is not None:
         snapshot["challenges"][0].update(model_source_fields(None, None, reference))
+    elif private == "vda2":
+        snapshot["challenges"][0].update(model_source_fields(
+            "owner/model", "12" * 20, declared_file_sha256=model_sha256,
+        ))
     store = SimpleNamespace(
         chain_cursor=lambda: (120, "0x" + "12" * 32),
         public_snapshot=lambda: snapshot,
@@ -1421,6 +1426,9 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path, pr
     assert len(ledger.matches) == 1
     assert ledger.matches[0].challenge_id == "challenge"
     assert ledger.matches[0].champion_after.private_submission == reference
+    assert ledger.matches[0].champion_after.declared_file_sha256 == (
+        model_sha256 if private == "vda2" else None
+    )
 
     # Startup has the same immutable facts/fence, but must not read the model
     # or disclosed payloads before scanning and refreshing current weights.

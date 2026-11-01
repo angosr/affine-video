@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from miner.submit import ModelSubmission
 from scoring.spec import parse_track_spec, track_spec_dict
 from tests.scoring.test_spec import rules_for_data, valid_spec
 from tests.validator.test_store import submission_at
@@ -550,7 +551,8 @@ def test_rule_upgrade_never_moves_original_ready_clock_or_submission_window(
 
 
 @pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
-def test_preproduced_archive_survives_cold_db_without_bulk(inventory_case, tmp_path, stage):
+@pytest.mark.parametrize("vda2", [False, True])
+def test_preproduced_archive_survives_cold_db_without_bulk(inventory_case, tmp_path, stage, vda2):
     case = inventory_case
     plans = (make_plan(case, 150), make_plan(case, 151, 1))
     for plan in plans:
@@ -558,7 +560,12 @@ def test_preproduced_archive_survives_cold_db_without_bulk(inventory_case, tmp_p
     source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path / "empty")
 
     def prepare(store):
-        identifier, _ = store.add_submission(submission_at(200))
+        submission = submission_at(200)
+        if vda2:
+            submission = replace(submission, payload=ModelSubmission(
+                submission.repo_id, submission.revision, "b2" * 32,
+            ).encode())
+        identifier, _ = store.add_submission(submission)
         store.transition(identifier, ChallengeState.FETCHING)
         store.transition(identifier, ChallengeState.VALIDATING)
         store.transition(identifier, ChallengeState.SCORING)

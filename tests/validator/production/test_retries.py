@@ -204,3 +204,178 @@ def test_blocked_recorder_ordinal_mismatch_fails_without_new_io_or_cas(monkeypat
     assert reads == [{"Bucket": "private", "Key": (
         f"tracks/abc/{RETRY_STATE_NAMESPACE}/{first.challenge_id}/scoring.json"
     )}]
+
+
+def test_publication_clock_cas_lost_response_reset_and_legacy_unknown(monkeypatch):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    original = replace(task(lease_token="one", attempts=1), state=ChallengeState.FETCHING,
+                       declared_file_sha256="ab" * 32)
+    create = objects.create_plan
+
+    def lost_response(name, body):
+        create(name, body)
+        raise OSError("response lost after commit")
+
+    monkeypatch.setattr(objects, "create_plan", lost_response)
+    committed = retries.record_publication_wait(original, http_status=403, observed_at_ms=100,
+                                                max_attempts=5)
+    assert committed.attempts == 0 and committed.http_grace.deadline_ms == 600_100
+    cold = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    checkpoint = cold.record_publication_wait(original, http_status=404, observed_at_ms=200,
+                                              max_attempts=5)
+    assert checkpoint.attempts == 0 and checkpoint.http_grace.first_status == 403
+    assert checkpoint.retry_after_ms == 600_100
+    before = objects.get(f"retry_state/{original.challenge_id}/admission.json")
+    cold.reset(original.challenge_id, "ADMISSION")
+    active = cold.restore(original, "ADMISSION")
+    assert active.http_grace == checkpoint.http_grace and active.attempts == 0
+    assert json.loads(before.body)["http_grace"] == json.loads(objects.get(
+        f"retry_state/{original.challenge_id}/admission.json").body)["http_grace"]
+    ordinary = cold.record_failure(original, "ADMISSION", code="SERVER_DOWN", summary="HF 500",
+                                    retry_after_ms=700_000, max_attempts=5)
+    assert ordinary.attempts == 1 and ordinary.http_grace == checkpoint.http_grace
+    name = f"retry_state/{original.challenge_id}/admission.json"
+    stored = objects.get(name)
+    legacy = json.loads(stored.body)
+    del legacy["http_grace"]
+    objects.replace_plan(name, canonical_json(legacy), etag=stored.etag)
+    before = objects.get(name)
+    with pytest.raises(RuntimeError, match="clock is unknown"):
+        cold.record_publication_wait(replace(original, lease_token="two", attempts=2),
+                                     http_status=404, observed_at_ms=900_000, max_attempts=5)
+    assert objects.get(name) == before
+
+
+@pytest.mark.parametrize("mutation", [None, "replace", "omit"])
+def test_vda2_retry_declaration_is_bound_to_the_original_task(mutation):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    original = replace(task(lease_token="one", attempts=1),
+                       declared_file_sha256="ab" * 32)
+    saved = retries.record_failure(original, "SCORING", code="GPU_DOWN", summary="unavailable",
+                                    retry_after_ms=200, max_attempts=2)
+    assert retries.restore(original, "SCORING") == saved
+    changed = replace(original, declared_file_sha256=("ff" * 32 if mutation == "replace" else None))
+    if mutation is not None:
+        with pytest.raises(RuntimeError, match="HF declaration"):
+            retries.restore(changed, "SCORING")
+
+
+@pytest.mark.parametrize("field,value", [("deadline_ms", 999_999), ("first_status", 500)])
+def test_publication_clock_tampering_cannot_create_a_wait(field, value):
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    original = replace(task(lease_token="one", attempts=1), state=ChallengeState.FETCHING,
+                       declared_file_sha256="ab" * 32)
+    retries.record_publication_wait(original, http_status=401, observed_at_ms=100, max_attempts=5)
+    name = f"retry_state/{original.challenge_id}/admission.json"
+    stored = objects.get(name)
+    row = json.loads(stored.body)
+    row["http_grace"][field] = value
+    objects.replace_plan(name, canonical_json(row), etag=stored.etag)
+    with pytest.raises(RuntimeError, match="clock is invalid"):
+        retries.restore(original, "ADMISSION")
+
+
+def test_first_checkpoint_after_an_expired_lease_preserves_the_existing_ordinal():
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    interrupted = task(lease_token="expired-host-recovery", attempts=2)
+    checkpoint = persist_retry_failure(
+        interrupted, stage="SCORING", code="GPU_DOWN", summary="worker unavailable",
+        retry_after_ms=200, max_attempts=2, record=retries.record_failure,
+    )
+    assert checkpoint.attempts == 2 and checkpoint.blocked
+    assert retries.restore(interrupted, "SCORING") == checkpoint
+
+
+@pytest.mark.parametrize("stage", ["ADMISSION", "SCORING"])
+@pytest.mark.parametrize("active_reset", [False, True])
+def test_retry_cas_write_failure_then_expired_lease_recovers_from_original_authority(
+    tmp_path, monkeypatch, stage, active_reset,
+):
+    from tests.validator.test_admission import settings as admission_settings
+    from tests.validator.test_admission import submission_at
+    from validator.admission import process_next_admission
+    from validator.download import ModelDownloadError
+    from validator.scoring import ScoringSettings, TemporaryScoringError, process_next_scoring
+    from validator.store import ChallengeStore
+
+    client = MemoryS3()
+    objects = PrivateObjectStore(client, bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    original_put = client.put_object
+    fail = [True]
+    tasks = []
+    calls = []
+
+    def put(**kwargs):
+        if fail:
+            fail.pop()
+            raise OSError("transport failed before PUT")
+        return original_put(**kwargs)
+
+    def restore(task, phase):
+        tasks.append(task)
+        return retries.restore(task, phase)
+
+    def unavailable(*_args, **_kwargs):
+        calls.append(True)
+        if stage == "ADMISSION":
+            raise ModelDownloadError("DOWNLOAD_TEMPORARY_FAILURE", "HF 500", temporary=True)
+        raise TemporaryScoringError("GPU_DOWN", "worker unavailable")
+
+    monkeypatch.setattr(client, "put_object", put)
+    with ChallengeStore(tmp_path / "write-failure.db") as store:
+        original = submission_at(100, "hk1")
+        identifier, _ = store.add_submission(original, occurred_at_ms=1)
+        if stage == "SCORING":
+            for state in (ChallengeState.FETCHING, ChallengeState.VALIDATING,
+                          ChallengeState.SCORING):
+                store.transition(identifier, state, occurred_at_ms=2)
+        configured = (
+            replace(admission_settings(tmp_path), lease_ms=300_000, max_attempts=2,
+                    restore_retry=restore, record_retry=retries.record_failure)
+            if stage == "ADMISSION" else
+            ScoringSettings(lease_ms=300_000, max_attempts=2, restore_retry=restore,
+                            record_retry=retries.record_failure)
+        )
+
+        def run(now):
+            common = dict(worker_id="worker", current_finalized_block=200,
+                          settings=configured, now_ms=now)
+            return (process_next_admission(store, downloader=unavailable, **common)
+                    if stage == "ADMISSION" else
+                    process_next_scoring(store, evaluator=unavailable, **common))
+
+        def attempt_counts():
+            return tuple(store._connection.execute(
+                "SELECT attempts, total_attempts FROM challenges WHERE challenge_id = ?",
+                (identifier,),
+            ).fetchone())
+
+        with pytest.raises(OSError, match="before PUT"):
+            run(10)
+        assert not client.objects
+        assert attempt_counts() == (1, 1)
+        if active_reset:
+            retries.record_failure(tasks[0], stage, code="RESTORED_TRANSPORT",
+                                   summary="original failure", retry_after_ms=100,
+                                   max_attempts=2)
+            retries.reset(identifier, stage)
+        assert run(300_011) is not None
+        assert store.get_challenge(identifier).state is ChallengeState.SYSTEM_DEFERRED
+        assert attempt_counts() == (1, 2)
+        assert run(600_012) is not None
+        row = store.public_challenge(identifier)
+        assert row["state"] == ChallengeState.SYSTEM_BLOCKED
+        assert row["submission_id"] == original.submission_id
+        assert row["block_height"] == original.position.block
+        assert attempt_counts() == (2, 3)
+        document = json.loads(objects.get(f"retry_state/{identifier}/{stage.lower()}.json").body)
+        assert document["attempts"] == 2 and document["state"] == "BLOCKED"
+        assert all(key.endswith(f"retry_state/{identifier}/{stage.lower()}.json")
+                   for _bucket, key in client.objects)
+        assert run(10**9) is None and len(calls) == 3
+        assert attempt_counts() == (2, 3)

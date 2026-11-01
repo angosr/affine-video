@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from miner.submit import (
+    HASHED_MAGIC,
     MAGIC,
     READY_MAGIC,
     ModelSubmission,
@@ -195,7 +196,7 @@ def submission_from_commitment(commitment: ChainCommitment) -> SubmissionRecord 
 
     payload = commitment.payload
     private = payload.startswith(READY_MAGIC)
-    if not payload.startswith(MAGIC) and not (private and commitment.netuid == 120):
+    if not payload.startswith((MAGIC, HASHED_MAGIC)) and not (private and commitment.netuid == 120):
         return None
     try:
         model = (PrivateModelSubmission.decode(payload) if private

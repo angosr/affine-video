@@ -9,6 +9,23 @@ from dataclasses import dataclass, replace
 from validator.queue import ChallengeState
 from validator.store import ChallengeStore, LeasedChallenge
 
+HF_PUBLICATION_WAIT = "HF_PUBLICATION_WAIT"
+HF_PUBLICATION_GRACE_MS = 600_000
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationGrace:
+    first_observed_at_ms: int
+    deadline_ms: int
+    first_status: int
+
+    def __post_init__(self) -> None:
+        if (type(self.first_observed_at_ms) is not int or self.first_observed_at_ms < 0
+                or type(self.deadline_ms) is not int
+                or self.deadline_ms != self.first_observed_at_ms + HF_PUBLICATION_GRACE_MS
+                or type(self.first_status) is not int or self.first_status not in (401, 403, 404)):
+            raise ValueError("HF publication grace facts are invalid")
+
 
 @dataclass(frozen=True, slots=True)
 class RetryCheckpoint:
@@ -17,9 +34,18 @@ class RetryCheckpoint:
     retry_after_ms: int
     error_code: str
     error_summary: str
+    http_grace: PublicationGrace | None = None
 
     def __post_init__(self) -> None:
-        if self.attempts <= 0:
+        if self.error_code == HF_PUBLICATION_WAIT and (
+            self.blocked or self.http_grace is None
+            or self.retry_after_ms != self.http_grace.deadline_ms
+        ):
+            raise ValueError("publication waiting requires its fixed grace deadline")
+        if (self.attempts < 0 or (self.attempts == 0 and not (
+            self.error_code == HF_PUBLICATION_WAIT and not self.blocked
+            and self.http_grace is not None
+        ))):
             raise ValueError("retry attempts must be positive")
         if type(self.retry_after_ms) is not int or self.retry_after_ms < 0:
             raise ValueError("retry time must be non-negative")
@@ -53,12 +79,23 @@ def prepare_durable_retry(
         return task, None
     checkpoint = restore(task, stage)
     if checkpoint is None:
+        # Missing/explicitly reset authority has zero recorded failures. A lost CAS
+        # response or expired local lease must not strand the next failure ordinal.
+        if task.attempts != 1:
+            store.synchronize_leased_attempts(task.challenge_id, task.lease_token, attempts=1)
+            task = replace(task, attempts=1)
         return task, None
     now_ms = clock()
+    publication_wait = checkpoint.error_code == HF_PUBLICATION_WAIT
     if checkpoint.blocked or checkpoint.attempts >= max_attempts:
         # Legacy checkpoints may still say DEFERRED at the configured ceiling.
         # Wall time cannot grant another attempt; only the operator reset can.
-        checkpoint = replace(checkpoint, blocked=True)
+        checkpoint = replace(
+            checkpoint, blocked=True,
+            error_code="INFRA_RETRY_EXHAUSTED" if publication_wait else checkpoint.error_code,
+            error_summary=("Infrastructure retry budget exhausted" if publication_wait
+                           else checkpoint.error_summary),
+        )
         store.synchronize_leased_attempts(
             task.challenge_id,
             task.lease_token,
@@ -84,8 +121,10 @@ def prepare_durable_retry(
         store.wait_leased(
             task.challenge_id,
             task.lease_token,
-            retry_after_ms=max(checkpoint.retry_after_ms, now_ms + wait_ms),
-            reason="DURABLE_RETRY_BACKOFF",
+            retry_after_ms=(checkpoint.retry_after_ms if publication_wait
+                            else max(checkpoint.retry_after_ms, now_ms + wait_ms)),
+            reason=(HF_PUBLICATION_WAIT if publication_wait
+                    else "DURABLE_RETRY_BACKOFF"),
             occurred_at_ms=now_ms,
         )
         return None, checkpoint

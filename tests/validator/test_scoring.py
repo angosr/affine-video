@@ -351,9 +351,9 @@ def test_paired_evaluator_restores_challenger_for_both_stages(
 
 
 @pytest.mark.parametrize("historical_public", [False, True])
-@pytest.mark.parametrize("private_source", [False, True])
+@pytest.mark.parametrize("source_kind", ["legacy", "private", "vda2"])
 def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
-    tmp_path, monkeypatch, historical_public, private_source,
+    tmp_path, monkeypatch, historical_public, source_kind,
 ) -> None:
     architecture = SelectorArchitecture(1, 1, 2, "float32")
     tensors = {
@@ -370,6 +370,8 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
         expected_hotkey="champion-hotkey",
     )
     from miner.submit import PrivateModelSubmission, model_source_fields
+    private_source = source_kind == "private"
+    declaration = validated.file_sha256 if source_kind == "vda2" else None
     private = PrivateModelSubmission("ef" * 32, validated.file_sha256) if private_source else None
     local_path.write_bytes(b"broken")
     track = SimpleNamespace(
@@ -406,6 +408,7 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
         revision=None if private_source else "34" * 20,
         position=ChainPosition(100, 0, 0),
         private_submission=private,
+        declared_file_sha256=declaration,
     )
     challenges = (
         {
@@ -413,7 +416,8 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
             "file_sha256": validated.file_sha256,
             "model_digest": validated.model_digest,
             "model_size_bytes": validated.size_bytes,
-            **model_source_fields(incumbent.repo_id, incumbent.revision, private),
+            **model_source_fields(incumbent.repo_id, incumbent.revision, private,
+                                  declared_file_sha256=declaration),
         },
     )
     if historical_public:
@@ -428,7 +432,8 @@ def test_promoted_champion_corrupt_cache_restores_for_both_scoring_stages(
             {"track_id": "old-track", "submission_id": "old-submission",
              "challenge_id": incumbent.challenge_id,
              "submission": {"hotkey": incumbent.hotkey,
-                            **model_source_fields(incumbent.repo_id, incumbent.revision, private),
+                            **model_source_fields(incumbent.repo_id, incumbent.revision, private,
+                                                  declared_file_sha256=declaration),
                             "block_height": 100,
                             "extrinsic_index": 0, "event_index": 0},
              "evaluation": {"state": "SUCCEEDED", "error_code": None,
