@@ -284,6 +284,11 @@ def _execution(device: str | None, runtime_identity: dict[str, Any] | None,
             "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
             "cudnn_benchmark": torch.backends.cudnn.benchmark,
             "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "deterministic_warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+            "cublas_workspace_config": (
+                ":4096:8" if os.environ.get("CUBLAS_WORKSPACE_CONFIG") == ":4096:8"
+                else "unrecognized"
+            ),
         }
         functions["TorchCaseScorer"] = TorchCaseScorer
     paths = {}
@@ -456,11 +461,23 @@ def validate_pair_evidence(value: Any, challenger_score: float, incumbent_score:
                 or len(hardware["compute_capability"]) != 2
                 or any(type(x) is not int or x < 0 for x in hardware["compute_capability"])
                 or type(hardware["total_memory"]) is not int or hardware["total_memory"] <= 0
-                or not isinstance(runtime, dict) or set(runtime) != {
+                or not isinstance(runtime, dict) or set(runtime) not in ({
                     "version", "cuda", "cudnn", "matmul_tf32", "cudnn_tf32",
                     "deterministic_algorithms", "cudnn_benchmark", "float32_matmul_precision",
-                } or runtime["matmul_tf32"] is not False or runtime["cudnn_tf32"] is not False):
+                }, {
+                    "version", "cuda", "cudnn", "matmul_tf32", "cudnn_tf32",
+                    "deterministic_algorithms", "cudnn_benchmark", "float32_matmul_precision",
+                    "deterministic_warn_only", "cublas_workspace_config",
+                }) or runtime["matmul_tf32"] is not False or runtime["cudnn_tf32"] is not False):
             raise ValueError("stage CUDA execution identity is invalid")
+        if "cublas_workspace_config" in runtime and (
+            runtime["cublas_workspace_config"] != ":4096:8"
+            or runtime["deterministic_warn_only"] is not False
+            or runtime["deterministic_algorithms"] is not True
+            or runtime["cudnn_benchmark"] is not False
+            or runtime["float32_matmul_precision"] != "highest"
+        ):
+            raise ValueError("stage CUDA deterministic policy evidence is invalid")
     elif (execution["backend"] != "numpy-cpu" or execution["logical_device"] is not None
           or execution["hardware"] is not None or execution["torch"] is not None):
         raise ValueError("stage backend identity is invalid")

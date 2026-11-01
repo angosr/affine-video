@@ -7,6 +7,8 @@ the authoritative evaluator selects this backend explicitly.
 
 from __future__ import annotations
 
+import os
+import sys
 from math import sqrt
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +22,35 @@ if TYPE_CHECKING:
     from scoring.exact import ExactCase
     from scoring.selector import FixedSelector
     from scoring.spec import BudgetSpec
+
+
+def configure_pair_determinism() -> None:
+    """Arm the isolated pair worker before any Torch CUDA context or handle.
+
+    This is not a teacher/generator default or a late repair for an initialized
+    process. Unsupported deterministic operations must raise, never warn-only.
+    """
+    previous = sys.modules.get("torch")
+    if previous is not None and previous.cuda.is_initialized():
+        raise RuntimeError("pair CUDA determinism requires an uninitialized worker")
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    import torch
+
+    if torch.cuda.is_initialized():
+        raise RuntimeError("CUDA initialized before pair determinism was armed")
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    if (not torch.are_deterministic_algorithms_enabled()
+            or torch.is_deterministic_algorithms_warn_only_enabled()
+            or torch.backends.cudnn.benchmark
+            or torch.backends.cuda.matmul.allow_tf32
+            or torch.backends.cudnn.allow_tf32
+            or torch.get_float32_matmul_precision() != "highest"
+            or os.environ.get("CUBLAS_WORKSPACE_CONFIG") != ":4096:8"):
+        raise RuntimeError("pair CUDA determinism policy could not be enforced")
 
 
 def dense_reference_attention(

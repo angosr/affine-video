@@ -1,3 +1,6 @@
+import builtins
+import os
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,6 +37,101 @@ class _Torch:
     @staticmethod
     def isfinite(value):
         return _FiniteResult(value == "finite")
+
+
+@pytest.fixture
+def pair_policy_torch(monkeypatch):
+    """Policy-only Torch stub: deliberately has no tensor or CUDA-init API."""
+    state = {"initialized": False, "enabled": False, "warn_only": True, "precision": "high"}
+    calls = []
+
+    def enable(enabled, *, warn_only):
+        assert not state["initialized"]
+        assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+        calls.append((enabled, warn_only))
+        state.update(enabled=enabled, warn_only=warn_only)
+
+    fake = SimpleNamespace(
+        cuda=SimpleNamespace(is_initialized=lambda: state["initialized"]),
+        backends=SimpleNamespace(cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=True)),
+                                 cudnn=SimpleNamespace(allow_tf32=True, benchmark=True)),
+        use_deterministic_algorithms=enable,
+        are_deterministic_algorithms_enabled=lambda: state["enabled"],
+        is_deterministic_algorithms_warn_only_enabled=lambda: state["warn_only"],
+        set_float32_matmul_precision=lambda value: state.update(precision=value),
+        get_float32_matmul_precision=lambda: state["precision"],
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", "inherited-uninitialized-value")
+    return SimpleNamespace(torch=fake, state=state, calls=calls)
+
+
+def test_pair_policy_enforces_actual_flags_before_cuda_initialization(pair_policy_torch):
+    case = pair_policy_torch
+    torch_backend.configure_pair_determinism()
+    assert case.calls == [(True, False)]
+    assert case.state == {"initialized": False, "enabled": True,
+                          "warn_only": False, "precision": "highest"}
+    assert case.torch.backends.cudnn.benchmark is False
+    assert case.torch.backends.cudnn.allow_tf32 is False
+    assert case.torch.backends.cuda.matmul.allow_tf32 is False
+    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+
+
+@pytest.mark.parametrize("initialize_on_import", [False, True])
+def test_pair_workspace_precedes_first_torch_import(
+    monkeypatch, pair_policy_torch, initialize_on_import,
+):
+    case = pair_policy_torch
+    monkeypatch.delitem(sys.modules, "torch")
+    original_import = builtins.__import__
+    imported = []
+
+    def import_torch(name, *args, **kwargs):
+        if name == "torch":
+            assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+            imported.append(name)
+            case.state["initialized"] = initialize_on_import
+            monkeypatch.setitem(sys.modules, "torch", case.torch)
+            return case.torch
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_torch)
+    if initialize_on_import:
+        with pytest.raises(RuntimeError, match="initialized before"):
+            torch_backend.configure_pair_determinism()
+        assert case.calls == []
+    else:
+        torch_backend.configure_pair_determinism()
+        assert case.calls == [(True, False)]
+    assert imported == ["torch"]
+
+
+def test_pair_policy_rejects_late_cuda_even_with_matching_environment(
+    monkeypatch, pair_policy_torch,
+):
+    case = pair_policy_torch
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    case.state["initialized"] = True
+    with pytest.raises(RuntimeError, match="uninitialized worker"):
+        torch_backend.configure_pair_determinism()
+    assert case.calls == []
+    assert case.state["enabled"] is False
+
+
+@pytest.mark.parametrize("ignored", ["algorithms", "warn_only", "precision"])
+def test_pair_policy_rejects_unenforced_settings(monkeypatch, pair_policy_torch, ignored):
+    case = pair_policy_torch
+    if ignored == "precision":
+        monkeypatch.setattr(case.torch, "set_float32_matmul_precision", lambda _value: None)
+    else:
+        def incomplete(enabled, *, warn_only):
+            case.state.update(enabled=False if ignored == "algorithms" else enabled,
+                              warn_only=True if ignored == "warn_only" else warn_only)
+
+        monkeypatch.setattr(case.torch, "use_deterministic_algorithms", incomplete)
+    with pytest.raises(RuntimeError, match="could not be enforced"):
+        torch_backend.configure_pair_determinism()
 
 
 def test_non_finite_gpu_logits_are_a_participant_failure() -> None:

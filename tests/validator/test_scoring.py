@@ -633,6 +633,89 @@ def ready_for_scoring(store: ChallengeStore) -> str:
     return identifier
 
 
+@pytest.mark.parametrize("failure", [ImportError, RuntimeError])
+def test_pair_determinism_failure_defers_before_model_or_cache_io(tmp_path, monkeypatch, failure):
+    from scoring import torch_backend
+
+    def unavailable():
+        raise failure("deterministic CUDA policy unavailable")
+
+    monkeypatch.setattr(torch_backend, "configure_pair_determinism", unavailable)
+    monkeypatch.setattr(scoring_module, "_load_task_selector",
+                        lambda *_a: pytest.fail("policy failure read model payload"))
+    monkeypatch.setattr(scoring_module, "ExactCacheReader",
+                        lambda *_a, **_k: pytest.fail("policy failure read cache payload"))
+    evaluator = FilePairedEvaluator(SimpleNamespace(), "unread.npz", "ab" * 32,
+                                    sample_task(), "cuda:0")
+    with ChallengeStore(tmp_path / "policy.db") as store:
+        identifier = ready_for_scoring(store)
+        before = store.public_snapshot()["challenges"][0]
+        outcome = process_next_scoring(
+            store, worker_id="worker", current_finalized_block=120,
+            settings=ScoringSettings(), evaluator=evaluator, now_ms=20,
+        )
+        assert outcome is not None and outcome.state is ChallengeState.SYSTEM_DEFERRED
+        assert outcome.code == "SCORING_RUNTIME_UNAVAILABLE"
+        after = store.get_challenge(identifier)
+        current = store.public_snapshot()["challenges"][0]
+        for key in ("submission_id", "challenge_id", "block_height",
+                    "extrinsic_index", "event_index"):
+            assert current[key] == before[key]
+        assert after.final_score is None and after.score_block is None
+        assert store.stage_score(identifier, ChallengeState.SCORING) is None
+
+
+@pytest.mark.parametrize("unsupported_operation", [False, True])
+def test_pair_policy_precedes_scoring_and_unsupported_operation_is_infrastructure(
+    monkeypatch, unsupported_operation,
+):
+    from scoring import torch_backend
+
+    calls = []
+    scoring = scoring_spec(routes=1, rollouts=4)
+    track = SimpleNamespace(scoring=scoring, cache=SimpleNamespace(exact_max_bytes=100))
+    paired = SimpleNamespace(challenger_score=.7, incumbent_score=.6, gain_lower_bound=.01,
+                             challenger_cells=(.7,) * 4)
+
+    def policy():
+        calls.append("policy")
+
+    class Reader:
+        def __init__(self, *_a, **_k):
+            assert calls == ["policy", "model", "model"]
+            calls.append("cache")
+            self.metadata = {"cases": [{}] * scoring.case_count}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return None
+
+    def score(*_a, **kwargs):
+        assert kwargs["device"] == "cuda:0" and calls[0] == "policy"
+        calls.append("score")
+        if unsupported_operation:
+            raise RuntimeError("operation has no deterministic CUDA implementation")
+        return paired
+
+    monkeypatch.setattr(torch_backend, "configure_pair_determinism", policy)
+    monkeypatch.setattr(scoring_module, "_load_task_selector", lambda *_a: calls.append("model"))
+    monkeypatch.setattr(scoring_module, "ExactCacheReader", Reader)
+    monkeypatch.setattr(scoring_module, "score_selector_pair", score)
+    monkeypatch.setattr(scoring_module, "pair_evidence", lambda *_a, **_k: calls.append("evidence"))
+    evaluator = FilePairedEvaluator(track, "unread.npz", "ab" * 32, sample_task(), "cuda:0")
+    messages = []
+    sender = SimpleNamespace(send=messages.append, close=lambda: None)
+    scoring_module._isolated_entry(sender, evaluator, sample_task(), None, None)
+    if unsupported_operation:
+        assert messages[0][:2] == ("temporary", "SCORING_WORKER_FAILURE")
+        assert calls == ["policy", "model", "model", "cache", "score"]
+    else:
+        assert messages[0][0] == "ok"
+        assert calls == ["policy", "model", "model", "cache", "score", "evidence"]
+
+
 @pytest.mark.parametrize("missing_clock", [False, True, "origin"])
 def test_tenure_exact_finishes_once_and_preserves_context_on_restart(
     tmp_path, monkeypatch, missing_clock,
@@ -1175,9 +1258,12 @@ def test_repeated_infrastructure_failure_remains_retryable(tmp_path) -> None:
         ]
 
 
-def test_finite_overflowing_selector_finishes_once_and_releases_fifo(tmp_path) -> None:
+def test_finite_overflowing_selector_finishes_once_and_releases_fifo(tmp_path, monkeypatch) -> None:
+    from scoring import torch_backend
     from tests.scoring.test_exact import exact_case
 
+    monkeypatch.setattr(torch_backend, "configure_pair_determinism",
+                        lambda: pytest.fail("NumPy pair worker touched CUDA policy"))
     architecture = SelectorArchitecture(1, 1, 2, "float32")
     paths = {}
     validated = {}

@@ -407,7 +407,8 @@ def test_recorded_approval_matches_competition_without_recapturing_the_runtime(p
                                paired.gain_lower_bound, track=track)
 
 
-def test_cuda_execution_metadata_is_observed_not_inherited_from_release(monkeypatch):
+@pytest.fixture
+def observed_cuda_execution(monkeypatch):
     fake = SimpleNamespace(
         __version__="fixture", version=SimpleNamespace(cuda="fixture"),
         device=lambda _name: SimpleNamespace(type="cuda"),
@@ -417,16 +418,62 @@ def test_cuda_execution_metadata_is_observed_not_inherited_from_release(monkeypa
                                  cudnn=SimpleNamespace(allow_tf32=False, benchmark=False,
                                                        version=lambda: 123)),
         are_deterministic_algorithms_enabled=lambda: True,
+        is_deterministic_algorithms_warn_only_enabled=lambda: False,
         get_float32_matmul_precision=lambda: "highest",
     )
     monkeypatch.setitem(sys.modules, "torch", fake)  # No CUDA, tensors, or GPU execution.
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
-    observed = _execution("cuda:0", None, time.time_ns() // 1_000_000)
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    return _execution("cuda:0", None, time.time_ns() // 1_000_000)
+
+
+def test_cuda_execution_metadata_is_observed_not_inherited_from_release(observed_cuda_execution):
+    observed = observed_cuda_execution
     assert observed["hardware"]["uuid"] == "GPU-fixture"
     assert observed["logical_device"] == "cuda:0"
     assert observed["cuda_visible_devices"] == "2"
     assert observed["torch"]["matmul_tf32"] is False
+    assert observed["torch"]["cublas_workspace_config"] == ":4096:8"
+    assert observed["torch"]["deterministic_warn_only"] is False
     assert observed["runtime_identity"] is None
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_cuda_policy_evidence_cold_read_preserves_old_facts(
+    monkeypatch, proof, observed_cuda_execution, legacy,
+):
+    track, paired, evidence = proof
+    evidence["execution"] = observed_cuda_execution
+    if legacy:
+        runtime = evidence["execution"]["torch"]
+        del runtime["cublas_workspace_config"], runtime["deterministic_warn_only"]
+        runtime.update(deterministic_algorithms=False, cudnn_benchmark=True,
+                       float32_matmul_precision="high")
+    original = canonical_json(evidence)
+    monkeypatch.setitem(sys.modules, "torch", None)  # Cold JSON verification cannot use Torch.
+    validate_pair_evidence(json.loads(original), paired.challenger_score, paired.incumbent_score,
+                           paired.gain_lower_bound, track=track)
+    assert canonical_json(evidence) == original
+
+
+@pytest.mark.parametrize("field,value", [
+    ("cublas_workspace_config", ":16:8"), ("deterministic_warn_only", True),
+    ("deterministic_algorithms", False), ("cudnn_benchmark", True),
+    ("float32_matmul_precision", "high"), ("cublas_workspace_config", None),
+    ("deterministic_warn_only", None),
+])
+def test_new_cuda_policy_evidence_rejects_drift_or_partial_fields(
+    proof, observed_cuda_execution, field, value,
+):
+    track, paired, evidence = proof
+    evidence["execution"] = observed_cuda_execution
+    if value is None:
+        del evidence["execution"]["torch"][field]
+    else:
+        evidence["execution"]["torch"][field] = value
+    with pytest.raises(ValueError, match="CUDA"):
+        validate_pair_evidence(evidence, paired.challenger_score, paired.incumbent_score,
+                               paired.gain_lower_bound, track=track)
 
 
 @pytest.fixture(params=[False, True], ids=["legacy-claim-unknown", "first-cas-evidence"])

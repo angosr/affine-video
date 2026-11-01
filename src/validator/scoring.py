@@ -134,6 +134,15 @@ class FilePairedEvaluator:
 
     def __call__(self, challenger: LeasedChallenge) -> StageOutcome:
         started_at_ms = time.time_ns() // 1_000_000
+        if self.scoring_device is not None:
+            from scoring.torch_backend import configure_pair_determinism
+
+            try:
+                configure_pair_determinism()
+            except (ImportError, RuntimeError) as exc:
+                raise TemporaryScoringError(
+                    "SCORING_RUNTIME_UNAVAILABLE", "deterministic CUDA pair policy is unavailable",
+                ) from exc
         try:
             scoring = self.track.scoring
             challenger_selector = _load_task_selector(self.track, challenger)
