@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Exclude already disclosed source identities from future inventory plans. New plans bind
+  their verified public disclosure inputs; cold recovery replays that frozen input instead
+  of today's growing set. Preserve legacy plans, READY seals, allocations and disclosure clocks;
+  insufficient remaining sources stop generation rather than reusing public sources.
+
+This source-exclusion candidate is not deployed.
+
 ## 2026-11-01 — Native deployment of 34774f9
 
 Operator-reported acceptance: application commit

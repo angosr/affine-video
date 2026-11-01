@@ -146,6 +146,12 @@ Private uploads, VDU/VDR and the public weight format are unchanged.
    retain the already-bound evaluation data. Data must have completed before the original
    finalized submission and still have been secret and not yet due for disclosure then.
    The same hidden data can serve multiple models; it is not produced separately for each model.
+
+   An unreleased producer update excludes sources already revealed in verified public batch
+   disclosures from future plans. New plans freeze the disclosure inputs they observed;
+   later publication does not reselect an existing plan or change its validity window.
+   Insufficient remaining sources in a stratum/slot stop generation rather than reuse
+   public sources. Previously sealed data and allocations remain unchanged.
    Confidence bounds group correlated cases by video
    rather than treating all 384 cases as independent.
    Confidence is specified per comparison, not as a lifetime false-promotion guarantee.
