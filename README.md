@@ -17,7 +17,7 @@ Earlier repository templates remain historical Git versions. Synchronizing this 
 not change live rules, start, data or runtime identity; application release tags identify
 the installed application commit, independently of later configuration/documentation commits.
 Use `git show track-a971c2714bf1:track.json` to read the tagged rules. That configuration
-tag targets the synchronization commit; `release-2026-11-01-1b95e40` targets the installed
+tag targets the synchronization commit; `release-2026-11-01-51c36db` targets the installed
 application commit. Neither tag authenticates unrecorded historical execution details.
 
 ## What to train
@@ -194,6 +194,12 @@ frozen specification, runtime and bound inputs, not the latest working tree or a
 hardware execution path. Archived outcomes and data bindings are not rewritten by a retry or
 maintenance release.
 
+The installed isolated CUDA pair worker sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` before CUDA
+initialization, requires deterministic algorithms with `warn_only=False`, and disables
+benchmarking and TF32. Late initialization or unavailable deterministic operations defer
+through infrastructure recovery. Its synthetic-only tiny validation does not establish
+cross-GPU bitwise equality or relabel the original scientific reports.
+
 New evidence-enabled matches seal a small score audit before publication. Once the original
 batch reaches its disclosure age, the existing publisher exposes the artifact referenced by
 `stage_evidence.public_audit`. It contains paired cell scores, their grouping/order, bootstrap
@@ -230,7 +236,12 @@ Full audit resolves each historical match's original rules once from
 rules are reported in `unavailable_score_audits`, never replaced with today's spec.
 `verify-match --track` accepts this same immutable spec or the original track envelope.
 
-The [2026-11-01 native release](CHANGELOG.md) (`1b95e40`) reports `disclosure_overdue` plan
+Verified results now include `cell_diagnostics`: original bootstrap parameters, weighted
+mean difference, decision margin, structural design counts and explicitly descriptive
+unweighted cell-difference dispersion. These inherit the existing verification scope;
+they do not estimate effective sample size or confidence coverage.
+
+The [2026-11-01 native release](CHANGELOG.md) (`51c36db`) reports `disclosure_overdue` plan
 digests separately from `disclosure_in_progress`.
 These are operational observations from match-bound deadlines and the public inventory's
 original retry projection, with observation time/source retained; they are not proof of a

@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-11-01 — Native deployment of 51c36db
+
+Operator-reported acceptance: application commit
+`51c36db644c2162bb5042cbf912d2276eec6b307`, native installation.
+Annotated application tag: `release-2026-11-01-51c36db`.
+
+| Installed identity | SHA-256 |
+| --- | --- |
+| Application source | `5fb34daa649ec92981649e21dc2d5878fef4416ed71f5ebbfa8ba0f17d442427` |
+| Native dependency lock | `075c4a291ec8f01abe6973f731171411bd3c124f92821527c9be085292066226` |
+| Runtime manifest | `e442c035fe9c066c59fae92e1b7d7d3ffe2dce3e3f826ffd657f0da5ff9d848d` |
+| Accepted release | `ffcb335eec224885b75bed73c78b27a8f8c558c2b3e5f8c88762cff89ab8389f` |
+| Computational dependency environment | `760c0f5eb73df2da4916caade6bcff625416eee7f52167cb2f5a8dfe55d7bf16` |
+
+Public status/summary/weights and the database advanced to block 9411658 with the installed
+identity, 12 successful challenges, 12 stages, eight READY batches and UID643 weight 1.
+Original submission/stage facts and retry decisions were preserved; public runtime error fields
+were null.
+
+- Enforce the fixed CUDA policy before new isolated pair work; record actual workspace and
+  warning-mode facts through the existing evidence path. Unsupported policy/operations
+  remain infrastructure failures, with no warning-only fallback or miner-loss conversion.
+- Derive useful cell diagnostics only after original identity, design and statistical
+  verification, shared by `audit` and `verify-match`. Preserve the original LCB/threshold
+  algorithm and artifact bytes.
+
+The same-device compatibility check used only synthetic inputs on the spare GPU. It was
+not a repeat of E2/E3/E16, a real-model evaluation or a cross-GPU reproducibility guarantee.
+Those scientific reports retain their original frozen identities. Rules r10/a971, data4e,
+original S/allocations/C/R, old stages, confidence 0.9975 and single-exact promotion remain
+unchanged. OCI remains package provenance rather than a new native Engine deployment.
+Signed release/seed chain anchors, reconstruction of missing historical evidence and empirical
+false-positive calibration were not performed.
+
 ## 2026-11-01 — Native deployment of 1b95e40
 
 Operator-reported acceptance: application commit
