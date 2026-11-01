@@ -15,6 +15,9 @@
   the existing operations guide; remove the superseded set-only case check and duplicate
   SQLite evidence bodies after successful immutable stage archival.
 - Add credential-free, read-only `veda audit` through `S3Repository.load`.
+- Resolve each historical audit against its original hash-authenticated rule artifact,
+  shared per spec digest. Report missing old rules as unavailable without substituting the
+  current track. Preserve the original spec through the existing immutable publication path.
 - Bind original case count, geometry and ordered route/rollout/source/step/window design
   when capturing or restoring stage evidence. Public `verify-match` reports statistics-only
   without the authenticated batch disclosure and never claims private model-inference replay.

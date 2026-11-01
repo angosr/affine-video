@@ -1156,10 +1156,17 @@ def test_runtime_manifest_is_content_addressed_and_published_before_track() -> N
     asyncio.run(publisher.publish(artifacts))
 
     writes = [call["Key"] for call in client.calls if "Body" in call]
-    assert writes[:2] == [
+    assert writes[:3] == [
         f"tracks/test/runtime/{digest}/manifest.json",
+        f"tracks/test/artifacts/{track.digest}",
         "tracks/test/track.json",
     ]
+    assert client.objects[f"tracks/test/artifacts/{track.digest}"] == canonical_json(
+        publication_module.track_spec_dict(track))
+    assert publisher.load_frozen_spec(track.digest) == track
+    client.calls.clear()
+    asyncio.run(publisher.publish(artifacts))
+    assert client.calls == []  # One original rule object, not a copy per match or software release.
 
 
 def test_storage_publishes_large_files_as_bounded_verified_chunks(tmp_path, monkeypatch) -> None:

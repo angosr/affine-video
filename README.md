@@ -177,9 +177,16 @@ cache order. Track case count and geometry are always checked. This does not rep
 inference or verify tensor payloads; `model_inference_reproduced` remains false.
 The credential-free `audit` command
 uses the normal public ledger verifier, including available published payload bytes, which
-may be large. Neither command needs a wallet, GPU, private storage keys or evaluator database.
+may stream gigabytes of public model and disclosed evaluation data. Run full audit only on
+an authorized, provisioned audit host, not as a routine development-machine check.
+Neither command needs a wallet, GPU, private storage keys or evaluator database.
 Statistical replay does not establish full model-inference replay when a private losing model
 is intentionally unavailable.
+
+Full audit resolves each historical match's original rules once from
+`artifacts/<track_spec_digest>`, authenticating its bytes by that digest. Missing original
+rules are reported in `unavailable_score_audits`, never replaced with today's spec.
+`verify-match --track` accepts this same immutable spec or the original track envelope.
 
 ## Watch the competition
 

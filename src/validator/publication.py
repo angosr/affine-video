@@ -663,6 +663,20 @@ def validate_public_weights_url(url: str) -> str:
     return url
 
 
+def _decode_frozen_spec(payload: bytes, digest: str) -> TrackSpec:
+    if not isinstance(digest, str) or _HEX_32.fullmatch(digest) is None:
+        raise PublicArtifactError("frozen specification digest is invalid")
+    if hashlib.sha256(payload).hexdigest() != digest:
+        raise PublicArtifactError("frozen specification bytes differ from their digest")
+    try:
+        track = parse_track_spec(_decode_canonical_object(payload, f"artifacts/{digest}"))
+        if track.digest != digest:
+            raise ValueError("decoded specification differs from its original digest")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PublicArtifactError("frozen specification is invalid") from exc
+    return track
+
+
 class _PublicHTTPBody(io.RawIOBase):
     def __init__(self, response: httpx.Response) -> None:
         self.response = response
@@ -934,6 +948,10 @@ class S3Repository:
                     self._stage_data_origin, track, artifacts.runtime_manifest[1],
                 )
             await asyncio.to_thread(self._put_immutable, *artifacts.runtime_manifest)
+        if "scoring" in track_document["spec"]:
+            # One original spec per digest, shared with the existing data-origin artifact path.
+            await asyncio.to_thread(self._put_immutable, f"artifacts/{track.digest}",
+                                    _json_bytes(track_document["spec"]))
         for artifact in artifacts.files:
             if artifact.before_publish is not None:
                 await asyncio.to_thread(artifact.before_publish)
@@ -1330,6 +1348,16 @@ class S3Repository:
                 or self._get_optional("weights.json") != fence):
             raise PublicArtifactError("maintenance public fence changed during collection")
         return artifacts
+
+    def load_frozen_spec(self, digest: str) -> TrackSpec | None:
+        """Read one original content-addressed spec, never substitute today's rules."""
+        if not isinstance(digest, str) or _HEX_32.fullmatch(digest) is None:
+            raise PublicArtifactError("frozen specification digest is invalid")
+        name = f"artifacts/{digest}"
+        payload = self._get_optional(name)
+        if payload is None:
+            return None
+        return _decode_frozen_spec(payload, digest)
 
     def _load_history(
         self, track: TrackSpec, runtime_manifest: bytes | None = None,

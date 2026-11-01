@@ -690,11 +690,114 @@ def test_public_audit_cli_is_read_only_cpu_and_needs_no_role(audit_case, tmp_pat
           "--artifact", str(paths[2]), "--batch-disclosure", str(disclosure)])
     assert json.loads(capsys.readouterr().out)[
         "verification_scope"] == "statistics-and-authenticated-plan-design"
+    paths[0].write_bytes(canonical_json(case.raw))  # Same immutable rule object used by full audit.
+    main(["verify-match", "--track", str(paths[0]), "--match", str(paths[1]),
+          "--artifact", str(paths[2])])
+    assert json.loads(capsys.readouterr().out)["gain_lower_bound"] == case.record.score_gain
     paths[0].write_bytes(canonical_json({"track_spec_digest": "00" * 32, "spec": case.raw}))
     with pytest.raises(SystemExit) as stopped:
         main(["verify-match", "--track", str(paths[0]), "--match", str(paths[1]),
               "--artifact", str(paths[2])])
     assert stopped.value.code == 1 and "digest" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("origin", ["present", "missing", "corrupt"])
+def test_full_audit_mixed_rules_uses_original_spec_or_reports_unavailable(
+    audit_case, monkeypatch, capsys, origin,
+):
+    import httpx
+
+    import cli as cli_module
+    from cli import main
+    from scoring.spec import parse_track_spec
+    from tests.validator.test_tournament import challenge
+    from validator.production.commitment import Artifact, ArtifactManifest
+    from validator.publication import (
+        HISTORICAL_MATCHES_PREFIX,
+        _summary_document,
+        build_genesis_artifacts,
+        encode_weight_artifact,
+    )
+    from validator.tournament import genesis_champion, resolve_tournament
+    from validator.weights import WeightArtifact, WeightChainState, WeightPlan
+
+    case = audit_case
+    original = canonical_json(case.record.document)
+    manifest = ArtifactManifest((Artifact(
+        HISTORICAL_MATCHES_PREFIX + case.record.object_name,
+        hashlib.sha256(original).hexdigest(), len(original), case.record.object_name,
+    ),))
+    raw = copy.deepcopy(case.raw)
+    raw.update(track_id="new-audit-rules", track_start_block=case.item["score_block"] + 100,
+               artifact_manifest_sha256=manifest.digest)
+    raw["scoring"]["bootstrap_seed"] += 99  # The original statistics must use the old seed.
+    current = parse_track_spec(raw)
+    failure = challenge(2, "new-hotkey", state=ChallengeState.PARTICIPANT_FAILED,
+                        error_code="MODEL_SCHEMA_INVALID")
+    failure.update(block_height=current.track_start_block + 1,
+                   score_block=current.track_start_block + 2)
+    tournament = resolve_tournament(
+        [failure], track_id=current.track_id, track_spec_digest=current.digest,
+        netuid=current.netuid, minimum_gain=current.full_video.minimum_gain,
+        minimum_exact_gain=current.scoring.minimum_frontier_gain, promotion=current.promotion,
+        initial_champion=genesis_champion(current), historical_matches=(case.record,),
+    )
+    block = current.track_start_block + 10
+    chain = WeightChainState(block, {current.initial_champion.hotkey: 0,
+                                    case.item["hotkey"]: 3, "new-hotkey": 4}, 1, 1.0, 1, {})
+    public = build_genesis_artifacts(current, chain, version_key=0,
+                                     runtime_manifest=manifest.encode(),
+                                     historical_matches=(case.record,))
+    new_match = canonical_json(tournament.matches[0].document)
+    weights = WeightArtifact(
+        current.track_id, current.digest, current.netuid, current.mechid, 0, block,
+        WeightPlan(block, (case.item["hotkey"],), (3,), (1.0,)), match_sequence=1,
+        terminal_match_sha256=hashlib.sha256(new_match).hexdigest(),
+    )
+    objects = {
+        "track.json": public.track, "weights.json": encode_weight_artifact(weights),
+        "summary.json": canonical_json(_summary_document(current, block, tournament)),
+        f"runtime/{manifest.digest}/manifest.json": manifest.encode(),
+        case.record.object_name: original, tournament.matches[0].object_name: new_match,
+        case.reference["public_audit"]["object"]: case.payload,
+        f"batch_groups/{case.plan.plan_digest}.json": disclosed_plan(case.plan),
+    }
+    spec_name = f"artifacts/{case.track.digest}"
+    if origin != "missing":
+        objects[spec_name] = (canonical_json(case.raw) if origin == "present"
+                              else canonical_json(raw))
+    requests = []
+
+    def get(request):
+        assert request.method == "GET" and "authorization" not in request.headers
+        name = request.url.path.removeprefix("/tracks/main/")
+        requests.append(name)
+        body = objects.get(name)
+        return (httpx.Response(404) if body is None else httpx.Response(
+            200, content=body, headers={"ETag": hashlib.sha256(body).hexdigest()}))
+
+    client = httpx.Client
+    monkeypatch.setattr(cli_module.httpx, "Client", lambda **kwargs: client(
+        transport=httpx.MockTransport(get), **kwargs))
+    if origin == "corrupt":
+        with pytest.raises(SystemExit) as stopped:
+            main(["audit", "--public-base-url", "https://public.example/tracks/main"])
+        assert stopped.value.code == 1 and "frozen specification bytes" in capsys.readouterr().err
+    else:
+        main(["audit", "--public-base-url", "https://public.example/tracks/main"])
+        output = json.loads(capsys.readouterr().out)
+        assert output["historical_matches"] == output["committed_matches"] == 1
+        if origin == "present":
+            assert len(output["score_audits"]) == 1 and output["unavailable_score_audits"] == []
+            assert output["score_audits"][0]["gain_lower_bound"] == case.record.score_gain
+        else:
+            assert output["score_audits"] == []
+            assert output["unavailable_score_audits"] == [{
+                "challenge_id": case.task.challenge_id, "stage": "SCORING",
+                "track_spec_digest": case.track.digest, "reason": "frozen_spec_unavailable",
+            }]
+    assert requests.count(spec_name) == 1
+    assert objects[case.record.object_name] == original  # No history rewrite or re-evaluation.
 
 
 def test_public_audit_disclosure_requires_r_match_fence_and_is_idempotent(audit_case, monkeypatch):

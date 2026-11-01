@@ -50,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     audit_ledger = modules.add_parser(
-        "audit", help="read-only ledger and published-byte audit; disclosed payloads may be large")
+        "audit", help="read-only ledger audit; may stream gigabytes of public models and data")
     audit_ledger.add_argument("--public-base-url", default=DEFAULT_PUBLIC_STATUS_URL.removesuffix(
         "/status.json"))
 
@@ -99,7 +99,7 @@ def _parser() -> argparse.ArgumentParser:
         "verify-match", help="recompute public paired scores and LCB from immutable JSON, CPU only",
     )
     audit.add_argument("--track", required=True, type=Path,
-                       help="original public track.json, including its spec digest envelope")
+                       help="original track envelope or immutable artifacts/<specdigest> spec")
     audit.add_argument("--match", required=True, type=Path, help="original public match JSON")
     audit.add_argument("--artifact", required=True, type=Path,
                        help="public score_audits object referenced by that match")
@@ -307,12 +307,22 @@ def _audit_ledger(parser: argparse.ArgumentParser, base_url: str) -> None:
             raise ValueError("public track is missing")
         track = parse_track_spec(_decode_track_document(pointer)["spec"])
         ledger = await repository.load(track)
-        proofs, unknown, sealed = [], 0, 0
+        proofs, unknown, sealed, unavailable = [], 0, 0, []
+        specs = {track.digest: track}
         for match in (*ledger.historical_matches, *ledger.matches):
             for stage in match.document["evaluation"]["stages"]:
                 reference = stage.get("stage_evidence", {}).get("public_audit")
                 if reference is None:
                     unknown += 1
+                    continue
+                digest = match.document["track_spec_digest"]
+                if digest not in specs:
+                    specs[digest] = repository.load_frozen_spec(digest)
+                original = specs[digest]
+                if original is None:
+                    unavailable.append({"challenge_id": match.challenge_id,
+                                        "stage": stage["stage"], "track_spec_digest": digest,
+                                        "reason": "frozen_spec_unavailable"})
                     continue
                 payload = repository._get_optional(reference["object"])
                 if payload is None:
@@ -320,14 +330,15 @@ def _audit_ledger(parser: argparse.ArgumentParser, base_url: str) -> None:
                     continue
                 proofs.append(verify_public_score_audit(
                     payload, json.dumps(match.document, sort_keys=True, separators=(",", ":"),
-                                        ensure_ascii=False).encode(), track,
+                                        ensure_ascii=False).encode(), original,
                     disclosure=repository._get_optional(
                         f"batch_groups/{stage['evaluation_batch']['plan_digest']}.json")))
         return {"track_spec_digest": track.digest, "source_block": ledger.source_block,
                 "committed_matches": ledger.committed_match_count,
                 "historical_matches": len(ledger.historical_matches),
                 "score_audits": proofs, "unknown_stage_evidence": unknown,
-                "sealed_or_unpublished_score_audits": sealed}
+                "sealed_or_unpublished_score_audits": sealed,
+                "unavailable_score_audits": unavailable}
 
     try:
         with httpx.Client(follow_redirects=False, timeout=30, trust_env=False) as client:
@@ -338,14 +349,18 @@ def _audit_ledger(parser: argparse.ArgumentParser, base_url: str) -> None:
 
 
 def _verify_match(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
-    from scoring.spec import parse_track_spec
-    from validator.publication import _decode_track_document
+    from validator.publication import _decode_frozen_spec, _decode_track_document
     from validator.reproducibility import verify_public_score_audit
 
     try:
+        match = arguments.match.read_bytes()
+        original = arguments.track.read_bytes()
+        if "spec" in json.loads(original):
+            original = json.dumps(_decode_track_document(original)["spec"], sort_keys=True,
+                                  separators=(",", ":"), ensure_ascii=False).encode()
+        track = _decode_frozen_spec(original, json.loads(match)["track_spec_digest"])
         result = verify_public_score_audit(
-            arguments.artifact.read_bytes(), arguments.match.read_bytes(),
-            parse_track_spec(_decode_track_document(arguments.track.read_bytes())["spec"]),
+            arguments.artifact.read_bytes(), match, track,
             disclosure=(None if arguments.batch_disclosure is None
                         else arguments.batch_disclosure.read_bytes()),
         )
