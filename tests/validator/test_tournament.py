@@ -7,6 +7,7 @@ from miner.submit import PrivateModelSubmission, model_source_fields
 from scoring.spec import PromotionSpec
 from validator.production.commitment import canonical_json
 from validator.queue import ChainPosition, ChallengeState
+from validator.reproducibility import stage_reference
 from validator.tournament import (
     Champion,
     MatchOutcome,
@@ -330,6 +331,24 @@ def test_preproduced_confirmation_still_requires_two_independent_decisions():
     item["stages"][-1]["evaluation_batch"] = item["stages"][0]["evaluation_batch"]
     item["evaluation_batch"] = item["stages"][-1]["evaluation_batch"]
     with pytest.raises(ValueError, match="independent inventory"):
+        resolve([item])
+
+
+def test_match_binds_only_private_stage_reference_and_legacy_bytes_stay_unchanged():
+    item = challenge(1, "alice", score=.5, incumbent_score=.5, paired_gain=0)
+    item["challenge_id"] = "34" * 32
+    old = resolve([item]).matches[0]
+    old_bytes = canonical_json(old.document)
+    reference = stage_reference(f"stages/{item['challenge_id']}/SCORING.json", b"private evidence")
+    item["stages"][0]["stage_evidence"] = reference
+    recorded = resolve([item]).matches[0]
+    assert recorded.document["evaluation"]["stages"][0]["stage_evidence"] == reference
+    assert recorded_match(recorded.document, netuid=7).document == recorded.document
+    assert b"private evidence" not in canonical_json(recorded.document)
+    del item["stages"][0]["stage_evidence"]
+    assert canonical_json(resolve([item]).matches[0].document) == old_bytes
+    item["stages"][0]["stage_evidence"] = {**reference, "object": "stages/other/SCORING.json"}
+    with pytest.raises(ValueError, match="reference is invalid"):
         resolve([item])
 
 

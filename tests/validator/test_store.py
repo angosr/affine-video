@@ -458,6 +458,37 @@ def test_leaderboard_orders_each_hotkeys_only_authoritative_score(tmp_path) -> N
         assert entries[1].challenge_id == newer
 
 
+def test_public_stage_reference_survives_verified_chain_restore_without_private_cells(tmp_path):
+    from validator.reproducibility import stage_reference
+
+    private = PrivateModelSubmission("ef" * 32, "ab" * 32, "cd" * 32)
+    record = submission_from_commitment(ChainCommitment(
+        "alice", 120, "ab" * 32, ChainPosition(101, 0, 0), private.encode(),
+    ))
+    item = scored_challenge(1, "alice", score=.6, incumbent_score=.7)
+    item.update(challenge_id=challenge_id(record.submission_id), submission_id=record.submission_id,
+                **model_source_fields(None, None, private))
+    reference = stage_reference(f"stages/{item['challenge_id']}/SCORING.json", b"private evidence")
+    item["stages"][0]["stage_evidence"] = reference
+    matches = resolve_tournament(
+        [item], track_id="private-track", track_spec_digest="ab" * 32, netuid=120,
+        minimum_gain=.003, minimum_exact_gain=.003, initial_champion=genesis_champion(),
+    ).matches
+    original = canonical_json(matches[0].document)
+    with ChallengeStore(tmp_path / "cold.db", track_spec_digest="ab" * 32) as store:
+        assert store.restore_public_matches(matches,
+                                            submissions={record.submission_id: record}) == 1
+        metrics = store.stage_score(matches[0].challenge_id, ChallengeState.SCORING).metrics
+        assert metrics["stage_evidence"] == reference
+        assert "reproducibility" not in metrics  # Unknown, not reconstructed from current state.
+        replayed = resolve_tournament(
+            store.public_snapshot()["challenges"], track_id="private-track",
+            track_spec_digest="ab" * 32, netuid=120, minimum_gain=.003,
+            minimum_exact_gain=.003, initial_champion=genesis_champion(),
+        )
+        assert canonical_json(replayed.matches[0].document) == original
+
+
 def test_later_participant_failure_preserves_previous_authoritative_score(tmp_path) -> None:
     with ChallengeStore(tmp_path / "validator.db") as store:
         older, _ = store.add_submission(submission_at(100), occurred_at_ms=10)

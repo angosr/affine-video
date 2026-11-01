@@ -12,6 +12,7 @@ from typing import Any
 from miner.submit import PrivateModelSubmission, model_source_fields, private_model_source
 from scoring.spec import PromotionSpec, TrackSpec
 from validator.queue import TERMINAL_STATES, ChainPosition, ChallengeState
+from validator.reproducibility import validate_stage_reference
 
 
 class MatchOutcome(StrEnum):
@@ -385,6 +386,10 @@ def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
     state = ChallengeState(challenge["state"])
     if state not in TERMINAL_STATES:
         raise ValueError("historical match is not terminal")
+    for stage in _evaluation_stages(challenge["stages"]):
+        if "stage_evidence" in stage:
+            validate_stage_reference(stage["stage_evidence"], challenge["challenge_id"],
+                                     stage["stage"])
     before = Champion.from_public(document["incumbent_before"])
     after = Champion.from_public(document["champion_after"])
     outcome = MatchOutcome(document["outcome"])
@@ -534,6 +539,9 @@ def _resolve_match(
     stages = _evaluation_stages(
         challenge.get("stages", []),
     )
+    for stage in stages:
+        if "stage_evidence" in stage:
+            validate_stage_reference(stage["stage_evidence"], identifier, stage["stage"])
     if any(stage["score_block"] < position.block for stage in stages):
         raise ValueError("stage decision block cannot precede its submission")
     for stage in stages:
@@ -866,6 +874,9 @@ def _evaluation_stages(
             if not isinstance(row["promotion"], Mapping):
                 raise ValueError("promotion context must be an object")
             document["promotion"] = dict(row["promotion"])
+        if "stage_evidence" in row:
+            validate_stage_reference(row["stage_evidence"])
+            document["stage_evidence"] = dict(row["stage_evidence"])
         if row.get("evaluation_batch") is not None:
             batch = _evaluation_batch(
                 row["evaluation_batch"],

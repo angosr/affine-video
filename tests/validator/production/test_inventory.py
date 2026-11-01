@@ -38,7 +38,11 @@ from .test_storage import MemoryS3
 
 
 @pytest.fixture
-def inventory_case():
+def inventory_case(monkeypatch):
+    from validator.production import environment
+
+    # This metadata-only fixture has no frozen teacher package or GPU runtime.
+    monkeypatch.setattr(environment, "evaluation_source_digest", lambda: "c0" * 32)
     pool = SourcePool(tuple(SourceLeaf(
         "production" if index < 24 else "audit",
         f"family-{index}", f"source-{index}", "prompt", (), "all",
@@ -100,6 +104,67 @@ def claim(inventory, plans, identifier="a1" * 32, stage="SCORING", **kwargs):
         ),
         disclosure_delay_seconds=kwargs.get("disclosure_delay_seconds", 1800),
     )
+
+
+def test_first_claim_captures_full_order_and_retries_keep_its_original_evidence(
+    inventory_case, monkeypatch,
+):
+    from validator.production import environment
+    from validator.production import inventory as module
+
+    case = inventory_case
+    inventory = Inventory(case.objects, case.track.digest)
+    plans = (make_plan(case, 190), make_plan(case, 101), make_plan(case, 250),
+             make_plan(case, 90, ready=False))
+    monkeypatch.setattr(module.time, "time_ns", lambda: 1_000_000_000_000)
+    monkeypatch.setattr(environment, "evaluation_source_digest", lambda: "de" * 32)
+    first = claim(inventory, plans)
+    assert first["submission_block"] == 200
+    assert first["selection"]["captured_at_ms"] == 1_000_000
+    assert first["selection"]["clock"] == "local-before-successful-cas"
+    assert first["selection"]["source_sha256"] == "de" * 32
+    candidates = first["selection"]["candidates"]
+    assert [row["generation_block"] for row in candidates] == [90, 101, 190, 250]
+    assert [row["s_eligible"] for row in candidates] == [False, True, True, False]
+    assert first["plan_digest"] == plans[1].plan_digest
+    assert all(len(row["source_selection_sha256"]) == 64 for row in candidates)
+    before = case.objects.get(ALLOCATION_OBJECT).body
+    monkeypatch.setattr(module.time, "time_ns", lambda: 2_000_000_000_000)
+    monkeypatch.setattr(environment, "evaluation_source_digest", lambda: "ef" * 32)
+    assert claim(inventory, (*plans, make_plan(case, 102))) == first
+    assert case.objects.get(ALLOCATION_OBJECT).body == before
+    assert Inventory(case.objects, case.track.digest).read()[1]["claims"] == [first]
+
+
+@pytest.mark.parametrize("damage", ["order", "eligibility", "previous_authority"])
+def test_claim_evidence_rejects_changed_selection_without_reassigning(inventory_case, damage):
+    case = inventory_case
+    inventory = Inventory(case.objects, case.track.digest)
+    claim(inventory, (make_plan(case, 101), make_plan(case, 102)))
+    stored, document = inventory.read()
+    selection = document["claims"][0]["selection"]
+    if damage == "order":
+        selection["candidates"].reverse()
+    elif damage == "eligibility":
+        selection["candidates"][0]["s_eligible"] = False
+    else:
+        selection["previous_authority_sha256"] = "00" * 32
+    case.objects.replace_plan(ALLOCATION_OBJECT, canonical_json(document), etag=stored.etag)
+    with pytest.raises(RuntimeError):
+        inventory.read()
+
+
+def test_legacy_claim_has_unknown_first_selection_and_is_never_backfilled(inventory_case):
+    case = inventory_case
+    inventory = Inventory(case.objects, case.track.digest)
+    plans = (make_plan(case, 101),)
+    claim(inventory, plans)
+    stored, document = inventory.read()
+    document["claims"][0].pop("selection")
+    old_bytes = canonical_json(document)
+    case.objects.replace_plan(ALLOCATION_OBJECT, old_bytes, etag=stored.etag)
+    assert "selection" not in claim(inventory, plans)
+    assert case.objects.get(ALLOCATION_OBJECT).body == old_bytes
 
 
 def test_inventory_plan_is_secret_committed_and_unassigned(inventory_case):

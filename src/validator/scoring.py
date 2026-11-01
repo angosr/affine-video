@@ -11,6 +11,7 @@ import json
 import multiprocessing
 import resource
 import signal
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import isfinite
@@ -31,6 +32,7 @@ from validator.download import ModelDownloadError, download_chunked_file, downlo
 from validator.production.batches import ReadyBatchSource
 from validator.production.confirmation import ConfirmationWorkerPool
 from validator.queue import ChallengeState, require_transition
+from validator.reproducibility import pair_evidence, validate_stage_reference
 from validator.retries import (
     RetryRecorder,
     RetryRestore,
@@ -85,7 +87,9 @@ class ScoringSettings:
     retry_max_ms: int = 60 * 60 * 1000
     max_attempts: int = 9
     alert: Callable[[str, Mapping[str, object]], None] | None = None
-    archive_stage: Callable[[LeasedChallenge, StageOutcome, int], None] | None = None
+    archive_stage: (
+        Callable[[LeasedChallenge, StageOutcome, int], Mapping[str, Any] | None] | None
+    ) = None
     restore_stage: Callable[[LeasedChallenge], object | None] | None = None
     restore_retry: RetryRestore | None = None
     record_retry: RetryRecorder | None = None
@@ -126,8 +130,10 @@ class FilePairedEvaluator:
     exact_sha256: str
     incumbent: LeasedChallenge
     scoring_device: str | None = None
+    runtime_identity: dict[str, Any] | None = None
 
     def __call__(self, challenger: LeasedChallenge) -> StageOutcome:
+        started_at_ms = time.time_ns() // 1_000_000
         try:
             scoring = self.track.scoring
             challenger_selector = _load_task_selector(self.track, challenger)
@@ -153,6 +159,13 @@ class FilePairedEvaluator:
                     seed=scoring.bootstrap_seed,
                     device=self.scoring_device,
                 )
+            evidence = pair_evidence(
+                self.track, reader.metadata, paired,
+                challenger_sha256=challenger.file_sha256,
+                incumbent_sha256=self.incumbent.file_sha256,
+                device=self.scoring_device, runtime_identity=self.runtime_identity,
+                started_at_ms=started_at_ms,
+            )
         except (CacheLoadError, ValueError, OSError) as exc:
             raise TemporaryScoringError("SCORING_CACHE_INVALID", str(exc)) from exc
         return StageOutcome(
@@ -162,6 +175,7 @@ class FilePairedEvaluator:
                 "exact_score": paired.challenger_score,
                 "incumbent_score": paired.incumbent_score,
                 "paired_gain_lower_bound": paired.gain_lower_bound,
+                "reproducibility": evidence,
             },
         )
 
@@ -219,6 +233,7 @@ class PairedTrackEvaluator:
     confirmation_pool: ConfirmationWorkerPool | None = None
     inventory_status: Mapping[str, Any] | None = None
     historical_matches: tuple[MatchRecord, ...] = ()
+    runtime_identity: dict[str, Any] | None = None
 
     def ready_through_block(self, current_finalized_block: int) -> int:
         """No artificial block delay: every finalized admitted submission is eligible."""
@@ -287,6 +302,7 @@ class PairedTrackEvaluator:
             batch.sha256,
             incumbent_task,
             self.scoring_device,
+            self.runtime_identity,
         )
         isolated = IsolatedEvaluator(
             evaluator,
@@ -852,7 +868,11 @@ def commit_evaluated_scoring(
     if not evaluated.recorded_locally:
         if settings.archive_stage is not None:
             try:
-                settings.archive_stage(task, result, result_score_block)
+                reference = settings.archive_stage(task, result, result_score_block)
+                if reference is not None:
+                    validate_stage_reference(reference, task.challenge_id, task.state.value)
+                    result = StageOutcome(result.score, {**result.metrics,
+                                                        "stage_evidence": dict(reference)})
             except Exception as exc:
                 state = _defer_or_fail(
                     store,

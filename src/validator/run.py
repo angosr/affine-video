@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -619,6 +620,23 @@ async def run_evaluator(
             batch_source=batch_source,
             confirmation_pool=confirmation_pool,
             historical_matches=historical_matches,
+            runtime_identity=(None if (
+                data_config is None or getattr(publisher, "release_approval", None) is None
+            ) else {
+                "release": publisher.release_approval.public_identity(
+                    track, runtime_manifest_payload),
+                "dependency_lock_sha256": hashlib.sha256(
+                    data_config.evaluator_artifact_path(
+                        data_config.runtime.dependency_lock).read_bytes()).hexdigest(),
+                "source_bundle_sha256": hashlib.sha256(
+                    data_config.evaluator_artifact_path(
+                        data_config.runtime.source_bundle).read_bytes()).hexdigest(),
+                "dependency_lock_path": str(data_config.evaluator_artifact_path(
+                    data_config.runtime.dependency_lock)),
+                "source_bundle_path": str(data_config.evaluator_artifact_path(
+                    data_config.runtime.source_bundle)),
+                "verified_at_ms": time.time_ns() // 1_000_000,
+            }),
         )
         work = _EvaluationWorker(
             database=database, track_spec_digest=track.digest,

@@ -1468,6 +1468,9 @@ class ChallengeStore:
         if type(score_block) is not int or score_block < 0:
             raise ValueError("score block must be a non-negative integer")
         timestamp = _timestamp(occurred_at_ms)
+        if ("reproducibility" in metrics and "cache_allocation" in metrics
+                and "stage_evidence" not in metrics):
+            raise ValueError("scored inventory evidence must be archived before local completion")
         metrics_json = _json(metrics)
         values = (
             identifier,
@@ -1937,6 +1940,8 @@ class ChallengeStore:
                         metrics = {}
                         if "promotion" in stage:
                             metrics["promotion"] = stage["promotion"]
+                        if "stage_evidence" in stage:
+                            metrics["stage_evidence"] = stage["stage_evidence"]
                         if batch is not None:
                             metrics.update({
                                 "incumbent_score": stage["incumbent_score"],
@@ -2098,6 +2103,8 @@ class ChallengeStore:
             }
             if "promotion" in stage_metrics:
                 document["promotion"] = stage_metrics["promotion"]
+            if "stage_evidence" in stage_metrics:
+                document["stage_evidence"] = stage_metrics["stage_evidence"]
             if "cache_sha256" in stage_metrics:
                 document["evaluation_batch"] = {
                     "sha256": stage_metrics["cache_sha256"],

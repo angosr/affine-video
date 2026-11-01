@@ -1562,8 +1562,9 @@ def test_public_artifacts_archive_a_scored_challenger_that_does_not_win(
 @pytest.mark.parametrize("gain,won,archive_failure", [
     (0.0025, False, False), (0.00250001, True, False), (0.00250001, True, True),
 ])
+@pytest.mark.parametrize("evidence_reference", [False, True])
 def test_exact_tenure_private_result_publication_and_cold_reader(
-    tmp_path, gain, won, archive_failure,
+    tmp_path, gain, won, archive_failure, evidence_reference,
 ):
     from tests.validator.test_tournament import tenure_challenge
     from validator.tournament import genesis_champion
@@ -1600,6 +1601,14 @@ def test_exact_tenure_private_result_publication_and_cold_reader(
                             gain=gain, submitted_ms=302401000)
     item.update(file_sha256=digest, model_size_bytes=model.stat().st_size)
     item.update(model_source_fields(None, None, PrivateModelSubmission("ef" * 32, digest)))
+    reference = None
+    if evidence_reference:
+        from validator.reproducibility import stage_reference
+
+        item["challenge_id"] = "34" * 32
+        reference = stage_reference(f"stages/{item['challenge_id']}/SCORING.json",
+                                    b"private stage; never a public payload")
+        item["stages"][0]["stage_evidence"] = reference
     store = SimpleNamespace(
         chain_cursor=lambda: (1000, "0x" + "12" * 32),
         public_snapshot=lambda: {"challenges": [item]},
@@ -1627,6 +1636,7 @@ def test_exact_tenure_private_result_publication_and_cold_reader(
     assert document["minimum_gain"] == 0.0025
     assert document["outcome"] == ("CHALLENGER_WON" if won else "CHAMPION_RETAINED")
     assert len(document["evaluation"]["stages"]) == 1
+    assert document["evaluation"]["stages"][0].get("stage_evidence") == reference
     client = MemoryS3()
     client.objects["isolated/tenure/" + history[0].object_name] = historical_body
     publisher = S3Repository(client, bucket="test", prefix="isolated/tenure")
@@ -1651,6 +1661,8 @@ def test_exact_tenure_private_result_publication_and_cold_reader(
     cold = S3Repository(client, bucket="test", prefix="isolated/tenure")
     recovered = asyncio.run(cold.recover(track))
     assert recovered.matches[0].document == document
+    if reference is not None:
+        assert not any(reference["object"] in call["Key"] for call in client.calls)
     assert recovered.matches[0].champion_after.hotkey == (
         item["hotkey"] if won else track.initial_champion.hotkey
     )

@@ -56,6 +56,11 @@ from validator.production.storage import (
     StorageError,
 )
 from validator.queue import TERMINAL_STATES
+from validator.reproducibility import (
+    stage_reference,
+    validate_pair_evidence,
+    validate_stage_reference,
+)
 from validator.uploads import MODEL_REFERENCE_FORMAT, decode_model_reference
 
 
@@ -377,9 +382,21 @@ class ReadyBatchSource:
             raise RuntimeError("winning R2 model reference differs")
         self.private_uploads.archive_champion(model)
 
-    def archive_stage(self, task: object, result: object, score_block: int) -> None:
+    def archive_stage(
+        self, task: object, result: object, score_block: int,
+    ) -> dict[str, object] | None:
         """Persist a scored nonterminal stage before changing local tournament state."""
 
+        metrics = {key: value for key, value in result.metrics.items() if key != "stage_evidence"}
+        if "reproducibility" in metrics:
+            validate_pair_evidence(metrics["reproducibility"], result.score,
+                                   metrics["incumbent_score"], metrics["paired_gain_lower_bound"],
+                                   track=self.track)
+            if metrics["reproducibility"]["challenger_sha256"] != task.file_sha256:
+                raise ValueError("stage evidence differs from its admitted challenger")
+            binding = self.stage_binding(task.challenge_id, confirmation=False)
+            if any(metrics.get(key) != value for key, value in binding.items()):
+                raise ValueError("stage evidence differs from its original allocation")
         document = {
             "format": "veda-stage-result-v1",
             "track_spec_digest": self.track.digest,
@@ -392,11 +409,16 @@ class ReadyBatchSource:
             "stage": task.state.value,
             "score": result.score,
             "score_block": score_block,
-            "metrics": dict(result.metrics),
+            "metrics": metrics,
         }
-        self.objects.create_plan(
-            self._stage_name(task.challenge_id, task.state.value), _json(document)
-        )
+        name, payload = self._stage_name(task.challenge_id, task.state.value), _json(document)
+        reference = stage_reference(name, payload)
+        if "reproducibility" in metrics:
+            validate_stage_reference(reference, task.challenge_id, task.state.value)
+            if result.metrics.get("stage_evidence", reference) != reference:
+                raise ValueError("stage evidence changed during archive retry")
+        self.objects.create_plan(name, payload)
+        return reference if "reproducibility" in metrics else None
 
     def restore_stage(self, task: object) -> ArchivedStage | None:
         """Restore an exact immutable stage result after loss of local SQLite state."""
@@ -468,10 +490,21 @@ class ReadyBatchSource:
                     or identity.get("challenge_id") != task.challenge_id
                     or _json(identity) != admission.body):
                 raise RuntimeError("archived stage conflicts with its allocated model")
+        metrics = dict(document["metrics"])
+        if "reproducibility" in metrics:
+            if "stage_evidence" in metrics:
+                raise RuntimeError("archived stage contains a circular evidence reference")
+            validate_pair_evidence(metrics["reproducibility"], document["score"],
+                                   metrics["incumbent_score"], metrics["paired_gain_lower_bound"],
+                                   track=self.track)
+            if metrics["reproducibility"]["challenger_sha256"] != task.file_sha256:
+                raise RuntimeError("archived stage evidence changes its challenger")
+            metrics["stage_evidence"] = stage_reference(
+                self._stage_name(task.challenge_id, task.state.value), stored.body)
         return ArchivedStage(
             float(document["score"]),
             document["score_block"],
-            document["metrics"],
+            metrics,
         )
 
     @staticmethod
@@ -589,7 +622,9 @@ class ReadyBatchSource:
                 or document.get("model_digest") != model_digest
                 or _json(document) != admission.body):
             raise RuntimeError("inventory claim admission identity is invalid")
+        pool_read_started_ms = time.time_ns() // 1_000_000
         plans = tuple(plan for _, plan in self._plans())
+        pool_read_finished_ms = time.time_ns() // 1_000_000
         # Selection is a metadata decision at S, not a scan of whatever bytes
         # happen to survive at admission time. Missing bytes recover the bound
         # READY; they must not silently select a different historical batch.
@@ -600,6 +635,7 @@ class ReadyBatchSource:
             submission_block=submission_block,
             submission_timestamp_ms=document["submission_timestamp_ms"],
             disclosure_delay_seconds=self.track.cache.disclosure_delay_seconds,
+            pool_read_interval_ms=(pool_read_started_ms, pool_read_finished_ms),
         )
         return claim is not None
 
@@ -636,7 +672,8 @@ class ReadyBatchSource:
             "cache_ready_sha256": hashlib.sha256(plan.encode()).hexdigest(),
             "cache_completed_block": plan.completed_block,
             "cache_completed_at_ms": plan.completed_at_ms,
-            "cache_allocation": claim,
+            "cache_allocation": {key: value for key, value in claim.items() if key != "selection"},
+            **({"claim_evidence": claim} if "selection" in claim else {}),
         }
 
     def inventory_status(self, plans: tuple[BatchPlan, ...]) -> dict[str, object]:
