@@ -43,7 +43,7 @@ from validator.publication import (
     fetch_weight_artifact,
     validate_public_weights_url,
 )
-from validator.queue import ChainPosition, challenge_id
+from validator.queue import ChainPosition, ChallengeState, challenge_id
 from validator.store import ChallengeStore
 from validator.tournament import (
     Tournament,
@@ -775,6 +775,35 @@ def test_confirmation_status_exposes_exact_aggregate_without_raw_inputs():
     assert miner["champion"] is False
     assert status["champion"] == baseline.public()
     assert "must stay private" not in json.dumps(status)
+
+
+def test_status_blocked_has_no_retry_eta_and_deferred_keeps_deadline(tmp_path):
+    track = parse_track_spec(valid_spec())
+    baseline = genesis_champion(track)
+    for blocked in (True, False):
+        with ChallengeStore(tmp_path / f"status-{blocked}.db") as store:
+            identifier, _ = store.add_submission(submission_at(200), occurred_at_ms=1)
+            for state in (ChallengeState.FETCHING, ChallengeState.VALIDATING,
+                          ChallengeState.SCORING):
+                store.transition(identifier, state, occurred_at_ms=2)
+            task = store.claim_next_scoring("worker", lease_ms=100, now_ms=3)
+            update = store.block_leased if blocked else store.defer_leased
+            update(identifier, task.lease_token, error_code="SCORING_UNAVAILABLE",
+                   error_summary="worker unavailable", retry_after_ms=999_000,
+                   occurred_at_ms=4)
+            snapshot = store.public_snapshot()
+            status = publication_module._status_document(
+                track, 211, Tournament((), baseline, ()),
+                [{**row, "uid": 7} for row in snapshot["challenges"]],
+                snapshot["challenges"], system_matches=[],
+            )
+            row = next(row for row in status["participants"] if row["challenge_id"] == identifier)
+            assert row["retry_after_ms"] == (None if blocked else 999_000)
+            assert row["alert"] is blocked
+            assert store._connection.execute(
+                "SELECT retry_after_ms FROM challenges WHERE challenge_id = ?", (identifier,),
+            ).fetchone()[0] == 999_000
+            assert status["champion"] == baseline.public()
 
 
 def test_public_repository_rejects_active_track_pointer_rollback() -> None:
