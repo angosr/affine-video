@@ -167,6 +167,70 @@ def test_legacy_claim_has_unknown_first_selection_and_is_never_backfilled(invent
     assert case.objects.get(ALLOCATION_OBJECT).body == old_bytes
 
 
+def test_successful_cas_row_seals_pool_version_and_only_winning_attempt_clock(
+    inventory_case, monkeypatch,
+):
+    from validator.production import inventory as module
+
+    case = inventory_case
+    plans = (make_plan(case, 101), make_plan(case, 102))
+    create = case.objects.create_plan
+    raced, ticks = False, [100_000_000_000]
+
+    def clock():
+        ticks[0] += 1_000_000
+        return ticks[0]
+
+    def race(name, payload):
+        nonlocal raced
+        if name == ALLOCATION_OBJECT and not raced:
+            raced = True
+            claim(Inventory(case.objects, case.track.digest), plans, identifier="a2" * 32)
+        return create(name, payload)
+
+    monkeypatch.setattr(module.time, "time_ns", clock)
+    monkeypatch.setattr(case.objects, "create_plan", race)
+    row = claim(Inventory(case.objects, case.track.digest), plans)
+    rows = Inventory(case.objects, case.track.digest).read()[1]["claims"]
+    assert rows[-1] == row and row["selection"]["cas_attempt"] == 2
+    assert row["selection"]["captured_at_ms"] > rows[0]["selection"]["captured_at_ms"]
+    assert row["selection"]["pool_sha256"] == rows[0]["selection"]["pool_sha256"]
+    sealed = case.objects.get(ALLOCATION_OBJECT).body
+    assert claim(Inventory(case.objects, case.track.digest), tuple(reversed(plans))) == row
+    assert case.objects.get(ALLOCATION_OBJECT).body == sealed
+
+
+def test_generation_change_during_pool_observation_retries_without_resampling_bound_claim(
+    inventory_case, tmp_path, monkeypatch,
+):
+    case = inventory_case
+    identity = {"format": "veda-admission-model-v1", "track_spec_digest": case.track.digest,
+                "challenge_id": "a1" * 32, "file_sha256": "b2" * 32,
+                "model_digest": "c3" * 32, "submission_block": 200,
+                "submission_timestamp_ms": 200_000}
+    case.objects.create_plan("admissions/" + "a1" * 32 + ".json", canonical_json(identity))
+    source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
+    first = (("plans/101.json", make_plan(case, 101)),)
+    complete = first + (("plans/102.json", make_plan(case, 102)),)
+    reads = iter((first, complete))
+    monkeypatch.setattr(source, "_plans", lambda: next(reads))
+    args = dict(confirmation=False, submission_block=200, file_sha256="b2" * 32,
+                model_digest="c3" * 32)
+    with pytest.raises(RuntimeError, match="changed during"):
+        source.claim_ready("a1" * 32, **args)
+    assert source.inventory.read()[1]["claims"] == []
+    monkeypatch.setattr(source, "_plans", lambda: complete)
+    assert source.claim_ready("a1" * 32, **args)
+    selection = source.inventory.read()[1]["claims"][0]["selection"]
+    assert len(selection["candidates"]) == 2 and selection["pool_read_interval_ms"] is not None
+    sealed = case.objects.get(ALLOCATION_OBJECT).body
+    # Bound retry reads its original plan once, not a new two-read selection pool.
+    reads = iter((first + (("plans/100.json", make_plan(case, 100)),),))
+    monkeypatch.setattr(source, "_plans", lambda: next(reads))
+    assert source.claim_ready("a1" * 32, **args)
+    assert case.objects.get(ALLOCATION_OBJECT).body == sealed
+
+
 def test_inventory_plan_is_secret_committed_and_unassigned(inventory_case):
     plan = make_plan(inventory_case, 101)
     assert BatchPlan.decode(plan.encode()) == plan

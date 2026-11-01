@@ -45,6 +45,7 @@ from validator.release import (
     require_release_approval,
     verify_data_binding,
 )
+from validator.reproducibility import verify_public_score_audit
 from validator.s3 import client_config, is_missing, is_precondition_failed
 from validator.store import ChallengeStore
 from validator.system_matches import (
@@ -917,6 +918,62 @@ class S3Repository:
         check_deadline(deadline)
         await asyncio.to_thread(self._put_immutable,
                                 disclosure.record_name, disclosure.record_payload)
+
+    async def publish_score_audit(self, payload: bytes, *, track: TrackSpec, now_ms: int) -> bool:
+        """One small immutable disclosure after R and its actual committed match.
+
+        Existing public objects are the receipt. No new retry ledger or pointers.
+        """
+        def publish() -> bool:
+            body = _decode_canonical_object(payload, "score audit")
+            if now_ms < body["context"]["not_before_ms"]:
+                raise PublicArtifactError("public score audit is premature")
+            name = f"score_audits/{body['challenge_id']}/{body['stage']}.json"
+            if self._confirmed_immutable.get(name) == hashlib.sha256(payload).hexdigest():
+                return False
+            weight_payload = self._get_optional("weights.json")
+            if weight_payload is None:
+                return False
+            fence = decode_weight_artifact(weight_payload)
+            if (fence.track_id != track.track_id or fence.track_spec_digest != track.digest
+                    or fence.netuid != track.netuid or fence.mechid != track.mechid):
+                raise PublicArtifactError("score audit weight fence belongs to another track")
+            if fence.match_sequence == 0:
+                return False
+            terminal = self._get_optional(
+                f"matches/{track.track_id}/{fence.match_sequence:012d}.json")
+            if (terminal is None
+                    or hashlib.sha256(terminal).hexdigest() != fence.terminal_match_sha256):
+                raise PublicArtifactError("score audit weight fence lacks its original match")
+            actual = None
+            for sequence in range(1, fence.match_sequence + 1):
+                item = (terminal if sequence == fence.match_sequence else self._get_optional(
+                    f"matches/{track.track_id}/{sequence:012d}.json"))
+                if item is None:
+                    raise PublicArtifactError("score audit match prefix is incomplete")
+                document = _decode_canonical_object(item, "match")
+                if (document["sequence"] != sequence
+                        or document["decided_block"] > fence.source_block):
+                    raise PublicArtifactError("score audit match lies outside its committed fence")
+                if document["challenge_id"] == body["challenge_id"]:
+                    actual = item
+                    break
+            if actual is None:
+                return False  # The original decision has not committed publicly yet.
+            try:
+                verify_public_score_audit(payload, actual, track)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PublicArtifactError("score audit conflicts with its actual match") from exc
+            prior = self._get_optional(name)
+            if prior is not None:
+                if prior != payload:
+                    raise PublicArtifactError("immutable public score audit changed")
+                self._confirmed_immutable[name] = hashlib.sha256(payload).hexdigest()
+                return False
+            self._put_immutable(name, payload)
+            return True
+
+        return await asyncio.to_thread(publish)
 
     async def publish(self, artifacts: PublicArtifacts) -> None:
         await self.stage(artifacts)

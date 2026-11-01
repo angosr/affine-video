@@ -57,6 +57,7 @@ from validator.production.storage import (
 )
 from validator.queue import TERMINAL_STATES
 from validator.reproducibility import (
+    public_score_audit,
     stage_reference,
     validate_pair_evidence,
     validate_stage_reference,
@@ -397,6 +398,27 @@ class ReadyBatchSource:
             binding = self.stage_binding(task.challenge_id, confirmation=False)
             if any(metrics.get(key) != value for key, value in binding.items()):
                 raise ValueError("stage evidence differs from its original allocation")
+            if "cache_allocation" in metrics and "promotion" in metrics:
+                claim = metrics.get("claim_evidence")
+                context = {
+                    "track_id": self.track.track_id, "data_spec_digest": self.data_track.digest,
+                    "submission_position": {"block_height": task.position.block,
+                                            "extrinsic_index": task.position.extrinsic_index,
+                                            "event_index": task.position.event_index},
+                    "not_before_ms": metrics["cache_completed_at_ms"]
+                    + self.track.cache.disclosure_delay_seconds * 1000,
+                    "claim_cas_interval_clock": "local-wall-clock-confirmed-read-upper-bound",
+                    "claim_sha256": (None if claim is None else
+                                     hashlib.sha256(canonical_json(claim)).hexdigest()),
+                }
+                prior = metrics.get("audit_context")
+                if prior is not None and any(prior.get(k) != v for k, v in context.items()):
+                    raise ValueError("stage public audit context changed during archive retry")
+                metrics["audit_context"] = prior if prior is not None else {
+                    **context, "claim_cas_interval_ms": (None if claim is None else [
+                        claim["selection"]["captured_at_ms"], time.time_ns() // 1_000_000,
+                    ]),
+                }
         document = {
             "format": "veda-stage-result-v1",
             "track_spec_digest": self.track.digest,
@@ -413,6 +435,9 @@ class ReadyBatchSource:
         }
         name, payload = self._stage_name(task.challenge_id, task.state.value), _json(document)
         reference = stage_reference(name, payload)
+        audit = public_score_audit(document)
+        if audit is not None:
+            reference["public_audit"] = audit[1]
         if "reproducibility" in metrics:
             validate_stage_reference(reference, task.challenge_id, task.state.value)
             if result.metrics.get("stage_evidence", reference) != reference:
@@ -499,8 +524,13 @@ class ReadyBatchSource:
                                    track=self.track)
             if metrics["reproducibility"]["challenger_sha256"] != task.file_sha256:
                 raise RuntimeError("archived stage evidence changes its challenger")
-            metrics["stage_evidence"] = stage_reference(
-                self._stage_name(task.challenge_id, task.state.value), stored.body)
+            reference = stage_reference(self._stage_name(task.challenge_id, task.state.value),
+                                        stored.body)
+            audit = public_score_audit(document)
+            if audit is not None:
+                reference["public_audit"] = audit[1]
+            validate_stage_reference(reference, task.challenge_id, task.state.value)
+            metrics["stage_evidence"] = reference
         return ArchivedStage(
             float(document["score"]),
             document["score_block"],
@@ -622,8 +652,23 @@ class ReadyBatchSource:
                 or document.get("model_digest") != model_digest
                 or _json(document) != admission.body):
             raise RuntimeError("inventory claim admission identity is invalid")
+        _, authority = self.inventory.read()
+        original = next((row for row in authority["claims"]
+                         if row["challenge_id"] == challenge_id and row["stage"] == stage), None)
+        if original is not None:
+            self.inventory.claim(
+                challenge_id=challenge_id, stage=stage, file_sha256=file_sha256,
+                model_digest=model_digest, plans=(self._plan_by_digest(original["plan_digest"]),),
+                submission_block=submission_block,
+                submission_timestamp_ms=document["submission_timestamp_ms"],
+                disclosure_delay_seconds=self.track.cache.disclosure_delay_seconds,
+            )
+            return True
         pool_read_started_ms = time.time_ns() // 1_000_000
         plans = tuple(plan for _, plan in self._plans())
+        repeated = tuple(plan for _, plan in self._plans())
+        if tuple(plan.encode() for plan in plans) != tuple(plan.encode() for plan in repeated):
+            raise RuntimeError("candidate inventory changed during its complete observation")
         pool_read_finished_ms = time.time_ns() // 1_000_000
         # Selection is a metadata decision at S, not a scan of whatever bytes
         # happen to survive at admission time. Missing bytes recover the bound
@@ -793,6 +838,25 @@ class ReadyBatchSource:
             and plan.completed_at_ms + self.track.cache.disclosure_delay_seconds * 1000 <= now_ms
             and self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is None
         )
+
+    def public_stage_audit(self, reference: dict[str, object], *, now_ms: int) -> bytes:
+        """Read one small sealed stage; no model or evaluation payload restoration."""
+        validate_stage_reference(reference)
+        audit_ref = reference["public_audit"]
+        if now_ms < audit_ref["not_before_ms"]:
+            raise ValueError("public score audit is not due")
+        stored = self.objects.get(reference["object"])
+        if stage_reference(reference["object"], stored.body) != {
+            key: reference[key] for key in ("object", "sha256", "size_bytes")
+        }:
+            raise RuntimeError("private stage differs from its immutable public commitment")
+        document = json.loads(stored.body)
+        if _json(document) != stored.body:
+            raise RuntimeError("private stage is not canonical")
+        audit = public_score_audit(document)
+        if audit is None or audit[1] != audit_ref:
+            raise RuntimeError("public audit differs from its score-time commitment")
+        return audit[0]
 
     def record_disclosed(self, plan_digest: str) -> None:
         """Persist only after the public immutable record and all bytes verified."""

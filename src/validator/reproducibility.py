@@ -10,7 +10,7 @@ import platform
 import re
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,10 @@ def stage_reference(name: str, payload: bytes) -> dict[str, Any]:
 
 def validate_stage_reference(value: Any, challenge_id: str | None = None,
                              stage: str | None = None) -> None:
-    if (not isinstance(value, dict) or set(value) != {"object", "sha256", "size_bytes"}
+    if (not isinstance(value, dict) or set(value) not in (
+        {"object", "sha256", "size_bytes"},
+        {"object", "sha256", "size_bytes", "public_audit"},
+    )
             or not isinstance(value["object"], str)
             or not re.fullmatch(r"stages/[0-9a-f]{64}/(?:SCORING|CONFIRMING)\.json",
                                 value["object"])
@@ -40,6 +43,167 @@ def validate_stage_reference(value: Any, challenge_id: str | None = None,
             or (challenge_id is not None and stage is not None
                 and value["object"] != f"stages/{challenge_id}/{stage}.json")):
         raise ValueError("stage evidence reference is invalid")
+    if "public_audit" in value:
+        audit = value["public_audit"]
+        expected = value["object"].replace("stages/", "score_audits/", 1)
+        if (not isinstance(audit, dict)
+                or set(audit) != {"object", "sha256", "size_bytes", "not_before_ms"}
+                or audit["object"] != expected or type(audit["not_before_ms"]) is not int
+                or audit["not_before_ms"] <= 0):
+            raise ValueError("public score audit reference is invalid")
+        validate_stage_reference({key: (value["object"] if key == "object" else audit[key])
+                                  for key in ("object", "sha256", "size_bytes")})
+
+
+_AUDIT_METRICS = (
+    "reproducibility", "incumbent_score", "paired_gain_lower_bound", "promotion",
+    "cache_sha256", "cache_generated_block", "cache_plan_digest", "cache_seed_block_hash",
+    "cache_ready_sha256", "cache_completed_block", "cache_completed_at_ms", "cache_allocation",
+    "claim_evidence",
+)
+
+
+def public_score_audit(document: dict[str, Any]) -> tuple[bytes, dict[str, Any]] | None:
+    """One deterministic redaction of the original private stage, sealed before its match.
+
+    Candidate rows contain only immutable digest references and eligibility facts,
+    never plan bodies, source proofs, prompts, masks, tensors or future questions.
+    """
+    if "audit_context" not in document["metrics"]:
+        return None  # Old stages have no retrospective public proof.
+    metrics = document["metrics"]
+    context = metrics["audit_context"]
+    body = canonical_json({
+        "format": "veda-public-score-audit-v1", "context": context,
+        **{key: document[key] for key in (
+            "track_spec_digest", "challenge_id", "submission_id", "hotkey", "file_sha256",
+            "stage", "score", "score_block",
+        )},
+        "metrics": {key: metrics.get(key) if key == "claim_evidence" else metrics[key]
+                    for key in _AUDIT_METRICS},
+    })
+    name = f"score_audits/{document['challenge_id']}/{document['stage']}.json"
+    return body, {**stage_reference(name, body), "not_before_ms": context["not_before_ms"]}
+
+
+def verify_public_score_audit(payload: bytes, match_payload: bytes, track: Any) -> dict[str, Any]:
+    """Read-only CPU audit of public bytes; never load models, tensors, DBs or CUDA."""
+    from validator.production.commitment import decode_canonical_json
+    from validator.production.inventory import _CLAIM_FIELDS, _validate_selection
+    from validator.tournament import Champion, validate_match_document
+
+    body, match = decode_canonical_json(payload), decode_canonical_json(match_payload)
+    if (not isinstance(body, dict) or set(body) != {
+        "format", "context", "track_spec_digest", "challenge_id", "submission_id", "hotkey",
+        "file_sha256", "stage", "score", "score_block", "metrics",
+    } or body["format"] != "veda-public-score-audit-v1"
+            or not isinstance(body["metrics"], dict) or set(body["metrics"]) != set(_AUDIT_METRICS)
+            or len(payload) > 2**20):
+        raise ValueError("public score audit fields are invalid")
+    record = validate_match_document(
+        match, sequence=match["sequence"], track_id=track.track_id,
+        track_spec_digest=track.digest, netuid=track.netuid,
+        minimum_gain=track.full_video.minimum_gain,
+        minimum_exact_gain=track.scoring.minimum_frontier_gain,
+        promotion=track.promotion, incumbent=replace(
+            Champion.from_public(match["incumbent_before"]), tenure_block=match[
+                "evaluation"]["stages"][0].get("promotion", {}).get("established_block")),
+    )
+    metrics, context = body["metrics"], body["context"]
+    if (not isinstance(context, dict) or set(context) != {
+        "track_id", "data_spec_digest", "submission_position", "not_before_ms",
+        "claim_sha256", "claim_cas_interval_ms",
+        "claim_cas_interval_clock",
+    } or context["claim_cas_interval_clock"] != "local-wall-clock-confirmed-read-upper-bound"
+            or context["track_id"] != track.track_id
+            or context["data_spec_digest"] != (track.data_spec_sha256 or track.digest)
+            or any(body[key] != match[key] for key in
+                   ("track_spec_digest", "challenge_id", "submission_id"))
+            or body["hotkey"] != match["submission"]["hotkey"]
+            or body["file_sha256"] != match["evaluation"]["file_sha256"]
+            or context["submission_position"] != {
+                key: match["submission"][key] for key in
+                ("block_height", "extrinsic_index", "event_index")
+            }):
+        raise ValueError("public score audit changes its match identity")
+    stages = [row for row in match["evaluation"]["stages"] if row["stage"] == body["stage"]]
+    if len(stages) != 1 or body["stage"] != "SCORING":
+        raise ValueError("public score audit lacks its original exact stage")
+    stage = stages[0]
+    reference = stage.get("stage_evidence")
+    validate_stage_reference(reference, body["challenge_id"], body["stage"])
+    expected_ref = {**stage_reference(f"score_audits/{body['challenge_id']}/SCORING.json", payload),
+                    "not_before_ms": context["not_before_ms"]}
+    if reference.get("public_audit") != expected_ref:
+        raise ValueError("public score audit differs from its immutable match commitment")
+    batch = stage["evaluation_batch"]
+    expected_batch = {
+        "sha256": metrics["cache_sha256"], "generated_block": metrics["cache_generated_block"],
+        "object": f"batches/{metrics['cache_sha256']}/manifest.json",
+        "plan_digest": metrics["cache_plan_digest"],
+        "seed_block_hash": metrics["cache_seed_block_hash"],
+        "ready_sha256": metrics["cache_ready_sha256"],
+        "completed_block": metrics["cache_completed_block"],
+        "completed_at_ms": metrics["cache_completed_at_ms"],
+        "allocation": metrics["cache_allocation"],
+    }
+    if (batch != expected_batch or body["score"] != stage["score"]
+            or body["score_block"] != stage["score_block"]
+            or metrics["incumbent_score"] != stage["incumbent_score"]
+            or metrics["paired_gain_lower_bound"] != stage["paired_gain_lower_bound"]
+            or metrics["promotion"] != stage.get("promotion")
+            or context["not_before_ms"] != metrics["cache_completed_at_ms"]
+            + track.cache.disclosure_delay_seconds * 1000
+            or not metrics["cache_completed_at_ms"]
+            < batch["allocation"]["submission_timestamp_ms"] < context["not_before_ms"]):
+        raise ValueError("public score audit changes its original batch or decision")
+    interval = context["claim_cas_interval_ms"]
+    if (context["claim_sha256"] is None) != (interval is None) or (
+        interval is not None and (
+            not isinstance(interval, list) or len(interval) != 2
+            or any(type(t) is not int for t in interval) or not 0 < interval[0] <= interval[1]
+            or not isinstance(context["claim_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", context["claim_sha256"])
+        )
+    ):
+        raise ValueError("public score audit claim observation interval is invalid")
+    claim = metrics["claim_evidence"]
+    if claim is None:
+        if context["claim_sha256"] is not None:
+            raise ValueError("unknown claim cannot assert a first-allocation timestamp")
+    else:
+        if (not isinstance(claim, dict) or set(claim) != _CLAIM_FIELDS | {"selection"}
+                or {k: v for k, v in claim.items() if k != "selection"} != batch["allocation"]
+                or hashlib.sha256(canonical_json(claim)).hexdigest() != context["claim_sha256"]
+                or interval is None or interval[0] != claim["selection"]["captured_at_ms"]):
+            raise ValueError("public score audit claim differs from its successful CAS row")
+        try:
+            _validate_selection(claim)
+        except RuntimeError as exc:
+            raise ValueError("public score audit selection evidence is invalid") from exc
+        if claim["selection"]["disclosure_delay_seconds"] != track.cache.disclosure_delay_seconds:
+            raise ValueError("public score audit changes the original data lifetime")
+    evidence = metrics["reproducibility"]
+    if evidence["challenger_sha256"] != body["file_sha256"]:
+        raise ValueError("public score audit changes its scored challenger")
+    incumbent = match["incumbent_before"]
+    private = incumbent.get("private_upload")
+    expected_incumbent = (private["file_sha256"] if private else
+                          track.initial_champion.evaluation_file_sha256
+                          if incumbent["challenge_id"] == "genesis" else None)
+    if expected_incumbent is not None and evidence["incumbent_sha256"] != expected_incumbent:
+        raise ValueError("public score audit changes its scored incumbent")
+    validate_pair_evidence(evidence, body["score"], metrics["incumbent_score"],
+                           metrics["paired_gain_lower_bound"], track=track)
+    return {
+        "challenge_id": body["challenge_id"], "stage": body["stage"],
+        "match_sha256": hashlib.sha256(match_payload).hexdigest(),
+        "audit_sha256": hashlib.sha256(payload).hexdigest(),
+        "case_count": len(evidence["case_order"]),
+        "challenger_score": body["score"], "incumbent_score": metrics["incumbent_score"],
+        "gain_lower_bound": metrics["paired_gain_lower_bound"],
+        "minimum_gain": match["minimum_gain"], "outcome": str(record.outcome),
+    }
 
 
 def _execution(device: str | None, runtime_identity: dict[str, Any] | None,

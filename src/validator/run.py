@@ -100,6 +100,10 @@ class ArtifactRepository(Protocol):
         deadline: float | None = None,
     ) -> None: ...
 
+    async def publish_score_audit(
+        self, payload: bytes, *, track: TrackSpec, now_ms: int,
+    ) -> bool: ...
+
     async def recover(
         self, track: TrackSpec, *, runtime_manifest: bytes | None = None,
     ) -> PublicLedger: ...
@@ -271,8 +275,16 @@ async def _publish_due_batch(
         # must not delay the independent, durable disclosure deadline.
         _LOG.exception("optional disclosed-data cleanup failed; retaining files")
     now_ms = time.time_ns() // 1_000_000
+    audit_error = None
+    try:
+        await _publish_due_score_audit(source, publisher, challenges=challenges, now_ms=now_ms)
+    except Exception as exc:
+        # Independent small evidence must neither depend on nor block a bulk retry.
+        audit_error = exc
     due = await asyncio.to_thread(source.due_plan_digests, now_ms)
     if not due:
+        if audit_error is not None:
+            raise audit_error
         return None
     retries = PrivateRetryStore(source.objects, track_spec_digest=source.data_track.digest)
     published = None
@@ -313,7 +325,27 @@ async def _publish_due_batch(
         retries.disclosure_failed(digest) for digest in due if digest != published
     )):
         raise RuntimeError("unresolved disclosure failure remains in durable retry state")
+    if audit_error is not None:
+        raise audit_error
     return published if published is not None else False
+
+
+async def _publish_due_score_audit(
+    source: ReadyBatchSource, publisher: ArtifactRepository, *,
+    challenges: list[dict[str, object]], now_ms: int,
+) -> None:
+    """At most one new small audit per existing disclosure pass, including late stages."""
+    for challenge in challenges:
+        if challenge["state"] != "SUCCEEDED":
+            continue
+        for stage in challenge.get("stages", ()):
+            reference = stage.get("stage_evidence")
+            audit = None if reference is None else reference.get("public_audit")
+            if audit is None or now_ms < audit["not_before_ms"]:
+                continue
+            payload = await asyncio.to_thread(source.public_stage_audit, reference, now_ms=now_ms)
+            if await publisher.publish_score_audit(payload, track=source.track, now_ms=now_ms):
+                return
 
 
 async def _reclaim_private_uploads(

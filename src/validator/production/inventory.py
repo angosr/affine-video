@@ -138,8 +138,10 @@ class Inventory:
         by_digest = {plan.plan_digest: plan for plan in ordered}
         if any(plan.track_spec_digest != self.track_spec_digest for plan in ordered):
             raise RuntimeError("inventory contains another track")
+        attempt = 0
 
         def update(document: dict[str, Any]) -> dict[str, Any] | None:
+            nonlocal attempt
             claims = document["claims"]
             own = [row for row in claims if row["challenge_id"] == challenge_id]
             if any(row["file_sha256"] != file_sha256 or row["model_digest"] != model_digest
@@ -152,6 +154,7 @@ class Inventory:
                 self.validate_claim(existing, by_digest[existing["plan_digest"]],
                                     disclosure_delay_seconds=disclosure_delay_seconds)
                 return existing
+            attempt += 1
             exact = next((row for row in own if row["stage"] == "SCORING"), None)
             if stage == "CONFIRMING" and exact is None:
                 raise RuntimeError("confirmation inventory requires an exact allocation")
@@ -190,6 +193,7 @@ class Inventory:
                     "selection": {
                         "algorithm": "earliest-expiry-stable-v1",
                         "source_sha256": evaluation_source_digest(),
+                        "cas_attempt": attempt,
                         "captured_at_ms": time.time_ns() // 1_000_000,
                         "clock": "local-before-successful-cas",
                         "pool_read_interval_ms": (
@@ -197,6 +201,7 @@ class Inventory:
                         "disclosure_delay_seconds": disclosure_delay_seconds,
                         "previous_authority_sha256": hashlib.sha256(
                             canonical_json(document)).hexdigest(),
+                        "pool_sha256": _pool_digest(candidates),
                         "candidates": candidates,
                     },
                 }
@@ -254,6 +259,7 @@ def _validate_selection(claim: dict[str, Any]) -> None:
         "algorithm", "captured_at_ms", "clock", "disclosure_delay_seconds",
         "previous_authority_sha256", "candidates", "pool_read_interval_ms",
         "source_sha256",
+        "pool_sha256", "cas_attempt",
     } or selection["algorithm"] != "earliest-expiry-stable-v1"
             or selection["clock"] != "local-before-successful-cas"
             or type(selection["captured_at_ms"]) is not int or selection["captured_at_ms"] <= 0
@@ -261,6 +267,8 @@ def _validate_selection(claim: dict[str, Any]) -> None:
             or selection["disclosure_delay_seconds"] <= 0
             or not _digest(selection["previous_authority_sha256"])
             or not _digest(selection["source_sha256"])
+            or type(selection["cas_attempt"]) is not int
+            or not 1 <= selection["cas_attempt"] <= 16
             or not isinstance(selection["candidates"], list) or not selection["candidates"]):
         raise RuntimeError("inventory first-selection evidence is invalid")
     interval = selection["pool_read_interval_ms"]
@@ -307,8 +315,16 @@ def _validate_selection(claim: dict[str, Any]) -> None:
         row["generation_block"], row["plan_digest"],
     )):
         raise RuntimeError("inventory candidate order differs")
+    if selection["pool_sha256"] != _pool_digest(candidates):
+        raise RuntimeError("inventory candidate pool version differs")
     selected = next((row for row in candidates if all(row[key] for key in
                     ("s_eligible", "slot_eligible", "families_eligible"))), None)
     if (selected is None or selected["plan_digest"] != claim["plan_digest"]
             or selected["plan_sha256"] != claim["ready_sha256"]):
         raise RuntimeError("inventory selected READY differs from first-selection evidence")
+
+
+def _pool_digest(candidates: list[dict[str, Any]]) -> str:
+    return hashlib.sha256(canonical_json([
+        {key: row[key] for key in ("plan_digest", "plan_sha256")} for row in candidates
+    ])).hexdigest()
