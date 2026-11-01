@@ -476,5 +476,15 @@ def test_loader_accepts_canonical_json_file(tmp_path) -> None:
 
 
 def test_repository_track_matches_the_current_parser() -> None:
-    track = load_track_spec(Path(__file__).resolve().parents[2] / "track.json")
+    path = Path(__file__).resolve().parents[2] / "track.json"
+    original = path.read_bytes()
+    track = load_track_spec(path)
+    assert hashlib.sha256(original).hexdigest() == track.digest == (
+        "a971c2714bf145f1953674492990207a6a61eecf61c093c487e179c114c24b63"
+    )
+    assert track.track_id == "veda-sn120-v2-r10"
+    assert track.track_start_block == 9380660
+    assert track.data_spec_sha256 == (
+        "4e405540e88443dd21541f305d75821c1b3707129c6651dea842e9d1b485c1aa"
+    )
     assert parse_track_spec(track_spec_dict(track)).digest == track.digest

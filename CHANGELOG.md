@@ -1,11 +1,35 @@
 # Changelog
 
-## Unreleased
+## 2026-11-01 — Native deployment of a3d3957
+
+Operator-reported acceptance: application commit
+`a3d3957d56c09e7948f76459ef4e6e1780082afd`, native installation at 20:47 CST.
+The database continued to cursor 9411110 with 12 successful challenges, 12 stages and no
+challenge errors. Public runtime identity had switched to this source, with UID643 weight 1.
+
+| Installed identity | SHA-256 |
+| --- | --- |
+| Application source | `c3ccaaf09671266456189916ef6f2344e11e21a9e4ed43dc0619f4afa7c31db4` |
+| Native dependency lock | `2dbc18e4e32fd1328444ffda17f61e021cc11117325cc2534f1074f5b61d507e` |
+| Runtime manifest | `576d19da9ccfda5a0960f161047d3b540314884592fddd9302fad2576931fe4e` |
+| Accepted release | `070e95dc61b02eebf3d35e4fd037c2d4e6b4b3921530b8cbaee9c54d8063e7d2` |
+| Computational dependency environment | `760c0f5eb73df2da4916caade6bcff625416eee7f52167cb2f5a8dfe55d7bf16` |
 
 - Derive structured disclosure overdue/upload observations through the existing audit
   repository. Preserve the difference between operational status and immutable public receipts.
 - Record explicit operator disclosure waivers in the original retry CAS, preserving its
   attempt/error history and stopping automatic work without marking data as disclosed.
+- Allow that decision during a retry backoff or upload lease. It stops future automatic work,
+  does not cancel uploads already in flight, and cannot overwrite real completion receipts.
+
+The existing `veda-sn120-v2-r10` rules, start, original data/READY/allocations/S/C/R,
+confidence 0.9975 and single-exact promotion remain unchanged. The repository configuration
+is synchronized to the original immutable spec `a971c2714bf145f1953674492990207a6a61eecf61c093c487e179c114c24b63`,
+with data origin `4e405540e88443dd21541f305d75821c1b3707129c6651dea842e9d1b485c1aa`.
+This configuration/documentation sync does not create a new runtime package or acceptance.
+E2/E3/E16 retain their original frozen source/hardware measurement identities; OCI remains
+package provenance rather than a new native Engine deployment. Seed/chain anchors and
+statistical recalibration are not claimed as completed by this release.
 
 ## 2026-11-01 — Native deployment of 36cc9ff
 

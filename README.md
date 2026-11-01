@@ -9,6 +9,14 @@ entire subnet's weight. UID0 starts as champion using the official VEDA selector
 - [Leaderboard and queue](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/status.json) · [Match summary](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/summary.json).
 - [VEDA research](https://veda-sparse.github.io/) · [Reference model](https://huggingface.co/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview).
 
+Repository [track.json](track.json) contains the exact bytes of the existing live rules,
+`veda-sn120-v2-r10`, SHA-256 `a971c2714bf145f1953674492990207a6a61eecf61c093c487e179c114c24b63`.
+The [immutable original specification](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/artifacts/a971c2714bf145f1953674492990207a6a61eecf61c093c487e179c114c24b63)
+pins data origin `4e405540e88443dd21541f305d75821c1b3707129c6651dea842e9d1b485c1aa`.
+Earlier repository templates remain historical Git versions. Synchronizing this file does
+not change live rules, start, data or runtime identity; application release tags identify
+the installed application commit, independently of later configuration/documentation commits.
+
 ## What to train
 
 Improve the selector's query/key projections so it picks useful attention blocks under the
@@ -218,8 +226,8 @@ Full audit resolves each historical match's original rules once from
 rules are reported in `unavailable_score_audits`, never replaced with today's spec.
 `verify-match --track` accepts this same immutable spec or the original track envelope.
 
-An unreleased audit update reports `disclosure_overdue` plan digests separately from
-`disclosure_in_progress`.
+The [2026-11-01 native release](CHANGELOG.md) (`a3d3957`) reports `disclosure_overdue` plan
+digests separately from `disclosure_in_progress`.
 These are operational observations from match-bound deadlines and the public inventory's
 original retry projection, with observation time/source retained; they are not proof of a
 complete private pool or of payload availability. A live upload lease is not a known failure.
