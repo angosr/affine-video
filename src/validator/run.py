@@ -39,6 +39,13 @@ from validator.production.confirmation import ConfirmationWorkerPool
 from validator.production.retries import PrivateRetryStore
 from validator.production.storage import ARTIFACT_MANIFEST_OBJECT, PrivateObjectStore
 from validator.publication import (
+    PUBLIC_STORAGE_BUCKET as PUBLIC_STORAGE_BUCKET,
+)
+from validator.publication import (
+    PUBLIC_STORAGE_PREFIX as PUBLIC_STORAGE_PREFIX,
+)
+from validator.publication import (
+    PUBLIC_STORAGE_URL,
     PublicArtifacts,
     PublicLedger,
     build_genesis_artifacts,
@@ -76,12 +83,6 @@ from validator.weights import (
     weight_update_due,
 )
 
-PUBLIC_STORAGE_BUCKET = "affine_video"
-PUBLIC_STORAGE_PREFIX = "tracks/main"
-PUBLIC_STORAGE_URL = (
-    "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/"
-    f"{PUBLIC_STORAGE_BUCKET}/{PUBLIC_STORAGE_PREFIX}"
-)
 DEFAULT_PUBLIC_WEIGHTS_URL = f"{PUBLIC_STORAGE_URL}/weights.json"
 DEFAULT_BASELINE_MANIFEST_URL = f"{PUBLIC_STORAGE_URL}/assets/veda_baseline_f16/manifest.json"
 DEFAULT_NETUID = PRODUCTION_NETUID

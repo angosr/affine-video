@@ -3,6 +3,7 @@ import json
 from dataclasses import replace
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from miner.submit import ModelSubmission
@@ -21,16 +22,19 @@ from validator.production.inventory import ALLOCATION_OBJECT, Inventory
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
+    PublishedPlanReference,
     ReadyObject,
     ReadySampleCache,
     build_plan,
     generation_seed,
+    public_disclosure_document,
     select_source_proofs,
     validate_source_selection_sequence,
 )
 from validator.production.retries import PrivateRetryStore
 from validator.production.service import PlanCoordinator
-from validator.production.storage import PrivateObjectStore
+from validator.production.storage import PreconditionFailed, PrivateObjectStore
+from validator.publication import PublicArtifactError, S3Repository
 from validator.queue import ChallengeState
 from validator.release import verify_competition_manifest
 from validator.scoring import (
@@ -444,7 +448,7 @@ def test_new_rules_keep_all_four_ready_seals_and_original_allocation_authority(
     assert cold.inventory_status(plans)["max_bytes"] == 768 * 1024**3
     coordinator = PlanCoordinator(track=rules, data_track=case.track, store=SimpleNamespace(
         finalized_block_hash=lambda _block: None,
-    ), objects=case.objects, source_pool=case.pool)
+    ), objects=case.objects, source_pool=case.pool, confirm_disclosure=lambda _plan: False)
     assert coordinator.create_next(now_ms=110_000, finalized_head=(110, "ab" * 32)) is None
     assert tuple(p for _, _, p in coordinator.plans()) == plans
     replacement = coordinator.create_next(disk_bytes=512 * 1024**3, now_ms=10**12,
@@ -534,7 +538,8 @@ def test_rule_upgrade_never_moves_original_ready_clock_or_submission_window(
     assert {p.plan_digest: p.encode() for _, p in upgraded._plans()} == sealed
     assert case.objects.get(ARTIFACT_MANIFEST_OBJECT).body == bootstrap == manifest.encode()
     kwargs = {"objects": case.objects, "source_pool": case.pool,
-              "store": SimpleNamespace(finalized_block_hash=lambda _block: None)}
+              "store": SimpleNamespace(finalized_block_hash=lambda _block: None),
+              "confirm_disclosure": lambda _plan: False}
     before_upgrade = PlanCoordinator(track=case.track, **kwargs)
     after_upgrade = PlanCoordinator(track=rules, data_track=case.track, **kwargs)
     half_life = min(plan.completed_at_ms for plan in plans) + 43_200_000
@@ -898,7 +903,7 @@ def test_zero_miners_preproduce_and_full_inventory_pauses_then_refills(inventory
     store = Store()
     store.height = 101
     coordinator = PlanCoordinator(track=case.track, store=store, objects=case.objects,
-                                  source_pool=case.pool)
+                                  source_pool=case.pool, confirm_disclosure=lambda _plan: False)
     first = coordinator.create_next(now_ms=101_000, finalized_head=store.chain_cursor())
     assert first.inventory_slot == 0
     assert coordinator.create_next(now_ms=101_000, finalized_head=store.chain_cursor()) is None
@@ -952,7 +957,7 @@ def test_four_batch_target_fills_two_per_slot_without_rewriting_ready(inventory_
     case.track = replace(case.track, cache=parse_track_spec(raw).cache)
     store = SimpleNamespace(finalized_block_hash=lambda _block: None)
     coordinator = PlanCoordinator(track=case.track, store=store, objects=case.objects,
-                                  source_pool=case.pool)
+                                  source_pool=case.pool, confirm_disclosure=lambda _plan: False)
     originals = {}
     slots = []
     for block in range(101, 105):
@@ -1199,3 +1204,290 @@ def test_disclosure_does_not_restore_files_before_production_age(
     monkeypatch.setattr(source, "_restore_sample_cache", unexpected_restore)
     assert source.public_disclosure(plan.plan_digest, now_ms=height * 1000) is None
     assert list(tmp_path.iterdir()) == []
+
+
+def _source_exclusion_case(case, tmp_path, *, write_receipt=True):
+    from tests.validator.test_publication import MemoryS3 as PublicMemoryS3
+
+    published, hidden = make_plan(case, 101), make_plan(case, 102)
+    for plan in (published, hidden):
+        case.objects.create_plan(f"plans/{plan.generation_block}.json", plan.encode())
+    source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
+    client = PublicMemoryS3()
+    repository = S3Repository(client, bucket="public", prefix="tracks/test")
+    repository._put_immutable(f"batch_groups/{published.plan_digest}.json",
+                              canonical_json(public_disclosure_document(published)))
+    if write_receipt:
+        source.record_disclosed(published.plan_digest)
+    coordinator = PlanCoordinator(
+        track=case.track, objects=case.objects, source_pool=case.pool,
+        store=SimpleNamespace(finalized_block_hash=lambda _block: None),
+        confirm_disclosure=repository.confirm_source_disclosure,
+    )
+    return SimpleNamespace(published=published, hidden=hidden, source=source, client=client,
+                           repository=repository, coordinator=coordinator)
+
+
+def test_new_plan_excludes_only_verified_public_sources_and_freezes_original_inputs(
+    inventory_case, tmp_path,
+):
+    case = inventory_case
+    data = _source_exclusion_case(case, tmp_path)
+    old = (data.published, data.hidden)
+    old_bytes = tuple(plan.encode() for plan in old)
+    allocation = claim(data.source.inventory, old)
+    authority = case.objects.get(ALLOCATION_OBJECT)
+    new = data.coordinator.create_next(now_ms=10**12, finalized_head=(110, "0x" + "ab" * 32))
+    reference = PublishedPlanReference.from_plan(data.published)
+    assert new.source_exclusions == (reference,)
+    assert json.loads(new.encode())["format"] == "veda-inventory-plan-v2"
+    assert BatchPlan.decode(new.encode()) == new
+    assert not {p.leaf.digest for p in new.source_proofs}.intersection(
+        p.leaf.digest for p in data.published.source_proofs)
+    assert tuple(case.objects.get(f"plans/{p.generation_block}.json").body
+                 for p in old) == old_bytes
+    assert case.objects.get(ALLOCATION_OBJECT) == authority
+
+    # A later disclosure cannot change this PLANNED item's frozen exclusion input.
+    data.repository._put_immutable(f"batch_groups/{data.hidden.plan_digest}.json",
+                                   canonical_json(public_disclosure_document(data.hidden)))
+    assert data.repository.confirm_source_disclosure(data.hidden) is True
+    data.source.record_disclosed(data.hidden.plan_digest)
+    cold = PlanCoordinator(track=case.track, objects=case.objects, source_pool=case.pool,
+                           store=SimpleNamespace(finalized_block_hash=lambda _block: None),
+                           confirm_disclosure=data.repository.confirm_source_disclosure)
+    assert cold.create_next(now_ms=10**12 + 1, finalized_head=(111, "0x" + "cd" * 32)) is None
+    assert cold.plans()[-1][2].encode() == new.encode()
+    assert claim(data.source.inventory, old) == allocation
+    assert case.objects.get(ALLOCATION_OBJECT) == authority
+    assert tuple(case.objects.get(f"plans/{p.generation_block}.json").body
+                 for p in old) == old_bytes
+
+    # Public replay loads only the referenced original metadata, not hidden future inputs.
+    reader = S3Repository(data.client, bucket="public", prefix="tracks/test")
+    data.client.calls.clear()
+    validate_source_selection_sequence(
+        (new,), commitments=case.track.source_commitments, scoring=case.track.scoring,
+        source_pool_merkle_root=case.pool.root, available_routes=case.track.model.selector.routes,
+        read_disclosed_plan=reader._source_disclosure_plan,
+    )
+    assert reader._confirmed_immutable == {reference.object_name: reference.disclosure_sha256}
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed", "bad-receipt"])
+def test_source_exclusion_capture_requires_original_verified_public_record(
+    inventory_case, tmp_path, damage,
+):
+    case = inventory_case
+    data = _source_exclusion_case(case, tmp_path)
+    name = f"tracks/test/batch_groups/{data.published.plan_digest}.json"
+    if damage == "missing":
+        del data.client.objects[name]
+    elif damage == "changed":
+        data.client.objects[name] = b'{}'
+    else:
+        receipt_name = f"disclosed/{data.published.plan_digest}.json"
+        stored = case.objects.get(receipt_name)
+        case.objects.replace_plan(receipt_name, b'{}', etag=stored.etag)
+    data.repository._confirmed_immutable.clear()  # Cold startup must authenticate original bytes.
+    before = tuple(plan.encode() for _, _, plan in data.coordinator.plans())
+    with pytest.raises((RuntimeError, PublicArtifactError), match="disclosure"):
+        data.coordinator.create_next(now_ms=10**12, finalized_head=(110, "0x" + "ab" * 32))
+    assert tuple(plan.encode() for _, _, plan in data.coordinator.plans()) == before
+
+
+@pytest.mark.parametrize("damage", ["ready-clock", "disclosure-sha", "unavailable", "reuse"])
+def test_private_and_public_replay_reject_changed_source_exclusion_inputs(
+    inventory_case, tmp_path, damage,
+):
+    case = inventory_case
+    data = _source_exclusion_case(case, tmp_path)
+    original = data.coordinator.create_next(now_ms=10**12, finalized_head=(110, "0x" + "ab" * 32))
+    reference = original.source_exclusions[0]
+    proofs = original.source_proofs
+    published = data.published
+    if damage == "ready-clock":
+        published = replace(published, completed_at_ms=published.completed_at_ms + 1)
+        data.client.objects[f"tracks/test/{reference.object_name}"] = canonical_json(
+            public_disclosure_document(published),
+        )
+    elif damage == "disclosure-sha":
+        reference = replace(reference, disclosure_sha256="ff" * 32)
+    elif damage == "reuse":
+        proofs = data.published.source_proofs
+    else:
+        reference = replace(reference, generation_block=100)
+    changed = build_plan(
+        track_spec_digest=case.track.digest, generation_block=original.generation_block,
+        block_hash=original.block_hash, secret=original.secret,
+        inventory_slot=original.inventory_slot,
+        source_proofs=proofs, scoring=case.track.scoring,
+        available_routes=case.track.model.selector.routes, source_exclusions=(reference,),
+    )
+    for known, read in (((published, data.hidden, changed), None),
+                        ((changed,), data.repository._source_disclosure_plan)):
+        with pytest.raises((ValueError, PublicArtifactError)):
+            validate_source_selection_sequence(
+                known, commitments=case.track.source_commitments, scoring=case.track.scoring,
+                source_pool_merkle_root=case.pool.root,
+                available_routes=case.track.model.selector.routes, read_disclosed_plan=read,
+            )
+
+
+def test_source_exclusion_create_race_retains_first_cas_plan(inventory_case, tmp_path, monkeypatch):
+    case = inventory_case
+    data = _source_exclusion_case(case, tmp_path)
+    create = case.objects.create_plan
+    first = []
+
+    def lost_race(name, body):
+        create(name, body)
+        first.append(body)
+        raise PreconditionFailed("another producer sealed the first plan")
+
+    monkeypatch.setattr(case.objects, "create_plan", lost_race)
+    winner = data.coordinator.create_next(now_ms=10**12,
+                                         finalized_head=(110, "0x" + "ab" * 32))
+    assert first == [winner.encode()]
+    assert winner.source_exclusions == (PublishedPlanReference.from_plan(data.published),)
+
+
+def test_legacy_plan_bytes_remain_frozen_and_old_planned_item_is_not_replaced(inventory_case):
+    case = inventory_case
+    planned = make_plan(case, 101, ready=False)
+    ready = make_plan(case, 101)
+    assert hashlib.sha256(planned.encode()).hexdigest() == (
+        "0b75a2b12b45d49c9aaeb561375a8cf35d1fdb7e2b91347bef908495e3342d05"
+    )
+    assert hashlib.sha256(ready.encode()).hexdigest() == (
+        "682aa03a7674107f24d1912e7093c5b197f06e7b76465e7763e426f4cff4f8cb"
+    )
+    assert "source_exclusions" not in json.loads(ready.encode())
+    assert BatchPlan.decode(ready.encode()).encode() == ready.encode()
+    case.objects.create_plan("plans/101.json", planned.encode())
+    coordinator = PlanCoordinator(track=case.track, objects=case.objects, source_pool=case.pool,
+                                  store=SimpleNamespace(finalized_block_hash=lambda _block: None),
+                                  confirm_disclosure=lambda _plan: False)
+    assert coordinator.create_next(now_ms=10**12, finalized_head=(110, "0x" + "ab" * 32)) is None
+    assert case.objects.get("plans/101.json").body == planned.encode()
+
+
+def test_exhausted_published_sources_do_not_reserve_or_reuse_a_plan(inventory_case, tmp_path):
+    case = inventory_case
+    data = _source_exclusion_case(case, tmp_path)
+    universe = sorted(item.sha256 for item in case.track.source_commitments
+                      if item.partition == "production" and item.generation_geometry == "all")[::2]
+    covered = {proof.leaf.digest for proof in data.published.source_proofs}
+    for block in range(103, 163):
+        if covered == set(universe):
+            break
+        plan = make_plan(case, block)
+        selected = {proof.leaf.digest for proof in plan.source_proofs}
+        if selected <= covered:
+            continue
+        case.objects.create_plan(f"plans/{block}.json", plan.encode())
+        data.repository._put_immutable(f"batch_groups/{plan.plan_digest}.json",
+                                       canonical_json(public_disclosure_document(plan)))
+        data.source.record_disclosed(plan.plan_digest)
+        covered.update(selected)
+    assert covered == set(universe)
+    before = tuple(plan.encode() for _, _, plan in data.coordinator.plans())
+    with pytest.raises(ValueError, match="exhausted.*all"):
+        data.coordinator.create_next(now_ms=10**12, finalized_head=(1000, "0x" + "ab" * 32))
+    assert tuple(plan.encode() for _, _, plan in data.coordinator.plans()) == before
+    assert case.objects.get_optional("plans/1000.json") is None
+    assert case.objects.get_optional(ALLOCATION_OBJECT) is None
+
+
+def test_publication_before_private_receipt_is_already_excluded(inventory_case, tmp_path):
+    case = inventory_case
+    data = _source_exclusion_case(case, tmp_path, write_receipt=False)
+    marker = f"disclosed/{data.published.plan_digest}.json"
+    assert case.objects.get_optional(marker) is None
+    first = data.coordinator.create_next(now_ms=10**12, finalized_head=(110, "0x" + "ab" * 32))
+    assert first.source_exclusions == (PublishedPlanReference.from_plan(data.published),)
+    assert case.objects.get_optional(marker) is None  # Do not fabricate the missing receipt.
+
+
+def test_new_exclusion_ready_claim_and_cold_retry_keep_original_allocation(
+    inventory_case, tmp_path,
+):
+    case = inventory_case
+    data = _source_exclusion_case(case, tmp_path)
+    planned = data.coordinator.create_next(now_ms=10**12,
+                                           finalized_head=(110, "0x" + "ab" * 32))
+    exact = ReadyObject("exact/new.npz", "34" * 32, 101)
+    ready = planned.ready(
+        exact=exact, dense_references=tuple(
+            DenseReference(row.rollout_id, data.published.dense_references[0].video,
+                           data.published.dense_references[0].latent) for row in planned.rollouts
+        ), sample_cache=data.published.sample_cache,
+        completed_block=111, completed_at_ms=1_999_000,
+    )
+    stored = case.objects.get("plans/110.json")
+    case.objects.replace_plan("plans/110.json", ready.encode(), etag=stored.etag)
+    # A singleton bound-plan replay must resolve only its original referenced metadata.
+    allocated = claim(data.source.inventory, (ready,), submission_block=2000,
+                      submission_timestamp_ms=2_000_000)
+    assert allocated["plan_digest"] == planned.plan_digest
+    assert allocated["ready_sha256"] == hashlib.sha256(ready.encode()).hexdigest()
+    authority = case.objects.get(ALLOCATION_OBJECT)
+    cold = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path / "cold")
+    assert claim(cold.inventory, (ready,), submission_block=2000,
+                 submission_timestamp_ms=2_000_000) == allocated
+    assert case.objects.get(ALLOCATION_OBJECT) == authority
+    assert case.objects.get("plans/110.json").body == ready.encode()
+    assert ready.source_exclusions == planned.source_exclusions
+    assert (ready.completed_at_ms, cold._plan_by_digest(ready.plan_digest).completed_at_ms) == (
+        1_999_000, 1_999_000,
+    )
+
+
+@pytest.mark.parametrize("damage", ["old-extra", "missing", "null", "duplicate", "future"])
+def test_versioned_exclusion_fields_are_strict_and_never_backfilled(
+    inventory_case, tmp_path, damage,
+):
+    data = _source_exclusion_case(inventory_case, tmp_path)
+    plan = data.coordinator.create_next(now_ms=10**12,
+                                        finalized_head=(110, "0x" + "ab" * 32))
+    document = json.loads(plan.encode())
+    if damage == "old-extra":
+        document["format"] = "veda-inventory-plan-v1"
+    elif damage == "missing":
+        del document["source_exclusions"]
+    elif damage == "null":
+        document["source_exclusions"] = None
+    elif damage == "duplicate":
+        document["source_exclusions"] *= 2
+    else:
+        document["source_exclusions"][0]["generation_block"] = plan.generation_block
+    with pytest.raises(ValueError):
+        BatchPlan.decode(canonical_json(document))
+
+
+@pytest.mark.parametrize("missing_status", [400, 404])
+def test_source_public_confirmation_is_anonymous_metadata_only_and_never_caches_absence(
+    inventory_case, missing_status,
+):
+    plan = make_plan(inventory_case, 101)
+    payload = canonical_json(public_disclosure_document(plan))
+    visible = [False]
+    calls = []
+
+    def respond(request):
+        assert request.method == "GET"
+        assert "authorization" not in request.headers
+        assert request.url.path == f"/main/batch_groups/{plan.plan_digest}.json"
+        calls.append(request.url.path)
+        if visible[0]:
+            return httpx.Response(200, content=payload, headers={"ETag": '"original"'})
+        return httpx.Response(missing_status, json={"statusCode": 404, "error": "not_found"})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        reader = S3Repository.from_public_http(client, base_url="https://public.test/main")
+        assert reader.confirm_source_disclosure(plan) is False
+        assert reader._confirmed_immutable == {}
+        visible[0] = True
+        assert reader.confirm_source_disclosure(plan) is True
+        assert reader.confirm_source_disclosure(plan) is True
+    assert len(calls) == 2

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import bittensor as bt
+import httpx
 from safetensors import SafetensorError, safe_open
 
 from scoring.cache import (
@@ -47,6 +48,7 @@ from validator.production.inventory import ALLOCATION_OBJECT
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
+    PublishedPlanReference,
     ReadyObject,
     ReadySampleCache,
     RolloutPlan,
@@ -71,6 +73,7 @@ from validator.production.storage import (
     StoredObject,
 )
 from validator.production.workers import close_workers
+from validator.publication import PUBLIC_STORAGE_URL, S3Repository
 from validator.release import ACCEPTANCE_LOGICAL_NAME, ReleaseApproval, verify_competition_manifest
 from validator.store import ChallengeStore
 
@@ -146,6 +149,7 @@ class PlanCoordinator:
         store: ChallengeStore,
         objects: PrivateObjectStore,
         source_pool: SourcePool,
+        confirm_disclosure: Callable[[BatchPlan], bool],
         data_track: TrackSpec | None = None,
     ) -> None:
         data_track = track if data_track is None else data_track
@@ -167,6 +171,7 @@ class PlanCoordinator:
         self.store = store
         self.objects = objects
         self.source_pool = source_pool
+        self.confirm_disclosure = confirm_disclosure
 
     def plans(self) -> tuple[tuple[str, StoredObject, BatchPlan], ...]:
         rows = []
@@ -188,6 +193,8 @@ class PlanCoordinator:
                 tuple(row[2] for row in rows),
                 commitments=self.track.source_commitments,
                 scoring=self.track.scoring,
+                source_pool_merkle_root=self.track.source_pool_merkle_root,
+                available_routes=self.track.model.selector.routes,
             )
         except ValueError as exc:
             raise RuntimeError("private plan source selection is invalid") from exc
@@ -221,6 +228,27 @@ class PlanCoordinator:
             return None
         if any(plan.generation_block == block for _, _, plan in existing):
             return None
+        references = []
+        excluded = set()
+        for _name, _stored, previous in existing:
+            receipt = self.objects.get_optional(f"disclosed/{previous.plan_digest}.json")
+            if previous.state != "READY":
+                if receipt is not None:
+                    raise RuntimeError("source disclosure receipt has no original READY")
+                continue
+            if receipt is not None and receipt.body != canonical_json({
+                "plan_digest": previous.plan_digest, "exact_sha256": previous.exact.sha256,
+            }):
+                raise RuntimeError("source disclosure receipt differs from its original READY")
+            visible = self.confirm_disclosure(previous)
+            if type(visible) is not bool:
+                raise RuntimeError("source disclosure verification returned no observation")
+            if not visible:
+                if receipt is not None:
+                    raise RuntimeError("source exclusion public disclosure is missing")
+                continue
+            references.append(PublishedPlanReference.from_plan(previous))
+            excluded.update(proof.leaf.digest for proof in previous.source_proofs)
         secret = secrets.token_hex(32)
         seed = generation_seed(self.track.digest, block_hash, secret)
         proofs = select_source_proofs(
@@ -230,7 +258,7 @@ class PlanCoordinator:
             strata=tuple(self.track.scoring.stratum_weight_map),
             sources_per_stratum=self.track.scoring.rollouts_per_stratum,
             batch_seed=seed,
-            excluded_source_digests=frozenset(), inventory_slot=slot,
+            excluded_source_digests=frozenset(excluded), inventory_slot=slot,
         )
         plan = build_plan(
             track_spec_digest=self.track.digest,
@@ -238,6 +266,7 @@ class PlanCoordinator:
             inventory_slot=slot,
             source_proofs=proofs, scoring=self.track.scoring,
             available_routes=self.track.model.selector.routes,
+            source_exclusions=tuple(references),
         )
         name = _plan_name(block)
         try:
@@ -246,6 +275,12 @@ class PlanCoordinator:
             # Randomness is frozen by the first successful create, never regenerated on retry.
             winner = BatchPlan.decode(self.objects.get(name).body)
             self._validate_plan(name, winner)
+            validate_source_selection_sequence(
+                tuple(row[2] for row in existing) + (winner,),
+                commitments=self.track.source_commitments, scoring=self.track.scoring,
+                source_pool_merkle_root=self.track.source_pool_merkle_root,
+                available_routes=self.track.model.selector.routes,
+            )
             return winner
         return plan
 
@@ -347,6 +382,11 @@ class WorkerPool:
 
 class ProducerService:
     @cached_property
+    def public_disclosures(self) -> S3Repository:
+        self._public_http_client = httpx.Client(timeout=30, follow_redirects=True)
+        return S3Repository.from_public_http(self._public_http_client, base_url=PUBLIC_STORAGE_URL)
+
+    @cached_property
     def content(self) -> LocalBatchStore:
         return LocalBatchStore(self.config.work_dir / "content")
 
@@ -422,6 +462,9 @@ class ProducerService:
                             objects=self.objects,
                             source_pool=self.pool,
                             data_track=self.track,
+                            confirm_disclosure=lambda plan: (
+                                self.public_disclosures.confirm_source_disclosure(plan)
+                            ),
                         )
                         created = coordinator.create_next(
                             disk_bytes=_disk_bytes(self.config.work_dir),
@@ -539,6 +582,9 @@ class ProducerService:
         finally:
             if workers is not None:
                 workers.close()
+            client = getattr(self, "_public_http_client", None)
+            if client is not None:
+                client.close()
 
     def _execute(
         self,

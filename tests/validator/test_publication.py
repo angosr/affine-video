@@ -23,10 +23,12 @@ from validator.production.commitment import (
 )
 from validator.production.plan import (
     DenseReference,
+    PublishedPlanReference,
     ReadyObject,
     ReadySampleCache,
     build_plan,
     generation_seed,
+    public_disclosure_document,
     select_source_proofs,
 )
 from validator.publication import (
@@ -2042,8 +2044,9 @@ def test_loader_reconciles_fixed_path_cutover_without_parsing_previous_scoring_s
 
 
 @pytest.mark.parametrize("reuse_data_identity", [False, True])
+@pytest.mark.parametrize("exclude_published", [False, True])
 def test_restart_verifies_disclosed_batches_without_restoring_private_files(
-    tmp_path, reuse_data_identity,
+    tmp_path, reuse_data_identity, exclude_published,
 ) -> None:
     from scoring.spec import data_spec_logical_name, track_spec_dict
     from tests.scoring.test_spec import rules_for_data
@@ -2087,6 +2090,27 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(
         "audit": {"all": [leaf.digest for leaf in pool.leaves if leaf.partition == "audit"]},
     }
     track = parse_track_spec(raw_track)
+    prior = None
+    if exclude_published:
+        prior_hash, prior_secret = "0x" + "34" * 32, "b6" * 32
+        prior_proofs = select_source_proofs(
+            pool, commitments=track.source_commitments, partition="production", strata=("all",),
+            sources_per_stratum=track.scoring.rollouts_per_stratum,
+            batch_seed=generation_seed(track.digest, prior_hash, prior_secret),
+            excluded_source_digests=frozenset(), inventory_slot=0,
+        )
+        prior = build_plan(
+            track_spec_digest=track.digest, generation_block=100, block_hash=prior_hash,
+            secret=prior_secret, inventory_slot=0, source_proofs=prior_proofs,
+            scoring=track.scoring, available_routes=track.model.selector.routes,
+        )
+        old_item = ReadyObject("original/data", "ab" * 32, 1)
+        prior = prior.ready(
+            exact=old_item, sample_cache=ReadySampleCache(old_item, old_item),
+            dense_references=tuple(DenseReference(rollout.rollout_id, old_item, old_item)
+                                   for rollout in prior.rollouts),
+            completed_block=101, completed_at_ms=101_000,
+        )
     block_hash = "0x" + "12" * 32
     proofs = select_source_proofs(
         pool,
@@ -2095,7 +2119,9 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(
         strata=tuple(track.scoring.stratum_weight_map),
         sources_per_stratum=track.scoring.rollouts_per_stratum,
         batch_seed=generation_seed(track.digest, block_hash, "a5" * 32),
-        excluded_source_digests=frozenset(), inventory_slot=0,
+        excluded_source_digests=frozenset(
+            proof.leaf.digest for proof in prior.source_proofs) if prior else frozenset(),
+        inventory_slot=0,
     )
     plan = build_plan(secret="a5" * 32, inventory_slot=0,
         track_spec_digest=track.digest,
@@ -2104,6 +2130,7 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(
         source_proofs=proofs,
         scoring=track.scoring,
         available_routes=track.model.selector.routes,
+        source_exclusions=(PublishedPlanReference.from_plan(prior),) if prior else None,
     )
 
     def ready_file(name, content):
@@ -2234,6 +2261,9 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(
     with pytest.raises(PublicArtifactError, match="premature"):
         asyncio.run(publisher.publish_disclosure(disclosure, track=track, now_ms=reveal_at - 1))
     assert client.objects == {}
+    if prior is not None:
+        publisher._put_immutable(f"batch_groups/{prior.plan_digest}.json",
+                                 canonical_json(public_disclosure_document(prior)))
     asyncio.run(publisher.publish_disclosure(disclosure, track=track, now_ms=reveal_at))
     assert not any(key.endswith(("weights.json", "track.json", "summary.json", "status.json"))
                    for key in client.objects)
@@ -2267,6 +2297,13 @@ def test_restart_verifies_disclosed_batches_without_restoring_private_files(
     assert restarted._load_batch_disclosures(track, (match,)) == frozenset(
         {ready.plan_digest}
     )
+    if prior is not None:
+        key = f"tracks/test/batch_groups/{prior.plan_digest}.json"
+        body = client.objects.pop(key)
+        with pytest.raises(PublicArtifactError, match="source exclusion"):
+            cold = S3Repository(client, bucket="public-data", prefix="tracks/test")
+            cold._load_batch_disclosures(track, (match,))
+        client.objects[key] = body
     another_allocation = {
         **allocation, "ordinal": 2, "challenge_id": "d4" * 32,
         "file_sha256": "e5" * 32, "model_digest": "f6" * 32, "submission_block": 301,

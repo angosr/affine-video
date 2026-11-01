@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Any
@@ -13,6 +14,7 @@ from validator.production.commitment import (
     SourceProof,
     canonical_json,
     decode_canonical_json,
+    verify_source_proof,
 )
 
 
@@ -133,6 +135,43 @@ class ReadySampleCache:
 
 
 @dataclass(frozen=True, slots=True)
+class PublishedPlanReference:
+    """A frozen reference to an original READY and its verified public disclosure."""
+
+    generation_block: int
+    plan_digest: str
+    disclosure_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.generation_block) is not int or self.generation_block < 0:
+            raise ValueError("disclosed generation block must be non-negative")
+        for value in (self.plan_digest, self.disclosure_sha256):
+            _digest_bytes(value, "disclosed plan reference")
+
+    @property
+    def object_name(self) -> str:
+        return f"batch_groups/{self.plan_digest}.json"
+
+    def document(self) -> dict[str, Any]:
+        return {"generation_block": self.generation_block, "plan_digest": self.plan_digest,
+                "disclosure_sha256": self.disclosure_sha256}
+
+    @classmethod
+    def from_document(cls, value: Any) -> PublishedPlanReference:
+        return cls(**_row(value, {"generation_block", "plan_digest",
+                                  "disclosure_sha256"}, "disclosed plan reference"))
+
+    @classmethod
+    def from_plan(cls, plan: BatchPlan) -> PublishedPlanReference:
+        return cls(plan.generation_block, plan.plan_digest,
+                   hashlib.sha256(canonical_json(public_disclosure_document(plan))).hexdigest())
+
+    def verify(self, plan: BatchPlan) -> None:
+        if self != type(self).from_plan(plan):
+            raise ValueError("source exclusion differs from its original public READY")
+
+
+@dataclass(frozen=True, slots=True)
 class BatchPlan:
     track_spec_digest: str
     generation_block: int
@@ -153,6 +192,7 @@ class BatchPlan:
     sample_cache: ReadySampleCache | None = None
     completed_block: int | None = None
     completed_at_ms: int | None = None
+    source_exclusions: tuple[PublishedPlanReference, ...] | None = None
 
     def __post_init__(self) -> None:
         _digest_bytes(self.track_spec_digest, "track specification digest")
@@ -167,6 +207,16 @@ class BatchPlan:
             type(self.inventory_slot) is not int or self.inventory_slot not in {0, 1}
         ):
             raise ValueError("inventory source slot must be zero or one")
+        if self.source_exclusions is not None:
+            if (self.inventory_slot is None or not isinstance(self.source_exclusions, tuple)
+                    or any(not isinstance(row, PublishedPlanReference)
+                           for row in self.source_exclusions)):
+                raise ValueError("source exclusions require production plan references")
+            blocks = [row.generation_block for row in self.source_exclusions]
+            if (blocks != sorted(set(blocks))
+                    or any(block >= self.generation_block for block in blocks)
+                    or len({row.plan_digest for row in self.source_exclusions}) != len(blocks)):
+                raise ValueError("source exclusions must be unique earlier plans in order")
         _digest_bytes(self.query_selection_seed, "query selection seed")
         _digest_bytes(self.plan_digest, "plan digest")
         if type(self.generation_block) is not int or self.generation_block < 0:
@@ -230,6 +280,7 @@ class BatchPlan:
                 "selected_steps": self.selected_steps,
                 "source_proofs": self.source_proofs,
                 "track_spec_digest": self.track_spec_digest,
+                "source_exclusions": self.source_exclusions,
             }
         )
 
@@ -304,8 +355,18 @@ class BatchPlan:
             {"dense_references", "exact", "sample_cache", "completed_block", "completed_at_ms"}
             if state == "READY" else set()
         )
-        if set(value) != expected or value.get("format") != "veda-inventory-plan-v1":
+        version = value.get("format")
+        if version == "veda-inventory-plan-v2":
+            expected |= {"source_exclusions"}
+        if (set(value) != expected
+                or version not in {"veda-inventory-plan-v1", "veda-inventory-plan-v2"}):
             raise ValueError("batch plan fields or format are invalid")
+        exclusions = None
+        if version == "veda-inventory-plan-v2":
+            if not isinstance(value["source_exclusions"], list):
+                raise ValueError("source exclusions must be a reference list")
+            exclusions = tuple(PublishedPlanReference.from_document(row)
+                               for row in value["source_exclusions"])
 
         def strings(name: str) -> tuple[str, ...]:
             rows = value[name]
@@ -349,6 +410,7 @@ class BatchPlan:
             sample_cache=sample_cache,
             completed_block=value.get("completed_block"),
             completed_at_ms=value.get("completed_at_ms"),
+            source_exclusions=exclusions,
         )
 
 
@@ -362,6 +424,7 @@ def build_plan(
     source_proofs: tuple[SourceProof, ...],
     scoring: ScoringSpec,
     available_routes: tuple[str, ...],
+    source_exclusions: tuple[PublishedPlanReference, ...] | None = None,
 ) -> BatchPlan:
     """Build an inventory item without knowing any future challenger identity."""
 
@@ -375,6 +438,7 @@ def build_plan(
         scoring=scoring,
         available_routes=available_routes,
         source_partition="production",
+        source_exclusions=source_exclusions,
     )
 
 
@@ -414,6 +478,7 @@ def _build_plan(
     scoring: ScoringSpec,
     available_routes: tuple[str, ...],
     source_partition: str,
+    source_exclusions: tuple[PublishedPlanReference, ...] | None = None,
 ) -> BatchPlan:
     if source_partition == "production" and (
         type(inventory_slot) is not int or inventory_slot not in {0, 1}
@@ -446,6 +511,7 @@ def _build_plan(
         "selected_steps": steps,
         "rollouts": rollouts,
         "query_selection_seed": query_seed,
+        "source_exclusions": source_exclusions,
     }
     digest = hashlib.sha256(canonical_json(_planned_document(arguments))).hexdigest()
     return BatchPlan(**arguments, plan_digest=digest)
@@ -626,27 +692,70 @@ def validate_source_selection_sequence(
     *,
     commitments: tuple[SourceCommitmentSpec, ...],
     scoring: ScoringSpec,
+    source_pool_merkle_root: str | None = None,
+    available_routes: tuple[str, ...] | None = None,
+    read_disclosed_plan: Callable[[PublishedPlanReference], BatchPlan] | None = None,
 ) -> None:
-    """Verify every production item's public half and secret-seeded ranking."""
+    """Replay each plan's frozen inputs, never today's growing disclosure set."""
 
     ordered = tuple(sorted(plans, key=lambda plan: plan.generation_block))
     if len({plan.generation_block for plan in ordered}) != len(ordered):
         raise ValueError("source selection plans repeat a generation block")
-    for plan in ordered:
+    by_block = {plan.generation_block: plan for plan in ordered}
+    verified: set[str] = set()
+
+    def validate(plan: BatchPlan) -> None:
+        if plan.plan_digest in verified:
+            return
         if plan.inventory_slot not in {0, 1}:
             raise ValueError("production inventory requires a source slot")
+        if source_pool_merkle_root is not None and any(not verify_source_proof(
+            proof, source_pool_merkle_root,
+            commitment_digests=tuple(item.sha256 for item in commitments),
+        ) for proof in plan.source_proofs):
+            raise ValueError("plan source proof is invalid")
+        excluded = set()
+        if plan.source_exclusions is not None:
+            if source_pool_merkle_root is None:
+                raise ValueError("source exclusion replay requires the original pool commitment")
+            for reference in plan.source_exclusions:
+                original = by_block.get(reference.generation_block)
+                if original is None:
+                    if read_disclosed_plan is None:
+                        raise ValueError("source exclusion original disclosure is unavailable")
+                    original = read_disclosed_plan(reference)
+                    by_block[original.generation_block] = original
+                reference.verify(original)
+                if original.track_spec_digest != plan.track_spec_digest:
+                    raise ValueError("source exclusion belongs to another data contract")
+                validate(original)
+                excluded.update(proof.leaf.digest for proof in original.source_proofs)
+        if available_routes is not None:
+            rebuilt = build_plan(
+                track_spec_digest=plan.track_spec_digest, generation_block=plan.generation_block,
+                block_hash=plan.block_hash, secret=plan.secret, inventory_slot=plan.inventory_slot,
+                source_proofs=plan.source_proofs, scoring=scoring,
+                available_routes=available_routes,
+                source_exclusions=plan.source_exclusions,
+            )
+            if rebuilt.planned_document() != plan.planned_document():
+                raise ValueError("plan differs from its deterministic schedule")
         expected = select_source_digests(
             commitments,
             partition="production",
             strata=tuple(scoring.stratum_weight_map),
             sources_per_stratum=scoring.rollouts_per_stratum,
             batch_seed=plan.batch_seed,
-            excluded_source_digests=frozenset(),
+            excluded_source_digests=frozenset(excluded),
             inventory_slot=plan.inventory_slot,
         )
         actual = tuple(proof.leaf.digest for proof in plan.source_proofs)
         if actual != expected:
             raise ValueError("plan source selection differs from the public commitment index")
+        verified.add(plan.plan_digest)
+
+    for plan in ordered:
+        validate(plan)
 
 
 def _rollouts(
@@ -712,7 +821,7 @@ def _ranked(values: tuple[Any, ...], seed: str, domain: str) -> tuple[Any, ...]:
 
 
 def _planned_document(arguments: dict[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         "batch_seed": arguments["batch_seed"],
         "block_hash": arguments["block_hash"],
         "secret": arguments["secret"],
@@ -726,6 +835,41 @@ def _planned_document(arguments: dict[str, Any]) -> dict[str, Any]:
         "selected_steps": [step.document() for step in arguments["selected_steps"]],
         "source_proofs": [proof.document() for proof in arguments["source_proofs"]],
         "track_spec_digest": arguments["track_spec_digest"],
+    }
+    if arguments.get("source_exclusions") is not None:
+        result["format"] = "veda-inventory-plan-v2"
+        result["source_exclusions"] = [row.document() for row in arguments["source_exclusions"]]
+    return result
+
+
+def public_selected_inputs_document(
+    selected: ReadySampleCache,
+) -> dict[str, dict[str, object] | None]:
+    """Derive public names from the original immutable selected-input references."""
+    return {
+        kind: (None if item is None else {
+            "object": f"batch_inputs/{item.sha256}/manifest.json",
+            "sha256": item.sha256, "size_bytes": item.size_bytes,
+        }) for kind, item in (("index", selected.index), ("text", selected.text),
+                              ("condition", selected.condition))
+    }
+
+
+def public_disclosure_document(plan: BatchPlan) -> dict[str, Any]:
+    """The original public projection, shared by publisher and exclusion verification."""
+    if plan.state != "READY" or plan.exact is None or plan.sample_cache is None:
+        raise ValueError("only READY data can have a public disclosure")
+    return {
+        "format": "veda-batch-disclosure-v3", "plan": plan.document(),
+        "public_exact_object": f"batches/{plan.exact.sha256}/manifest.json",
+        "public_dense_references": [
+            {"rollout_id": reference.rollout_id, **{
+                kind: {"object": f"batch_assets/{item.sha256}/manifest.json",
+                       "sha256": item.sha256, "size_bytes": item.size_bytes}
+                for kind, item in (("video", reference.video), ("latent", reference.latent))
+            }} for reference in plan.dense_references
+        ],
+        "public_selected_inputs": public_selected_inputs_document(plan.sample_cache),
     }
 
 

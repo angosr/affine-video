@@ -356,6 +356,27 @@ def test_source_selection_is_reproducible_from_the_public_index() -> None:
     assert all(verify_source_proof(item, pool.root) for item in selected)
 
 
+@pytest.mark.parametrize("slot", [0, 1])
+@pytest.mark.parametrize("remaining", [1, 2])
+def test_exclusion_capacity_is_checked_per_original_stratum_and_slot(slot, remaining):
+    commitments = tuple(SourceCommitmentSpec(f"{index:064x}", "production", stratum)
+                        for stratum, offset in (("a", 0), ("b", 10))
+                        for index in range(offset, offset + 8))
+    # Filter only after assigning the original fixed half; do not shift survivors to a new slot.
+    half = tuple(sorted(item.sha256 for item in commitments
+                        if item.generation_geometry == "a"))[slot::2]
+    excluded = frozenset(half[remaining:])
+    arguments = dict(partition="production", strata=("a", "b"), sources_per_stratum=2,
+                     batch_seed="ab" * 32, excluded_source_digests=excluded, inventory_slot=slot)
+    if remaining < 2:
+        with pytest.raises(ValueError, match="exhausted.*a"):
+            select_source_digests(commitments, **arguments)
+    else:
+        result = select_source_digests(commitments, **arguments)
+        assert set(result[:2]) == set(half[:2])
+        assert not set(result).intersection(excluded)
+
+
 def test_source_selection_is_partition_explicit_and_audit_is_deterministic() -> None:
     leaves = tuple(
         SourceLeaf(

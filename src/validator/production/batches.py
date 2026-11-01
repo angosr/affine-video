@@ -36,11 +36,18 @@ from validator.production.inventory import ALLOCATION_OBJECT, Inventory
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
+    PublishedPlanReference,
     ReadyObject,
-    ReadySampleCache,
     build_plan,
+    public_disclosure_document,
     select_query_tiles,
     validate_source_selection_sequence,
+)
+from validator.production.plan import (
+    ReadySampleCache as ReadySampleCache,
+)
+from validator.production.plan import (
+    public_selected_inputs_document as public_selected_inputs_document,
 )
 from validator.production.storage import (
     ADMISSIONS_NAMESPACE,
@@ -111,28 +118,6 @@ class BatchDisclosure:
     record_name: str
     record_payload: bytes
     files: tuple[DisclosureFile, ...]
-
-
-def public_selected_inputs_document(
-    selected: ReadySampleCache,
-) -> dict[str, dict[str, object] | None]:
-    """Derive the one public mapping for the private READY input references."""
-
-    result: dict[str, dict[str, object] | None] = {}
-    for kind, item in (
-        ("index", selected.index),
-        ("text", selected.text),
-        ("condition", selected.condition),
-    ):
-        if item is None:
-            result[kind] = None
-            continue
-        result[kind] = {
-            "object": f"batch_inputs/{item.sha256}/manifest.json",
-            "sha256": item.sha256,
-            "size_bytes": item.size_bytes,
-        }
-    return result
 
 
 class ReadyBatchSource:
@@ -838,24 +823,16 @@ class ReadyBatchSource:
                 plan.exact.sha256,
             )
         ]
-        references = []
         directory = self.cache_dir / "disclosures" / plan.plan_digest
         for reference in plan.dense_references:
             check_deadline(deadline)
-            public = {"rollout_id": reference.rollout_id}
-            for kind, item, suffix in (
-                ("video", reference.video, ".mp4"),
-                ("latent", reference.latent, ".safetensors"),
+            for item, suffix in (
+                (reference.video, ".mp4"),
+                (reference.latent, ".safetensors"),
             ):
                 path = self._materialize(plan, item, directory / f"{item.sha256}{suffix}")
                 object_name = f"batch_assets/{item.sha256}/manifest.json"
                 files.append(DisclosureFile(object_name, path, item.sha256))
-                public[kind] = {
-                    "object": object_name,
-                    "sha256": item.sha256,
-                    "size_bytes": item.size_bytes,
-                }
-            references.append(public)
         selected_inputs = self._restore_sample_cache(plan)
         assert plan.sample_cache is not None
         public_inputs = public_selected_inputs_document(plan.sample_cache)
@@ -872,15 +849,7 @@ class ReadyBatchSource:
             object_name = public["object"]
             assert isinstance(object_name, str)
             files.append(DisclosureFile(object_name, path, item.sha256))
-        record = canonical_json(
-            {
-                "format": "veda-batch-disclosure-v3",
-                "plan": plan.document(),
-                "public_exact_object": f"batches/{plan.exact.sha256}/manifest.json",
-                "public_dense_references": references,
-                "public_selected_inputs": public_inputs,
-            }
-        )
+        record = canonical_json(public_disclosure_document(plan))
         check_deadline(deadline)
         return BatchDisclosure(
             f"batch_groups/{plan.plan_digest}.json",
@@ -1060,9 +1029,19 @@ class ReadyBatchSource:
                 tuple(sorted(plans, key=lambda plan: plan.generation_block)),
                 commitments=self.track.source_commitments,
                 scoring=self.track.scoring,
+                source_pool_merkle_root=self.track.source_pool_merkle_root,
+                available_routes=self.track.model.selector.routes,
+                read_disclosed_plan=self._source_exclusion_plan,
             )
         except ValueError as exc:
             raise RuntimeError("private plan source selection is invalid") from exc
+
+    def _source_exclusion_plan(self, reference: PublishedPlanReference) -> BatchPlan:
+        name = f"{PLANS_NAMESPACE}/{reference.generation_block}.json"
+        original = BatchPlan.decode(self.objects.get(name).body)
+        self._validate_plan(name, original)
+        reference.verify(original)
+        return original
 
     def _validate_plan(self, name: str, plan: BatchPlan) -> None:
         if name != f"{PLANS_NAMESPACE}/{plan.generation_block}.json":
@@ -1088,6 +1067,7 @@ class ReadyBatchSource:
             source_proofs=plan.source_proofs,
             scoring=self.track.scoring,
             available_routes=self.track.model.selector.routes,
+            source_exclusions=plan.source_exclusions,
         )
         if rebuilt.planned_document() != plan.planned_document():
             raise RuntimeError("private plan conflicts with the deterministic track schedule")

@@ -33,11 +33,19 @@ from validator.chunks import (
     verify_chunked_content,
 )
 from validator.production.batches import BatchDisclosure, public_selected_inputs_document
-from validator.production.commitment import Artifact, ArtifactManifest, verify_source_proof
+from validator.production.commitment import (
+    Artifact,
+    ArtifactManifest,
+    canonical_json,
+    decode_canonical_json,
+    verify_source_proof,
+)
 from validator.production.inventory import Inventory
 from validator.production.plan import (
     BatchPlan,
+    PublishedPlanReference,
     build_plan,
+    public_disclosure_document,
     validate_source_selection_sequence,
 )
 from validator.queue import TERMINAL_STATES
@@ -80,6 +88,12 @@ _STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 HISTORICAL_MATCHES_PREFIX = "evidence/system-panel/history/"
 _MAX_WEIGHT_ARTIFACT_BYTES = 1024 * 1024
 _MAX_PUBLIC_OBJECT_BYTES = 1024 * 1024
+PUBLIC_STORAGE_BUCKET = "affine_video"
+PUBLIC_STORAGE_PREFIX = "tracks/main"
+PUBLIC_STORAGE_URL = (
+    "https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/"
+    f"{PUBLIC_STORAGE_BUCKET}/{PUBLIC_STORAGE_PREFIX}"
+)
 _SUMMARY_LEADERBOARD_LIMIT = 100
 _LOG = logging.getLogger(__name__)
 _LEGACY_UNFENCED_WEIGHT_TRACK = (
@@ -799,6 +813,35 @@ class S3Repository:
         if self._writer_lock is not None:
             self._writer_lock.close()
             self._writer_lock = None
+
+    def confirm_source_disclosure(self, plan: BatchPlan) -> bool:
+        """Confirm only the original small public record; never fetch evaluation payloads."""
+        reference = PublishedPlanReference.from_plan(plan)
+        if self._confirmed_immutable.get(reference.object_name) == reference.disclosure_sha256:
+            return True
+        expected = canonical_json(public_disclosure_document(plan))
+        observed = self._get_optional(reference.object_name)
+        if observed is None:
+            return False
+        if observed != expected:
+            raise PublicArtifactError("source exclusion public disclosure is missing or changed")
+        self._confirmed_immutable[reference.object_name] = reference.disclosure_sha256
+        return True
+
+    def _source_disclosure_plan(self, reference: PublishedPlanReference) -> BatchPlan:
+        payload = self._get_optional(reference.object_name)
+        if payload is None or hashlib.sha256(payload).hexdigest() != reference.disclosure_sha256:
+            raise PublicArtifactError("source exclusion public disclosure is missing or changed")
+        try:
+            document = decode_canonical_json(payload)
+            plan = BatchPlan.decode(canonical_json(document["plan"]))
+            reference.verify(plan)
+            if document != public_disclosure_document(plan):
+                raise ValueError("source disclosure is not the original canonical projection")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublicArtifactError("source exclusion public disclosure is invalid") from exc
+        self._confirmed_immutable[reference.object_name] = reference.disclosure_sha256
+        return plan
 
     @classmethod
     def from_environment(cls, *, bucket: str, prefix: str) -> S3Repository:
@@ -1776,6 +1819,7 @@ class S3Repository:
                 source_proofs=plan.source_proofs,
                 scoring=track.scoring,
                 available_routes=track.model.selector.routes,
+                source_exclusions=plan.source_exclusions,
             )
             if rebuilt.planned_document() != plan.planned_document():
                 raise PublicArtifactError(
@@ -1795,22 +1839,11 @@ class S3Repository:
             ):
                 raise PublicArtifactError("public match conflicts with its batch disclosure")
 
-            public_references = []
             files = [(exact_name, plan.exact.sha256, plan.exact.size_bytes)]
             for reference in plan.dense_references:
-                public = {"rollout_id": reference.rollout_id}
-                for kind, item in (
-                    ("video", reference.video),
-                    ("latent", reference.latent),
-                ):
+                for item in (reference.video, reference.latent):
                     object_name = f"batch_assets/{item.sha256}/manifest.json"
-                    public[kind] = {
-                        "object": object_name,
-                        "sha256": item.sha256,
-                        "size_bytes": item.size_bytes,
-                    }
                     files.append((object_name, item.sha256, item.size_bytes))
-                public_references.append(public)
             if plan.sample_cache is None:
                 raise PublicArtifactError("public READY plan omitted selected source inputs")
             public_inputs = public_selected_inputs_document(plan.sample_cache)
@@ -1826,13 +1859,7 @@ class S3Repository:
                 object_name = public["object"]
                 assert isinstance(object_name, str)
                 files.append((object_name, item.sha256, item.size_bytes))
-            expected = {
-                "format": "veda-batch-disclosure-v3",
-                "plan": plan.document(),
-                "public_exact_object": exact_name,
-                "public_dense_references": public_references,
-                "public_selected_inputs": public_inputs,
-            }
+            expected = public_disclosure_document(plan)
             if document != expected:
                 raise PublicArtifactError("public batch disclosure is not canonical")
             for object_name, sha256, size_bytes in files:
@@ -1869,6 +1896,9 @@ class S3Repository:
                 tuple(plan for _digest, plan, _name, _payload in prefix),
                 commitments=track.source_commitments,
                 scoring=track.scoring,
+                source_pool_merkle_root=track.source_pool_merkle_root,
+                available_routes=track.model.selector.routes,
+                read_disclosed_plan=self._source_disclosure_plan,
             )
         except ValueError as exc:
             raise PublicArtifactError(
