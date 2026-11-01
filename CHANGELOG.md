@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 2026-11-01 — Native deployment of 34774f9
+
+Operator-reported acceptance: application commit
+`34774f9da8e375117f7f37dbe08766b3343cdb8f`, native installation.
+Annotated tag: `release-2026-11-01-34774f9`, targeting that application commit.
+The existing OCI identity remains dependency/package provenance, not a new Docker Engine deployment.
+
+| Installed identity | SHA-256 |
+| --- | --- |
+| Application source | `c5bda78ed0215910407a7ece8152e9c99c7862f7076c5112dcf7994f8ce2c1de` |
+| Native dependency lock | `486e2ca46509670c5255bc5a1a9ac770e4332440c60f17210fbbdb3109b70b5b` |
+| Runtime manifest | `6c35276b2d4c936935f7fe2a6b8c8a439f13effb68699f35da31d20c2af85106` |
+| Accepted release | `f3a82eac057bb6edc521b05330d7fc22d5d8c8b7eb5f8b3c9c00cfff8df7df8a` |
+| Computational dependency environment | `760c0f5eb73df2da4916caade6bcff625416eee7f52167cb2f5a8dfe55d7bf16` |
+
+Track `veda-sn120-v2-r10`, its original competition/data bindings, start, database,
+READY bytes and C/R clocks remained unchanged. The six non-runtime configuration files
+were byte-identical across maintenance. Original E2/E3/E16 reports retain their own frozen
+source and hardware identities; this release does not relabel or repeat those experiments.
 
 - Bound automatic infrastructure retries by the existing budget; preserve blocked tasks,
   original data-scoped operator recovery and FIFO, with no automatic public blocked retry ETA.
@@ -8,11 +26,12 @@
   the existing 128-byte payload limit. Bind the declaration through the original task,
   admission, archives, public match and authenticated recovery before assigning model ownership.
 - Use the original admission retry CAS for a fixed ten-minute HF publication wait starting
-  at the first actual anonymous metadata 401/403/404 observation. Waiting preserves the infrastructure
+  at the first actual anonymous HF metadata 401/403/404 observation. Waiting preserves the infrastructure
   failure budget, original submission and FIFO; reset and recovery retain the original clock.
   CDN payload errors after successful anonymous metadata retain infrastructure retry semantics.
-- These source changes are not deployed. The dated installed identity below remains the
-  last operator-reported baseline; historical results and missing evidence are not rewritten.
+
+Historical outcomes and missing evidence are not rewritten. Seed precommitments, protocol
+anchors, statistical recalibration and future source exclusion are not part of this installed release.
 
 ## 2026-11-01 — Native deployment of 63ca340
 

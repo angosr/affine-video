@@ -72,7 +72,7 @@ existing output. **It does not check the complete tensor schema or competition e
 
 ### 3. Stage an immutable Hugging Face revision
 
-The SHA-bound VDA2 workflow below is an unreleased candidate; check the
+The SHA-bound VDA2 workflow is supported by the 2026-11-01 native release; check the
 [changelog](CHANGELOG.md) and live runtime before using it on-chain.
 Upload to an existing private repository and keep it private until the chain commitment
 is finalized:
@@ -116,7 +116,7 @@ not automatically retry. If a transaction's outcome is uncertain, inspect its ch
 before submitting again.
 
 After finalization, make that same repository/revision anonymously readable without
-changing the file. The first actual anonymous metadata HTTP 401/403/404 observation starts one fixed
+changing the file. The first actual anonymous HF metadata HTTP 401/403/404 observation starts one fixed
 10-minute publication window. During that wait, no infrastructure failure budget is spent;
 the original task is checked again at the deadline. Restarting, retrying or operator recovery
 does not extend the window. Time alone does not reject a model: a later actual 401/403/404
