@@ -164,10 +164,18 @@ Download the original public track envelope, match and referenced audit JSON, th
 
 ```bash
 uv run veda verify-match --track track.json --match match.json --artifact audit.json
+uv run veda verify-match --track track.json --match match.json --artifact audit.json \
+  --batch-disclosure batch-group.json
 uv run veda audit
 ```
 
-`verify-match` checks the small JSON artifacts on CPU. The credential-free `audit` command
+`verify-match` checks the small JSON artifacts on CPU. Without the original
+`batch_groups/<plan_digest>.json`, it explicitly reports `statistics-only`: self-reported
+cells alone do not authenticate the original case design. With that disclosure, the match's
+READY SHA authenticates the plan and every route/rollout/source/step/window in canonical
+cache order. Track case count and geometry are always checked. This does not replay model
+inference or verify tensor payloads; `model_inference_reproduced` remains false.
+The credential-free `audit` command
 uses the normal public ledger verifier, including available published payload bytes, which
 may be large. Neither command needs a wallet, GPU, private storage keys or evaluator database.
 Statistical replay does not establish full model-inference replay when a private losing model

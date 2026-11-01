@@ -37,7 +37,12 @@ the original allocation remains the sole assignment authority. Published audit a
 are deterministic hash-bound projections after the original data's disclosure age.
 
 `veda verify-match` performs CPU statistical verification of three original public JSON
-files. `veda audit` uses `S3Repository.load`, including its history, match/fence, model and
+files. With `--batch-disclosure`, it also binds every ordered case to the original READY
+plan whose full SHA is committed by the match. Without that input it reports only statistical
+replay, never authentication of the reported case identities. Private stage capture/recovery
+checks the same canonical plan order; capture uses the already-verified cache metadata.
+Neither scope establishes model-inference replay, especially for a private losing model.
+`veda audit` uses `S3Repository.load`, including its history, match/fence, model and
 available disclosure-byte checks. It is GET-only and never acquires a writer lock, opens
 SQLite, loads a wallet or changes a pointer. Missing historical evidence remains unknown.
 The candidate implementation has CPU coverage; it is not a report of deployed evidence or

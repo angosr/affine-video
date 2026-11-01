@@ -10,6 +10,9 @@
 - Reuse public audit receipts before reading private stage inputs. Candidate input evidence
   records complete observed enumeration and original plan facts, not a globally atomic pool.
 - Add credential-free, read-only `veda audit` through `S3Repository.load`.
+- Bind original case count, geometry and ordered route/rollout/source/step/window design
+  when capturing or restoring stage evidence. Public `verify-match` reports statistics-only
+  without the authenticated batch disclosure and never claims private model-inference replay.
 - Present the champion and recent comparisons without ranking different batches by absolute
   scores. Show each comparison's LCB and original submission-locked threshold.
 - Publish allowlisted diagnostic summaries, known duplicate references, recorded automatic

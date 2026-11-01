@@ -57,6 +57,7 @@ from validator.production.storage import (
 )
 from validator.queue import TERMINAL_STATES
 from validator.reproducibility import (
+    plan_case_order,
     public_score_audit,
     stage_reference,
     validate_pair_evidence,
@@ -414,9 +415,12 @@ class ReadyBatchSource:
         if getattr(self.track, "netuid", None) == 120 and execution["runtime_identity"] is None:
             raise ValueError("new production scoring requires its approved execution identity")
         if "reproducibility" in metrics:
+            plan = (self._allocated_plan(task.challenge_id, confirmation=False)
+                    if "cache_generated_block" in metrics
+                    or getattr(self.track, "netuid", None) == 120 else None)
             validate_pair_evidence(metrics["reproducibility"], result.score,
                                    metrics["incumbent_score"], metrics["paired_gain_lower_bound"],
-                                   track=self.track)
+                                   track=self.track, plan=plan)
             if metrics["reproducibility"]["challenger_sha256"] != task.file_sha256:
                 raise ValueError("stage evidence differs from its admitted challenger")
             binding = self.stage_binding(task.challenge_id, confirmation=False)
@@ -511,6 +515,9 @@ class ReadyBatchSource:
         ):
             raise RuntimeError("archived stage result conflicts with its challenge")
         generated_block = document["metrics"].get("cache_generated_block")
+        if ("reproducibility" in document["metrics"] and generated_block is None
+                and getattr(self.track, "netuid", None) == 120):
+            raise RuntimeError("archived stage case evidence lacks its allocated READY batch")
         if generated_block is not None and (
             type(generated_block) is not int
             or generated_block < 0
@@ -552,7 +559,8 @@ class ReadyBatchSource:
                 raise RuntimeError("archived stage contains a circular evidence reference")
             validate_pair_evidence(metrics["reproducibility"], document["score"],
                                    metrics["incumbent_score"], metrics["paired_gain_lower_bound"],
-                                   track=self.track)
+                                   track=self.track, plan=(plan if generated_block is not None
+                                                          else None))
             if metrics["reproducibility"]["challenger_sha256"] != task.file_sha256:
                 raise RuntimeError("archived stage evidence changes its challenger")
             reference = stage_reference(self._stage_name(task.challenge_id, task.state.value),
@@ -1155,6 +1163,11 @@ def _validate_plan_case_binding(path: Path, plan: BatchPlan, track: TrackSpec) -
     ):
         raise CacheLoadError("cache selected inputs conflict with the frozen READY plan")
     cases = reader.metadata["cases"]
+    fields = ("route", "rollout_id", "step_index")
+    if [{key: row[key] for key in fields} for row in cases] != [
+        {key: row[key] for key in fields} for row in plan_case_order(plan)
+    ]:
+        raise CacheLoadError("cache cases do not match the frozen batch plan")
     rollouts = {rollout.rollout_id: rollout for rollout in plan.rollouts}
     steps = {step.index: step for step in plan.selected_steps}
     expected = {

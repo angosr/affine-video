@@ -1735,6 +1735,9 @@ def test_completed_unit_recovery_requires_bound_valid_artifacts(
 def test_exact_cases_are_bound_field_by_field_to_the_batch_plan(
     tmp_path, monkeypatch, dense_mutation
 ) -> None:
+    # This CPU fixture has no frozen inference distribution; selection still records a source ID.
+    monkeypatch.setattr("validator.production.environment.evaluation_source_digest",
+                        lambda: "ef" * 32)
     pool = SourcePool(tuple(proof(index).leaf for index in range(4)))
     selected_sources = select_source_proofs(
         pool, commitments=source_commitments(pool), partition="production",

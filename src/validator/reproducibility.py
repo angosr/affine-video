@@ -86,7 +86,8 @@ def public_score_audit(document: dict[str, Any]) -> tuple[bytes, dict[str, Any]]
     return body, {**stage_reference(name, body), "not_before_ms": context["not_before_ms"]}
 
 
-def verify_public_score_audit(payload: bytes, match_payload: bytes, track: Any) -> dict[str, Any]:
+def verify_public_score_audit(payload: bytes, match_payload: bytes, track: Any, *,
+                              disclosure: bytes | None = None) -> dict[str, Any]:
     """Read-only CPU audit of public bytes; never load models, tensors, DBs or CUDA."""
     from validator.production.commitment import decode_canonical_json
     from validator.production.inventory import _CLAIM_FIELDS, _validate_selection
@@ -193,8 +194,28 @@ def verify_public_score_audit(payload: bytes, match_payload: bytes, track: Any) 
                           if incumbent["challenge_id"] == "genesis" else None)
     if expected_incumbent is not None and evidence["incumbent_sha256"] != expected_incumbent:
         raise ValueError("public score audit changes its scored incumbent")
+    plan = None
+    if disclosure is not None:
+        from validator.production.plan import BatchPlan
+
+        document = decode_canonical_json(disclosure)
+        if (not isinstance(document, dict) or set(document) != {
+            "format", "plan", "public_dense_references", "public_exact_object",
+            "public_selected_inputs",
+        } or document["format"] != "veda-batch-disclosure-v3"):
+            raise ValueError("score audit batch disclosure is invalid")
+        plan = BatchPlan.decode(canonical_json(document["plan"]))
+        if (plan.state != "READY" or plan.track_spec_digest != context["data_spec_digest"]
+                or hashlib.sha256(plan.encode()).hexdigest() != batch["ready_sha256"]
+                or plan.plan_digest != batch["plan_digest"]
+                or plan.exact.sha256 != batch["sha256"]
+                or plan.generation_block != batch["generated_block"]
+                or plan.block_hash != batch["seed_block_hash"]
+                or plan.completed_block != batch["completed_block"]
+                or plan.completed_at_ms != batch["completed_at_ms"]):
+            raise ValueError("score audit disclosure differs from its authenticated READY")
     validate_pair_evidence(evidence, body["score"], metrics["incumbent_score"],
-                           metrics["paired_gain_lower_bound"], track=track)
+                           metrics["paired_gain_lower_bound"], track=track, plan=plan)
     return {
         "challenge_id": body["challenge_id"], "stage": body["stage"],
         "match_sha256": hashlib.sha256(match_payload).hexdigest(),
@@ -203,6 +224,9 @@ def verify_public_score_audit(payload: bytes, match_payload: bytes, track: Any) 
         "challenger_score": body["score"], "incumbent_score": metrics["incumbent_score"],
         "gain_lower_bound": metrics["paired_gain_lower_bound"],
         "minimum_gain": match["minimum_gain"], "outcome": str(record.outcome),
+        "verification_scope": ("statistics-and-authenticated-plan-design" if plan is not None
+                               else "statistics-only"),
+        "model_inference_reproduced": False,
     }
 
 
@@ -306,8 +330,18 @@ def pair_evidence(track: Any, metadata: dict[str, Any], paired: Any, *,
     return result
 
 
+def plan_case_order(plan: Any) -> list[dict[str, Any]]:
+    """The existing cache writer's canonical order, derived from original plan facts."""
+    cases = [CaseDesign(route, rollout.stratum, rollout.rollout_id, rollout.source_id,
+                        step.index, step.window)
+             for route in plan.selected_routes for rollout in plan.rollouts
+             for step in plan.selected_steps]
+    return [asdict(case) for case in sorted(cases, key=lambda case: (
+        case.route, case.stratum, case.rollout_id, case.step_index))]
+
+
 def validate_pair_evidence(value: Any, challenger_score: float, incumbent_score: float,
-                           bound: float, *, track: Any = None) -> None:
+                           bound: float, *, track: Any = None, plan: Any = None) -> None:
     """Recompute only CPU statistics from recorded cells, including on cold restore.
 
     Stored execution facts are not replaced by the restoring machine's identity.
@@ -360,6 +394,12 @@ def validate_pair_evidence(value: Any, challenger_score: float, incumbent_score:
         raise ValueError("stage bootstrap parameters are invalid")
     if track is not None:
         scoring = track.scoring
+        if (len(design) != scoring.case_count
+                or len({row.route for row in design}) != scoring.sampled_route_count
+                or len({row.step_index for row in design}) != scoring.sampled_step_count
+                or any(len({row.rollout_id for row in design if row.stratum == stratum})
+                       != scoring.rollouts_per_stratum for stratum in scoring.stratum_weight_map)):
+            raise ValueError("stage case geometry differs from its track")
         if (value["stratum_weights"] != [list(row) for row in scoring.stratum_weight_map.items()]
                 or value["step_window_weights"] != [list(row) for row in
                                                    scoring.step_window_weight_map.items()]
@@ -369,6 +409,8 @@ def validate_pair_evidence(value: Any, challenger_score: float, incumbent_score:
                 or value["budgets"] != [asdict(budget) for budget in scoring.budgets]
                 or value["tail_mean_weight"] != scoring.tail_mean_weight):
             raise ValueError("stage statistical policy differs from its track")
+    if plan is not None and value["case_order"] != plan_case_order(plan):
+        raise ValueError("stage case order differs from its authenticated READY plan")
     actual = (
         _weighted_cell_mean(value["challenger_cells"], design, *weights),
         _weighted_cell_mean(value["incumbent_cells"], design, *weights),

@@ -21,6 +21,7 @@ from validator.queue import ChainPosition, ChallengeState
 from validator.reproducibility import (
     _execution,
     pair_evidence,
+    plan_case_order,
     stage_reference,
     validate_pair_evidence,
     validate_stage_reference,
@@ -80,6 +81,141 @@ def test_recorded_cells_recompute_exact_statistics_and_reject_changes(proof, dam
                                paired.gain_lower_bound, track=track)
 
 
+def cell_statistics(evidence):
+    design = [CaseDesign(**row) for row in evidence["case_order"]]
+    weights = dict(evidence["stratum_weights"]), dict(evidence["step_window_weights"])
+    a, b = evidence["challenger_cells"], evidence["incumbent_cells"]
+    return (_weighted_cell_mean(a, design, *weights), _weighted_cell_mean(b, design, *weights),
+            paired_score_gain_bound(a, b, design, stratum_weights=weights[0],
+                                    step_window_weights=weights[1], **evidence["bootstrap"]))
+
+
+def test_whole_route_removal_is_not_the_original_384_cases():
+    from scoring.spec import load_track_spec
+
+    track = load_track_spec("track.json")
+    track = replace(track, scoring=replace(track.scoring, bootstrap_resamples=20))
+    scoring = track.scoring
+    design = [CaseDesign(f"r{r}", s, f"{s}-{i}", f"source-{s}-{i}", j, w)
+              for r in range(scoring.sampled_route_count) for s in scoring.stratum_weight_map
+              for i in range(scoring.rollouts_per_stratum)
+              for j, w in enumerate(scoring.step_window_weight_map)]
+    assert len(design) == scoring.case_count == 384
+    evidence = {"case_order": [asdict(row) for row in design],
+                "challenger_cells": [.6] * len(design), "incumbent_cells": [.5] * len(design),
+                "stratum_weights": [list(row) for row in scoring.stratum_weight_map.items()],
+                "step_window_weights": [list(row) for row in
+                                        scoring.step_window_weight_map.items()],
+                "bootstrap": {"confidence": scoring.match_confidence,
+                              "resamples": scoring.bootstrap_resamples,
+                              "seed": scoring.bootstrap_seed}}
+    a, b, bound = cell_statistics(evidence)
+    paired = SimpleNamespace(challenger_score=a, incumbent_score=b, gain_lower_bound=bound,
+                             challenger_cells=evidence["challenger_cells"],
+                             incumbent_cells=evidence["incumbent_cells"])
+    evidence = pair_evidence(track, {"cases": evidence["case_order"]}, paired,
+                             challenger_sha256="12" * 32, incumbent_sha256="23" * 32,
+                             device=None, runtime_identity=None,
+                             started_at_ms=time.time_ns() // 1_000_000)
+    keep = [i for i, row in enumerate(evidence["case_order"]) if row["route"] != "r0"]
+    for key in ("case_order", "challenger_cells", "incumbent_cells"):
+        evidence[key] = [evidence[key][i] for i in keep]
+    scores = cell_statistics(evidence)
+    # This subset is still a complete Cartesian product and internally consistent.
+    validate_pair_evidence(evidence, *scores)
+    with pytest.raises(ValueError, match="geometry"):
+        validate_pair_evidence(evidence, *scores, track=track)
+    with pytest.raises(ValueError, match="geometry"):
+        pair_evidence(track, {"cases": evidence["case_order"]}, SimpleNamespace(
+            challenger_score=scores[0], incumbent_score=scores[1], gain_lower_bound=scores[2],
+            challenger_cells=evidence["challenger_cells"],
+            incumbent_cells=evidence["incumbent_cells"]),
+            challenger_sha256="12" * 32, incumbent_sha256="23" * 32,
+            device=None, runtime_identity=None, started_at_ms=time.time_ns() // 1_000_000)
+
+
+@pytest.mark.parametrize("change", ["order", "route", "rollout", "source", "step", "window"])
+def test_self_consistent_cells_must_match_original_plan_design(audit_case, change):
+    case = audit_case
+    evidence = copy.deepcopy(case.metrics["reproducibility"])
+    if change == "order":
+        for key in ("case_order", "challenger_cells", "incumbent_cells"):
+            evidence[key].reverse()
+    else:
+        field = {"route": "route", "rollout": "rollout_id", "source": "source_id",
+                 "step": "step_index", "window": "step_window"}[change]
+        values = list(dict.fromkeys(row[field] for row in evidence["case_order"]))
+        for row in evidence["case_order"]:
+            row[field] = (row[field] + "-other" if change in {"route", "source", "rollout"} else
+                          values[(values.index(row[field]) + 1) % len(values)])
+    scores = cell_statistics(evidence)
+    validate_pair_evidence(evidence, *scores, track=case.track)  # Statistical replay is valid.
+    with pytest.raises(ValueError, match="authenticated READY plan"):
+        validate_pair_evidence(evidence, *scores, track=case.track, plan=case.plan)
+
+
+def test_cache_metadata_order_is_checked_before_any_tensor_read(audit_case, monkeypatch):
+    from validator.production import batches
+
+    case = audit_case
+    metadata = {"sample_cache": case.plan.sample_cache.document(),
+                "cases": list(reversed(plan_case_order(case.plan)))}
+    monkeypatch.setattr(batches, "ExactCacheReader", lambda *_a, **_k: SimpleNamespace(
+        metadata=metadata))
+    monkeypatch.setattr(batches.np, "load", lambda *_a, **_k: pytest.fail("opened tensor payload"))
+    with pytest.raises(batches.CacheLoadError, match="frozen batch plan"):
+        batches._validate_plan_case_binding(None, case.plan, case.track)
+
+
+@pytest.mark.parametrize("operation", ["capture", "restore"])
+def test_stage_capture_and_restore_bind_plan_without_cache_payload(
+    audit_case, tmp_path, monkeypatch, operation,
+):
+    case = audit_case
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="original")
+    source = ReadyBatchSource(track=case.track, objects=objects, cache_dir=tmp_path / "unread")
+    monkeypatch.setattr(source, "_allocated_plan", lambda *_a, **_k: case.plan)
+    monkeypatch.setattr(source, "stage_binding", case.source.stage_binding)
+    monkeypatch.setattr(source, "_restore_exact", lambda *_a: pytest.fail("restored 10GB cache"))
+    metrics = copy.deepcopy(case.metrics)
+    for row in metrics["reproducibility"]["case_order"]:
+        row["source_id"] += "-replacement"
+    scores = cell_statistics(metrics["reproducibility"])
+    validate_pair_evidence(metrics["reproducibility"], *scores, track=case.track)
+    metrics["incumbent_score"], metrics["paired_gain_lower_bound"] = scores[1:]
+    original = case.source.objects.get(case.reference["object"]).body
+    if operation == "capture":
+        with pytest.raises(ValueError, match="authenticated READY plan"):
+            source.archive_stage(case.task, StageOutcome(scores[0], metrics),
+                                 case.item["score_block"])
+        assert objects.list_names("stages/") == ()
+    else:
+        document = json.loads(original)
+        document.update(metrics=metrics, score=scores[0])
+        objects.create_plan(case.reference["object"], canonical_json(document))
+        claim = metrics["cache_allocation"]
+        monkeypatch.setattr(source.inventory, "read", lambda: (None, {"claims": [claim]}))
+        objects.create_plan(f"admissions/{case.task.challenge_id}.json", canonical_json({
+            "track_spec_digest": case.track.digest, "model_digest": claim["model_digest"],
+            "file_sha256": case.task.file_sha256, "challenge_id": case.task.challenge_id,
+        }))
+        with pytest.raises(ValueError, match="authenticated READY plan"):
+            source.restore_stage(case.task)
+    assert case.source.objects.get(case.reference["object"]).body == original
+
+
+def test_production_evidence_cannot_drop_plan_binding_on_restore(audit_case, tmp_path):
+    case = audit_case
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="original")
+    source = ReadyBatchSource(track=case.track, objects=objects, cache_dir=tmp_path / "unread")
+    source.track = SimpleNamespace(digest=case.track.digest, netuid=120)
+    document = json.loads(case.source.objects.get(case.reference["object"]).body)
+    del document["metrics"]["cache_generated_block"]
+    objects.create_plan(case.reference["object"], canonical_json(document))
+    with pytest.raises(RuntimeError, match="lacks its allocated READY batch"):
+        source.restore_stage(case.task)
+
+
 def test_recorded_weight_order_survives_canonical_json_without_changing_bootstrap():
     scoring = scoring_spec(routes=1, rollouts=4)
     scoring = SimpleNamespace(**{
@@ -87,7 +223,8 @@ def test_recorded_weight_order_survives_canonical_json_without_changing_bootstra
             "budgets", "tail_mean_weight", "match_confidence", "bootstrap_resamples",
             "bootstrap_seed",
         )
-    }, stratum_weight_map={"z": .6, "a": .4}, step_window_weight_map={"late": .3, "early": .7})
+    }, stratum_weight_map={"z": .6, "a": .4}, step_window_weight_map={"late": .3, "early": .7},
+        sampled_route_count=1, rollouts_per_stratum=4, sampled_step_count=2, case_count=16)
     track = SimpleNamespace(scoring=scoring)
     design = [CaseDesign("r", s, f"{s}-{i}", f"{s}-source-{i}", step, window)
               for s in scoring.stratum_weight_map for i in range(4)
@@ -298,9 +435,8 @@ def audit_case(tmp_path, monkeypatch, request, plan_inputs_case):
     track = parse_track_spec(raw)
     inventory_case.track = track
     scoring = track.scoring
-    design = [CaseDesign(f"route-{r}", "all", f"rollout-{i}", f"source-{i}", step, window)
-              for i in range(4) for r in range(2)
-              for step, window in enumerate(scoring.step_window_weight_map)]
+    plan = make_plan(inventory_case, 95)
+    design = [CaseDesign(**row) for row in plan_case_order(plan)]
     has_claim, won = request.param if isinstance(request.param, tuple) else (request.param, True)
     b = [.65] * len(design)
     a = [.75 + i / 1000 for i in range(len(design))] if won else b[:]
@@ -324,7 +460,6 @@ def audit_case(tmp_path, monkeypatch, request, plan_inputs_case):
                             submitted_ms=200_000)
     item.update(challenge_id="34" * 32, submission_id="45" * 32, file_sha256="12" * 32,
                 final_score=paired.challenger_score, incumbent_score=paired.incumbent_score)
-    plan = make_plan(inventory_case, 95)
     batch = {"sha256": plan.exact.sha256, "plan_digest": plan.plan_digest,
              "seed_block_hash": plan.block_hash, "generated_block": 95,
              "completed_block": plan.completed_block, "completed_at_ms": plan.completed_at_ms,
@@ -357,6 +492,7 @@ def audit_case(tmp_path, monkeypatch, request, plan_inputs_case):
             disclosure_delay_seconds=track.cache.disclosure_delay_seconds)
     metrics["private_payload"] = "NEVER-PUBLISH-MODEL-OR-SECRET"
     source = ReadyBatchSource(track=track, objects=objects, cache_dir=tmp_path)
+    monkeypatch.setattr(source, "_allocated_plan", lambda *_a, **_k: plan)
     monkeypatch.setattr(source, "stage_binding", lambda *_a, **_k: {
         key: metrics[key] for key in ("cache_ready_sha256", "cache_completed_block",
                                      "cache_completed_at_ms", "cache_allocation", "claim_evidence")
@@ -378,7 +514,7 @@ def audit_case(tmp_path, monkeypatch, request, plan_inputs_case):
     payload = source.public_stage_audit(reference, now_ms=due)
     return SimpleNamespace(track=track, source=source, reference=reference, item=item,
                            record=record, payload=payload, due=due, raw=raw,
-                           has_claim_evidence=has_claim, task=task, metrics=metrics)
+                           has_claim_evidence=has_claim, task=task, metrics=metrics, plan=plan)
 
 
 def test_public_cpu_audit_is_bound_to_actual_match_and_preserves_original_stage(audit_case):
@@ -387,6 +523,8 @@ def test_public_cpu_audit_is_bound_to_actual_match_and_preserves_original_stage(
     result = verify_public_score_audit(case.payload, canonical_json(case.record.document),
                                       case.track)
     assert result["case_count"] == 24 and result["outcome"] == "CHALLENGER_WON"
+    assert result["verification_scope"] == "statistics-only"
+    assert result["model_inference_reproduced"] is False
     assert case.source.objects.get(case.reference["object"]).body == before
     assert b"source_proofs" not in case.payload and b"model_path" not in case.payload
     body = json.loads(case.payload)
@@ -400,6 +538,50 @@ def test_public_cpu_audit_is_bound_to_actual_match_and_preserves_original_stage(
         assert body["context"]["claim_sha256"] == hashlib.sha256(canonical_json(claim)).hexdigest()
     with pytest.raises(ValueError, match="not due"):
         case.source.public_stage_audit(case.reference, now_ms=case.due - 1)
+
+
+def disclosed_plan(plan):
+    from validator.production.batches import public_selected_inputs_document
+
+    return canonical_json({
+        "format": "veda-batch-disclosure-v3", "plan": plan.document(),
+        "public_exact_object": f"batches/{plan.exact.sha256}/manifest.json",
+        "public_dense_references": [{
+            "rollout_id": row.rollout_id,
+            **{kind: {"object": f"batch_assets/{item.sha256}/manifest.json",
+                      "sha256": item.sha256, "size_bytes": item.size_bytes}
+               for kind, item in (("video", row.video), ("latent", row.latent))},
+        } for row in plan.dense_references],
+        "public_selected_inputs": public_selected_inputs_document(plan.sample_cache),
+    })
+
+
+def test_public_audit_authenticates_case_design_only_with_original_disclosure(audit_case):
+    case = audit_case
+    disclosure = disclosed_plan(case.plan)
+    result = verify_public_score_audit(case.payload, canonical_json(case.record.document),
+                                      case.track, disclosure=disclosure)
+    assert result["verification_scope"] == "statistics-and-authenticated-plan-design"
+    assert result["model_inference_reproduced"] is False
+    changed = json.loads(disclosure)
+    changed["plan"]["completed_at_ms"] += 1
+    with pytest.raises(ValueError, match="authenticated READY"):
+        verify_public_score_audit(case.payload, canonical_json(case.record.document),
+                                  case.track, disclosure=canonical_json(changed))
+    # Even rehashing a self-consistent score audit cannot change original source grouping.
+    body, match = json.loads(case.payload), copy.deepcopy(case.record.document)
+    for row in body["metrics"]["reproducibility"]["case_order"]:
+        row["source_id"] += "-replacement"
+    payload = canonical_json(body)
+    match["evaluation"]["stages"][0]["stage_evidence"]["public_audit"] = {
+        **stage_reference(case.reference["public_audit"]["object"], payload),
+        "not_before_ms": case.due,
+    }
+    assert verify_public_score_audit(payload, canonical_json(match), case.track)[
+        "verification_scope"] == "statistics-only"
+    with pytest.raises(ValueError, match="authenticated READY plan"):
+        verify_public_score_audit(payload, canonical_json(match), case.track,
+                                  disclosure=disclosure)
 
 
 @pytest.mark.parametrize("audit_case", [(True, False)], indirect=True)
@@ -428,11 +610,7 @@ def test_cold_private_stage_keeps_original_public_audit_hash_and_cas_interval(
     cold = ReadyBatchSource(track=case.track, objects=case.source.objects,
                             cache_dir=tmp_path / "cold")
     monkeypatch.setattr(cold, "stage_binding", case.source.stage_binding)
-    monkeypatch.setattr(cold, "_allocated_plan", lambda *_a, **_k: SimpleNamespace(
-        generation_block=case.metrics["cache_generated_block"],
-        plan_digest=case.metrics["cache_plan_digest"],
-        block_hash=case.metrics["cache_seed_block_hash"],
-        exact=SimpleNamespace(sha256=case.metrics["cache_sha256"])))
+    monkeypatch.setattr(cold, "_allocated_plan", lambda *_a, **_k: case.plan)
     restored = cold.restore_stage(case.task)
     assert restored.metrics["stage_evidence"] == case.reference
     assert cold.archive_stage(case.task, restored, restored.score_block) == case.reference
@@ -493,7 +671,15 @@ def test_public_audit_cli_is_read_only_cpu_and_needs_no_role(audit_case, tmp_pat
         path.write_bytes(body)
     main(["verify-match", "--track", str(paths[0]), "--match", str(paths[1]),
           "--artifact", str(paths[2])])
-    assert json.loads(capsys.readouterr().out)["gain_lower_bound"] == case.record.score_gain
+    result = json.loads(capsys.readouterr().out)
+    assert result["gain_lower_bound"] == case.record.score_gain
+    assert result["verification_scope"] == "statistics-only"
+    disclosure = tmp_path / "batch.json"
+    disclosure.write_bytes(disclosed_plan(case.plan))
+    main(["verify-match", "--track", str(paths[0]), "--match", str(paths[1]),
+          "--artifact", str(paths[2]), "--batch-disclosure", str(disclosure)])
+    assert json.loads(capsys.readouterr().out)[
+        "verification_scope"] == "statistics-and-authenticated-plan-design"
     paths[0].write_bytes(canonical_json({"track_spec_digest": "00" * 32, "spec": case.raw}))
     with pytest.raises(SystemExit) as stopped:
         main(["verify-match", "--track", str(paths[0]), "--match", str(paths[1]),

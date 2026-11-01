@@ -103,6 +103,8 @@ def _parser() -> argparse.ArgumentParser:
     audit.add_argument("--match", required=True, type=Path, help="original public match JSON")
     audit.add_argument("--artifact", required=True, type=Path,
                        help="public score_audits object referenced by that match")
+    audit.add_argument("--batch-disclosure", type=Path,
+                       help="original batch_groups JSON to verify the authenticated case design")
     evaluator = modules.add_parser("evaluator", help="operate evaluation and data production")
     evaluator_commands = evaluator.add_subparsers(dest="command", required=True)
     produce = evaluator_commands.add_parser("produce", help="produce private evaluation batches")
@@ -318,7 +320,9 @@ def _audit_ledger(parser: argparse.ArgumentParser, base_url: str) -> None:
                     continue
                 proofs.append(verify_public_score_audit(
                     payload, json.dumps(match.document, sort_keys=True, separators=(",", ":"),
-                                        ensure_ascii=False).encode(), track))
+                                        ensure_ascii=False).encode(), track,
+                    disclosure=repository._get_optional(
+                        f"batch_groups/{stage['evaluation_batch']['plan_digest']}.json")))
         return {"track_spec_digest": track.digest, "source_block": ledger.source_block,
                 "committed_matches": ledger.committed_match_count,
                 "historical_matches": len(ledger.historical_matches),
@@ -339,10 +343,12 @@ def _verify_match(parser: argparse.ArgumentParser, arguments: argparse.Namespace
     from validator.reproducibility import verify_public_score_audit
 
     try:
-        result = verify_public_score_audit(arguments.artifact.read_bytes(),
-                                           arguments.match.read_bytes(),
-                                           parse_track_spec(_decode_track_document(
-                                               arguments.track.read_bytes())["spec"]))
+        result = verify_public_score_audit(
+            arguments.artifact.read_bytes(), arguments.match.read_bytes(),
+            parse_track_spec(_decode_track_document(arguments.track.read_bytes())["spec"]),
+            disclosure=(None if arguments.batch_disclosure is None
+                        else arguments.batch_disclosure.read_bytes()),
+        )
     except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
         parser.exit(1, f"error: {exc}\n")
     print(json.dumps(result, sort_keys=True))
