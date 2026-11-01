@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased
+## 2026-11-01 — Native deployment of 63ca340
+
+Operator-reported acceptance: application commit
+`63ca3400336f766bad9844c2acd57e423c1c69a3`, native installation; not a new Docker Engine
+deployment. The existing OCI descriptor remains dependency/package provenance.
+Annotated navigation tag: `release-2026-11-01-63ca340`, targeting the application commit
+above rather than any later documentation commit.
+
+| Installed identity | SHA-256 |
+| --- | --- |
+| Application source | `bb6141c3da179f2fb8f66091ef5784b30e7882ebf844b6266df1eed7a7ed4b80` |
+| Runtime manifest | `64a4ae2946853a7a3808146995b5341080565c8ec34c3660ae73e70f1d1b8591` |
+| Acceptance | `db51fcc52181e3692efef2ba806bfcf30f865f225f520f4945f8b6344a5e8a5d` |
+| Installed native lock | `b51b2b29b1dbf52742f96a1955df599a6f4ebf3454aade093e61c365c93377fb` |
+| Operator maintenance receipt | `8cdd778011889db7b9abc7a7529208acd4d48573b25b89fcc980de4c2d0e7a40` |
+
+The operator verified the new public runtime identity at source block 9409592. At 15:46 CST,
+the original database had continued to cursor 9409627 with 12 successful challenges and 12
+stages, no challenge errors, eight unchanged READY commitments/C/R, and UID643 weight 1.
+The original six non-payload configurations, DB, S, claims and data identity were preserved.
+CDE remained unchanged. The original maintenance failure and strict integrity checks were
+retained; no dependency source/RECORD or verification guard was relaxed.
+
+The following capabilities are installed. No new natural evidence-enabled match had occurred
+at acceptance: installation and CLI help checks do not establish capture, disclosure or
+public statistical replay of a new real match. Historical missing evidence remains unknown.
 
 - Seal per-match execution identity, calculated paired cells, statistical parameters and
   first-selection observations through the existing claim and stage authorities.
@@ -28,12 +53,12 @@
 - Reject a re-signed copy of the official baseline by canonical tensor digest without creating
   a synthetic challenge or assigning baseline ownership to a miner.
 
-These source changes have not been deployed by this development session. They preserve
+This maintenance preserves
 the active rules, confidence 0.9975, exact-only promotion, original submissions, opportunities,
 model privacy and original data commitments. No GPU experiment or historical re-evaluation
 is part of these changes.
 
-## Operator-reported deployed baseline, 2026-11-01
+## Previous baseline (operator report, 2026-11-01)
 
 - Application commit: `f8c40c04815d853a206493236672cc53aefaae87`.
 - Application source digest:

@@ -24,8 +24,8 @@ transactions or complete host-loss recovery.
 
 ## Source, live runtime and historical execution
 
-The [changelog](../../CHANGELOG.md) labels source candidates and the last operator-reported
-deployed baseline separately. Resolve the current software through `status.json.runtime_release`
+The [changelog](../../CHANGELOG.md) distinguishes dated deployments, historical baselines
+and unexecuted proposals. Resolve current software through `status.json.runtime_release`
 and its actual source, installed lock, manifest and acceptance. A checkout, descriptor or
 current status cannot establish which environment or GPU executed an earlier match.
 
@@ -51,8 +51,7 @@ host, not the development machine. For each match it uses the original digest-au
 spec is reported unavailable; malformed or wrong-digest bytes fail verification. The active
 spec is never a substitute. `verify-match` accepts the same raw immutable spec as its input.
 Preserving rules does not supply missing historical runtime identity or calculated cells.
-The candidate implementation has CPU coverage; it is not a report of deployed evidence or
-new GPU measurements. Private loser payloads remain private.
+Private loser payloads remain private.
 
 ### Evidence ownership and lifetime
 
@@ -64,7 +63,7 @@ not a new inventory or state file.
 
 | Fact or field group | Sole writer and authoritative storage | Consumers and public timing | Retention and cleanup |
 | --- | --- | --- | --- |
-| Original S, hotkey, file/model digest and opportunity | Existing admission/scanner and original admission/SQLite records | Existing FIFO admission, claim and tournament; existing public submission/match projections | Preserve original recovery and uniqueness history; this candidate changes no retention or opportunity. |
+| Original S, hotkey, file/model digest and opportunity | Existing admission/scanner and original admission/SQLite records | Existing FIFO admission, claim and tournament; existing public submission/match projections | Preserve original recovery and uniqueness history; this maintenance changes no retention or opportunity. |
 | Original rules at `artifacts/<specdigest>` | Existing approved public `stage` writes the canonical original spec once by its digest, reusing the existing artifact/data-origin key space | `audit` reads each original version once per invocation; `verify-match` accepts the same object. Staged before its mutable track pointer; no per-match spec copy or separate version registry | Keep while any active/historical match binds the digest. Never invent unavailable past specs or replace them with current rules. No automatic TTL or cleanup of referenced rules. |
 | `selection.inputs`: complete observed plan versions and enumeration pages | `Inventory.claim` writes one hash-named immutable attachment under `stages/<challenge>/<stage>.inputs/` before CAS | `Inventory.read/observed_plans` and the original plan validator recompute candidates. The successful original allocation CAS row is the only association authority. Full inputs remain private, including plans not yet due. | Keep every attachment referenced by a claim or archived stage. A pre-CAS attachment may be unreferenced after contention/crash: remove only in an authorized quiescent maintenance window after checking all original claim/stage references and in-flight writers. Never delete it online merely because one CAS lost. No automatic GC or cleanup daemon is added. |
 | `selection`: algorithm/source, observed pool interval, successful attempt clock, predecessor SHA, candidate order/eligibility and input hash | Successful row in the original `plans/allocations.json` CAS; retries reuse that row | `Inventory.read`, admission/stage binding and the audit projection. This records complete observed enumeration, not a globally atomic pool. | Keep as original assignment history. The attachment freezes observed plan versions that may later advance from PLANNED to READY; it is not an alternative plan or pool authority. Repeated CAS attempts reuse identical hash-named input bytes. |
@@ -90,13 +89,35 @@ reading further private stages. There is no persisted scan cursor or additional 
 Late scoring still publishes its audit when bulk data was disclosed earlier.
 Audit uploads never write the four mutable competition pointers.
 
-This is a source-and-CPU candidate, not a deployed or real-miner evidence receipt. Production
-installation and a subsequent natural match/disclosure/readback remain operator acceptance.
+The operator reported native installation and public runtime acceptance of 63ca340 on
+2026-11-01; its identities and receipt are recorded once in the changelog. No subsequent
+natural evidence-enabled match had occurred at acceptance. Capture, original-R disclosure
+and public replay of a new real match therefore remain unverified, not implied by deployment.
 Historical missing execution/cells/first-allocation observations stay unknown. Public selection
 evidence authenticates the recorded observation and commitments; it cannot prove a globally
 atomic pool or independently inspect private candidate plan bodies before their original R.
 No automatic orphan-attachment reclamation is claimed. Current immutable evidence has no TTL;
 any later evidence-retirement policy must preserve active references and be explicitly approved.
+
+### Public spec versions and application release tag
+
+Keep `track_id=veda-sn120-v2-r10`. The public rule version is its existing full digest,
+currently `a971c2714bf145f1953674492990207a6a61eecf61c093c487e179c114c24b63`.
+The operator read back the original 78073-byte `artifacts/<digest>` and verified that SHA.
+Use this immutable public object for replay, without a new alias, pointer or version ledger.
+
+The annotated application tag `release-2026-11-01-63ca340` has been published, pointing exactly to
+the deployed commit `63ca3400336f766bad9844c2acd57e423c1c69a3`, not a later documentation
+commit. Its annotation records the source/manifest/acceptance/native-lock identities
+and original public spec recorded above and in the changelog. It is a navigation label,
+not runtime approval, a data identity, or proof of historical execution. Creation and push
+followed review and fresh checks that the name was unused; no tag was forced or moved.
+
+Do not create a Git spec tag claiming that the checkout contains the deployed public spec.
+The repository's release-input `track.json` at that commit has digest
+`e35b75ac4d7be3f244f05978605cfe064086d5dae192aa7a9c0f79fb9c3c5e29`, which differs from
+the final bound public rule digest. No additional spec copy is proposed in Git. These labels
+change no application version, rules, start, DB, READY, C/R, claims or public protocol.
 
 ## Protocol and rules proposals awaiting explicit decisions
 
