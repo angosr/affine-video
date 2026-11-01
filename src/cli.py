@@ -88,16 +88,16 @@ def _parser() -> argparse.ArgumentParser:
     upload.add_argument("--hotkey", default="default")
     upload.add_argument("--wallet-path")
 
-    evaluator = modules.add_parser("evaluator", help="operate evaluation and data production")
-    evaluator_commands = evaluator.add_subparsers(dest="command", required=True)
-    audit = evaluator_commands.add_parser(
-        "audit", help="recompute public paired scores and LCB from immutable JSON, CPU only",
+    audit = modules.add_parser(
+        "verify-match", help="recompute public paired scores and LCB from immutable JSON, CPU only",
     )
     audit.add_argument("--track", required=True, type=Path,
                        help="original public track.json, including its spec digest envelope")
     audit.add_argument("--match", required=True, type=Path, help="original public match JSON")
     audit.add_argument("--artifact", required=True, type=Path,
                        help="public score_audits object referenced by that match")
+    evaluator = modules.add_parser("evaluator", help="operate evaluation and data production")
+    evaluator_commands = evaluator.add_subparsers(dest="command", required=True)
     produce = evaluator_commands.add_parser("produce", help="produce private evaluation batches")
     produce.add_argument("--config", required=True)
     produce.add_argument("--once", action="store_true")
@@ -174,6 +174,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     arguments = parser.parse_args(argv)
+    if arguments.module == "verify-match":
+        _verify_match(parser, arguments)
+        return
     if arguments.module == "monitor":
         try:
             asyncio.run(_run_monitor(arguments.status_url, arguments.watch))
@@ -281,21 +284,22 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
     print(json.dumps(output, sort_keys=True))
 
 
-def _run_evaluator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
-    if arguments.command == "audit":
-        from scoring.spec import parse_track_spec
-        from validator.publication import _decode_track_document
-        from validator.reproducibility import verify_public_score_audit
+def _verify_match(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
+    from scoring.spec import parse_track_spec
+    from validator.publication import _decode_track_document
+    from validator.reproducibility import verify_public_score_audit
 
-        try:
-            result = verify_public_score_audit(arguments.artifact.read_bytes(),
-                                               arguments.match.read_bytes(),
-                                               parse_track_spec(_decode_track_document(
-                                                   arguments.track.read_bytes())["spec"]))
-        except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
-            parser.exit(1, f"error: {exc}\n")
-        print(json.dumps(result, sort_keys=True))
-        return
+    try:
+        result = verify_public_score_audit(arguments.artifact.read_bytes(),
+                                           arguments.match.read_bytes(),
+                                           parse_track_spec(_decode_track_document(
+                                               arguments.track.read_bytes())["spec"]))
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+        parser.exit(1, f"error: {exc}\n")
+    print(json.dumps(result, sort_keys=True))
+
+
+def _run_evaluator(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
     if arguments.command == "policy":
         from validator.production.commitment import canonical_json
         from validator.production.storage import evaluator_iam_policy, verify_evaluator_iam_policy

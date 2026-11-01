@@ -919,6 +919,24 @@ class S3Repository:
         await asyncio.to_thread(self._put_immutable,
                                 disclosure.record_name, disclosure.record_payload)
 
+    async def score_audit_published(self, reference: dict[str, Any], *,
+                                    track: TrackSpec, now_ms: int) -> bool:
+        """Reuse the original public receipt before reading any private stage input."""
+        from validator.reproducibility import validate_stage_reference
+
+        validate_stage_reference(reference)
+        audit = reference["public_audit"]
+        if self._confirmed_immutable.get(audit["object"]) == audit["sha256"]:
+            return True
+        payload = await asyncio.to_thread(self._get_optional, audit["object"])
+        if payload is None:
+            return False
+        if (len(payload) != audit["size_bytes"]
+                or hashlib.sha256(payload).hexdigest() != audit["sha256"]):
+            raise PublicArtifactError("public audit receipt differs from its original commitment")
+        await self.publish_score_audit(payload, track=track, now_ms=now_ms)
+        return self._confirmed_immutable.get(audit["object"]) == audit["sha256"]
+
     async def publish_score_audit(self, payload: bytes, *, track: TrackSpec, now_ms: int) -> bool:
         """One small immutable disclosure after R and its actual committed match.
 

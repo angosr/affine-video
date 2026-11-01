@@ -104,6 +104,10 @@ class ArtifactRepository(Protocol):
         self, payload: bytes, *, track: TrackSpec, now_ms: int,
     ) -> bool: ...
 
+    async def score_audit_published(
+        self, reference: dict[str, Any], *, track: TrackSpec, now_ms: int,
+    ) -> bool: ...
+
     async def recover(
         self, track: TrackSpec, *, runtime_manifest: bytes | None = None,
     ) -> PublicLedger: ...
@@ -342,6 +346,8 @@ async def _publish_due_score_audit(
             reference = stage.get("stage_evidence")
             audit = None if reference is None else reference.get("public_audit")
             if audit is None or now_ms < audit["not_before_ms"]:
+                continue
+            if await publisher.score_audit_published(reference, track=source.track, now_ms=now_ms):
                 continue
             payload = await asyncio.to_thread(source.public_stage_audit, reference, now_ms=now_ms)
             if await publisher.publish_score_audit(payload, track=source.track, now_ms=now_ms):

@@ -491,17 +491,17 @@ def test_public_audit_cli_is_read_only_cpu_and_needs_no_role(audit_case, tmp_pat
                                   canonical_json(case.record.document),
                                   case.payload), strict=True):
         path.write_bytes(body)
-    main(["evaluator", "audit", "--track", str(paths[0]), "--match", str(paths[1]),
+    main(["verify-match", "--track", str(paths[0]), "--match", str(paths[1]),
           "--artifact", str(paths[2])])
     assert json.loads(capsys.readouterr().out)["gain_lower_bound"] == case.record.score_gain
     paths[0].write_bytes(canonical_json({"track_spec_digest": "00" * 32, "spec": case.raw}))
     with pytest.raises(SystemExit) as stopped:
-        main(["evaluator", "audit", "--track", str(paths[0]), "--match", str(paths[1]),
+        main(["verify-match", "--track", str(paths[0]), "--match", str(paths[1]),
               "--artifact", str(paths[2])])
     assert stopped.value.code == 1 and "digest" in capsys.readouterr().err
 
 
-def test_public_audit_disclosure_requires_r_match_fence_and_is_idempotent(audit_case):
+def test_public_audit_disclosure_requires_r_match_fence_and_is_idempotent(audit_case, monkeypatch):
     from tests.validator.test_publication import MemoryS3 as PublicS3
     from validator.publication import PublicArtifactError, S3Repository, encode_weight_artifact
     from validator.weights import WeightArtifact, WeightPlan
@@ -536,6 +536,17 @@ def test_public_audit_disclosure_requires_r_match_fence_and_is_idempotent(audit_
                                                  now_ms=case.due))
     assert [call["Key"] for call in client.calls] == ["test/" + case.reference[
         "public_audit"]["object"]]
+    from validator.run import _publish_due_score_audit
+
+    cold = S3Repository(client, bucket="public", prefix="test")
+    monkeypatch.setattr(case.source, "public_stage_audit",
+                        lambda *_a, **_k: pytest.fail("redundant private stage read"))
+    asyncio.run(_publish_due_score_audit(case.source, cold, challenges=[case.item],
+                                        now_ms=case.due))
+    monkeypatch.setattr(cold, "_get_optional",
+                        lambda *_a: pytest.fail("confirmed audit should use its existing cache"))
+    asyncio.run(_publish_due_score_audit(case.source, cold, challenges=[case.item],
+                                        now_ms=case.due))
 
 
 @pytest.mark.parametrize("failure", [None, "audit", "bulk"])
@@ -557,6 +568,9 @@ def test_existing_disclosure_loop_bounds_late_audits_and_bulk_failures_are_indep
     )
 
     class Publisher:
+        async def score_audit_published(self, *_a, **_k):
+            return False
+
         async def publish_score_audit(self, payload, **_kwargs):
             assert payload == case.payload
             calls.append("audit")
