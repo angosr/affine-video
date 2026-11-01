@@ -268,6 +268,8 @@ class PrivateRetryStore:
         for _ in range(8):
             stored = self.objects.get_optional(name)
             row = None if stored is None else self._decode_disclosure(stored.body, plan_digest)
+            if row is not None and "operator_waiver" in row:
+                return None
             if completed_attempt is None:
                 if row is not None and row["retry_after_ms"] > now_ms:
                     return None
@@ -297,25 +299,95 @@ class PrivateRetryStore:
 
     def disclosure_failed(self, plan_digest: str) -> bool:
         """Read unresolved failure from the original checkpoint, including in-flight retries."""
+        return self.disclosure_status(plan_digest, now_ms=0)["state"] == "FAILED"
+
+    def disclosure_status(self, plan_digest: str, *, now_ms: int) -> dict[str, Any]:
+        """Project the original retry authority; a waiver is never a public receipt."""
         if not _digest(plan_digest):
             raise ValueError("disclosure retry identity is invalid")
+        if type(now_ms) is not int or now_ms < 0:
+            raise ValueError("disclosure observation time is invalid")
         stored = self.objects.get_optional(
             f"{RETRY_STATE_NAMESPACE}/disclosures/{plan_digest}.json",
         )
-        return (stored is not None
-                and self._decode_disclosure(stored.body, plan_digest)["error"] is not None)
+        row = None if stored is None else self._decode_disclosure(stored.body, plan_digest)
+        state = "OVERDUE"
+        if row is not None:
+            if "operator_waiver" in row:
+                state = "WAIVED"
+            elif row["error"] is not None:
+                state = "FAILED"  # Reserving another lease does not clear the prior failure.
+            elif row["retry_after_ms"] > now_ms:
+                state = "UPLOADING"
+        return {
+            "plan_digest": plan_digest, "state": state,
+            "attempt": 0 if row is None else row["attempt"],
+            "retry_after_ms": (None if row is None or state == "WAIVED"
+                               else row["retry_after_ms"]),
+            "waived_at_ms": (row["operator_waiver"]["decided_at_ms"]
+                             if state == "WAIVED" else None),
+        }
+
+    def waive_disclosure(self, plan_digest: str, *, now_ms: int, reason: str) -> None:
+        """Explicit operator decision in the same CAS row, preserving attempt/error history.
+
+        An unexpired fence must settle first: this operation cannot retract bytes
+        already being uploaded by another process. It never creates a receipt.
+        """
+        if (not _digest(plan_digest) or type(now_ms) is not int or now_ms < 0
+                or not isinstance(reason, str) or not reason.strip() or len(reason) > 256
+                or any(ord(char) < 32 or ord(char) == 127 for char in reason)):
+            raise ValueError("disclosure waiver decision is invalid")
+        name = f"{RETRY_STATE_NAMESPACE}/disclosures/{plan_digest}.json"
+        for _ in range(8):
+            stored = self.objects.get_optional(name)
+            row = None if stored is None else self._decode_disclosure(stored.body, plan_digest)
+            if row is not None and "operator_waiver" in row:
+                if row["operator_waiver"]["reason"] != reason:
+                    raise RuntimeError("disclosure already has a different operator decision")
+                return  # A lost response/restart must not replace the original decision time.
+            if row is not None and row["retry_after_ms"] > now_ms:
+                raise RuntimeError("disclosure has an unexpired attempt fence")
+            document = dict(row) if row is not None else {
+                "format": "veda-disclosure-retry-v1", "track_spec_digest": self.track_spec_digest,
+                "plan_digest": plan_digest, "attempt": 0, "retry_after_ms": 0, "error": None,
+            }
+            document["operator_waiver"] = {"decided_at_ms": now_ms, "reason": reason}
+            try:
+                if stored is None:
+                    self.objects.create_plan(name, canonical_json(document))
+                else:
+                    self.objects.replace_plan(name, canonical_json(document), etag=stored.etag)
+            except PreconditionFailed:
+                continue
+            return
+        raise RuntimeError("disclosure retry authority changed repeatedly")
 
     def _decode_disclosure(self, payload: bytes, plan_digest: str) -> dict[str, Any]:
         row = decode_canonical_json(payload)
+        fields = {"format", "track_spec_digest", "plan_digest", "attempt",
+                  "retry_after_ms", "error"}
         if (
-            not isinstance(row, dict) or set(row) != {
-                "format", "track_spec_digest", "plan_digest", "attempt", "retry_after_ms", "error",
-            } or row["format"] != "veda-disclosure-retry-v1"
+            not isinstance(row, dict) or set(row) not in (fields, fields | {"operator_waiver"})
+            or row["format"] != "veda-disclosure-retry-v1"
             or row["track_spec_digest"] != self.track_spec_digest
             or row["plan_digest"] != plan_digest
-            or type(row["attempt"]) is not int or row["attempt"] <= 0
+            or type(row["attempt"]) is not int or row["attempt"] < 0
             or type(row["retry_after_ms"]) is not int or row["retry_after_ms"] < 0
             or (row["error"] is not None and not isinstance(row["error"], str))
+        ):
+            raise RuntimeError("disclosure retry authority is invalid")
+        waiver = row.get("operator_waiver")
+        if "operator_waiver" in row and (
+            not isinstance(waiver, dict) or set(waiver) != {"decided_at_ms", "reason"}
+            or type(waiver["decided_at_ms"]) is not int or waiver["decided_at_ms"] < 0
+            or not isinstance(waiver["reason"], str) or not waiver["reason"].strip()
+            or len(waiver["reason"]) > 256
+            or any(ord(char) < 32 or ord(char) == 127 for char in waiver["reason"])
+        ):
+            raise RuntimeError("disclosure retry authority is invalid")
+        if row["attempt"] == 0 and (
+            waiver is None or row["retry_after_ms"] != 0 or row["error"] is not None
         ):
             raise RuntimeError("disclosure retry authority is invalid")
         return row

@@ -345,7 +345,11 @@ def _audit_ledger(parser: argparse.ArgumentParser, base_url: str) -> None:
                 "historical_matches": len(ledger.historical_matches),
                 "score_audits": proofs, "unknown_stage_evidence": unknown,
                 "sealed_or_unpublished_score_audits": sealed,
-                "unavailable_score_audits": unavailable}
+                "unavailable_score_audits": unavailable,
+                "disclosure_overdue": [row for row in ledger.disclosure_status
+                                       if row["state"] in {"OVERDUE", "FAILED"}],
+                "disclosure_in_progress": [row for row in ledger.disclosure_status
+                                           if row["state"] == "UPLOADING"]}
 
     try:
         with httpx.Client(follow_redirects=False, timeout=30, trust_env=False) as client:

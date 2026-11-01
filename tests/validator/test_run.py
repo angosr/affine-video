@@ -184,6 +184,39 @@ def test_disclosure_cooldown_is_not_a_successful_observation():
     )) is None
 
 
+def test_waived_disclosure_never_restarts_bulk_or_reappears_as_failure(tmp_path, monkeypatch):
+    from tests.validator.production.test_storage import MemoryS3 as PrivateMemoryS3
+    from validator.production.retries import PrivateRetryStore
+    from validator.production.storage import PrivateObjectStore
+
+    track = parse_track_spec(valid_spec())
+    objects = PrivateObjectStore(PrivateMemoryS3(), bucket="test", prefix="test")
+    digest = "ab" * 32
+    now = track.cache.disclosure_delay_seconds * 1000 + 10_000
+    retries = PrivateRetryStore(objects, track_spec_digest=track.digest)
+    retries.disclosure_attempt(digest, now_ms=100, lease_ms=100)
+    retries.disclosure_attempt(digest, now_ms=200, lease_ms=100,
+                               completed_attempt=1, error="old failure")
+    retries.waive_disclosure(digest, now_ms=now, reason="Explicit operator decision")
+    before = dict(objects._client.objects)
+    monkeypatch.setattr(run_module.time, "time_ns", lambda: now * 1_000_000)
+    plan = SimpleNamespace(state="READY", completed_block=101, completed_at_ms=1000,
+                           plan_digest=digest)
+    for restart in range(2):
+        source = run_module.ReadyBatchSource(track=track, objects=objects,
+                                             cache_dir=tmp_path / str(restart))
+        monkeypatch.setattr(source, "_plans", lambda: (("plans/original.json", plan),))
+        monkeypatch.setattr(source, "protected_plan_digests", lambda *_a: frozenset())
+        monkeypatch.setattr(source, "prune_disclosed", lambda *_a: 0)
+        monkeypatch.setattr(source, "public_disclosure",
+                            lambda *_a, **_k: pytest.fail("waiver performed bulk IO"))
+        assert asyncio.run(run_module._publish_due_batch(
+            source, SimpleNamespace(), finalized_block=120, challenges=[],
+        )) is None
+        now += 10**8
+    assert objects._client.objects == before
+
+
 @pytest.mark.parametrize("already_scanned", [False, True])
 @pytest.mark.parametrize("same_hotkey", [False, True])
 def test_empty_new_track_recovers_verified_old_submission_before_fifo(

@@ -2,12 +2,37 @@
 
 ## Unreleased
 
+- Derive structured disclosure overdue/upload observations through the existing audit
+  repository. Preserve the difference between operational status and immutable public receipts.
+- Record explicit operator disclosure waivers in the original retry CAS, preserving its
+  attempt/error history and stopping automatic work without marking data as disclosed.
+
+## 2026-11-01 — Native deployment of 36cc9ff
+
+Operator-reported acceptance: application commit
+`36cc9ffaaa17988bd7ef8b35f851e4910290ad32`, native installation.
+Annotated tag: `release-2026-11-01-36cc9ff`, targeting that application commit.
+
+| Installed identity | SHA-256 |
+| --- | --- |
+| Application source | `83923c182c7bf12f490bfaf0f393b9ff770bfdadc04e34fad38fac24974dd375` |
+| Native dependency lock | `201360dcc3962e296da908a3ce0ee21ca6af4c7751ab1ac76467aed212dbfdfc` |
+| Runtime manifest | `93ab97fc02c53eb25f6bd5ecc873c1598c42753ae40cb07df715580348b732fc` |
+| Accepted release | `c9451c6e0ebc0d22130d46618b78b7e627afa22113b3073a2717d4964c668460` |
+| Computational dependency environment | `760c0f5eb73df2da4916caade6bcff625416eee7f52167cb2f5a8dfe55d7bf16` |
+
 - Exclude already disclosed source identities from future inventory plans. New plans bind
   their verified public disclosure inputs; cold recovery replays that frozen input instead
   of today's growing set. Preserve legacy plans, READY seals, allocations and disclosure clocks;
   insufficient remaining sources stop generation rather than reusing public sources.
 
-This source-exclusion candidate is not deployed.
+At acceptance, public status/summary/weights had advanced to block 9410935 with the new
+runtime identity; the database continued to 9410942 with 12 successful challenges and 12
+stages. The six non-runtime configurations and original submission facts were unchanged.
+No new natural v2 plan had been observed; installed support is not proof of a generated plan.
+Track `veda-sn120-v2-r10`, data identity, original S, allocations, READY bytes and C/R remain
+unchanged, with confidence 0.9975 and a single exact stage. E2/E3/E16 retain their original
+measurement identities. OCI remains package provenance, not a new native Engine identity.
 
 ## 2026-11-01 — Native deployment of 34774f9
 

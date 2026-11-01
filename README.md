@@ -147,8 +147,8 @@ Private uploads, VDU/VDR and the public weight format are unchanged.
    finalized submission and still have been secret and not yet due for disclosure then.
    The same hidden data can serve multiple models; it is not produced separately for each model.
 
-   An unreleased producer update excludes sources already revealed in verified public batch
-   disclosures from future plans. New plans freeze the disclosure inputs they observed;
+   The [2026-11-01 native release](CHANGELOG.md) (`36cc9ff`) excludes sources already revealed
+   in verified public batch disclosures from future plans. New plans freeze the inputs they observed;
    later publication does not reselect an existing plan or change its validity window.
    Insufficient remaining sources in a stratum/slot stop generation rather than reuse
    public sources. Previously sealed data and allocations remain unchanged.
@@ -217,6 +217,17 @@ Full audit resolves each historical match's original rules once from
 `artifacts/<track_spec_digest>`, authenticating its bytes by that digest. Missing original
 rules are reported in `unavailable_score_audits`, never replaced with today's spec.
 `verify-match --track` accepts this same immutable spec or the original track envelope.
+
+An unreleased audit update reports `disclosure_overdue` plan digests separately from
+`disclosure_in_progress`.
+These are operational observations from match-bound deadlines and the public inventory's
+original retry projection, with observation time/source retained; they are not proof of a
+complete private pool or of payload availability. A live upload lease is not a known failure.
+The operator API `ReadyBatchSource.waive_disclosure` authenticates an original due READY plan
+and records an explicit decision in its existing disclosure retry CAS. It preserves attempts,
+errors and clocks, refuses an unexpired attempt fence, and suppresses subsequent automatic
+work and overdue reporting. A waiver never creates a disclosure receipt or permits deletion
+of the original data. Its reason stays private; an actual public receipt remains authoritative.
 
 ## Watch the competition
 

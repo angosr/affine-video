@@ -1084,6 +1084,104 @@ def test_public_inventory_contains_no_seed_secret_proofs_or_inputs(inventory_cas
     assert b"source_proofs" not in encoded and b"sample_cache" not in encoded
 
 
+def test_disclosure_waiver_drives_due_failed_and_public_status_from_original_data_cas(
+    inventory_case, tmp_path, monkeypatch,
+):
+    from validator.production import batches as batches_module
+
+    case = inventory_case
+    plans = (make_plan(case, 101), make_plan(case, 102, 1))
+    original = tuple(plan.encode() for plan in plans)
+    rules = parse_track_spec(rules_for_data(case.track))
+    assert rules.digest != case.track.digest
+    now = max(plan.completed_at_ms for plan in plans) + (
+        case.track.cache.disclosure_delay_seconds * 1000
+    ) + 1
+    monkeypatch.setattr(batches_module.time, "time_ns", lambda: now * 1_000_000)
+    monkeypatch.setattr(ReadyBatchSource, "_plans", lambda _self: tuple(
+        (f"plans/{plan.generation_block}.json", plan) for plan in plans))
+    source = ReadyBatchSource(track=rules, data_track=case.track, objects=case.objects,
+                              cache_dir=tmp_path)
+    retries = PrivateRetryStore(case.objects, track_spec_digest=case.track.digest)
+    digest = plans[0].plan_digest
+    retries.disclosure_attempt(digest, now_ms=now - 100_000, lease_ms=100)
+    retries.disclosure_attempt(digest, now_ms=now - 99_999, lease_ms=100,
+                               completed_attempt=1, error="private transport detail")
+    before = case.objects.get(f"retry_state/disclosures/{digest}.json")
+    source.waive_disclosure(digest, now_ms=now, reason="Explicit operator decision")
+    cold = ReadyBatchSource(track=rules, data_track=case.track, objects=case.objects,
+                            cache_dir=tmp_path / "cold")
+    assert cold.due_plan_digests(now) == (plans[1].plan_digest,)
+    status = cold.inventory_status(plans)
+    assert status["disclosure_pending_batches"] == 1
+    assert [row["state"] for row in status["disclosure_status"]] == ["WAIVED", "OVERDUE"]
+    after = json.loads(case.objects.get(f"retry_state/disclosures/{digest}.json").body)
+    assert {key: after[key] for key in json.loads(before.body)} == json.loads(before.body)
+    assert not retries.disclosure_failed(digest)
+    assert case.objects.get_optional(f"disclosed/{digest}.json") is None
+    assert original == tuple(plan.encode() for plan in plans)
+    assert b"Explicit operator decision" not in canonical_json(status)
+    assert b"private transport detail" not in canonical_json(status)
+    assert Inventory(case.objects, case.track.digest).read()[1]["claims"] == []
+
+
+def test_disclosure_waiver_checks_original_ready_deadline_and_receipt(
+    inventory_case, tmp_path, monkeypatch,
+):
+    case = inventory_case
+    plan = make_plan(case, 101)
+    source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
+    monkeypatch.setattr(source, "_plans", lambda: (("plans/original.json", plan),))
+    due = plan.completed_at_ms + case.track.cache.disclosure_delay_seconds * 1000
+    with pytest.raises(ValueError, match="due READY"):
+        source.waive_disclosure(plan.plan_digest, now_ms=due - 1, reason="Operator decision")
+    assert case.objects.get_optional(f"retry_state/disclosures/{plan.plan_digest}.json") is None
+    case.objects.create_plan(f"disclosed/{plan.plan_digest}.json", canonical_json({
+        "plan_digest": plan.plan_digest, "exact_sha256": "ff" * 32,
+    }))
+    with pytest.raises(RuntimeError, match="receipt differs"):
+        source.due_plan_digests(due)
+    with pytest.raises(ValueError, match="completion receipt"):
+        source.waive_disclosure(plan.plan_digest, now_ms=due, reason="Operator decision")
+
+
+def test_disclosure_audit_checks_public_group_before_a_lagging_retry_failure(
+    inventory_case, monkeypatch,
+):
+    from tests.validator.test_publication import MemoryS3 as PublicMemoryS3
+    from validator import publication as publication_module
+    from validator.publication import PublicLedger
+
+    case = inventory_case
+    plan = make_plan(case, 101)
+    due = plan.completed_at_ms + case.track.cache.disclosure_delay_seconds * 1000
+    monkeypatch.setattr(publication_module.time, "time_ns", lambda: (due + 2) * 1_000_000)
+    client = PublicMemoryS3()
+    client.objects["tracks/test/status.json"] = canonical_json({
+        "track_id": case.track.track_id, "track_spec_digest": case.track.digest,
+        "source_block": 800,
+        "inventory": {"observed_at_ns": (due + 1) * 1_000_000, "disclosure_status": [{
+            "plan_digest": plan.plan_digest, "state": "FAILED", "attempt": 1,
+            "retry_after_ms": due + 1000, "waived_at_ms": None, "disclose_at_ms": due,
+        }]},
+    })
+    repository = S3Repository(client, bucket="public", prefix="tracks/test")
+    ledger = PublicLedger(800, ())
+    assert repository._load_disclosure_status(case.track, case.track, ledger, frozenset())[0][
+        "state"
+    ] == "FAILED"
+    group = f"tracks/test/batch_groups/{plan.plan_digest}.json"
+    original = canonical_json(public_disclosure_document(plan))
+    client.objects[group] = original
+    assert repository._load_disclosure_status(case.track, case.track, ledger, frozenset()) == ()
+    assert ledger.disclosed_plan_digests == frozenset()  # No claim that payloads were audited.
+    tampered = json.loads(original)
+    tampered["public_exact_object"] += ".changed"
+    client.objects[group] = canonical_json(tampered)
+    with pytest.raises(PublicArtifactError, match="receipt is invalid"):
+        repository._load_disclosure_status(case.track, case.track, ledger, frozenset())
+
+
 def test_operator_retry_keeps_original_inventory_cas_claim_and_ready_bytes(
     inventory_case, tmp_path,
 ):

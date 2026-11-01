@@ -49,6 +49,7 @@ from validator.production.plan import (
 from validator.production.plan import (
     public_selected_inputs_document as public_selected_inputs_document,
 )
+from validator.production.retries import PrivateRetryStore
 from validator.production.storage import (
     ADMISSIONS_NAMESPACE,
     EXACT_NAMESPACE,
@@ -770,18 +771,16 @@ class ReadyBatchSource:
         available = [plan for plan in plans
                      if (plan.state == "PLANNED" or plan.completed_at_ms
                           + self.track.cache.disclosure_delay_seconds * 1000 > now)]
+        disclosure_status = self._disclosure_status(plans, now_ms=now)
         return {
             "observed_at_ns": now * 1_000_000,
             "ready_batches": sum(plan.state == "READY" for plan in available),
             "producing_batches": sum(plan.state == "PLANNED" for plan in available),
             "target_batches": self.track.cache.inventory_target_batches,
             "max_bytes": self.track.cache.inventory_max_bytes,
-            "disclosure_pending_batches": sum(
-                plan.state == "READY" and plan.completed_at_ms
-                + self.track.cache.disclosure_delay_seconds * 1000 <= now
-                and self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is None
-                for plan in plans
-            ),
+            "disclosure_pending_batches": sum(row["state"] != "WAIVED"
+                                              for row in disclosure_status),
+            "disclosure_status": disclosure_status,
             "commitments": [{
                 "plan_digest": plan.plan_digest, "secret_commitment": plan.secret_commitment,
                 "generation_block": plan.generation_block, "state": plan.state,
@@ -858,11 +857,44 @@ class ReadyBatchSource:
         )
 
     def due_plan_digests(self, now_ms: int) -> tuple[str, ...]:
-        return tuple(
-            plan.plan_digest for _, plan in self._plans()
-            if plan.state == "READY" and plan.completed_block is not None
-            and plan.completed_at_ms + self.track.cache.disclosure_delay_seconds * 1000 <= now_ms
-            and self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is None
+        return tuple(row["plan_digest"] for row in self._disclosure_status(
+            tuple(plan for _, plan in self._plans()), now_ms=now_ms,
+        ) if row["state"] != "WAIVED")
+
+    def _disclosure_status(self, plans: tuple[BatchPlan, ...], *,
+                           now_ms: int) -> list[dict[str, object]]:
+        retries = PrivateRetryStore(self.objects, track_spec_digest=self.data_track.digest)
+        result = []
+        for plan in plans:
+            if plan.state != "READY" or plan.completed_block is None:
+                continue
+            due_at = plan.completed_at_ms + self.track.cache.disclosure_delay_seconds * 1000
+            if due_at > now_ms:
+                continue
+            receipt = self.objects.get_optional(f"disclosed/{plan.plan_digest}.json")
+            if receipt is not None:
+                if receipt.body != canonical_json({
+                    "plan_digest": plan.plan_digest, "exact_sha256": plan.exact.sha256,
+                }):
+                    raise RuntimeError("disclosure receipt differs from its original READY")
+                continue
+            result.append({
+                **retries.disclosure_status(plan.plan_digest, now_ms=now_ms),
+                "disclose_at_ms": due_at,
+            })
+        return result
+
+    def waive_disclosure(self, plan_digest: str, *, now_ms: int, reason: str) -> None:
+        """Operator API: authenticate the original due plan before updating its retry CAS."""
+        plan = self._plan_by_digest(plan_digest)
+        if (plan.state != "READY" or plan.completed_at_ms
+                + self.track.cache.disclosure_delay_seconds * 1000 > now_ms):
+            raise ValueError("only an original due READY disclosure can be waived")
+        receipt = self.objects.get_optional(f"disclosed/{plan_digest}.json")
+        if receipt is not None:
+            raise ValueError("disclosure already has a public completion receipt")
+        PrivateRetryStore(self.objects, track_spec_digest=self.data_track.digest).waive_disclosure(
+            plan_digest, now_ms=now_ms, reason=reason,
         )
 
     def public_stage_audit(self, reference: dict[str, object], *, now_ms: int) -> bytes:

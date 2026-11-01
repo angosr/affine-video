@@ -136,6 +136,7 @@ class PublicLedger:
     disclosed_plan_digests: frozenset[str] = frozenset()
     committed_match_count: int = 0
     historical_matches: tuple[MatchRecord, ...] = ()
+    disclosure_status: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def required_finalized_block(self) -> int:
@@ -1463,7 +1464,114 @@ class S3Repository:
         self._verify_model_archives(ledger.matches)
         data_track = self._load_data_track(track, runtime_manifest)
         disclosures = self._load_batch_disclosures(data_track, ledger.matches)
-        return replace(ledger, disclosed_plan_digests=disclosures)
+        return replace(ledger, disclosed_plan_digests=disclosures,
+                       disclosure_status=self._load_disclosure_status(track, data_track, ledger,
+                                                                      disclosures))
+
+    def _load_disclosure_status(
+        self, track: TrackSpec, data_track: TrackSpec, ledger: PublicLedger,
+        disclosed: frozenset[str],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Operational projection, not an immutable receipt or a complete private-pool audit.
+
+        Match-bound missing groups remain detectable with older publishers. New
+        status exposes the original retry CAS projection, including unused plans
+        and explicit operator decisions. Its source/time are kept as observations.
+        """
+        now = time.time_ns() // 1_000_000
+        rows = {}
+        for match in ledger.matches:
+            for stage in match.document["evaluation"]["stages"]:
+                batch = stage.get("evaluation_batch")
+                if batch is None or batch.get("completed_at_ms") is None:
+                    continue
+                due = batch["completed_at_ms"] + data_track.cache.disclosure_delay_seconds * 1000
+                if due <= now and batch["plan_digest"] not in disclosed:
+                    rows[batch["plan_digest"]] = {
+                        "plan_digest": batch["plan_digest"], "disclose_at_ms": due,
+                        "state": "OVERDUE", "attempt": None, "retry_after_ms": None,
+                        "waived_at_ms": None, "status_source_block": None,
+                        "observed_at_ms": now,
+                    }
+        payload = self._get_optional("status.json")
+        if payload is not None:
+            status = _decode_canonical_object(payload, "status")
+            if (status.get("track_spec_digest") != track.digest
+                    or status.get("track_id") != track.track_id):
+                # Live pointers can cross during maintenance; never attribute an
+                # unrelated operational decision to this verified ledger.
+                return tuple(rows[digest] for digest in sorted(rows))
+            inventory = status.get("inventory", {})
+            if "disclosure_status" in inventory:
+                source = _integer(status.get("source_block"), "disclosure status source")
+                observed = _integer(inventory.get("observed_at_ns"), "inventory observation")
+                observed //= 1_000_000
+                pending = inventory["disclosure_status"]
+                if not isinstance(pending, list):
+                    raise PublicArtifactError("disclosure status must be a list")
+                seen = set()
+                for row in pending:
+                    row = _object(row, {"plan_digest", "state", "attempt", "retry_after_ms",
+                                        "waived_at_ms", "disclose_at_ms"}, "disclosure status")
+                    digest = row["plan_digest"]
+                    if (not isinstance(digest, str) or _HEX_32.fullmatch(digest) is None
+                            or digest in seen):
+                        raise PublicArtifactError("disclosure status plan identity is invalid")
+                    seen.add(digest)
+                    due = _integer(row["disclose_at_ms"], "disclosure due time")
+                    attempt = _integer(row["attempt"], "disclosure attempt")
+                    if due > observed or row["state"] not in {
+                        "OVERDUE", "UPLOADING", "FAILED", "WAIVED",
+                    }:
+                        raise PublicArtifactError("disclosure status phase is invalid")
+                    if digest in rows and rows[digest]["disclose_at_ms"] != due:
+                        raise PublicArtifactError("disclosure status changes the original deadline")
+                    if row["state"] == "WAIVED":
+                        waived = _integer(row["waived_at_ms"], "waiver time")
+                        if waived < due or waived > observed or row["retry_after_ms"] is not None:
+                            raise PublicArtifactError("disclosure waiver observation is invalid")
+                    else:
+                        if row["waived_at_ms"] is not None:
+                            raise PublicArtifactError("disclosure phase has an unexpected waiver")
+                        if row["retry_after_ms"] is not None:
+                            _integer(row["retry_after_ms"], "disclosure retry time")
+                        if row["state"] in {"UPLOADING", "FAILED"} and attempt == 0:
+                            raise PublicArtifactError("disclosure attempt is missing")
+                        if row["state"] == "UPLOADING" and (
+                            row["retry_after_ms"] is None or row["retry_after_ms"] <= observed
+                        ):
+                            raise PublicArtifactError("disclosure upload has no live fence")
+                    if digest in disclosed:
+                        rows.pop(digest, None)
+                        continue
+                    # A stale upload observation is not an indefinitely renewed lease.
+                    phase = row["state"]
+                    if phase == "UPLOADING" and row["retry_after_ms"] <= now:
+                        phase = "OVERDUE"
+                    rows[digest] = {**row, "state": phase, "status_source_block": source,
+                                    "observed_at_ms": observed}
+        for digest in tuple(rows):
+            if rows[digest]["state"] == "WAIVED":
+                continue
+            # The public group can commit before its private completion marker.
+            # Check only that small original receipt here, never payload bodies.
+            name = f"batch_groups/{digest}.json"
+            payload = self._get_optional(name)
+            if payload is None:
+                continue
+            try:
+                document = _decode_canonical_object(payload, name)
+                plan = BatchPlan.decode(_json_bytes(document["plan"]))
+                if (plan.state != "READY" or plan.plan_digest != digest
+                        or plan.track_spec_digest != data_track.digest
+                        or plan.completed_at_ms + data_track.cache.disclosure_delay_seconds * 1000
+                        != rows[digest]["disclose_at_ms"]
+                        or document != public_disclosure_document(plan)):
+                    raise ValueError("disclosure receipt differs from its original plan")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PublicArtifactError("public disclosure receipt is invalid") from exc
+            rows.pop(digest)
+        return tuple(rows[digest] for digest in sorted(rows))
 
     def _stage_data_origin(self, track: TrackSpec, runtime_manifest: bytes) -> None:
         """Preserve the pinned original public spec before changing public pointers.
@@ -1748,14 +1856,6 @@ class S3Repository:
             record_name = f"batch_groups/{plan_digest}.json"
             payload = self._get_optional(record_name)
             if payload is None:
-                completed_at = used_batches[0].get("completed_at_ms")
-                if completed_at is not None and time.time_ns() // 1_000_000 >= (
-                    completed_at + track.cache.disclosure_delay_seconds * 1000
-                ):
-                    _LOG.error(
-                        "DATA_DISCLOSURE_OVERDUE plan_digest=%s completed_at_ms=%d",
-                        plan_digest, completed_at,
-                    )
                 continue
             document = _decode_canonical_object(payload, record_name)
             if set(document) != {

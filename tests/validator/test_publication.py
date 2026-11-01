@@ -2528,3 +2528,82 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
     snapshot["challenges"][0]["score_block"] = 121
     with pytest.raises(PublicArtifactError, match="newer"):
         build_public_artifacts(store, track, chain, version_key=9)
+
+
+def test_disclosure_audit_uses_retry_projection_without_inventing_completion(monkeypatch):
+    track = parse_track_spec(valid_spec())
+    client = MemoryS3()
+    repository = S3Repository(client, bucket="public", prefix="tracks/test")
+    now = 1_000_000
+    monkeypatch.setattr(publication_module.time, "time_ns", lambda: now * 1_000_000)
+    digests = [f"{index:064x}" for index in range(1, 6)]
+    rows = [{"plan_digest": digest, "state": state, "attempt": 1,
+             "retry_after_ms": (None if state == "WAIVED" else now + 100),
+             "waived_at_ms": (now - 100 if state == "WAIVED" else None),
+             "disclose_at_ms": now - 200}
+            for digest, state in zip(digests[:4], ["WAIVED", "UPLOADING", "FAILED", "OVERDUE"],
+                                     strict=True)]
+    status = {"track_id": track.track_id, "track_spec_digest": track.digest, "source_block": 800,
+              "inventory": {"observed_at_ns": now * 1_000_000, "disclosure_status": rows}}
+    client.objects["tracks/test/status.json"] = canonical_json(status)
+    batches = [{"plan_digest": digest, "completed_at_ms": now - 200
+                - track.cache.disclosure_delay_seconds * 1000} for digest in digests]
+    ledger = publication_module.PublicLedger(800, (SimpleNamespace(document={
+        "evaluation": {"stages": [{"evaluation_batch": batch} for batch in batches]},
+    }),))
+    result = repository._load_disclosure_status(track, track, ledger, frozenset())
+    assert [row["state"] for row in result] == ["WAIVED", "UPLOADING", "FAILED",
+                                                "OVERDUE", "OVERDUE"]
+    assert result[0]["status_source_block"] == 800
+    assert result[-1]["status_source_block"] is None  # Missing projection is not a waiver.
+    assert ledger.disclosed_plan_digests == frozenset()
+    later = now + 101
+    monkeypatch.setattr(publication_module.time, "time_ns", lambda: later * 1_000_000)
+    assert repository._load_disclosure_status(track, track, ledger, frozenset())[1]["state"] == (
+        "OVERDUE"
+    )
+    # Public immutable receipts outrank a lagging failed/waived status projection.
+    assert repository._load_disclosure_status(track, track, ledger, frozenset(digests)) == ()
+    del client.objects["tracks/test/status.json"]
+    legacy = repository._load_disclosure_status(track, track, ledger, frozenset())
+    assert all(row["state"] == "OVERDUE" for row in legacy)
+
+
+@pytest.mark.parametrize("change", ["duplicate", "future_waiver", "wrong_due", "wrong_track",
+                                    "fake_lease", "unexpected_waiver"])
+def test_disclosure_audit_rejects_malformed_public_retry_projection(change, monkeypatch):
+    track = parse_track_spec(valid_spec())
+    now = 1_000_000
+    monkeypatch.setattr(publication_module.time, "time_ns", lambda: now * 1_000_000)
+    row = {"plan_digest": "ab" * 32, "state": "WAIVED", "attempt": 0,
+           "retry_after_ms": None, "waived_at_ms": now - 1, "disclose_at_ms": now - 2}
+    status = {"track_id": track.track_id, "track_spec_digest": track.digest, "source_block": 800,
+              "inventory": {"observed_at_ns": now * 1_000_000, "disclosure_status": [row]}}
+    batch = {"plan_digest": row["plan_digest"], "completed_at_ms": row["disclose_at_ms"]
+             - track.cache.disclosure_delay_seconds * 1000}
+    ledger = publication_module.PublicLedger(800, (SimpleNamespace(document={
+        "evaluation": {"stages": [{"evaluation_batch": batch}]},
+    }),))
+    if change == "duplicate":
+        status["inventory"]["disclosure_status"].append(dict(row))
+    elif change == "future_waiver":
+        row["waived_at_ms"] = now + 1
+    elif change == "wrong_due":
+        row["disclose_at_ms"] -= 1
+    elif change == "wrong_track":
+        status["track_spec_digest"] = "ff" * 32
+    elif change == "fake_lease":
+        row.update(state="UPLOADING", attempt=1, waived_at_ms=None, retry_after_ms=now)
+    else:
+        row.update(state="FAILED", attempt=1)
+    client = MemoryS3()
+    client.objects["tracks/test/status.json"] = canonical_json(status)
+    repository = S3Repository(client, bucket="public", prefix="tracks/test")
+    if change == "wrong_track":
+        # The independent live pointer cannot waive a different frozen ledger.
+        assert repository._load_disclosure_status(track, track, ledger, frozenset())[0][
+            "state"
+        ] == "OVERDUE"
+        return
+    with pytest.raises(PublicArtifactError, match="disclosure"):
+        repository._load_disclosure_status(track, track, ledger, frozenset())

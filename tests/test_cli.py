@@ -80,6 +80,7 @@ def test_public_monitor_needs_no_miner_or_validator_setup(monkeypatch, capsys) -
 def test_public_audit_reuses_s3_load_and_http_gets_without_credentials(monkeypatch, capsys):
     import asyncio
     import hashlib
+    import time
 
     import httpx
 
@@ -100,6 +101,17 @@ def test_public_audit_reuses_s3_load_and_http_gets_without_credentials(monkeypat
     objects = {"track.json": artifacts.track, "summary.json": artifacts.summary,
                "weights.json": artifacts.weights,
                f"runtime/{manifest.digest}/manifest.json": manifest.encode()}
+    now = time.time_ns() // 1_000_000
+    objects["status.json"] = canonical_json({
+        "track_id": track.track_id, "track_spec_digest": track.digest, "source_block": 10,
+        "inventory": {"observed_at_ns": now * 1_000_000, "disclosure_status": [
+            {"plan_digest": digest, "state": state, "attempt": 1,
+             "disclose_at_ms": now - 2, "waived_at_ms": now - 1 if state == "WAIVED" else None,
+             "retry_after_ms": None if state == "WAIVED" else now + 60_000}
+            for digest, state in [("ab" * 32, "WAIVED"), ("cd" * 32, "FAILED"),
+                                  ("ef" * 32, "UPLOADING")]
+        ]},
+    })
     methods, loads = [], []
 
     def handler(request):
@@ -125,6 +137,9 @@ def test_public_audit_reuses_s3_load_and_http_gets_without_credentials(monkeypat
     result = json.loads(capsys.readouterr().out)
     assert result["committed_matches"] == 0 and loads == [True]
     assert result["unknown_stage_evidence"] == 0 and set(methods) == {"GET"}
+    assert [row["plan_digest"] for row in result["disclosure_overdue"]] == ["cd" * 32]
+    assert [row["plan_digest"] for row in result["disclosure_in_progress"]] == ["ef" * 32]
+    assert "ab" * 32 not in json.dumps(result)  # Waived, never falsely counted as disclosed.
     assert not asyncio.iscoroutine(result)
     # Corrupt public summary facts remain fatal; audit never falls back to status.json.
     objects["summary.json"] = canonical_json({**json.loads(artifacts.summary), "match_count": 1})
