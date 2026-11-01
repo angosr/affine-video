@@ -34,7 +34,7 @@ from validator.release import verify_competition_manifest
 from validator.scoring import ScoringSettings, StageOutcome, process_next_scoring
 from validator.store import ChallengeStore
 
-from .test_storage import MemoryS3
+from .test_storage import MemoryS3, seed_legacy_stage
 
 
 @pytest.fixture
@@ -167,6 +167,94 @@ def test_legacy_claim_has_unknown_first_selection_and_is_never_backfilled(invent
     assert case.objects.get(ALLOCATION_OBJECT).body == old_bytes
 
 
+@pytest.mark.parametrize("damage", [
+    "omit", "replace", "forged-facts", "wrong-first", "input-bytes",
+])
+def test_selection_consumer_checks_original_plan_bytes_not_declared_booleans(
+    inventory_case, damage,
+):
+    from validator.production.inventory import _pool_digest
+
+    case = inventory_case
+    inventory = Inventory(case.objects, case.track.digest)
+    plans = (make_plan(case, 101), make_plan(case, 102))
+    claim(inventory, plans)
+    stored, document = inventory.read()
+    row = document["claims"][0]
+    candidates = row["selection"]["candidates"]
+    if damage == "input-bytes":
+        name = row["selection"]["inputs"]["object"]
+        original = case.objects.get(name)
+        case.objects.replace_plan(name, b"changed original input", etag=original.etag)
+    else:
+        if damage == "omit":
+            candidates.pop(0)
+        elif damage == "replace":
+            candidates[0]["plan_sha256"] = "ff" * 32
+        elif damage == "forged-facts":
+            candidates[0].update(completed_at_ms=250_000, s_eligible=False)
+            candidates.reverse()  # Self-consistent declared order, but false original plan facts.
+        elif damage == "wrong-first":
+            row.update(plan_digest=candidates[1]["plan_digest"],
+                       ready_sha256=candidates[1]["plan_sha256"])
+        if damage != "wrong-first":
+            row.update(plan_digest=candidates[0]["plan_digest"],
+                       ready_sha256=candidates[0]["plan_sha256"])
+        row["selection"]["pool_sha256"] = _pool_digest(candidates)
+        case.objects.replace_plan(ALLOCATION_OBJECT, canonical_json(document), etag=stored.etag)
+    with pytest.raises(RuntimeError):
+        inventory.read()
+
+
+@pytest.mark.parametrize("damage", ["omitted-input", "unfinished", "limited", "wrong-origin"])
+def test_claim_capture_rejects_incomplete_original_enumeration(inventory_case, damage):
+    case = inventory_case
+    plans = (make_plan(case, 101), make_plan(case, 102))
+    for plan in plans:
+        case.objects.create_plan(f"plans/{plan.generation_block}.json", plan.encode())
+    observations = [{}, {}]
+    for observation in observations:
+        case.objects.list_names("plans/", observation=observation)
+    if damage == "unfinished":
+        observations[1]["complete"] = False
+    if damage == "limited":
+        observations[1]["limit"] = 1000
+    if damage == "wrong-origin":
+        for observation in observations:
+            observation["bucket"] = "other-authority"
+    inventory = Inventory(case.objects, case.track.digest)
+    with pytest.raises(RuntimeError, match="enumeration"):
+        inventory.claim(
+            challenge_id="a1" * 32, stage="SCORING", file_sha256="b2" * 32,
+            model_digest="c3" * 32, plans=plans[:1] if damage == "omitted-input" else plans,
+            submission_block=200, submission_timestamp_ms=200_000,
+            disclosure_delay_seconds=1800,
+            enumeration={"algorithm": "ReadyBatchSource._plans-v1", "observations": observations},
+        )
+    assert inventory.read()[1]["claims"] == []
+
+
+def test_original_planned_candidate_remains_verifiable_after_ready_transition(inventory_case):
+    case = inventory_case
+    inventory = Inventory(case.objects, case.track.digest)
+    planned = make_plan(case, 150, ready=False)
+    original = claim(inventory, (make_plan(case, 101), planned))
+    case.objects.create_plan("plans/150.json", make_plan(case, 150).encode())
+    cold = Inventory(case.objects, case.track.digest)
+    row = cold.read()[1]["claims"][0]
+    assert row == original
+    observed = next(p for p in cold.observed_plans(row) if p.plan_digest == planned.plan_digest)
+    assert observed.state == "PLANNED"
+
+
+def test_capture_rejects_enumerated_plan_under_a_substituted_key(inventory_case, tmp_path):
+    case = inventory_case
+    case.objects.create_plan("plans/999.json", make_plan(case, 101).encode())
+    source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="key disagrees"):
+        source._plans(observation={})
+
+
 def test_successful_cas_row_seals_pool_version_and_only_winning_attempt_clock(
     inventory_case, monkeypatch,
 ):
@@ -210,23 +298,37 @@ def test_generation_change_during_pool_observation_retries_without_resampling_bo
                 "submission_timestamp_ms": 200_000}
     case.objects.create_plan("admissions/" + "a1" * 32 + ".json", canonical_json(identity))
     source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
-    first = (("plans/101.json", make_plan(case, 101)),)
-    complete = first + (("plans/102.json", make_plan(case, 102)),)
-    reads = iter((first, complete))
-    monkeypatch.setattr(source, "_plans", lambda: next(reads))
+    case.objects.create_plan("plans/101.json", make_plan(case, 101).encode())
+    actual_plans, reads = source._plans, [0]
+
+    def changing(**kwargs):
+        rows = actual_plans(**kwargs)
+        reads[0] += 1
+        if reads[0] == 1:
+            case.objects.create_plan("plans/102.json", make_plan(case, 102, 1).encode())
+        return rows
+
+    monkeypatch.setattr(source, "_plans", changing)
     args = dict(confirmation=False, submission_block=200, file_sha256="b2" * 32,
                 model_digest="c3" * 32)
     with pytest.raises(RuntimeError, match="changed during"):
         source.claim_ready("a1" * 32, **args)
     assert source.inventory.read()[1]["claims"] == []
-    monkeypatch.setattr(source, "_plans", lambda: complete)
+    monkeypatch.setattr(source, "_plans", actual_plans)
     assert source.claim_ready("a1" * 32, **args)
     selection = source.inventory.read()[1]["claims"][0]["selection"]
     assert len(selection["candidates"]) == 2 and selection["pool_read_interval_ms"] is not None
     sealed = case.objects.get(ALLOCATION_OBJECT).body
     # Bound retry reads its original plan once, not a new two-read selection pool.
-    reads = iter((first + (("plans/100.json", make_plan(case, 100)),),))
-    monkeypatch.setattr(source, "_plans", lambda: next(reads))
+    case.objects.create_plan("plans/100.json", make_plan(case, 100).encode())
+    reads[0] = 0
+
+    def once(**kwargs):
+        reads[0] += 1
+        assert reads[0] == 1
+        return actual_plans(**kwargs)
+
+    monkeypatch.setattr(source, "_plans", once)
     assert source.claim_ready("a1" * 32, **args)
     assert case.objects.get(ALLOCATION_OBJECT).body == sealed
 
@@ -323,7 +425,7 @@ def test_new_rules_keep_all_four_ready_seals_and_original_allocation_authority(
                "cache_generated_block": plan.generation_block,
                "cache_plan_digest": plan.plan_digest,
                "cache_seed_block_hash": plan.block_hash, "cache_sha256": plan.exact.sha256}
-    cold.archive_stage(task, StageOutcome(.8, metrics), 210)
+    seed_legacy_stage(cold, task, StageOutcome(.8, metrics), 210)
     assert source.restore_stage(task).score == .8
     archived = json.loads(case.objects.get(source._stage_name(task.challenge_id, "SCORING")).body)
     assert archived["track_spec_digest"] == rules.digest
@@ -478,7 +580,7 @@ def test_preproduced_archive_survives_cold_db_without_bulk(inventory_case, tmp_p
             "cache_seed_block_hash": plan.block_hash, "cache_sha256": plan.exact.sha256,
             "incumbent_score": 0.8, "paired_gain_lower_bound": -0.1,
         }
-        source.archive_stage(task, StageOutcome(0.7, metrics), 210)
+        seed_legacy_stage(source, task, StageOutcome(0.7, metrics), 210)
 
     with ChallengeStore(tmp_path / "cold.db", track_spec_digest=case.track.digest) as store:
         cold = prepare(store)
@@ -887,7 +989,7 @@ def test_claim_lost_response_keeps_original_allocation(inventory_case, monkeypat
     def put_then_lose(**kwargs):
         nonlocal lost
         result = put(**kwargs)
-        if not lost:
+        if not lost and kwargs["Key"].endswith(ALLOCATION_OBJECT):
             lost = True
             raise OSError("PUT committed but response was lost")
         return result
@@ -997,7 +1099,7 @@ def test_reader_binds_original_metadata_even_when_payload_needs_recovery(
     }))
     plan = make_plan(case, 101)
     source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
-    monkeypatch.setattr(source, "_plans", lambda: (("plans/101.json", plan),))
+    case.objects.create_plan("plans/101.json", plan.encode())
     assert source.claim_ready("a1" * 32, confirmation=False, submission_block=200,
                                   file_sha256="b2" * 32, model_digest="c3" * 32)
     authority = source.inventory.read()[1]

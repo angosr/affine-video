@@ -2176,7 +2176,9 @@ def test_ready_batch_source_restores_only_the_challenge_bound_confirmation(tmp_p
         position=ChainPosition(100, 0, 0),
     )
     result = SimpleNamespace(score=0.8, metrics={"requires_confirmation": True})
-    source.archive_stage(task, result, 121)
+    from .test_storage import seed_legacy_stage
+
+    seed_legacy_stage(source, task, result, 121)
     archived = source.restore_stage(task)
     assert archived is not None
     assert archived.score == 0.8

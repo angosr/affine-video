@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from scoring.exact import CaseDesign, _weighted_cell_mean, paired_score_gain_bound
+from tests.validator.production.test_inventory import inventory_case as inventory_fixture
+from tests.validator.production.test_inventory import make_plan
 from tests.validator.production.test_storage import MemoryS3
 from tests.validator.test_scoring import ready_for_scoring, scoring_spec
 from validator.production.batches import ReadyBatchSource
@@ -50,6 +52,11 @@ def proof():
                              device=None, runtime_identity=None,
                              started_at_ms=time.time_ns() // 1_000_000)
     return track, paired, evidence
+
+
+@pytest.fixture
+def plan_inputs_case(monkeypatch):
+    return inventory_fixture.__wrapped__(monkeypatch)
 
 
 @pytest.mark.parametrize("damage", ["cell", "order", "seed", "weights", "runtime"])
@@ -141,6 +148,38 @@ def test_private_stage_is_single_immutable_object_and_cold_restore_keeps_origina
     with pytest.raises(ValueError, match="changed during archive retry"):
         source.archive_stage(task, StageOutcome(result.score, {**metrics,
                                                               "stage_evidence": damaged}), 120)
+
+
+@pytest.mark.parametrize("missing", ["cells", "approved-runtime"])
+def test_new_scoring_cannot_silently_become_a_legacy_stage(tmp_path, proof, missing):
+    track, paired, evidence = proof
+    track = SimpleNamespace(digest=track.digest, scoring=track.scoring, netuid=120)
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="original")
+    source = ReadyBatchSource(track=track, objects=objects, cache_dir=tmp_path)
+    task = SimpleNamespace(challenge_id="34" * 32, state=ChallengeState.SCORING)
+    metrics = {} if missing == "cells" else {"reproducibility": evidence}
+    with pytest.raises(ValueError, match="new .*requires"):
+        source.archive_stage(task, StageOutcome(paired.challenger_score, metrics), 120)
+    assert objects.list_names("stages/") == ()
+
+
+def test_legacy_stage_replay_never_captures_the_new_process_runtime(tmp_path, monkeypatch):
+    import validator.reproducibility as module
+    from tests.validator.production.test_storage import seed_legacy_stage
+
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="old")
+    source = ReadyBatchSource(track=SimpleNamespace(digest="ab" * 32), objects=objects,
+                              cache_dir=tmp_path)
+    task = SimpleNamespace(challenge_id="34" * 32, submission_id="45" * 32, hotkey="miner",
+                           repo_id="owner/model", revision="56" * 20, file_sha256="12" * 32,
+                           state=ChallengeState.SCORING, position=ChainPosition(100, 0, 0))
+    seed_legacy_stage(source, task, StageOutcome(.7, {}), 120)
+    before = source.objects.get(source._stage_name(task.challenge_id, "SCORING")).body
+    monkeypatch.setattr(module, "_execution", lambda *_a: pytest.fail("recaptured current runtime"))
+    old = source.restore_stage(task)
+    assert old.metrics == {}
+    assert source.archive_stage(task, StageOutcome(old.score, old.metrics), old.score_block) is None
+    assert source.objects.get(source._stage_name(task.challenge_id, "SCORING")).body == before
 
 
 def test_archive_reference_is_persisted_before_result_and_private_cells_are_not_projected(
@@ -244,19 +283,20 @@ def test_cuda_execution_metadata_is_observed_not_inherited_from_release(monkeypa
 
 
 @pytest.fixture(params=[False, True], ids=["legacy-claim-unknown", "first-cas-evidence"])
-def audit_case(tmp_path, monkeypatch, request):
-    from scoring.spec import parse_track_spec
-    from tests.scoring.test_spec import valid_spec
+def audit_case(tmp_path, monkeypatch, request, plan_inputs_case):
+    from scoring.spec import parse_track_spec, track_spec_dict
     from tests.validator.test_tournament import tenure_challenge
     from validator.tournament import genesis_champion, resolve_tournament
 
-    raw = valid_spec()
+    inventory_case = plan_inputs_case
+    raw = track_spec_dict(inventory_case.track)
     raw["promotion"] = {"format": "veda-exact-tenure-v1", "minimum_gain": .002,
                         "decay_seconds": 604800}
     raw["scoring"].update(minimum_frontier_gain=.003, match_confidence=.9975,
                            bootstrap_resamples=4000)
     raw["full_video"]["minimum_gain"] = .003
     track = parse_track_spec(raw)
+    inventory_case.track = track
     scoring = track.scoring
     design = [CaseDesign(f"route-{r}", "all", f"rollout-{i}", f"source-{i}", step, window)
               for i in range(4) for r in range(2)
@@ -281,15 +321,18 @@ def audit_case(tmp_path, monkeypatch, request):
                              started_at_ms=time.time_ns() // 1_000_000)
     baseline = replace(genesis_champion(track), tenure_block=100)  # Authenticated fixture fact.
     item = tenure_challenge(1, baseline, gain=paired.gain_lower_bound,
-                            submitted_ms=2000)
+                            submitted_ms=200_000)
     item.update(challenge_id="34" * 32, submission_id="45" * 32, file_sha256="12" * 32,
                 final_score=paired.challenger_score, incumbent_score=paired.incumbent_score)
-    batch = {**item["evaluation_batch"], "generated_block": 95,
-             "completed_block": 98, "completed_at_ms": 1000, "ready_sha256": "56" * 32}
+    plan = make_plan(inventory_case, 95)
+    batch = {"sha256": plan.exact.sha256, "plan_digest": plan.plan_digest,
+             "seed_block_hash": plan.block_hash, "generated_block": 95,
+             "completed_block": plan.completed_block, "completed_at_ms": plan.completed_at_ms,
+             "ready_sha256": hashlib.sha256(plan.encode()).hexdigest()}
     allocation = dict(ordinal=1, challenge_id=item["challenge_id"], stage="SCORING",
                       plan_digest=batch["plan_digest"], ready_sha256=batch["ready_sha256"],
                       file_sha256=item["file_sha256"], model_digest=item["model_digest"],
-                      submission_block=item["block_height"], submission_timestamp_ms=2000)
+                      submission_block=item["block_height"], submission_timestamp_ms=200_000)
     batch["allocation"] = allocation
     stage = item["stages"][0]
     stage.update(score=paired.challenger_score, incumbent_score=paired.incumbent_score,
@@ -303,35 +346,16 @@ def audit_case(tmp_path, monkeypatch, request):
                "cache_sha256": batch["sha256"], "cache_generated_block": 95,
                "cache_plan_digest": batch["plan_digest"],
                "cache_seed_block_hash": batch["seed_block_hash"]}
-    if has_claim:
-        from validator.production.inventory import _pool_digest
-
-        candidates = [{
-            "plan_digest": batch["plan_digest"], "plan_sha256": batch["ready_sha256"],
-            "generation_block": 95, "state": "READY", "completed_block": 98,
-            "completed_at_ms": 1000, "inventory_slot": 0,
-            "source_selection_sha256": "78" * 32, "s_eligible": True,
-            "slot_eligible": True, "families_eligible": True,
-        }, {
-            "plan_digest": "89" * 32, "plan_sha256": "9a" * 32,
-            "generation_block": 150, "state": "READY", "completed_block": 151,
-            "completed_at_ms": 3000, "inventory_slot": 1,
-            "source_selection_sha256": "ab" * 32, "s_eligible": False,
-            "slot_eligible": True, "families_eligible": True,
-        }]
-        metrics["claim_evidence"] = {**allocation, "selection": {
-            "algorithm": "earliest-expiry-stable-v1", "source_sha256": "bc" * 32,
-            "cas_attempt": 2, "captured_at_ms": 4000, "clock": "local-before-successful-cas",
-            "pool_read_interval_ms": [3000, 3500],
-            "disclosure_delay_seconds": track.cache.disclosure_delay_seconds,
-            "previous_authority_sha256": hashlib.sha256(canonical_json({
-                "format": "veda-inventory-allocations-v1", "track_spec_digest": track.digest,
-                "claims": [],
-            })).hexdigest(), "pool_sha256": _pool_digest(candidates),
-            "candidates": candidates,
-        }}
-    metrics["private_payload"] = "NEVER-PUBLISH-MODEL-OR-SECRET"
     objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="original")
+    if has_claim:
+        from validator.production.inventory import Inventory
+
+        metrics["claim_evidence"] = Inventory(objects, track.digest).claim(
+            **{k: v for k, v in allocation.items() if k not in
+               {"ordinal", "plan_digest", "ready_sha256"}},
+            plans=(plan, make_plan(inventory_case, 150)),
+            disclosure_delay_seconds=track.cache.disclosure_delay_seconds)
+    metrics["private_payload"] = "NEVER-PUBLISH-MODEL-OR-SECRET"
     source = ReadyBatchSource(track=track, objects=objects, cache_dir=tmp_path)
     monkeypatch.setattr(source, "stage_binding", lambda *_a, **_k: {
         key: metrics[key] for key in ("cache_ready_sha256", "cache_completed_block",
@@ -372,7 +396,7 @@ def test_public_cpu_audit_is_bound_to_actual_match_and_preserves_original_stage(
         claim = body["metrics"]["claim_evidence"]
         assert len(claim["selection"]["candidates"]) == 2
         assert claim["selection"]["candidates"][1]["s_eligible"] is False
-        assert body["context"]["claim_cas_interval_ms"][0] == 4000
+        assert body["context"]["claim_cas_interval_ms"][0] == claim["selection"]["captured_at_ms"]
         assert body["context"]["claim_sha256"] == hashlib.sha256(canonical_json(claim)).hexdigest()
     with pytest.raises(ValueError, match="not due"):
         case.source.public_stage_audit(case.reference, now_ms=case.due - 1)
@@ -444,11 +468,11 @@ def test_public_cpu_audit_rejects_changes_without_gpu(audit_case, damage):
 def test_public_cpu_audit_cannot_replace_original_s_window_even_with_a_new_digest(audit_case):
     case = audit_case
     body, document = json.loads(case.payload), copy.deepcopy(case.record.document)
-    body["metrics"]["cache_completed_at_ms"] = 2500  # Original S timestamp is 2000.
-    body["context"]["not_before_ms"] = 2500 + case.track.cache.disclosure_delay_seconds * 1000
+    body["metrics"]["cache_completed_at_ms"] = 200_001  # Original S timestamp is 200000.
+    body["context"]["not_before_ms"] = 200_001 + case.track.cache.disclosure_delay_seconds * 1000
     for batch in (document["evaluation"]["evaluation_batch"],
                   document["evaluation"]["stages"][0]["evaluation_batch"]):
-        batch["completed_at_ms"] = 2500
+        batch["completed_at_ms"] = 200_001
     document["evaluation"]["stages"][0]["stage_evidence"]["public_audit"] = {
         **stage_reference(case.reference["public_audit"]["object"], canonical_json(body)),
         "not_before_ms": body["context"]["not_before_ms"],

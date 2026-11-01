@@ -156,7 +156,8 @@ class ReadyBatchSource:
             self.cache_dir / "content" if batch_dir is None else batch_dir
         )
         self.public_base_url = public_base_url
-        self.inventory = Inventory(objects, self.data_track.digest)
+        self.inventory = Inventory(objects, self.data_track.digest,
+                                   validate_plans=self._validate_snapshot)
         self.private_uploads = None
 
     def _materialize(self, plan: BatchPlan, item: ReadyObject, destination: Path) -> Path:
@@ -389,6 +390,24 @@ class ReadyBatchSource:
         """Persist a scored nonterminal stage before changing local tournament state."""
 
         metrics = {key: value for key, value in result.metrics.items() if key != "stage_evidence"}
+        name = self._stage_name(task.challenge_id, task.state.value)
+        if self.objects.get_optional(name) is not None:
+            original = self.restore_stage(task)
+            original_metrics = {k: v for k, v in original.metrics.items() if k != "stage_evidence"}
+            if "audit_context" not in metrics:
+                original_metrics.pop("audit_context", None)
+            # The original archive is the evidence, including an honest legacy absence.
+            if (original.score != result.score or original.score_block != score_block
+                    or metrics != original_metrics
+                    or result.metrics.get("stage_evidence", original.metrics.get("stage_evidence"))
+                    != original.metrics.get("stage_evidence")):
+                raise ValueError("stage evidence changed during archive retry")
+            return original.metrics.get("stage_evidence")
+        if "reproducibility" not in metrics:
+            raise ValueError("new scoring requires its original reproducibility evidence")
+        execution = metrics["reproducibility"]["execution"]
+        if getattr(self.track, "netuid", None) == 120 and execution["runtime_identity"] is None:
+            raise ValueError("new production scoring requires its approved execution identity")
         if "reproducibility" in metrics:
             validate_pair_evidence(metrics["reproducibility"], result.score,
                                    metrics["incumbent_score"], metrics["paired_gain_lower_bound"],
@@ -400,6 +419,13 @@ class ReadyBatchSource:
                 raise ValueError("stage evidence differs from its original allocation")
             if "cache_allocation" in metrics and "promotion" in metrics:
                 claim = metrics.get("claim_evidence")
+                if claim is not None and getattr(self.track, "netuid", None) == 120:
+                    enumeration = claim["selection"]["enumeration"]
+                    if enumeration is None or any(
+                        row["endpoint"] is None for row in enumeration["observations"]
+                    ):
+                        raise ValueError(
+                            "new production selection requires its complete enumeration")
                 context = {
                     "track_id": self.track.track_id, "data_spec_digest": self.data_track.digest,
                     "submission_position": {"block_height": task.position.block,
@@ -665,8 +691,9 @@ class ReadyBatchSource:
             )
             return True
         pool_read_started_ms = time.time_ns() // 1_000_000
-        plans = tuple(plan for _, plan in self._plans())
-        repeated = tuple(plan for _, plan in self._plans())
+        first, second = {}, {}
+        plans = tuple(plan for _, plan in self._plans(observation=first))
+        repeated = tuple(plan for _, plan in self._plans(observation=second))
         if tuple(plan.encode() for plan in plans) != tuple(plan.encode() for plan in repeated):
             raise RuntimeError("candidate inventory changed during its complete observation")
         pool_read_finished_ms = time.time_ns() // 1_000_000
@@ -681,6 +708,8 @@ class ReadyBatchSource:
             submission_timestamp_ms=document["submission_timestamp_ms"],
             disclosure_delay_seconds=self.track.cache.disclosure_delay_seconds,
             pool_read_interval_ms=(pool_read_started_ms, pool_read_finished_ms),
+            enumeration={"algorithm": "ReadyBatchSource._plans-v1",
+                         "observations": [first, second]},
         )
         return claim is not None
 
@@ -853,6 +882,14 @@ class ReadyBatchSource:
         document = json.loads(stored.body)
         if _json(document) != stored.body:
             raise RuntimeError("private stage is not canonical")
+        claim = document["metrics"].get("claim_evidence")
+        if claim is not None:
+            _, authority = self.inventory.read()
+            actual = next((row for row in authority["claims"]
+                           if row["challenge_id"] == document["challenge_id"]
+                           and row["stage"] == document["stage"]), None)
+            if claim != actual:
+                raise RuntimeError("public audit changes its original verified selection inputs")
         audit = public_score_audit(document)
         if audit is None or audit[1] != audit_ref:
             raise RuntimeError("public audit differs from its score-time commitment")
@@ -971,27 +1008,33 @@ class ReadyBatchSource:
             return plan
         raise RuntimeError("challenge has no allocated hidden inventory")
 
-    def _plans(self) -> tuple[tuple[str, BatchPlan], ...]:
+    def _plans(self, *, observation: dict | None = None) -> tuple[tuple[str, BatchPlan], ...]:
         rows = []
         prefix = f"{PLANS_NAMESPACE}/"
-        for name in self.objects.list_names(prefix):
+        for name in self.objects.list_names(prefix, observation=observation):
             if name == ALLOCATION_OBJECT:
                 continue
             if not name.startswith(prefix) or not name.endswith(".json"):
                 raise RuntimeError("private plan index contains an unexpected object")
             plan = BatchPlan.decode(self.objects.get(name).body)
-            self._validate_plan(name, plan)
+            if name != f"plans/{plan.generation_block}.json":
+                raise RuntimeError("private plan key disagrees with its generation block")
             rows.append((name, plan))
         rows.sort(key=lambda row: row[1].generation_block)
+        self._validate_snapshot(tuple(plan for _name, plan in rows))
+        return tuple(rows)
+
+    def _validate_snapshot(self, plans: tuple[BatchPlan, ...]) -> None:
+        for plan in plans:
+            self._validate_plan(f"plans/{plan.generation_block}.json", plan)
         try:
             validate_source_selection_sequence(
-                tuple(plan for _name, plan in rows),
+                tuple(sorted(plans, key=lambda plan: plan.generation_block)),
                 commitments=self.track.source_commitments,
                 scoring=self.track.scoring,
             )
         except ValueError as exc:
             raise RuntimeError("private plan source selection is invalid") from exc
-        return tuple(rows)
 
     def _validate_plan(self, name: str, plan: BatchPlan) -> None:
         if name != f"{PLANS_NAMESPACE}/{plan.generation_block}.json":

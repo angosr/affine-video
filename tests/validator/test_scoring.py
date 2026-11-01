@@ -47,7 +47,7 @@ from validator.scoring import (
 )
 from validator.store import ChallengeStore, LeasedChallenge
 
-from .production.test_storage import MemoryS3
+from .production.test_storage import MemoryS3, seed_legacy_stage
 from .test_store import submission_at
 
 
@@ -1053,7 +1053,7 @@ def test_private_stage_archive_resumes_fifo_without_missing_batch(tmp_path, stag
             store.transition(identifier, stage, occurred_at_ms=14)
         task = store.claim_next_scoring("lost", lease_ms=10, now_ms=20)
         assert task is not None
-        source.archive_stage(task, StageOutcome(0.0, {}), 150)
+        seed_legacy_stage(source, task, StageOutcome(0.0, {}), 150)
 
     # Local DB/result loss: replay the same submission, leaving only the private archive.
     with ChallengeStore(tmp_path / "recovered.db") as store:

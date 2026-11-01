@@ -26,6 +26,22 @@ from validator.publication import S3Repository
 from validator.s3 import client_config
 
 
+def seed_legacy_stage(source, task, result, score_block):
+    """Authentic old archive fixture, not the new-score production entry point."""
+    from miner.submit import model_source_fields
+    from validator.production.commitment import canonical_json
+
+    source.objects.create_plan(source._stage_name(task.challenge_id, task.state.value),
+                               canonical_json({
+        "format": "veda-stage-result-v1", "track_spec_digest": source.track.digest,
+        "challenge_id": task.challenge_id, "submission_id": task.submission_id,
+        "hotkey": task.hotkey, **model_source_fields(task.repo_id, task.revision,
+                                                    getattr(task, "private_submission", None)),
+        "file_sha256": task.file_sha256, "stage": task.state.value, "score": result.score,
+        "score_block": score_block, "metrics": result.metrics,
+    }))
+
+
 class MemoryS3:
     def __init__(self) -> None:
         self.objects = {}
@@ -86,6 +102,49 @@ def test_private_listing_supports_bounded_original_index_pages():
         store.list_names("uploads/", limit=16, after="plans/1.json")
     with pytest.raises(ValueError, match="positive"):
         store.list_names("uploads/", limit=0)
+
+
+def test_complete_listing_retains_page_chain_without_raw_continuation_tokens():
+    from types import SimpleNamespace
+
+    class Paged(MemoryS3):
+        meta = SimpleNamespace(endpoint_url="https://r2.example")
+
+        def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+            assert Prefix == "original/plans/"
+            page = 0 if ContinuationToken is None else int(ContinuationToken.split("-")[-1])
+            return {
+                "Contents": [{"Key": f"{Prefix}{page * 2 + n}.json"} for n in range(2)],
+                "IsTruncated": page < 2,
+                **({"NextContinuationToken": f"PRIVATE-CONTINUATION-{page + 1}"}
+                   if page < 2 else {}),
+            }
+
+    observation = {}
+    names = PrivateObjectStore(Paged(), bucket="private", prefix="original").list_names(
+        "plans/", observation=observation)
+    assert names == tuple(f"plans/{n}.json" for n in range(6))
+    assert observation["complete"] is True and observation["endpoint"] == "https://r2.example"
+    pages = observation["pages"]
+    assert len(pages) == 3 and pages[-1]["is_truncated"] is False
+    assert pages[0]["request_token_sha256"] is None
+    assert pages[1]["request_token_sha256"] == pages[0]["next_token_sha256"]
+    assert pages[-1]["next_token_sha256"] is None
+    assert "PRIVATE-CONTINUATION" not in json.dumps(observation)
+
+
+@pytest.mark.parametrize("fault", ["missing-end", "cursor-cycle"])
+def test_listing_observation_rejects_missing_terminal_fact_and_cursor_cycles(fault):
+    class Broken(MemoryS3):
+        def list_objects_v2(self, **_kwargs):
+            return ({"Contents": []} if fault == "missing-end" else
+                    {"Contents": [], "IsTruncated": True, "NextContinuationToken": "repeat"})
+
+    observation = {"complete": True}  # A failed new observation must erase a stale receipt.
+    with pytest.raises(StorageError):
+        PrivateObjectStore(Broken(), bucket="private", prefix="original").list_names(
+            "plans/", observation=observation)
+    assert not observation.get("complete")
 
 
 @pytest.mark.parametrize("directory", [

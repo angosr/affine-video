@@ -573,9 +573,12 @@ class PrivateObjectStore:
 
     def list_names(
         self, prefix: str, *, limit: int | None = None, after: str | None = None,
+        observation: dict[str, Any] | None = None,
     ) -> tuple[str, ...]:
         """List a private directory index, retaining its scoped trailing slash."""
 
+        if observation is not None:
+            observation.clear()
         if limit is not None and (type(limit) is not int or limit <= 0):
             raise ValueError("private listing limit must be positive")
         relative = prefix.strip("/")
@@ -585,6 +588,8 @@ class PrivateObjectStore:
             raise ValueError("private listing cursor is outside its prefix")
         token: str | None = None
         names: list[str] = []
+        pages = []
+        seen_tokens = set()
         while True:
             arguments: dict[str, Any] = {"Bucket": self._bucket, "Prefix": query + "/"}
             if limit is not None:
@@ -594,21 +599,53 @@ class PrivateObjectStore:
             elif after_key is not None:
                 arguments["StartAfter"] = after_key
             response = self._client.list_objects_v2(**arguments)
+            if observation is not None and "IsTruncated" not in response:
+                raise StorageError("listing observation lacks its explicit pagination end fact")
+            page_names = []
             for item in response.get("Contents", []):
                 key = item.get("Key")
                 root = f"{self._prefix}/"
                 if not isinstance(key, str) or not key.startswith(root):
                     raise StorageError("object store returned a key outside the private prefix")
                 names.append(key[len(root) :])
+                page_names.append(key[len(root) :])
+            truncated = response.get("IsTruncated", False)
+            if type(truncated) is not bool:
+                raise StorageError("object listing truncation fact is invalid")
+            next_token = response.get("NextContinuationToken") if truncated else None
+            if observation is not None:
+                pages.append({
+                    "request_token_sha256": (None if token is None else
+                                             hashlib.sha256(token.encode()).hexdigest()),
+                    "next_token_sha256": (None if not isinstance(next_token, str) else
+                                          hashlib.sha256(next_token.encode()).hexdigest()),
+                    "names": page_names, "is_truncated": truncated,
+                })
             if limit is not None and len(names) >= limit:
                 break
-            if not response.get("IsTruncated", False):
+            if not truncated:
                 break
             token = response.get("NextContinuationToken")
             if not isinstance(token, str) or not token:
                 raise StorageError("truncated object listing omitted its continuation token")
+            if token in seen_tokens:
+                raise StorageError("object listing repeated a continuation token")
+            seen_tokens.add(token)
         if len(set(names)) != len(names):
             raise StorageError("object store listing contains duplicate keys")
+        if observation is not None:
+            endpoint = getattr(getattr(self._client, "meta", None), "endpoint_url", None)
+            if endpoint is not None:
+                parsed = urlparse(endpoint)
+                if (parsed.scheme != "https" or not parsed.netloc or parsed.username
+                        or parsed.password or parsed.query or parsed.fragment):
+                    raise StorageError("listing provenance requires a credential-free endpoint")
+            observation.update({
+                "api": "ListObjectsV2", "bucket": self._bucket, "endpoint": endpoint,
+                "authority_prefix": self._prefix, "directory": relative + "/",
+                "limit": limit, "after": after, "pages": pages,
+                "complete": bool(pages and not pages[-1]["is_truncated"]),
+            })
         return tuple(sorted(names))
 
     def download_content(
