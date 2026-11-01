@@ -1,12 +1,14 @@
 # Verification and operations
 
 Use the public [track specification](https://iblosevwkuiootbbgnsy.storage.supabase.co/storage/v1/object/public/affine_video/tracks/main/track.json)
-for the active identity and runtime manifest. A repository checkout is not automatically the
-deployed evaluator. Public URLs and the single `weights.json` path stay fixed across releases.
+for the active competition and data identity. Resolve the approved runtime manifest through
+`status.json.runtime_release`. A repository checkout is not automatically the deployed
+evaluator. Public URLs and the single `weights.json` path stay fixed across releases.
 
 ## Published evidence
 
-Follow the active track's artifact manifest for its bound acceptance and raw evidence.
+Follow the competition manifest and the actual runtime manifest for their bound evidence
+and runtime acceptance respectively.
 Each report retains its original runtime, hardware and input identities; a historical result
 does not authorize newer source or establish a rerun on different hardware.
 The checked-in [research inventory](acceptance/inventory.json) is a historical index,
@@ -19,6 +21,49 @@ full-video confirmation in the current exact-only track. Startup also checks run
 storage and data isolation. Research studies are separate from these release requirements.
 Component tests and accelerated chain fixtures do not establish real-miner rewards, chain
 transactions or complete host-loss recovery.
+
+## Source, live runtime and historical execution
+
+The [changelog](../../CHANGELOG.md) labels source candidates and the last operator-reported
+deployed baseline separately. Resolve the current software through `status.json.runtime_release`
+and its actual source, installed lock, manifest and acceptance. A checkout, descriptor or
+current status cannot establish which environment or GPU executed an earlier match.
+
+Evidence-enabled scoring retains already-calculated cells and observed execution facts in
+the original private stage. First-claim evidence references immutable private enumeration
+inputs and explicit pagination completion. It is an observed input snapshot, not an atomic
+transaction across the plan directory and allocation CAS. Full plan bodies stay private;
+the original allocation remains the sole assignment authority. Published audit artifacts
+are deterministic hash-bound projections after the original data's disclosure age.
+
+`veda verify-match` performs CPU statistical verification of three original public JSON
+files. `veda audit` uses `S3Repository.load`, including its history, match/fence, model and
+available disclosure-byte checks. It is GET-only and never acquires a writer lock, opens
+SQLite, loads a wallet or changes a pointer. Missing historical evidence remains unknown.
+The candidate implementation has CPU coverage; it is not a report of deployed evidence or
+new GPU measurements. Private loser payloads remain private.
+
+## Protocol and rules proposals awaiting explicit decisions
+
+The following are design boundaries, not implemented changes or release prerequisites.
+The active confidence remains 0.9975, promotion uses one exact batch, and `track_id` remains
+`veda-sn120-v2-r10`. Infrastructure time limits are diagnostic/recovery deadlines: they do
+not turn `SYSTEM_BLOCKED` into a miner loss or reset its submission, claim or opportunity.
+
+| Proposal | Existing interface and proposed boundary | History and data impact |
+| --- | --- | --- |
+| External pre-seed commitment | `PlanCoordinator.create_next`, `BatchPlan` and disclosure verification currently bind private plan facts. To prove commitment before an unpredictable seed, an independently verifiable finalized commitment must fix the nonce/root and a future block before that block occurs. An operator-owned S3 timestamp alone is insufficient. The exact chain payload, finality ordering and authorized signer require a separate decision. | This changes generation provenance and its data contract. Existing READY bytes, original commitments and clocks cannot be re-labelled as externally precommitted. No new transaction is authorized here. |
+| HF file commitment, first digest owner and HTTP buffer | `ModelSubmission.encode/decode` preserves VDA1 repo/revision bytes; its current competition maximum is 121 bytes. Appending a file hash changes encoding and can exceed that bound. A versioned payload/manifest reference and its byte budget must be chosen before editing the chain parser or admission binding. Canonical ownership must be validated in original S order; an unverified declared digest cannot reserve a model. A first-fetch interval needs an original-S clock and a defined distinction between provider failure and participant unavailability. | Old VDA1 records must decode byte-for-byte without invented hashes. VDR1 and the private route remain unchanged. No new wall-clock deadline may silently reassign ownership, discard a deferred task or consume a new opportunity. |
+| Confidence 0.975 and a second test | `ScoringSpec`, `PairedTrackEvaluator`, `Inventory` and tournament validation need an explicit choice of second exact versus full-video measurement and the combined promotion rule. The existing historical confirmation allocation checks opposite slots and disjoint families. Both batches must already satisfy the original S boundary; a later generated batch cannot repair that eligibility. | A rules change needs its own accepted identity and statistical justification. Existing outcomes are not recomputed. Current exact/full scientific implementations are not evidence that a proposed two-test policy has been approved or measured. |
+| Source-pool exclusions | Define exclusion criteria and provenance before changing the bound `SourcePool`, source-cache binding, Merkle root and `TrackSpec.source_commitments`. Publishing existing hotkey exclusion reasons is separate from changing dataset exclusions. | A changed source pool is a data-contract migration. Old source proofs, plans, READY bytes and C/R cannot be rewritten. Treatment of already-committed data must be decided explicitly. |
+
+`S3Repository._recover` currently rejects a different specification under an active track ID.
+Future rule activation must therefore specify a verified maintenance migration and continuous
+immutable match numbering while preserving the fixed ID, prior policy/outcomes, S, claims,
+champion tenure and opportunities. This task does not relax the digest checks, restart a
+track or add another ledger. Compatible software maintenance keeps the existing competition
+and data identity. Hardware flags and production-side dense checks remain recorded; current
+GPU recomputation of an old authenticated cache is not restored as a consumer gate.
 
 ## Maintenance tooling
 

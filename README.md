@@ -153,6 +153,26 @@ frozen specification, runtime and bound inputs, not the latest working tree or a
 hardware execution path. Archived outcomes and data bindings are not rewritten by a retry or
 maintenance release.
 
+New evidence-enabled matches seal a small score audit before publication. Once the original
+batch reaches its disclosure age, the existing publisher exposes the artifact referenced by
+`stage_evidence.public_audit`. It contains paired cell scores, their grouping/order, bootstrap
+parameters and recorded execution identity. Future question data and private model payloads
+are excluded. Aggregate-only historical matches have unknown missing evidence; today's
+runtime or a new experiment cannot fill it in.
+
+Download the original public track envelope, match and referenced audit JSON, then run:
+
+```bash
+uv run veda verify-match --track track.json --match match.json --artifact audit.json
+uv run veda audit
+```
+
+`verify-match` checks the small JSON artifacts on CPU. The credential-free `audit` command
+uses the normal public ledger verifier, including available published payload bytes, which
+may be large. Neither command needs a wallet, GPU, private storage keys or evaluator database.
+Statistical replay does not establish full model-inference replay when a private losing model
+is intentionally unavailable.
+
 ## Watch the competition
 
 ```bash
@@ -165,6 +185,10 @@ outcomes, waiting/computing activity and retry alerts. It needs no wallet, GPU
 or storage key. `status.json` is the current
 view; `summary.json` includes the committed match count and latest match. Immutable match records
 use `matches/<track_id>/<12-digit-sequence>.json` under the same public `tracks/main/` prefix.
+Scores from different batches form no absolute-score ladder. Comparison views show the
+champion and submission chronology, with each match's paired LCB and original threshold.
+Public diagnostics use fixed safe summaries and recorded retry origins; raw exception text
+and credentials remain private. Unknown historical retry or duplicate details stay unknown.
 
 ## Validators
 
@@ -191,6 +215,10 @@ uv run ruff check src tests
 uv run pytest
 ```
 
-GPU-dependent validation needs the frozen runtime in [`Dockerfile.runtime`](Dockerfile.runtime).
+GPU-dependent validation needs the frozen runtime described by
+[`Dockerfile.runtime`](Dockerfile.runtime), or its verified native installation with the
+actual installed lock and acceptance. A native installation does not imply a Docker Engine.
 [Runtime verification](evidence/system-panel/README.md) explains evidence binding and operational
 limits. Research experiments are not additional miner submission requirements.
+The [changelog](CHANGELOG.md) separates unreleased source from the dated deployed baseline;
+the live runtime identity remains authoritative for the current installation.
