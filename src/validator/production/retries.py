@@ -105,6 +105,11 @@ class PrivateRetryStore:
                     if checkpoint is None:
                         raise RuntimeError("active retry state retained a failed attempt token")
                     return checkpoint
+                if current.state == "BLOCKED":
+                    assert checkpoint is not None
+                    return checkpoint
+                if current.attempts >= max_attempts:
+                    raise RuntimeError("durable retry budget requires an operator reset")
                 attempts = current.attempts + 1
                 generation = current.generation + 1
             blocked = attempts >= max_attempts

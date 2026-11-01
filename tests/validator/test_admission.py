@@ -1126,7 +1126,7 @@ def test_corrupted_cached_model_is_recovered_instead_of_blaming_participant(tmp_
         assert challenge.error_code == "DOWNLOAD_TEMPORARY_FAILURE"
 
 
-def test_admission_retry_ceiling_cools_down_then_recovers_automatically(tmp_path) -> None:
+def test_admission_retry_ceiling_requires_operator_resume(tmp_path) -> None:
     alerts = []
 
     def unavailable(*_args, **_kwargs):
@@ -1169,9 +1169,15 @@ def test_admission_retry_ceiling_cools_down_then_recovers_automatically(tmp_path
         ]
         model = tmp_path / "repaired.safetensors"
         write_model(model, "hk1")
+        assert process_next_admission(
+            store, worker_id="automatic", settings=configured,
+            current_finalized_block=10_000, now_ms=120_100,
+            downloader=lambda *_args, **_kwargs: pytest.fail("blocked model I/O"),
+        ) is None
+        store.resume_blocked(identifier, occurred_at_ms=120_101)
         recovered = process_next_admission(
             store, worker_id="recovered", settings=configured,
-            current_finalized_block=10_000, now_ms=120_100,
+            current_finalized_block=10_000, now_ms=120_102,
             downloader=model_downloader(model),
         )
         assert recovered is not None and recovered.status is AdmissionStatus.ACCEPTED
@@ -1224,9 +1230,17 @@ def test_admission_retry_ceiling_survives_total_local_state_loss(tmp_path) -> No
     write_model(model, "hk1")
     with ChallengeStore(tmp_path / "validator-recovered.db") as store:
         store.add_submission(submission, occurred_at_ms=1)
+        blocked = process_next_admission(
+            store, worker_id="automatic", settings=configured,
+            current_finalized_block=10_000, now_ms=150_100,
+            downloader=lambda *_args, **_kwargs: pytest.fail("cold blocked model I/O"),
+        )
+        assert blocked.status is AdmissionStatus.BLOCKED
+        retries.reset(identifier, "ADMISSION")
+        store.resume_blocked(identifier, occurred_at_ms=150_101)
         outcome = process_next_admission(
             store, worker_id="recovered", settings=configured,
-            current_finalized_block=10_000, now_ms=150_100,
+            current_finalized_block=10_000, now_ms=150_102,
             downloader=model_downloader(model),
         )
         assert outcome is not None and outcome.status is AdmissionStatus.ACCEPTED
@@ -1296,10 +1310,16 @@ def test_long_admission_failure_starts_cooldown_when_the_failure_is_observed(
             "recovered", lease_ms=1_000, ready_through_block=10_000,
             now_ms=failed_at + configured.retry_max_ms,
         )
+        assert recovered is None
+        store.resume_blocked(identifier, occurred_at_ms=failed_at + configured.retry_max_ms)
+        recovered = store.claim_next_admission(
+            "operator-resumed", lease_ms=1_000, ready_through_block=10_000,
+            now_ms=failed_at + configured.retry_max_ms + 1,
+        )
         assert recovered is not None and recovered.challenge_id == identifier
 
 
-def test_slow_durable_admission_restore_uses_the_clock_after_io(tmp_path, monkeypatch):
+def test_slow_durable_admission_restore_cannot_expire_a_block(tmp_path, monkeypatch):
     from validator.retries import RetryCheckpoint
 
     clock = {"ms": 1_000}
@@ -1321,7 +1341,8 @@ def test_slow_durable_admission_restore_uses_the_clock_after_io(tmp_path, monkey
             store, worker_id="worker", settings=configured, current_finalized_block=10_000,
             downloader=model_downloader(model),
         )
-        assert outcome is not None and outcome.status is AdmissionStatus.ACCEPTED
+        assert outcome is not None and outcome.status is AdmissionStatus.BLOCKED
+        assert clock["ms"] == 7_201_000
 
 
 def test_disk_full_during_download_preparation_uses_durable_retry_ceiling(

@@ -134,6 +134,7 @@ def process_next_admission(
         clock=clock,
         restore=settings.restore_retry,
         wait_ms=settings.retry_base_ms,
+        max_attempts=settings.max_attempts,
     )
     if task is None:
         assert restored_retry is not None

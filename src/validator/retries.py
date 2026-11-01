@@ -45,6 +45,7 @@ def prepare_durable_retry(
     clock: Callable[[], int],
     restore: RetryRestore | None,
     wait_ms: int,
+    max_attempts: int,
 ) -> tuple[LeasedChallenge | None, RetryCheckpoint | None]:
     """Restore a durable retry fence before any participant or GPU I/O."""
 
@@ -54,7 +55,10 @@ def prepare_durable_retry(
     if checkpoint is None:
         return task, None
     now_ms = clock()
-    if checkpoint.blocked and checkpoint.retry_after_ms > now_ms:
+    if checkpoint.blocked or checkpoint.attempts >= max_attempts:
+        # Legacy checkpoints may still say DEFERRED at the configured ceiling.
+        # Wall time cannot grant another attempt; only the operator reset can.
+        checkpoint = replace(checkpoint, blocked=True)
         store.synchronize_leased_attempts(
             task.challenge_id,
             task.lease_token,

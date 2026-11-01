@@ -473,6 +473,8 @@ def test_evaluator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch,
         lambda _path: SimpleNamespace(
             validator_database=cli_module.Path("validator.db"),
             track_spec=cli_module.Path("track.json"),
+            artifact_manifest=SimpleNamespace(read_bytes=lambda: b"runtime"),
+            data_binding=lambda *_args: (SimpleNamespace(digest="ab" * 32), b"data"),
             storage_bucket="private",
             storage_prefix="root",
         ),
@@ -502,6 +504,103 @@ def test_evaluator_retry_explicitly_resumes_an_infrastructure_block(monkeypatch,
         "state": "CONFIRMING",
     }
     assert calls == ["probe", "durable", "local"]
+
+
+@pytest.mark.parametrize("damage", [None, "data_spec", "data_manifest", "runtime_origin"])
+def test_evaluator_retry_uses_authenticated_data_scope_and_original_rule_identity(
+    tmp_path, monkeypatch, capsys, damage,
+):
+    from dataclasses import replace
+
+    from tests.validator.production.test_config import bound_data_configuration
+    from tests.validator.production.test_storage import MemoryS3
+    from tests.validator.test_store import submission_at
+    from validator.production.commitment import canonical_json
+    from validator.production.retries import PrivateRetryStore
+    from validator.production.storage import RETRY_STATE_NAMESPACE, PrivateObjectStore
+
+    rules, data, config, runtime, original_manifest = bound_data_configuration(tmp_path)
+    assert rules.digest != data.digest
+    prefix = f"{config.storage_prefix}/tracks/{data.digest}"
+    rule_prefix = f"{config.storage_prefix}/tracks/{rules.digest}"
+    client = MemoryS3()
+    objects = PrivateObjectStore(client, bucket=config.storage_bucket, prefix=prefix)
+    retries = PrivateRetryStore(objects, track_spec_digest=rules.digest)
+    with ChallengeStore(config.validator_database, track_spec_digest=rules.digest) as store:
+        identifier, _ = store.add_submission(submission_at(200), occurred_at_ms=1)
+        for state in (ChallengeState.FETCHING, ChallengeState.VALIDATING, ChallengeState.SCORING):
+            store.transition(identifier, state, occurred_at_ms=2)
+        task = store.claim_next_scoring("original-worker", lease_ms=100, now_ms=3)
+        retries.record_failure(task, "SCORING", code="GPU_DOWN", summary="worker unavailable",
+                               retry_after_ms=100, max_attempts=1)
+        store.block_leased(identifier, task.lease_token, error_code="GPU_DOWN",
+                           error_summary="worker unavailable", retry_after_ms=100,
+                           occurred_at_ms=4)
+        before_row = store.get_challenge(identifier)
+        before_events = store.challenge_events(identifier)
+        before_public = store.public_challenge(identifier)
+    name = f"{RETRY_STATE_NAMESPACE}/{identifier}/scoring.json"
+    before = objects.get(name)
+    # A wrong namespace must not be probed, read or rewritten as a fallback.
+    rule_objects = PrivateObjectStore(client, bucket=config.storage_bucket, prefix=rule_prefix)
+    rule_objects.create_plan(name, b"unrelated rule-scope object")
+    all_before = dict(client.objects)
+    factories = []
+
+    def from_environment(*, bucket, prefix):
+        factories.append((bucket, prefix))
+        assert (bucket, prefix) == (config.storage_bucket, objects._prefix)
+        return objects
+
+    monkeypatch.setattr(PrivateObjectStore, "from_environment", from_environment)
+    if damage == "data_spec":
+        config.data_track_spec.write_bytes(b"{}")
+    elif damage == "data_manifest":
+        config.data_competition_manifest.write_bytes(canonical_json({"wrong": True}))
+    elif damage == "runtime_origin":
+        changed = replace(runtime, artifacts=tuple(
+            replace(asset, sha256="ff" * 32) if asset.sha256 == data.digest else asset
+            for asset in runtime.artifacts
+        ))
+        config.artifact_manifest.write_bytes(changed.encode())
+    argv = ["evaluator", "retry", identifier, "--database", str(config.validator_database),
+            "--production-config", str(tmp_path / "producer.json")]
+    if damage is not None:
+        with pytest.raises(SystemExit) as exc:
+            main(argv)
+        assert exc.value.code == 1
+        assert factories == [] and client.objects == all_before
+        with ChallengeStore(config.validator_database, track_spec_digest=rules.digest) as store:
+            assert store.get_challenge(identifier) == before_row
+            assert store.challenge_events(identifier) == before_events
+        assert objects.get(name) == before
+        return
+
+    main(argv)
+    assert json.loads(capsys.readouterr().out) == {
+        "challenge_id": identifier, "state": "SCORING",
+    }
+    assert factories == [(config.storage_bucket, prefix)]
+    reset = json.loads(objects.get(name).body)
+    prior = json.loads(before.body)
+    assert reset["track_spec_digest"] == rules.digest and reset["state"] == "ACTIVE"
+    assert reset["generation"] == prior["generation"] + 1 and reset["attempts"] == 0
+    assert {key: value for key, value in reset.items() if key not in {
+        "generation", "attempts", "state", "error_code", "error_summary",
+        "last_attempt", "retry_after_ms",
+    }} == {key: value for key, value in prior.items() if key not in {
+        "generation", "attempts", "state", "error_code", "error_summary",
+        "last_attempt", "retry_after_ms",
+    }}
+    assert rule_objects.get(name).body == b"unrelated rule-scope object"
+    assert set(client.objects) == set(all_before)
+    with ChallengeStore(config.validator_database, track_spec_digest=rules.digest) as store:
+        resumed = store.claim_next_scoring("operator-resumed", lease_ms=100, now_ms=10**9)
+        assert resumed.submission_id == task.submission_id and resumed.position == task.position
+        assert resumed.challenge_id == task.challenge_id and resumed.attempts == 1
+        assert retries.restore(resumed, "SCORING") is None
+        assert store.public_challenge(identifier)["block_height"] == before_public["block_height"]
+    assert config.data_competition_manifest.read_bytes() == original_manifest.encode()
 
 
 def test_evaluator_forwards_runtime_and_storage_configuration(monkeypatch, tmp_path) -> None:

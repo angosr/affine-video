@@ -146,6 +146,7 @@ losses. Retries preserve already-bound evaluation data and archived stage result
 selecting replacement data. Quality metrics, budgets and thresholds are defined by the live track,
 not adjustable per submission. Scores from different batches are not directly comparable;
 promotion uses the paired comparison with the incumbent.
+After the existing retry budget is exhausted, SYSTEM_BLOCKED waits for an explicit `veda evaluator retry` operation. Time alone does not restart model or GPU work. Recovery preserves the original submission, allocation and FIFO order; public blocked status has no automatic retry ETA.
 
 Public immutable match records bind the submitted model, stage scores and evaluation data by
 their recorded hashes. When replay data is available, reproduce a match using its original

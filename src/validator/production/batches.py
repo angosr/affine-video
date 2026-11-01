@@ -787,6 +787,7 @@ class ReadyBatchSource:
                 "plan_digest": plan.plan_digest, "secret_commitment": plan.secret_commitment,
                 "generation_block": plan.generation_block, "state": plan.state,
                 "completed_at_ms": plan.completed_at_ms,
+                "completed_block": plan.completed_block,
                 "disclose_at_ms": (None if plan.completed_at_ms is None else
                                    plan.completed_at_ms
                                    + self.track.cache.disclosure_delay_seconds * 1000),

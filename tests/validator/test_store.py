@@ -1004,6 +1004,7 @@ def test_scoring_waits_for_an_earlier_deferred_challenge(tmp_path) -> None:
             error_summary="temporary outage",
             occurred_at_ms=110,
         )
+        assert store.public_challenge(first_id)["retry_after_ms"] == 200
         advance_to_scoring(store, second_id, 120)
 
         assert store.claim_next_scoring("score", lease_ms=50, now_ms=150) is None
@@ -1023,6 +1024,60 @@ def test_scoring_waits_for_an_earlier_deferred_challenge(tmp_path) -> None:
 
         second = store.claim_next_scoring("score", lease_ms=50, now_ms=202)
         assert second is None
+
+
+@pytest.mark.parametrize("stage", [
+    ChallengeState.FETCHING, ChallengeState.VALIDATING,
+    ChallengeState.SCORING, ChallengeState.CONFIRMING,
+])
+def test_blocked_fifo_head_never_automatically_leases_or_skips_after_restart(tmp_path, stage):
+    path = tmp_path / "blocked-fifo.db"
+    with ChallengeStore(path) as store:
+        first, _ = store.add_submission(submission_at(100), occurred_at_ms=1)
+        stages = (ChallengeState.FETCHING, ChallengeState.VALIDATING,
+                  ChallengeState.SCORING, ChallengeState.CONFIRMING)
+        for target in stages[:stages.index(stage) + 1]:
+            store.transition(first, target, occurred_at_ms=2)
+        task = (
+            store.claim_next_admission("admit", lease_ms=50, ready_through_block=200, now_ms=3)
+            if stage in {ChallengeState.FETCHING, ChallengeState.VALIDATING}
+            else store.claim_next_scoring("score", lease_ms=50, now_ms=3)
+        )
+        # Cold recovery must preserve an old, already elapsed retry timestamp.
+        store.block_leased(first, task.lease_token, error_code="SYSTEM_UNAVAILABLE",
+                           error_summary="infrastructure outage", retry_after_ms=1,
+                           occurred_at_ms=4)
+        later, _ = store.add_submission(submission_at(101, hotkey="hk2"), occurred_at_ms=5)
+        advance_to_scoring(store, later, 6)
+        queued, _ = store.add_submission(submission_at(102, hotkey="hk3"), occurred_at_ms=9)
+        original = store.get_challenge(first)
+        events = store.challenge_events(first)
+        assert store.public_challenge(first)["retry_after_ms"] is None
+        assert next(row for row in store.public_snapshot()["challenges"]
+                    if row["challenge_id"] == first)["retry_after_ms"] is None
+        assert store._connection.execute(
+            "SELECT retry_after_ms FROM challenges WHERE challenge_id = ?", (first,),
+        ).fetchone()[0] == 1
+    for now in (50, 10**9):
+        with ChallengeStore(path) as store:
+            assert store.claim_next_scoring("score", lease_ms=50, now_ms=now) is None
+            assert store.claim_next_admission(
+                "admit", lease_ms=50, ready_through_block=200, now_ms=now,
+            ) is None
+            assert store.get_challenge(first) == original
+            assert store.challenge_events(first) == events
+            assert store.get_challenge(later).attempts == 0
+            assert store.get_challenge(queued).attempts == 0
+    with ChallengeStore(path) as store:
+        assert store.resume_blocked(first, occurred_at_ms=10**9) is stage
+        resumed = (
+            store.claim_next_admission("admit", lease_ms=50, ready_through_block=200,
+                                       now_ms=10**9 + 1)
+            if stage in {ChallengeState.FETCHING, ChallengeState.VALIDATING}
+            else store.claim_next_scoring("score", lease_ms=50, now_ms=10**9 + 1)
+        )
+        assert resumed.challenge_id == first and resumed.state is stage
+        assert resumed.position.block == 100 and resumed.attempts == 1
 
 
 def test_public_snapshot_uses_explicit_allowlist(tmp_path) -> None:

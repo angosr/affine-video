@@ -412,11 +412,12 @@ def _run_evaluator(parser: argparse.ArgumentParser, arguments: argparse.Namespac
             if config.validator_database.resolve() != Path(arguments.database).resolve():
                 raise ValueError("production configuration uses a different validator database")
             track = load_track_spec(config.track_spec)
+            data_track, _ = config.data_binding(track, config.artifact_manifest.read_bytes())
             with ChallengeStore(arguments.database, track_spec_digest=track.digest) as store:
                 stage = store.blocked_resume_state(arguments.challenge_id)
                 objects = PrivateObjectStore.from_environment(
                     bucket=config.storage_bucket,
-                    prefix=f"{config.storage_prefix}/tracks/{track.digest}",
+                    prefix=f"{config.storage_prefix}/tracks/{data_track.digest}",
                 )
                 objects.verify_conditional_writes()
                 retries = PrivateRetryStore(objects, track_spec_digest=track.digest)

@@ -1250,7 +1250,7 @@ def test_finite_overflowing_selector_finishes_once_and_releases_fifo(tmp_path) -
 
 
 @pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
-def test_persistent_infrastructure_probes_preserve_opportunity_and_fifo(tmp_path, stage):
+def test_exhausted_infrastructure_budget_stays_blocked_across_restarts(tmp_path, stage):
     retries = PrivateRetryStore(
         PrivateObjectStore(MemoryS3(), bucket="private", prefix="tracks/test"),
         track_spec_digest="ab" * 32,
@@ -1272,30 +1272,37 @@ def test_persistent_infrastructure_probes_preserve_opportunity_and_fifo(tmp_path
         later, _ = store.add_submission(submission_at(101, hotkey="later"), occurred_at_ms=15)
         for state in (ChallengeState.FETCHING, ChallengeState.VALIDATING, ChallengeState.SCORING):
             store.transition(later, state, occurred_at_ms=16)
-        for attempt in range(8):
-            now = 20 + attempt * 100
-            result = process_next_scoring(
-                store, worker_id="worker", current_finalized_block=200,
-                settings=settings, evaluator=unavailable, now_ms=now,
-            )
-            assert result is not None and result.state is ChallengeState.SYSTEM_BLOCKED
-            assert store.get_challenge(first).score_block is None
-            assert store.get_challenge(first).final_score is None
-            assert store.get_challenge(later).attempts == 0
+        result = process_next_scoring(
+            store, worker_id="worker", current_finalized_block=200,
+            settings=settings, evaluator=unavailable, now_ms=20,
+        )
+        assert result is not None and result.state is ChallengeState.SYSTEM_BLOCKED
+        original = store.get_challenge(first)
+        events = store.challenge_events(first)
+    for now in (119, 120, 820, 10**9):
+        with ChallengeStore(tmp_path / "outage.db") as store:
             assert process_next_scoring(
                 store, worker_id="worker", current_finalized_block=200,
-                settings=settings, evaluator=unavailable, now_ms=now + 99,
+                settings=settings, evaluator=unavailable, now_ms=now,
             ) is None
-        assert calls == [first] * 8
+            assert store.get_challenge(first) == original
+            assert store.challenge_events(first) == events
+            assert store.get_challenge(later).attempts == 0
+    assert calls == [first]
+    with ChallengeStore(tmp_path / "outage.db") as store:
+        retries.reset(first, stage.value)
+        # Resetting only the durable half cannot silently release the local fence.
+        assert store.claim_next_scoring("automatic", lease_ms=100, now_ms=10**9) is None
+        store.resume_blocked(first, occurred_at_ms=10**9)
         recovered = process_next_scoring(
             store, worker_id="recovered", current_finalized_block=200,
-            settings=settings, evaluator=isolated_success, now_ms=820,
+            settings=settings, evaluator=isolated_success, now_ms=10**9 + 1,
         )
         assert recovered is not None and recovered.challenge_id == first
         assert recovered.state is ChallengeState.SUCCEEDED
         following = process_next_scoring(
             store, worker_id="next", current_finalized_block=200,
-            settings=settings, evaluator=isolated_success, now_ms=821,
+            settings=settings, evaluator=isolated_success, now_ms=10**9 + 2,
         )
         assert following is not None and following.challenge_id == later
 
@@ -1470,7 +1477,7 @@ def test_real_inventory_supply_watchdog_survives_cold_databases_and_retains_fifo
     assert alerts == ["SCORING_RETRY_STARTED", "SCORING_RETRY_EXHAUSTED"]
 
 
-def test_scoring_retry_ceiling_cools_down_then_recovers_automatically(tmp_path) -> None:
+def test_scoring_retry_ceiling_requires_operator_resume(tmp_path) -> None:
     alerts = []
     settings = ScoringSettings(
         max_attempts=1,
@@ -1507,13 +1514,18 @@ def test_scoring_retry_ceiling_cools_down_then_recovers_automatically(tmp_path) 
             )
         ]
 
+        assert process_next_scoring(
+            store, worker_id="automatic", current_finalized_block=100, settings=settings,
+            evaluator=lambda _task: pytest.fail("blocked GPU work"), now_ms=3_600_020,
+        ) is None
+        store.resume_blocked(identifier, occurred_at_ms=3_600_021)
         success = process_next_scoring(
             store,
             worker_id="worker",
             current_finalized_block=100,
             settings=settings,
             evaluator=lambda _task: StageOutcome(0.7, {"stage": "scoring"}),
-            now_ms=3_600_020,
+            now_ms=3_600_022,
         )
         assert success is not None and success.state is ChallengeState.SUCCEEDED
 
@@ -1562,12 +1574,80 @@ def test_scoring_retry_ceiling_survives_total_local_state_loss(tmp_path) -> None
     assert calls == 2
     with ChallengeStore(tmp_path / "validator-recovered.db") as store:
         identifier = ready_for_scoring(store)
+        blocked = process_next_scoring(
+            store, worker_id="automatic", current_finalized_block=100, settings=settings,
+            evaluator=lambda _task: pytest.fail("cold blocked GPU work"), now_ms=40,
+        )
+        assert blocked.state is ChallengeState.SYSTEM_BLOCKED
+        retries.reset(identifier, "SCORING")
+        store.resume_blocked(identifier, occurred_at_ms=41)
         recovered = process_next_scoring(
             store, worker_id="recovered", current_finalized_block=100, settings=settings,
-            evaluator=lambda _task: StageOutcome(0.7, {}), now_ms=40,
+            evaluator=lambda _task: StageOutcome(0.7, {}), now_ms=42,
         )
         assert recovered is not None and recovered.state is ChallengeState.SUCCEEDED
         assert store.get_challenge(identifier).state is ChallengeState.SUCCEEDED
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+@pytest.mark.parametrize("attempts", [9, 12])
+def test_old_exhausted_checkpoint_stops_before_stage_restore_batch_or_gpu(
+    tmp_path, blocked, attempts,
+):
+    from validator.retries import RetryCheckpoint
+
+    checkpoint = RetryCheckpoint(attempts, blocked, 30, "GPU_DOWN", "old outage")
+    restores = []
+
+    def restore(task, stage):
+        restores.append((task.challenge_id, stage))
+        return checkpoint
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("an exhausted checkpoint cannot restore bulk, claim data or use GPU")
+
+    class Evaluator:
+        batch_ready = staticmethod(forbidden)
+        __call__ = staticmethod(forbidden)
+
+    settings = ScoringSettings(
+        restore_retry=restore, record_retry=forbidden, restore_stage=forbidden,
+    )
+    # Both a pre-budget implementation's DEFERRED row and its BLOCKED row fence
+    # a completely cold SQLite database, even long after the original cooldown.
+    for index in range(2):
+        path = tmp_path / f"cold-{index}.db"
+        with ChallengeStore(path) as store:
+            identifier = ready_for_scoring(store)
+            original = store.get_challenge(identifier)
+            original_path = store.model_path(identifier)
+            original_file = store.public_challenge(identifier)["file_sha256"]
+            result = process_next_scoring(
+                store, worker_id="cold", current_finalized_block=200,
+                settings=settings, evaluator=Evaluator(), now_ms=10**9,
+            )
+            assert result.state is ChallengeState.SYSTEM_BLOCKED
+            fenced = store.get_challenge(identifier)
+            row = store.public_challenge(identifier)
+            assert row["retry_after_ms"] is None
+            assert store._connection.execute(
+                "SELECT attempts, retry_after_ms FROM challenges WHERE challenge_id = ?",
+                (identifier,),
+            ).fetchone()[:] == (attempts, 30)
+            assert fenced.attempts == attempts  # Recover the existing durable total.
+            assert fenced.submission_id == original.submission_id
+            assert store.model_path(identifier) == original_path
+            assert row["file_sha256"] == original_file
+            assert fenced.final_score is None and fenced.score_block is None
+            events = store.challenge_events(identifier)
+        with ChallengeStore(path) as store:
+            assert process_next_scoring(
+                store, worker_id="restart", current_finalized_block=200,
+                settings=settings, evaluator=Evaluator(), now_ms=10**9 + 100,
+            ) is None
+            assert store.get_challenge(identifier) == fenced
+            assert store.challenge_events(identifier) == events
+    assert restores == [(identifier, "SCORING")] * 2
 
 
 @pytest.mark.parametrize("failure_phase", ["evaluate", "archive", "decision"])
@@ -1638,6 +1718,12 @@ def test_long_scoring_failure_starts_cooldown_at_failure_not_task_start(
         recovered = store.claim_next_scoring(
             "recovered", lease_ms=1_000, now_ms=failed_at + configured.retry_max_ms,
         )
+        assert recovered is None
+        store.resume_blocked(identifier, occurred_at_ms=failed_at + configured.retry_max_ms)
+        recovered = store.claim_next_scoring(
+            "operator-resumed", lease_ms=1_000,
+            now_ms=failed_at + configured.retry_max_ms + 1,
+        )
         assert recovered is not None and recovered.challenge_id == identifier
         assert recovered.state is stage
 
@@ -1669,7 +1755,7 @@ def test_slow_failed_binding_probe_cools_down_from_completion(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("stage", [ChallengeState.SCORING, ChallengeState.CONFIRMING])
-def test_cooldown_probe_keeps_fifo_and_resumes_original_stage(tmp_path, stage):
+def test_operator_resume_keeps_fifo_and_original_stage(tmp_path, stage):
     calls = []
     alerts = []
     configured = ScoringSettings(
@@ -1703,14 +1789,19 @@ def test_cooldown_probe_keeps_fifo_and_resumes_original_stage(tmp_path, stage):
             store, worker_id="worker", settings=configured,
             current_finalized_block=200, evaluator=recovered, now_ms=119,
         ) is None
-        first_result = process_next_scoring(
+        assert process_next_scoring(
             store, worker_id="worker", settings=configured,
             current_finalized_block=200, evaluator=recovered, now_ms=120,
+        ) is None
+        store.resume_blocked(first, occurred_at_ms=121)
+        first_result = process_next_scoring(
+            store, worker_id="worker", settings=configured,
+            current_finalized_block=200, evaluator=recovered, now_ms=122,
         )
         assert first_result is not None and first_result.state is ChallengeState.SUCCEEDED
         later_result = process_next_scoring(
             store, worker_id="worker", settings=configured,
-            current_finalized_block=200, evaluator=recovered, now_ms=121,
+            current_finalized_block=200, evaluator=recovered, now_ms=123,
         )
         assert later_result is not None and later_result.state is ChallengeState.SUCCEEDED
         assert calls == [(first, stage), (first, stage), (later, ChallengeState.SCORING)]

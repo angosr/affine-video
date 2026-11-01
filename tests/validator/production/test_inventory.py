@@ -27,11 +27,17 @@ from validator.production.plan import (
     select_source_proofs,
     validate_source_selection_sequence,
 )
+from validator.production.retries import PrivateRetryStore
 from validator.production.service import PlanCoordinator
 from validator.production.storage import PrivateObjectStore
 from validator.queue import ChallengeState
 from validator.release import verify_competition_manifest
-from validator.scoring import ScoringSettings, StageOutcome, process_next_scoring
+from validator.scoring import (
+    ScoringSettings,
+    StageOutcome,
+    TemporaryScoringError,
+    process_next_scoring,
+)
 from validator.store import ChallengeStore
 
 from .test_storage import MemoryS3, seed_legacy_stage
@@ -1042,16 +1048,78 @@ def test_public_inventory_contains_no_seed_secret_proofs_or_inputs(inventory_cas
     case = inventory_case
     plans = (replace(make_plan(case, 101), completed_at_ms=10**15),
              make_plan(case, 102, 1, ready=False))
+    original = tuple(plan.encode() for plan in plans)
     source = ReadyBatchSource(track=case.track, objects=case.objects, cache_dir=tmp_path)
     status = source.inventory_status(plans)
     assert status["ready_batches"] == status["producing_batches"] == 1
     assert status["target_batches"] == 2
     assert status["commitments"][0]["secret_commitment"] == plans[0].secret_commitment
+    assert [row["completed_block"] for row in status["commitments"]] == [102, None]
+    for plan, payload, row in zip(plans, original, status["commitments"], strict=True):
+        assert plan.encode() == payload
+        assert row["completed_at_ms"] == plan.completed_at_ms
+        assert row["disclose_at_ms"] == (
+            None if plan.completed_at_ms is None else plan.completed_at_ms
+            + case.track.cache.disclosure_delay_seconds * 1000
+        )
+        assert row["ready_sha256"] == (
+            hashlib.sha256(payload).hexdigest() if plan.state == "READY" else None
+        )
     encoded = canonical_json(status)
     for plan in plans:
         assert plan.secret.encode() not in encoded
         assert plan.batch_seed.encode() not in encoded
     assert b"source_proofs" not in encoded and b"sample_cache" not in encoded
+
+
+def test_operator_retry_keeps_original_inventory_cas_claim_and_ready_bytes(
+    inventory_case, tmp_path,
+):
+    case = inventory_case
+    plans = (make_plan(case, 101), make_plan(case, 102, 1))
+    original_plans = tuple(plan.encode() for plan in plans)
+    inventory = Inventory(case.objects, case.track.digest)
+    retries = PrivateRetryStore(case.objects, track_spec_digest=case.track.digest)
+    settings = ScoringSettings(
+        max_attempts=1, restore_retry=retries.restore, record_retry=retries.record_failure,
+    )
+    attempts = []
+
+    def evaluate(task):
+        allocation = claim(inventory, plans, identifier=task.challenge_id,
+                           submission_block=task.position.block)
+        attempts.append((task.submission_id, task.position, allocation))
+        if len(attempts) == 1:
+            raise TemporaryScoringError("GPU_DOWN", "worker unavailable")
+        return StageOutcome(0.7, {})
+
+    path = tmp_path / "operator.db"
+    with ChallengeStore(path) as store:
+        identifier, _ = store.add_submission(submission_at(200), occurred_at_ms=1)
+        for state in (ChallengeState.FETCHING, ChallengeState.VALIDATING, ChallengeState.SCORING):
+            store.transition(identifier, state, occurred_at_ms=2)
+        result = process_next_scoring(
+            store, worker_id="worker", settings=settings, current_finalized_block=300,
+            evaluator=evaluate, now_ms=10,
+        )
+        assert result.state is ChallengeState.SYSTEM_BLOCKED
+        authority = case.objects.get(ALLOCATION_OBJECT)
+    with ChallengeStore(path) as store:
+        assert process_next_scoring(
+            store, worker_id="automatic", settings=settings, current_finalized_block=300,
+            evaluator=evaluate, now_ms=10**9,
+        ) is None
+        retries.reset(identifier, "SCORING")
+        store.resume_blocked(identifier, occurred_at_ms=10**9)
+        result = process_next_scoring(
+            store, worker_id="operator-resumed", settings=settings, current_finalized_block=300,
+            evaluator=evaluate, now_ms=10**9 + 1,
+        )
+        assert result.state is ChallengeState.SUCCEEDED
+        assert store.get_challenge(identifier).attempts == 2
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert case.objects.get(ALLOCATION_OBJECT) == authority
+    assert tuple(plan.encode() for plan in plans) == original_plans
 
 
 def test_slots_remain_family_disjoint_across_different_seeds(inventory_case):

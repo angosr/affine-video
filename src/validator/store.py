@@ -1266,11 +1266,11 @@ class ChallengeStore:
         retry_after_ms: int,
         occurred_at_ms: int | None = None,
     ) -> None:
-        """Cool down exhausted retries without making infrastructure failure a loss."""
+        """Fence exhausted retries until an explicit operator resume, without a loss."""
 
         timestamp = _timestamp(occurred_at_ms)
-        if retry_after_ms <= timestamp:
-            raise ValueError("retry time must be in the future")
+        if retry_after_ms < 0:
+            raise ValueError("retry time must be non-negative")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             current = self._require_lease_locked(identifier, lease_token)
@@ -2194,7 +2194,9 @@ class ChallengeStore:
             "error_summary": public_error_summary(row["error_code"]),
             "duplicate_of": duplicate_of,
             "retry_history": retry_history[-16:],
-            "retry_after_ms": row["retry_after_ms"],
+            "retry_after_ms": (
+                None if row["state"] == ChallengeState.SYSTEM_BLOCKED else row["retry_after_ms"]
+            ),
             "file_sha256": row["file_sha256"],
             "model_digest": row["model_digest"],
             "model_size_bytes": row["model_size_bytes"],
@@ -2309,7 +2311,6 @@ class ChallengeStore:
         parameters: list[Any] = [
             *direct_states,
             ChallengeState.SYSTEM_DEFERRED,
-            ChallengeState.SYSTEM_BLOCKED,
             *stages,
             now,
         ]
@@ -2334,7 +2335,7 @@ class ChallengeStore:
                 WHERE (
                     c.state IN ({direct_placeholders})
                     OR (
-                        c.state IN (?, ?) AND c.resume_state IN ({resume_placeholders})
+                        c.state = ? AND c.resume_state IN ({resume_placeholders})
                         AND c.retry_after_ms <= ?
                     )
                 )
@@ -2351,7 +2352,7 @@ class ChallengeStore:
             current = ChallengeState(row["state"])
             effective_stage = (
                 ChallengeState(row["resume_state"])
-                if current in {ChallengeState.SYSTEM_DEFERRED, ChallengeState.SYSTEM_BLOCKED}
+                if current is ChallengeState.SYSTEM_DEFERRED
                 else current
             )
             if scoring_ready_through_block is not None:
@@ -2417,7 +2418,7 @@ class ChallengeStore:
                     error_summary=None,
                     details=None,
                 )
-            elif current in {ChallengeState.SYSTEM_DEFERRED, ChallengeState.SYSTEM_BLOCKED}:
+            elif current is ChallengeState.SYSTEM_DEFERRED:
                 target = ChallengeState(row["resume_state"])
                 self._transition_locked(
                     row["challenge_id"],

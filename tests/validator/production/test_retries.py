@@ -8,6 +8,7 @@ from validator.production.commitment import canonical_json
 from validator.production.retries import PrivateRetryStore
 from validator.production.storage import RETRY_STATE_NAMESPACE, PrivateObjectStore
 from validator.queue import ChainPosition, ChallengeState
+from validator.retries import persist_retry_failure
 from validator.store import LeasedChallenge
 
 from .test_storage import MemoryS3
@@ -134,11 +135,72 @@ def test_retry_state_is_cas_idempotent_blocking_and_resettable() -> None:
     } == {
         f"tracks/abc/{RETRY_STATE_NAMESPACE}/{second_task.challenge_id}/scoring.json"
     }
+    before = dict(client.objects)
     probe = retries.record_failure(
         replace(second_task, lease_token="automatic-probe", attempts=3), "SCORING",
         code="GPU_DOWN", summary="still unavailable", retry_after_ms=400, max_attempts=2,
     )
-    assert probe.blocked and probe.attempts == 3 and probe.retry_after_ms == 400
+    assert probe == blocked
+    assert client.objects == before
 
     retries.reset(second_task.challenge_id, "SCORING")
     assert retries.restore(replace(second_task, lease_token="lease-3"), "SCORING") is None
+    reset = json.loads(next(iter(client.objects.values()))[0])
+    assert reset["generation"] == 2 and reset["attempts"] == 0
+    resumed = retries.record_failure(
+        replace(first_task, lease_token="operator-resumed"), "SCORING",
+        code="GPU_DOWN", summary="worker unavailable", retry_after_ms=500, max_attempts=2,
+    )
+    assert resumed.attempts == 1 and not resumed.blocked
+
+
+def test_legacy_deferred_checkpoint_cannot_record_past_the_current_budget():
+    client = MemoryS3()
+    objects = PrivateObjectStore(client, bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    original = task(lease_token="old", attempts=1)
+    retries.record_failure(original, "SCORING", code="GPU_DOWN", summary="outage",
+                           retry_after_ms=200, max_attempts=2)
+    before = dict(client.objects)
+    with pytest.raises(RuntimeError, match="operator reset"):
+        retries.record_failure(replace(original, lease_token="new", attempts=2), "SCORING",
+                               code="GPU_DOWN", summary="outage", retry_after_ms=300,
+                               max_attempts=1)
+    assert client.objects == before
+
+
+@pytest.mark.parametrize("attempts", [1, 3])
+def test_blocked_recorder_ordinal_mismatch_fails_without_new_io_or_cas(monkeypatch, attempts):
+    client = MemoryS3()
+    objects = PrivateObjectStore(client, bucket="private", prefix="tracks/abc")
+    retries = PrivateRetryStore(objects, track_spec_digest="ef" * 32)
+    first = task(lease_token="first", attempts=1)
+    retries.record_failure(first, "SCORING", code="GPU_DOWN", summary="worker unavailable",
+                           retry_after_ms=200, max_attempts=2)
+    retries.record_failure(replace(first, lease_token="last", attempts=2), "SCORING",
+                           code="GPU_DOWN", summary="worker unavailable",
+                           retry_after_ms=300, max_attempts=2)
+    before = dict(client.objects)
+    reads = []
+    get = client.get_object
+
+    def read_checkpoint(**kwargs):
+        reads.append(kwargs)
+        return get(**kwargs)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("an exhausted ordinal cannot write CAS or perform other object I/O")
+
+    monkeypatch.setattr(client, "get_object", read_checkpoint)
+    for method in ("put_object", "delete_object", "head_object", "list_objects_v2"):
+        monkeypatch.setattr(client, method, forbidden)
+    with pytest.raises(RuntimeError, match="ordinal disagrees"):
+        persist_retry_failure(
+            replace(first, lease_token="stale-or-extra", attempts=attempts), stage="SCORING",
+            code="GPU_DOWN", summary="still unavailable", retry_after_ms=400,
+            max_attempts=2, record=retries.record_failure,
+        )
+    assert client.objects == before
+    assert reads == [{"Bucket": "private", "Key": (
+        f"tracks/abc/{RETRY_STATE_NAMESPACE}/{first.challenge_id}/scoring.json"
+    )}]
