@@ -48,6 +48,43 @@ SQLite, loads a wallet or changes a pointer. Missing historical evidence remains
 The candidate implementation has CPU coverage; it is not a report of deployed evidence or
 new GPU measurements. Private loser payloads remain private.
 
+### Evidence ownership and lifetime
+
+The maintained path is submission → original allocation CAS → paired scoring → original
+stage archive → immutable match reference → existing public publisher → shared verification.
+There is no evidence scheduler, second selection authority, retry table or separate audit DB.
+The following table groups fields with the same writer and lifetime; it is documentation,
+not a new inventory or state file.
+
+| Fact or field group | Sole writer and authoritative storage | Consumers and public timing | Retention and cleanup |
+| --- | --- | --- | --- |
+| Original S, hotkey, file/model digest and opportunity | Existing admission/scanner and original admission/SQLite records | Existing FIFO admission, claim and tournament; existing public submission/match projections | Preserve original recovery and uniqueness history; this candidate changes no retention or opportunity. |
+| `selection.inputs`: complete observed plan versions and enumeration pages | `Inventory.claim` writes one hash-named immutable attachment under `stages/<challenge>/<stage>.inputs/` before CAS | `Inventory.read/observed_plans` and the original plan validator recompute candidates. The successful original allocation CAS row is the only association authority. Full inputs remain private, including plans not yet due. | Keep every attachment referenced by a claim or archived stage. A pre-CAS attachment may be unreferenced after contention/crash: remove only in an authorized quiescent maintenance window after checking all original claim/stage references and in-flight writers. Never delete it online merely because one CAS lost. No automatic GC or cleanup daemon is added. |
+| `selection`: algorithm/source, observed pool interval, successful attempt clock, predecessor SHA, candidate order/eligibility and input hash | Successful row in the original `plans/allocations.json` CAS; retries reuse that row | `Inventory.read`, admission/stage binding and the audit projection. This records complete observed enumeration, not a globally atomic pool. | Keep as original assignment history. The attachment freezes observed plan versions that may later advance from PLANNED to READY; it is not an alternative plan or pool authority. Repeated CAS attempts reuse identical hash-named input bytes. |
+| `reproducibility`: model SHA, ordered cells/design, aggregation/bootstrap policy and observed execution/release facts | Actual paired worker computes once; `archive_stage` seals it in the original `stages/<challenge>/<stage>.json` before recording the SQLite result | Cold restore, tournament projection and the shared CPU verifier. The case design must equal the authenticated plan and verified cache metadata order. | Preserve the immutable stage while its decision/evidence is referenced. A public redaction does not replace the private original. No GPU rerun or current-runtime backfill is allowed. |
+| `audit_context`: original data/S identity, R, claim SHA and local CAS observation bounds | Same one-time stage archive, derived from the existing original allocation and verified batch | Public projection and verifier; upper bound is a confirmed client read, not an exact server CAS timestamp | Same lifetime as the stage; never recalculate clocks on restart/publication. |
+| `stage_evidence` / `public_audit` object, SHA, size and not-before reference | `archive_stage` derives references from sealed bytes; original SQLite stage and immutable match contain projections | Existing tournament/publication, restore and read-only verification | After successful archival, SQLite keeps summaries/references, not duplicate cells, execution bodies, claim snapshots or audit context. Existing DB rows are not rewritten. Keep immutable match references and their original objects; no new mutable pointer or cleanup status is maintained. |
+| `score_audits/<challenge>/<stage>.json` | Existing unique public publisher writes exactly `public_score_audit(original_stage)`; hash is sealed before the match | Ordinary public GET, `verify-match` and `audit`, only after original R and an actual committed match/weights fence. No future plan bodies, losing model payloads or secrets are copied. | The public object itself is the publication receipt. Keep it while the immutable match references it. Existing in-process confirmed-byte memoization is disposable on restart, not a persistent verification cache or ledger. |
+| Safe diagnostics / duplicate pointer / retry origins / exclusions | Existing private events and exclusion rows remain authoritative; public status is an allowlisted projection | Monitor and status readers; no raw exception text or new retry/selection source | Existing status pointer is replaced by the normal publisher; retain original private history under its existing policy. Unknown historical fields remain unknown. |
+| `verification_scope` / `model_inference_reproduced` | Computed stdout of the shared verifier; never persisted as competition state | User-facing verification result | No object or state to clean. Statistics plus original plan design is still not replay of private model inference. |
+
+`public_score_audit` is the sole serializer of the public redaction. The publisher,
+`verify-match`, and the score-audit pass of `audit` all call `verify_public_score_audit`;
+the latter first obtains the ledger through `S3Repository.load`. The public stage reference
+does not point readers at a credential-protected cells file: the existing disclosure pass
+uploads actual small public JSON bytes, with at most one new audit per pass. Errors use that
+same loop and its existing error reporting; an existing public object is reused before any
+private read. Late scoring still publishes its audit when bulk data was disclosed earlier.
+Audit uploads never write the four mutable competition pointers.
+
+This is a source-and-CPU candidate, not a deployed or real-miner evidence receipt. Production
+installation and a subsequent natural match/disclosure/readback remain operator acceptance.
+Historical missing execution/cells/first-allocation observations stay unknown. Public selection
+evidence authenticates the recorded observation and commitments; it cannot prove a globally
+atomic pool or independently inspect private candidate plan bodies before their original R.
+No automatic orphan-attachment reclamation is claimed. Current immutable evidence has no TTL;
+any later evidence-retirement policy must preserve active references and be explicitly approved.
+
 ## Protocol and rules proposals awaiting explicit decisions
 
 The following are design boundaries, not implemented changes or release prerequisites.

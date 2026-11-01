@@ -9,6 +9,9 @@
   Missing historical cells, execution identity or first-allocation observations stay unknown.
 - Reuse public audit receipts before reading private stage inputs. Candidate input evidence
   records complete observed enumeration and original plan facts, not a globally atomic pool.
+- Document each evidence authority, consumer, disclosure boundary and cleanup condition in
+  the existing operations guide; remove the superseded set-only case check and duplicate
+  SQLite evidence bodies after successful immutable stage archival.
 - Add credential-free, read-only `veda audit` through `S3Repository.load`.
 - Bind original case count, geometry and ordered route/rollout/source/step/window design
   when capturing or restoring stage evidence. Public `verify-match` reports statistics-only
