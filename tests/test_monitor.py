@@ -93,6 +93,18 @@ def test_monitor_renders_all_active_competitors_in_uid_order() -> None:
     assert "do not affect tournament rank" in rendered
 
 
+def test_monitor_shows_locked_threshold_and_safe_diagnostics():
+    rendered = render_status({"participants": [{
+        "hotkey": "abcdef", "score": .95, "score_gain": -.0004, "minimum_gain": .00269,
+        "error_code": "SCORING_CACHE_UNAVAILABLE", "error_summary": "SECRET raw frame",
+        "duplicate_of": "ab" * 32, "retry_history": [{"source": "automatic"}],
+    }]}, color=False)
+    assert "LCB" in rendered and "THETA" in rendered and "0.002690" in rendered
+    assert "-0.000400" in rendered and "original bound scoring cache" in rendered
+    assert "duplicate_of=" + "ab" * 32 in rendered and "retry source=automatic" in rendered
+    assert "SECRET" not in rendered
+
+
 @pytest.mark.parametrize("phase", ["SCHEDULED", "ACCEPTING"])
 def test_monitor_displays_only_the_reported_phase(phase):
     rendered = render_status(

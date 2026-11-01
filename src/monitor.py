@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from validator.alerts import public_duplicate_of, public_error_summary
 from validator.publication import PublicArtifactError, validate_public_weights_url
 
 _MAX_STATUS_BYTES = 1024 * 1024
@@ -71,10 +72,12 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
         "MATCH",
         "TRIES",
         "SCORE",
-        "GAIN",
+        "LCB",
+        "THETA",
         "RESULT",
     )
     rows: list[tuple[str, ...]] = []
+    diagnostics = []
     for raw in participants:
         if not isinstance(raw, Mapping):
             raise PublicArtifactError("public status participant is invalid")
@@ -91,6 +94,14 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
         score = raw.get("score")
         gain = raw.get("score_gain")
         outcome = raw.get("outcome")
+        if raw.get("error_code"):
+            diagnostics.append(f"{hotkey[:6]}: {public_error_summary(raw['error_code'])}")
+        duplicate = public_duplicate_of(raw.get("duplicate_of"))
+        if duplicate:
+            diagnostics.append(f"{hotkey[:6]}: duplicate_of={duplicate}")
+        history = raw.get("retry_history", [])
+        if history and history[-1].get("source") in {"automatic", "operator"}:
+            diagnostics.append(f"{hotkey[:6]}: last retry source={history[-1]['source']}")
         rows.append(
             (
                 str(raw.get("uid", "?")),
@@ -102,6 +113,8 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
                 str(raw.get("attempts", 0)),
                 f"{float(score):.6f}" if isinstance(score, (int, float)) else "-",
                 f"{float(gain):+.6f}" if isinstance(gain, (int, float)) else "-",
+                (f"{float(raw['minimum_gain']):.6f}"
+                 if isinstance(raw.get("minimum_gain"), (int, float)) else "-"),
                 str(outcome) if outcome is not None else "-",
             )
         )
@@ -144,6 +157,8 @@ def render_status(status: Mapping[str, Any], *, color: bool | None = None) -> st
         )
     else:
         lines.append("No participants yet")
+    if diagnostics:
+        lines.extend(["", *diagnostics])
     system_matches = status.get("system_matches", [])
     if not isinstance(system_matches, Sequence) or isinstance(system_matches, (str, bytes)):
         raise PublicArtifactError("public status system matches are invalid")

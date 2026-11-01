@@ -5,23 +5,25 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import hashlib
+import io
 import json
 import logging
 import os
 import re
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
 from miner.submit import private_model_source
 from scoring.spec import TrackSpec, data_spec_logical_name, parse_track_spec, track_spec_dict
+from validator.alerts import public_duplicate_of, public_error_summary
 from validator.chunks import (
     ChunkManifest,
     build_chunk_manifest,
@@ -269,6 +271,7 @@ def build_public_artifacts(
         snapshot["challenges"],
         system_matches=system_match_summaries(system_matches),
         historical_matches=historical_matches,
+        exclusions=snapshot.get("exclusions", []),
     )
     if release_approval is not None and runtime_manifest is not None:
         status["runtime_release"] = release_approval.public_identity(track, runtime_manifest)
@@ -660,6 +663,79 @@ def validate_public_weights_url(url: str) -> str:
     return url
 
 
+class _PublicHTTPBody(io.RawIOBase):
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+        self.chunks = iter(response.iter_bytes(chunk_size=65536))
+        self.pending = b""
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        while not self.pending:
+            try:
+                self.pending = next(self.chunks)
+            except StopIteration:
+                self.response.close()
+                return 0
+        size = min(len(buffer), len(self.pending))
+        buffer[:size], self.pending = self.pending[:size], self.pending[size:]
+        return size
+
+    def close(self) -> None:
+        self.response.close()
+        super().close()
+
+
+class _PublicHTTPReader:
+    """Only adapt public GETs; all ledger and byte validation stays in S3Repository.load."""
+    def __init__(self, client: httpx.Client, base_url: str, bucket: str, prefix: str) -> None:
+        validate_public_weights_url(base_url)
+        if urlparse(base_url).query:
+            raise ValueError("public audit base URL must not contain a query")
+        self.client, self.base_url = client, base_url.rstrip("/")
+        self.bucket, self.prefix = bucket, prefix + "/"
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+        name = Key.removeprefix(self.prefix)
+        if (Bucket != self.bucket or not Key.startswith(self.prefix)
+                or not _STORAGE_PREFIX.fullmatch(name) or ".." in name.split("/")):
+            raise PublicArtifactError("public audit object lies outside its fixed prefix")
+        response = self.client.send(self.client.build_request(
+            "GET", self.base_url + "/" + quote(name, safe="/"),
+            headers={"Cache-Control": "no-cache", "Accept-Encoding": "identity"},
+        ), stream=True)
+        missing = response.status_code == 404
+        if response.status_code == 400:
+            error = bytearray()
+            for part in response.iter_bytes(chunk_size=8192):
+                error.extend(part)
+                if len(error) > 8192:
+                    break
+            if len(error) <= 8192:
+                try:
+                    document = json.loads(error)
+                    missing = (str(document.get("statusCode")) == "404"
+                               and document.get("error") == "not_found")
+                except (ValueError, AttributeError):
+                    pass
+        if missing:
+            response.close()
+            error = PublicArtifactError("public audit object is missing")
+            error.response = {"Error": {"Code": "NoSuchKey"}}
+            raise error
+        try:
+            response.raise_for_status()
+            if response.headers.get("content-encoding", "identity") != "identity":
+                raise PublicArtifactError("public audit requires original identity-encoded bytes")
+        except Exception:
+            response.close()
+            raise
+        return {"Body": io.BufferedReader(_PublicHTTPBody(response)),
+                "ETag": response.headers.get("etag")}
+
+
 class S3Repository:
     """Persist versioned match facts and publish bounded current-state pointers."""
 
@@ -699,6 +775,11 @@ class S3Repository:
             handle.close()
             raise PublicArtifactError("another evaluator holds the public writer lock") from exc
         self._writer_lock = handle
+
+    @classmethod
+    def from_public_http(cls, client: httpx.Client, *, base_url: str) -> S3Repository:
+        return cls(_PublicHTTPReader(client, base_url, "public", "tracks/main"),
+                   bucket="public", prefix="tracks/main")
 
     def close(self) -> None:
         if self._writer_lock is not None:
@@ -1453,7 +1534,10 @@ class S3Repository:
             initial_champion=genesis_champion(track),
             historical_matches=history,
         )
-        if summary != _summary_document(track, source_block, tournament):
+        if summary not in (
+            _summary_document(track, source_block, tournament),
+            _legacy_summary_document(track, source_block, tournament),
+        ):
             raise PublicArtifactError("public summary does not match its immutable matches")
 
         matches.extend(self._load_following_matches(track, match_count + 1, incumbent))
@@ -2026,6 +2110,23 @@ def _summary_document(
     }
 
 
+def _legacy_summary_document(track: TrackSpec, source_block: int,
+                             tournament: Tournament) -> dict[str, Any]:
+    """Read existing mutable summaries without reinterpreting immutable match bytes.
+
+    Only the former display order is reproduced. New publications never use it.
+    """
+    document = _summary_document(track, source_block, tournament)
+    rows = [{k: v for k, v in row.items() if k not in {"rank", "comparison"}}
+            for row in tournament.leaderboard]
+    if rows:
+        rows = rows[:1] + sorted(rows[1:], key=lambda row: (
+            -row["score"], row["block_height"], row["extrinsic_index"], row["event_index"]))
+    document["leaderboard"] = [{"rank": i, **row} for i, row in enumerate(rows, 1)][
+        :_SUMMARY_LEADERBOARD_LIMIT]
+    return document
+
+
 def _terminal_match_fence(tournament: Tournament) -> tuple[int, str | None]:
     """Bind mutable weights to the immutable terminal match in their snapshot."""
 
@@ -2046,6 +2147,7 @@ def _status_document(
     *,
     system_matches: list[dict[str, Any]],
     historical_matches: tuple[MatchRecord, ...] = (),
+    exclusions: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Build the bounded live view used by the operator monitor."""
 
@@ -2116,8 +2218,7 @@ def _status_document(
                 "state": challenge["state"],
                 "queue_position": None,
                 "match_sequence": None if match is None else match.sequence,
-                "score": (match.final_score if historical and match is not None else
-                          tournament.champion.score if is_champion else
+                "score": (match.final_score if match is not None else
                           challenge["final_score"] if challenge["final_score"] is not None
                           else latest_score),
                 "file_sha256": challenge.get("file_sha256"),
@@ -2138,6 +2239,17 @@ def _status_document(
                     else challenge["attempts"]
                 ),
                 "error_code": challenge["error_code"],
+                "error_summary": public_error_summary(challenge["error_code"]),
+                "duplicate_of": public_duplicate_of(challenge.get("duplicate_of")),
+                "retry_history": [{key: row[key] for key in (
+                    "source", "sequence", "stage", "occurred_at_ms",
+                )} for row in challenge.get("retry_history", [])[-16:]
+                    if row.get("source") in {"operator", "automatic"}
+                    and row.get("stage") in {"FETCHING", "VALIDATING", "SCORING", "CONFIRMING"}
+                    and type(row.get("sequence")) is int
+                    and type(row.get("occurred_at_ms")) is int],
+                "retry_after_ms": challenge.get("retry_after_ms"),
+                "minimum_gain": (None if match is None else match.document["minimum_gain"]),
                 "alert": challenge["state"] == "SYSTEM_BLOCKED",
             }
         )
@@ -2160,6 +2272,7 @@ def _status_document(
             "batch_generated_block": None if batch is None else batch["generated_block"],
             "outcome": original.outcome, "champion": True, "attempts": None,
             "error_code": evaluation["error_code"], "alert": False,
+            "minimum_gain": original.document["minimum_gain"],
         })
     waiting = [
         row
@@ -2183,6 +2296,7 @@ def _status_document(
         "champion": tournament.champion.public(),
         "system_matches": system_matches,
         "participants": active_rows,
+        "exclusions": list(exclusions),
     }
 
 

@@ -77,6 +77,62 @@ def test_public_monitor_needs_no_miner_or_validator_setup(monkeypatch, capsys) -
     assert "ACCEPTING" in capsys.readouterr().out
 
 
+def test_public_audit_reuses_s3_load_and_http_gets_without_credentials(monkeypatch, capsys):
+    import asyncio
+    import hashlib
+
+    import httpx
+
+    from scoring.spec import parse_track_spec
+    from tests.scoring.test_spec import valid_spec
+    from validator.production.commitment import Artifact, ArtifactManifest, canonical_json
+    from validator.publication import S3Repository, build_genesis_artifacts
+    from validator.weights import WeightChainState
+
+    manifest = ArtifactManifest((Artifact("fixture/identity", "ab" * 32, 1, "artifacts/fixture"),))
+    raw = valid_spec()
+    raw["artifact_manifest_sha256"] = manifest.digest
+    track = parse_track_spec(raw)
+    artifacts = build_genesis_artifacts(
+        track, WeightChainState(120, {track.initial_champion.hotkey: 0}, 1, 1.0, 10, {}),
+        version_key=0,
+    )
+    objects = {"track.json": artifacts.track, "summary.json": artifacts.summary,
+               "weights.json": artifacts.weights,
+               f"runtime/{manifest.digest}/manifest.json": manifest.encode()}
+    methods, loads = [], []
+
+    def handler(request):
+        methods.append(request.method)
+        assert request.method == "GET" and "authorization" not in request.headers
+        body = objects.get(request.url.path.removeprefix("/tracks/main/"))
+        if body is None:
+            return httpx.Response(400, json={"statusCode": "404", "error": "not_found"})
+        return httpx.Response(200, content=body, headers={"etag": hashlib.sha256(body).hexdigest()})
+
+    original_client, original_load = httpx.Client, S3Repository.load
+
+    async def load(self, *args, **kwargs):
+        loads.append(True)
+        return await original_load(self, *args, **kwargs)
+
+    monkeypatch.setattr(S3Repository, "load", load)
+    monkeypatch.setattr(S3Repository, "from_environment",
+                        lambda **_k: pytest.fail("audit read private credentials"))
+    monkeypatch.setattr(cli_module.httpx, "Client", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(handler), **kwargs))
+    main(["audit", "--public-base-url", "https://public.example/tracks/main"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["committed_matches"] == 0 and loads == [True]
+    assert result["unknown_stage_evidence"] == 0 and set(methods) == {"GET"}
+    assert not asyncio.iscoroutine(result)
+    # Corrupt public summary facts remain fatal; audit never falls back to status.json.
+    objects["summary.json"] = canonical_json({**json.loads(artifacts.summary), "match_count": 1})
+    with pytest.raises(SystemExit) as stopped:
+        main(["audit", "--public-base-url", "https://public.example/tracks/main"])
+    assert stopped.value.code == 1
+
+
 def test_public_monitor_watch_and_custom_url(monkeypatch, capsys) -> None:
     calls = []
 

@@ -628,6 +628,20 @@ def test_duplicate_hotkey_is_terminally_rejected_and_excluded_from_rankings() ->
     ]
 
 
+def test_comparison_view_keeps_champion_then_recency_without_cross_batch_score_ranks():
+    tournament = resolve([
+        challenge(1, "winner", score=.8, incumbent_score=.7, paired_gain=.02),
+        challenge(2, "high-mean-loss", score=.99, incumbent_score=.98, paired_gain=.005),
+        challenge(3, "recent-loss", score=.4, incumbent_score=.39, paired_gain=.004),
+    ])
+    assert [row["hotkey"] for row in tournament.leaderboard] == [
+        "winner", "recent-loss", "high-mean-loss", "genesis-hotkey",
+    ]
+    assert [row["rank"] for row in tournament.leaderboard] == [1, None, None, None]
+    assert tournament.leaderboard[1]["comparison"]["gain_lower_bound"] == .004
+    assert tournament.leaderboard[1]["comparison"]["minimum_gain"] == .01
+
+
 def test_tournament_rejects_a_second_non_rejected_submission_for_one_hotkey() -> None:
     with pytest.raises(ValueError, match="later submissions"):
         resolve(

@@ -87,6 +87,45 @@ def settings(tmp_path) -> AdmissionSettings:
     )
 
 
+def test_resigned_official_baseline_is_not_a_new_model_or_a_fake_genesis_record(tmp_path):
+    from scoring.model import validate_model
+
+    baseline = tmp_path / "official.safetensors"
+    save_file({"selector.weight": np.ones((2, 2), dtype=np.float32)}, baseline)
+    original = validate_model(baseline, schema=SCHEMA, max_bytes=10_000)
+    submitted = tmp_path / "resigned.safetensors"
+    write_model(submitted, "hk1")
+    resigned = validate_model(submitted, schema=SCHEMA, max_bytes=10_000, expected_hotkey="hk1")
+    assert resigned.file_sha256 != original.file_sha256
+    assert resigned.model_digest == original.model_digest
+    objects = PrivateObjectStore(MemoryS3(), bucket="private", prefix="test")
+    source = ReadyBatchSource(track=SimpleNamespace(digest="ab" * 32), objects=objects,
+                              cache_dir=tmp_path / "archive")
+    config = replace(settings(tmp_path), baseline_model_digest=original.model_digest,
+                     archive_rejection=source.archive_rejection, restore=source.restore_admission)
+    with ChallengeStore(tmp_path / "baseline.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(
+            store, worker_id="fixture", current_finalized_block=110, now_ms=10,
+            settings=config,
+            downloader=model_downloader(submitted),
+        )
+        assert outcome.code == "BASELINE_DUPLICATE" and outcome.duplicate_of == "genesis"
+        assert store.get_challenge(identifier).state is ChallengeState.PARTICIPANT_FAILED
+        assert store.public_challenge(identifier)["duplicate_of"] == "genesis"
+        assert store.model_owner(original.model_digest) is None
+        assert len(store.public_snapshot()["challenges"]) == 1
+    with ChallengeStore(tmp_path / "cold-baseline.db") as store:
+        identifier, _ = store.add_submission(submission_at(100, "hk1"), occurred_at_ms=1)
+        outcome = process_next_admission(
+            store, worker_id="cold", current_finalized_block=120, now_ms=20, settings=config,
+            downloader=lambda *_a, **_k: pytest.fail("baseline rejection redownloaded"),
+        )
+        assert outcome.code == "BASELINE_DUPLICATE"
+        assert store.public_challenge(identifier)["duplicate_of"] == "genesis"
+        assert store.model_owner(original.model_digest) is None
+
+
 @pytest.mark.parametrize("crash", [False, True])
 def test_no_pre_submission_pool_preserves_opportunity_and_cold_decision(tmp_path, crash):
     objects = PrivateObjectStore(MemoryS3(), bucket="private-data", prefix="test")

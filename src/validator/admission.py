@@ -65,6 +65,7 @@ class AdmissionSettings:
     record_retry: RetryRecorder | None = None
     eligible: Callable[[object], bool] | None = None
     private_download: Callable[..., DownloadedModel] | None = None
+    baseline_model_digest: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -82,6 +83,12 @@ class AdmissionSettings:
             raise ValueError("retry base cannot exceed retry maximum")
         if (self.restore_retry is None) != (self.record_retry is None):
             raise ValueError("durable admission retry callbacks must be configured together")
+        if self.baseline_model_digest is not None and (
+            not isinstance(self.baseline_model_digest, str)
+            or len(self.baseline_model_digest) != 64
+            or any(c not in "0123456789abcdef" for c in self.baseline_model_digest)
+        ):
+            raise ValueError("official baseline digest is invalid")
         if self.archive_rejection is not None and self.restore is None:
             raise ValueError("archived admission rejections require a restore callback")
 
@@ -332,6 +339,14 @@ def process_next_admission(
             summary="cached model changed during validation",
         )
 
+    if validated.model_digest == settings.baseline_model_digest:
+        return _reject_participant(
+            store, task, settings,
+            _observed_rejection(store, task, "BASELINE_DUPLICATE",
+                                "model tensors duplicate the official baseline",
+                                current_finalized_block, duplicate_of="genesis"),
+            current_finalized_block=current_finalized_block, clock=clock,
+        )
     duplicate_owner = store.model_owner(validated.model_digest)
     if duplicate_owner is not None:
         return _reject_exact_duplicate(
@@ -427,6 +442,7 @@ def _reject_participant(
                 score_block=rejection.score_block,
                 file_sha256=rejection.file_sha256,
                 model_size_bytes=rejection.model_size_bytes,
+                duplicate_of=rejection.duplicate_of,
             )
             return AdmissionOutcome(
                 task.challenge_id,

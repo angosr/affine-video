@@ -353,13 +353,24 @@ def resolve_tournament(
                 for candidate in leaderboard_candidates
                 if candidate.challenge_id != champion.challenge_id
             ),
-            key=_champion_order,
+            key=lambda candidate: candidate.position,
+            reverse=True,
         )
     )
-    leaderboard = tuple(
-        {"rank": rank, **candidate.public()} for rank, candidate in enumerate(ranked, start=1)
-    )
-    return Tournament(tuple(matches), champion, leaderboard)
+    by_id = {match.challenge_id: match for match in (*historical_matches, *matches)}
+    leaderboard = []
+    for candidate in ranked:
+        match = by_id.get(candidate.challenge_id)
+        comparison = None if match is None else {
+            "challenger_score": match.final_score,
+            "incumbent_score": match.document["evaluation"]["incumbent_score"],
+            "gain_lower_bound": match.score_gain, "minimum_gain": match.document["minimum_gain"],
+            "batch_sha256": (None if match.document["evaluation"]["evaluation_batch"] is None
+                             else match.document["evaluation"]["evaluation_batch"]["sha256"]),
+        }
+        leaderboard.append({"rank": 1 if candidate.challenge_id == champion.challenge_id else None,
+                            **candidate.public(), "comparison": comparison})
+    return Tournament(tuple(matches), champion, tuple(leaderboard))
 
 
 def recorded_match(document: Mapping[str, Any], *, netuid: int) -> MatchRecord:
@@ -722,10 +733,6 @@ def _position(value: Mapping[str, Any]) -> ChainPosition:
         _integer(value.get("extrinsic_index"), "extrinsic_index"),
         _integer(value.get("event_index"), "event_index"),
     )
-
-
-def _champion_order(value: Champion) -> tuple[float, ChainPosition]:
-    return (-value.score, value.position)
 
 
 def _required_string(value: Mapping[str, Any], key: str) -> str:

@@ -11,6 +11,8 @@ from collections.abc import Sequence
 from math import isfinite
 from pathlib import Path
 
+import httpx
+
 from miner.chain import submit_model
 from miner.prepare import prepare_model
 from miner.submit import ModelSubmission, PrivateModelSubmission, SubmissionFormatError
@@ -46,6 +48,11 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         help="refresh continuously at this positive interval",
     )
+
+    audit_ledger = modules.add_parser(
+        "audit", help="read-only ledger and published-byte audit; disclosed payloads may be large")
+    audit_ledger.add_argument("--public-base-url", default=DEFAULT_PUBLIC_STATUS_URL.removesuffix(
+        "/status.json"))
 
     miner = modules.add_parser("miner", help="commit a pinned model reference")
     miner_commands = miner.add_subparsers(dest="command", required=True)
@@ -109,7 +116,7 @@ def _parser() -> argparse.ArgumentParser:
     policy_action = policy.add_mutually_exclusive_group(required=True)
     policy_action.add_argument("--write", type=Path)
     policy_action.add_argument("--verify", type=Path)
-    leaderboard = evaluator_commands.add_parser("leaderboard", help="inspect local rankings")
+    leaderboard = evaluator_commands.add_parser("leaderboard", help="inspect local comparisons")
     leaderboard.add_argument("--database", required=True)
     challenges = evaluator_commands.add_parser("challenges", help="inspect local challenges")
     challenges.add_argument("--database", required=True)
@@ -176,6 +183,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser.parse_args(argv)
     if arguments.module == "verify-match":
         _verify_match(parser, arguments)
+        return
+    if arguments.module == "audit":
+        _audit_ledger(parser, arguments.public_base_url)
         return
     if arguments.module == "monitor":
         try:
@@ -282,6 +292,45 @@ def _run_miner(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -
     except (SubmissionFormatError, OSError, RuntimeError, ValueError) as exc:
         parser.exit(1, f"error: {exc}\n")
     print(json.dumps(output, sort_keys=True))
+
+
+def _audit_ledger(parser: argparse.ArgumentParser, base_url: str) -> None:
+    from scoring.spec import parse_track_spec
+    from validator.publication import _decode_track_document
+    from validator.reproducibility import verify_public_score_audit
+
+    async def audit(repository):
+        pointer = repository._get_optional("track.json")
+        if pointer is None:
+            raise ValueError("public track is missing")
+        track = parse_track_spec(_decode_track_document(pointer)["spec"])
+        ledger = await repository.load(track)
+        proofs, unknown, sealed = [], 0, 0
+        for match in (*ledger.historical_matches, *ledger.matches):
+            for stage in match.document["evaluation"]["stages"]:
+                reference = stage.get("stage_evidence", {}).get("public_audit")
+                if reference is None:
+                    unknown += 1
+                    continue
+                payload = repository._get_optional(reference["object"])
+                if payload is None:
+                    sealed += 1
+                    continue
+                proofs.append(verify_public_score_audit(
+                    payload, json.dumps(match.document, sort_keys=True, separators=(",", ":"),
+                                        ensure_ascii=False).encode(), track))
+        return {"track_spec_digest": track.digest, "source_block": ledger.source_block,
+                "committed_matches": ledger.committed_match_count,
+                "historical_matches": len(ledger.historical_matches),
+                "score_audits": proofs, "unknown_stage_evidence": unknown,
+                "sealed_or_unpublished_score_audits": sealed}
+
+    try:
+        with httpx.Client(follow_redirects=False, timeout=30, trust_env=False) as client:
+            result = asyncio.run(audit(S3Repository.from_public_http(client, base_url=base_url)))
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, httpx.HTTPError) as exc:
+        parser.exit(1, f"error: {exc}\n")
+    print(json.dumps(result, sort_keys=True))
 
 
 def _verify_match(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:

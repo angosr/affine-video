@@ -453,9 +453,45 @@ def test_leaderboard_orders_each_hotkeys_only_authoritative_score(tmp_path) -> N
 
         entries = store.leaderboard()
         assert len(entries) == 2
-        assert entries[0].challenge_id == older
-        assert entries[0].final_score == 0.9
-        assert entries[1].challenge_id == newer
+        assert entries[0].challenge_id == newer
+        assert entries[0].final_score == 0.5
+        assert entries[1].challenge_id == older
+
+
+def test_public_diagnostics_expose_safe_retry_origins_and_duplicate_reference(tmp_path):
+    import json
+
+    with ChallengeStore(tmp_path / "diagnostics.db") as store:
+        identifier, _ = store.add_submission(submission_at(100), occurred_at_ms=1)
+        task = store.claim_next_admission("worker", ready_through_block=200, lease_ms=10, now_ms=2)
+        store.defer_leased(identifier, task.lease_token, retry_after_ms=20,
+                           error_code="MODEL_DOWNLOAD_FAILED",
+                           error_summary="https://user:SECRET@private.example/?token=SECRET",
+                           occurred_at_ms=3)
+        assert "SECRET" not in json.dumps(store.public_challenge(identifier))
+        task = store.claim_next_admission("worker", ready_through_block=200, lease_ms=10, now_ms=20)
+        store.block_leased(identifier, task.lease_token, error_code="MODEL_ARCHIVE_UNAVAILABLE",
+                           error_summary="private frame SECRET", retry_after_ms=40,
+                           occurred_at_ms=21)
+        store.resume_blocked(identifier, occurred_at_ms=22)
+        task = store.claim_next_admission("worker", ready_through_block=200, lease_ms=10, now_ms=23)
+        # Normal expiry is recorded as another automatic recovery, without changing S.
+        task = store.claim_next_admission("worker", ready_through_block=200, lease_ms=10, now_ms=34)
+        store.complete_challenge(identifier, ChallengeState.PARTICIPANT_FAILED,
+                                  error_code="EXACT_DUPLICATE", error_summary="SECRET",
+                                  duplicate_of="ab" * 32, lease_token=task.lease_token,
+                                  occurred_at_ms=35, score_block=110)
+        row = store.public_challenge(identifier)
+        assert [event["source"] for event in row["retry_history"]] == [
+            "automatic", "operator", "automatic",
+        ]
+        assert row["block_height"] == 100 and row["duplicate_of"] == "ab" * 32
+        assert "SECRET" not in json.dumps(row) and row["error_summary"]
+        store.seed_legacy_exclusions({"old-contest-hotkey": 90})
+        assert store.public_snapshot()["exclusions"] == [{
+            "hotkey": "old-contest-hotkey", "first_block": 90,
+            "reason": "LEGACY_CONTEST_ACTIVATED",
+        }]
 
 
 def test_public_stage_reference_survives_verified_chain_restore_without_private_cells(tmp_path):

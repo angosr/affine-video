@@ -62,6 +62,44 @@ class MissingObject(Exception):
     response = {"Error": {"Code": "NoSuchKey"}}
 
 
+@pytest.mark.parametrize("change", [None, "content", "size", "missing"])
+def test_public_http_audit_streams_original_chunk_guards(change):
+    original = b"fixture" * 20_000
+    digest = hashlib.sha256(original).hexdigest()
+    manifest = chunks.ChunkManifest(digest, len(original), (
+        chunks.ChunkPart("part-00000", digest, len(original)),
+    ))
+    content = {None: original, "content": b"x" + original[1:],
+               "size": original + b"x", "missing": None}[change]
+    closed = []
+
+    class Stream(httpx.SyncByteStream):
+        def __iter__(self):
+            for offset in range(0, len(content), 17_000):
+                yield content[offset:offset + 17_000]
+
+        def close(self):
+            closed.append(True)
+
+    def get(request):
+        assert request.method == "GET" and "authorization" not in request.headers
+        if request.url.path.endswith(".parts/part-00000"):
+            if content is None:
+                return httpx.Response(404)
+            return httpx.Response(200, stream=Stream())
+        assert request.url.path.endswith("/models/fixture")
+        return httpx.Response(200, content=manifest.encode(), headers={"ETag": '"original"'})
+
+    with httpx.Client(transport=httpx.MockTransport(get)) as client:
+        repository = S3Repository.from_public_http(client, base_url="https://public.example/main")
+        if change is None:
+            repository._verify_public_file("models/fixture", digest, len(original))
+        else:
+            with pytest.raises(PublicArtifactError):
+                repository._verify_public_file("models/fixture", digest, len(original))
+    assert bool(closed) is (change != "missing")
+
+
 class MemoryS3:
     def __init__(self) -> None:
         self.objects = {}
@@ -1375,6 +1413,16 @@ def test_storage_ledger_rebuilds_and_verifies_every_committed_match(tmp_path, pr
 
     summary_key = "veda/track/summary.json"
     original_summary = client.objects[summary_key]
+    legacy_summary = json.loads(original_summary)
+    rows = [{k: v for k, v in row.items() if k not in {"rank", "comparison"}}
+            for row in legacy_summary["leaderboard"]]
+    rows = rows[:1] + sorted(rows[1:], key=lambda row: (
+        -row["score"], row["block_height"], row["extrinsic_index"], row["event_index"]))
+    legacy_summary["leaderboard"] = [{"rank": i, **row} for i, row in enumerate(rows, 1)]
+    client.objects[summary_key] = canonical_json(legacy_summary)
+    assert asyncio.run(S3Repository(client, bucket="public-data", prefix="veda/track").recover(
+        track)).matches == ledger.matches
+    client.objects[summary_key] = original_summary
     wrong_summary = json.loads(original_summary)
     wrong_summary["leaderboard_total"] += 1
     client.objects[summary_key] = canonical_json(wrong_summary)
@@ -2319,6 +2367,7 @@ def test_public_artifacts_bind_summary_matches_and_weights_to_one_snapshot(
         ),
         scoring=SimpleNamespace(minimum_frontier_gain=0.001),
         full_video=SimpleNamespace(minimum_gain=0.001),
+        promotion=None,
     )
     chain = WeightChainState(
         120,

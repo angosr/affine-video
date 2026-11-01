@@ -302,13 +302,18 @@ class ReadyBatchSource:
                 or (
                     document.get("duplicate_of") is not None
                     and not _digest(document["duplicate_of"])
+                    and not (document["error_code"] == "BASELINE_DUPLICATE"
+                             and document["duplicate_of"] == "genesis")
                 )
                 or (
                     (document["error_code"] in {
                         "REFERENCE_DUPLICATE", "EXACT_DUPLICATE", "DUPLICATE_HOTKEY",
+                        "BASELINE_DUPLICATE",
                     })
                     != (document.get("duplicate_of") is not None)
                 )
+                or (document["error_code"] == "BASELINE_DUPLICATE"
+                    and document["duplicate_of"] != "genesis")
                 or (
                     (document.get("file_sha256") is None)
                     != (document.get("model_size_bytes") is None)

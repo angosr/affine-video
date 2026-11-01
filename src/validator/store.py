@@ -20,6 +20,7 @@ from miner.submit import (
     model_source_fields,
     private_model_source,
 )
+from validator.alerts import public_duplicate_of, public_error_summary
 from validator.queue import (
     TERMINAL_STATES,
     ChainPosition,
@@ -1594,6 +1595,7 @@ class ChallengeStore:
         score_block: int | None = None,
         file_sha256: str | None = None,
         model_size_bytes: int | None = None,
+        duplicate_of: str | None = None,
     ) -> None:
         """Commit a terminal state and its decision block atomically."""
 
@@ -1650,7 +1652,8 @@ class ChallengeStore:
                 timestamp=timestamp,
                 error_code=error_code,
                 error_summary=error_summary,
-                details={"final_score": final_score},
+                details={"final_score": final_score,
+                         **({} if duplicate_of is None else {"duplicate_of": duplicate_of})},
             )
             self._connection.execute(
                 """
@@ -1680,10 +1683,9 @@ class ChallengeStore:
             JOIN submissions submission
               ON submission.submission_id = challenge.submission_id
             WHERE challenge.state = ?
-            ORDER BY challenge.final_score DESC,
-                     submission.block_height ASC,
-                     submission.extrinsic_index ASC,
-                     submission.event_index ASC
+            ORDER BY submission.block_height DESC,
+                     submission.extrinsic_index DESC,
+                     submission.event_index DESC
             """,
             (ChallengeState.SUCCEEDED,),
         ).fetchall()
@@ -2015,13 +2017,12 @@ class ChallengeStore:
         try:
             leaderboard_entries = self.leaderboard()
             leaderboard = [
-                {"rank": rank, **_public_entry(entry)}
-                for rank, entry in enumerate(leaderboard_entries, start=1)
+                {"rank": None, **_public_entry(entry)} for entry in leaderboard_entries
             ]
             challenge_rows = self._connection.execute(
                 """
                 SELECT c.challenge_id, c.submission_id, c.state,
-                       c.total_attempts AS attempts,
+                       c.total_attempts AS attempts, c.retry_after_ms,
                        c.error_code, c.error_summary, c.final_score,
                        c.score_block,
                        c.file_sha256, c.model_digest, c.model_size_bytes,
@@ -2035,6 +2036,21 @@ class ChallengeStore:
                 """
             ).fetchall()
             challenges = [self._public_challenge_row(row) for row in challenge_rows]
+            by_id = {row["challenge_id"]: row for row in challenges}
+            for entry in leaderboard:
+                stages = by_id[entry["challenge_id"]]["stages"]
+                entry["comparison"] = (None if not stages else {
+                    "gain_lower_bound": stages[-1].get("paired_gain_lower_bound"),
+                    "minimum_gain": stages[-1].get("promotion", {}).get("minimum_gain"),
+                    "evaluation_batch": stages[-1].get("evaluation_batch"),
+                })
+            exclusions = [{"hotkey": row["hotkey"], "first_block": row["first_block"],
+                           "reason": (row["reason"] if row["reason"] in {
+                               "RESERVED_UID0", "LEGACY_CONTEST_ACTIVATED",
+                           } else "EXCLUDED")}
+                          for row in self._connection.execute(
+                              "SELECT hotkey, first_block, reason FROM competition_exclusions "
+                              "ORDER BY first_block, hotkey").fetchall()]
             self._connection.commit()
         except Exception:
             self._connection.rollback()
@@ -2042,6 +2058,7 @@ class ChallengeStore:
         return {
             "leaderboard": leaderboard,
             "challenges": challenges,
+            "exclusions": exclusions,
         }
 
     def public_challenge(self, identifier: str) -> dict[str, Any]:
@@ -2052,7 +2069,7 @@ class ChallengeStore:
             row = self._connection.execute(
                 """
                 SELECT c.challenge_id, c.submission_id, c.state,
-                       c.total_attempts AS attempts,
+                       c.total_attempts AS attempts, c.retry_after_ms,
                        c.error_code, c.error_summary, c.final_score,
                        c.score_block,
                        c.file_sha256, c.model_digest, c.model_size_bytes,
@@ -2079,11 +2096,21 @@ class ChallengeStore:
         events = self._connection.execute(
             """
             SELECT sequence, previous_state, state, occurred_at_ms,
-                   error_code, error_summary
+                   error_code, error_summary, details_json
             FROM challenge_events WHERE challenge_id = ? ORDER BY sequence
             """,
             (row["challenge_id"],),
         ).fetchall()
+        retry_history, duplicate_of = [], None
+        for event in events:
+            details = json.loads(event["details_json"])
+            duplicate_of = public_duplicate_of(details.get("duplicate_of")) or duplicate_of
+            source = ("operator" if details.get("operator_retry") is True else
+                      "automatic" if details.get("retry") is True else None)
+            if source is not None:
+                retry_history.append({"source": source, "sequence": event["sequence"],
+                                      "stage": event["state"],
+                                      "occurred_at_ms": event["occurred_at_ms"]})
         stage_rows = self._connection.execute(
             """
             SELECT stage, score, score_block, metrics_json, created_at_ms
@@ -2164,7 +2191,10 @@ class ChallengeStore:
             "state": row["state"],
             "attempts": row["attempts"],
             "error_code": row["error_code"],
-            "error_summary": row["error_summary"],
+            "error_summary": public_error_summary(row["error_code"]),
+            "duplicate_of": duplicate_of,
+            "retry_history": retry_history[-16:],
+            "retry_after_ms": row["retry_after_ms"],
             "file_sha256": row["file_sha256"],
             "model_digest": row["model_digest"],
             "model_size_bytes": row["model_size_bytes"],
@@ -2184,7 +2214,7 @@ class ChallengeStore:
                     "state": event["state"],
                     "occurred_at_ms": event["occurred_at_ms"],
                     "error_code": event["error_code"],
-                    "error_summary": event["error_summary"],
+                    "error_summary": public_error_summary(event["error_code"]),
                 }
                 for event in events
             ],
@@ -2399,6 +2429,16 @@ class ChallengeStore:
                 )
             else:
                 target = current
+                if row["lease_token"] is not None and row["lease_expires_at_ms"] <= now:
+                    self._connection.execute(
+                        """INSERT INTO challenge_events (
+                            challenge_id, sequence, previous_state, state, occurred_at_ms,
+                            error_code, error_summary, details_json
+                        ) SELECT ?, COALESCE(MAX(sequence), -1) + 1, ?, ?, ?, NULL, NULL, ?
+                          FROM challenge_events WHERE challenge_id = ?""",
+                        (row["challenge_id"], current, current, now,
+                         _json({"retry": True, "reason": "LEASE_EXPIRED"}), row["challenge_id"]),
+                    )
 
             token = f"{worker_id}:{secrets.token_hex(16)}"
             expires = now + lease_ms
