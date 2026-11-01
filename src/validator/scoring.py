@@ -866,6 +866,7 @@ def commit_evaluated_scoring(
         else evaluated.recorded_score_block
     )
     if not evaluated.recorded_locally:
+        stored_metrics = result.metrics
         if settings.archive_stage is not None:
             try:
                 reference = settings.archive_stage(task, result, result_score_block)
@@ -873,6 +874,10 @@ def commit_evaluated_scoring(
                     validate_stage_reference(reference, task.challenge_id, task.state.value)
                     result = StageOutcome(result.score, {**result.metrics,
                                                         "stage_evidence": dict(reference)})
+                    # The original immutable stage owns the body; SQLite keeps its projection.
+                    stored_metrics = {key: value for key, value in result.metrics.items()
+                                      if key not in {"reproducibility", "claim_evidence",
+                                                     "audit_context"}}
             except Exception as exc:
                 state = _defer_or_fail(
                     store,
@@ -889,7 +894,7 @@ def commit_evaluated_scoring(
             task.state,
             score=result.score,
             score_block=result_score_block,
-            metrics=result.metrics,
+            metrics=stored_metrics,
             occurred_at_ms=evaluated.clock(),
         )
     if task.state is ChallengeState.SCORING and result.metrics.get("requires_confirmation") is True:

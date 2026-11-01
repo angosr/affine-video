@@ -323,14 +323,21 @@ def test_archive_reference_is_persisted_before_result_and_private_cells_are_not_
     tmp_path, proof,
 ):
     _, paired, evidence = proof
+    captured = []
+
+    def archive(_task, result, _block):
+        captured.append(copy.deepcopy(result.metrics))
+        return reference
+
     with ChallengeStore(tmp_path / "local.db") as store:
         identifier = ready_for_scoring(store)
         reference = stage_reference(f"stages/{identifier}/SCORING.json", b"private fixture")
         outcome = process_next_scoring(
             store, worker_id="worker", current_finalized_block=200, now_ms=20,
-            settings=ScoringSettings(archive_stage=lambda *_a: reference),
+            settings=ScoringSettings(archive_stage=archive),
             evaluator=lambda _task: StageOutcome(paired.challenger_score, {
                 "reproducibility": evidence, "claim_evidence": {"secret": "private-only"},
+                "audit_context": {"secret": "original-only"},
             }),
         )
         assert outcome.state is ChallengeState.SUCCEEDED
@@ -339,8 +346,11 @@ def test_archive_reference_is_persisted_before_result_and_private_cells_are_not_
         assert "private-only" not in json.dumps(row)
         assert "challenger_cells" not in json.dumps(row)
         assert "execution" not in json.dumps(row)
-        assert store.stage_score(identifier, ChallengeState.SCORING).metrics[
-            "stage_evidence"] == reference
+        stored = store.stage_score(identifier, ChallengeState.SCORING).metrics
+        assert stored == {"stage_evidence": reference}
+        assert captured[0]["reproducibility"] == evidence
+        assert captured[0]["claim_evidence"] == {"secret": "private-only"}
+        assert captured[0]["audit_context"] == {"secret": "original-only"}
 
 
 def test_execution_binds_original_release_small_artifacts_and_does_not_read_secret_env(
@@ -688,6 +698,8 @@ def test_public_audit_cli_is_read_only_cpu_and_needs_no_role(audit_case, tmp_pat
 
 
 def test_public_audit_disclosure_requires_r_match_fence_and_is_idempotent(audit_case, monkeypatch):
+    import httpx
+
     from tests.validator.test_publication import MemoryS3 as PublicS3
     from validator.publication import PublicArtifactError, S3Repository, encode_weight_artifact
     from validator.weights import WeightArtifact, WeightPlan
@@ -715,8 +727,32 @@ def test_public_audit_disclosure_requires_r_match_fence_and_is_idempotent(audit_
     with pytest.raises(PublicArtifactError, match="fence"):
         asyncio.run(repository.publish_score_audit(case.payload, track=case.track, now_ms=case.due))
     client.objects["test/weights.json"] = encode_weight_artifact(fence)
+    before = case.source.objects.get(case.reference["object"]).body
+    committed = dict(client.objects)
     assert asyncio.run(repository.publish_score_audit(case.payload, track=case.track,
                                                       now_ms=case.due))
+    # Publication exposes actual public bytes, not a private-only cells reference.
+    group_name = f"batch_groups/{case.plan.plan_digest}.json"
+    client.objects["test/" + group_name] = disclosed_plan(case.plan)
+
+    def get(request):
+        assert request.method == "GET" and "authorization" not in request.headers
+        name = request.url.path.removeprefix("/tracks/main/")
+        body = client.objects["test/" + name]
+        return httpx.Response(200, content=body, headers={"ETag": hashlib.sha256(body).hexdigest()})
+
+    with httpx.Client(transport=httpx.MockTransport(get)) as http:
+        public = S3Repository.from_public_http(http, base_url="https://public.example/tracks/main")
+        result = verify_public_score_audit(
+            public._get_optional(case.reference["public_audit"]["object"]),
+            public._get_optional(case.record.object_name), case.track,
+            disclosure=public._get_optional(group_name),
+        )
+    assert result["verification_scope"] == "statistics-and-authenticated-plan-design"
+    assert result["gain_lower_bound"] == case.record.score_gain
+    assert result["model_inference_reproduced"] is False
+    assert all(client.objects[key] == value for key, value in committed.items())
+    assert case.source.objects.get(case.reference["object"]).body == before
     cold = S3Repository(client, bucket="public", prefix="test")
     assert not asyncio.run(cold.publish_score_audit(case.payload, track=case.track,
                                                  now_ms=case.due))

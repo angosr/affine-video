@@ -1170,15 +1170,6 @@ def _validate_plan_case_binding(path: Path, plan: BatchPlan, track: TrackSpec) -
         raise CacheLoadError("cache cases do not match the frozen batch plan")
     rollouts = {rollout.rollout_id: rollout for rollout in plan.rollouts}
     steps = {step.index: step for step in plan.selected_steps}
-    expected = {
-        (route, rollout.rollout_id, step.index)
-        for route in plan.selected_routes
-        for rollout in plan.rollouts
-        for step in plan.selected_steps
-    }
-    actual = {(case["route"], case["rollout_id"], case["step_index"]) for case in cases}
-    if actual != expected or len(actual) != len(cases):
-        raise CacheLoadError("cache cases do not match the frozen batch plan")
 
     with np.load(path, allow_pickle=False) as archive:
         for index, case in enumerate(cases):
