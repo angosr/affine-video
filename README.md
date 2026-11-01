@@ -223,6 +223,7 @@ an authorized, provisioned audit host, not as a routine development-machine chec
 Neither command needs a wallet, GPU, private storage keys or evaluator database.
 Statistical replay does not establish full model-inference replay when a private losing model
 is intentionally unavailable.
+The false-positive rate has not been empirically calibrated.
 
 Full audit resolves each historical match's original rules once from
 `artifacts/<track_spec_digest>`, authenticating its bytes by that digest. Missing original

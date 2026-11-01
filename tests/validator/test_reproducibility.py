@@ -610,9 +610,25 @@ def test_public_cpu_audit_is_bound_to_actual_match_and_preserves_original_stage(
     assert result["case_count"] == 24 and result["outcome"] == "CHALLENGER_WON"
     assert result["verification_scope"] == "statistics-only"
     assert result["model_inference_reproduced"] is False
+    diagnostics = result["cell_diagnostics"]
+    body = json.loads(case.payload)
+    assert diagnostics["bootstrap"] == body["metrics"]["reproducibility"]["bootstrap"]
+    assert diagnostics["weighted_mean_difference"] == (
+        result["challenger_score"] - result["incumbent_score"])
+    assert diagnostics["decision_margin"] == result["gain_lower_bound"] - result["minimum_gain"]
+    assert diagnostics["design_coverage"] == {
+        "route_count": 2, "rollouts_by_stratum": {"all": 4},
+        "steps_by_window": {"early": 1, "late": 1, "middle": 1},
+    }
+    dispersion = diagnostics["descriptive_unweighted_cell_differences"]
+    assert dispersion["minimum"] == pytest.approx(.1)
+    assert dispersion["maximum"] == pytest.approx(.123)
+    assert dispersion["population_standard_deviation"] == pytest.approx(
+        ((24**2 - 1) / 12) ** .5 * .001)
+    assert "calibration" not in result
+    assert "challenger_cells" not in json.dumps(result)  # Refer to, do not duplicate, the artifact.
     assert case.source.objects.get(case.reference["object"]).body == before
     assert b"source_proofs" not in case.payload and b"model_path" not in case.payload
-    body = json.loads(case.payload)
     assert (body["context"]["claim_cas_interval_ms"] is not None) == case.has_claim_evidence
     assert b"NEVER-PUBLISH-MODEL-OR-SECRET" not in case.payload
     if case.has_claim_evidence:
@@ -675,6 +691,37 @@ def test_public_cpu_audit_recomputes_retained_champion_at_strict_gate(audit_case
     result = verify_public_score_audit(case.payload, canonical_json(case.record.document),
                                       case.track)
     assert result["gain_lower_bound"] == 0 and result["outcome"] == "CHAMPION_RETAINED"
+    assert result["cell_diagnostics"]["descriptive_unweighted_cell_differences"] == {
+        "minimum": 0, "maximum": 0, "population_standard_deviation": 0,
+    }
+
+
+@pytest.mark.parametrize("audit_case", [True], indirect=True)
+@pytest.mark.parametrize("damage", ["cell", "missing_cells", "plan"])
+def test_cell_diagnostics_run_only_after_original_validation(audit_case, monkeypatch, damage):
+    from validator import reproducibility
+
+    case = audit_case
+    body, match = json.loads(case.payload), copy.deepcopy(case.record.document)
+    disclosure = disclosed_plan(case.plan)
+    if damage == "plan":
+        document = json.loads(disclosure)
+        document["plan"]["completed_at_ms"] += 1
+        disclosure = canonical_json(document)
+    else:
+        if damage == "cell":
+            body["metrics"]["reproducibility"]["challenger_cells"][0] -= .1
+        else:
+            del body["metrics"]["reproducibility"]["challenger_cells"]
+        match["evaluation"]["stages"][0]["stage_evidence"]["public_audit"] = {
+            **stage_reference(case.reference["public_audit"]["object"], canonical_json(body)),
+            "not_before_ms": case.due,
+        }
+    monkeypatch.setattr(reproducibility.math, "sqrt",
+                        lambda *_a: pytest.fail("diagnostics ran before evidence validation"))
+    with pytest.raises(ValueError):
+        verify_public_score_audit(canonical_json(body), canonical_json(match), case.track,
+                                  disclosure=disclosure)
 
 
 def test_cold_private_stage_keeps_original_public_audit_hash_and_cas_interval(
@@ -759,6 +806,8 @@ def test_public_audit_cli_is_read_only_cpu_and_needs_no_role(audit_case, tmp_pat
     result = json.loads(capsys.readouterr().out)
     assert result["gain_lower_bound"] == case.record.score_gain
     assert result["verification_scope"] == "statistics-only"
+    assert result["cell_diagnostics"]["bootstrap"]["confidence"] == (
+        case.track.scoring.match_confidence)
     disclosure = tmp_path / "batch.json"
     disclosure.write_bytes(disclosed_plan(case.plan))
     main(["verify-match", "--track", str(paths[0]), "--match", str(paths[1]),
@@ -776,7 +825,7 @@ def test_public_audit_cli_is_read_only_cpu_and_needs_no_role(audit_case, tmp_pat
     assert stopped.value.code == 1 and "digest" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("origin", ["present", "missing", "corrupt"])
+@pytest.mark.parametrize("origin", ["present", "missing", "corrupt", "legacy"])
 def test_full_audit_mixed_rules_uses_original_spec_or_reports_unavailable(
     audit_case, monkeypatch, capsys, origin,
 ):
@@ -797,6 +846,11 @@ def test_full_audit_mixed_rules_uses_original_spec_or_reports_unavailable(
     from validator.weights import WeightArtifact, WeightChainState, WeightPlan
 
     case = audit_case
+    if origin == "legacy":
+        document = copy.deepcopy(case.record.document)
+        for stage in document["evaluation"]["stages"]:
+            stage.pop("stage_evidence", None)
+        case.record = replace(case.record, document=document)
     original = canonical_json(case.record.document)
     manifest = ArtifactManifest((Artifact(
         HISTORICAL_MATCHES_PREFIX + case.record.object_name,
@@ -839,7 +893,7 @@ def test_full_audit_mixed_rules_uses_original_spec_or_reports_unavailable(
     }
     spec_name = f"artifacts/{case.track.digest}"
     if origin != "missing":
-        objects[spec_name] = (canonical_json(case.raw) if origin == "present"
+        objects[spec_name] = (canonical_json(case.raw) if origin in {"present", "legacy"}
                               else canonical_json(raw))
     requests = []
 
@@ -865,13 +919,19 @@ def test_full_audit_mixed_rules_uses_original_spec_or_reports_unavailable(
         if origin == "present":
             assert len(output["score_audits"]) == 1 and output["unavailable_score_audits"] == []
             assert output["score_audits"][0]["gain_lower_bound"] == case.record.score_gain
+            assert output["score_audits"][0]["cell_diagnostics"]["bootstrap"] == (
+                json.loads(case.payload)["metrics"]["reproducibility"]["bootstrap"])
+        elif origin == "legacy":
+            assert output["score_audits"] == output["unavailable_score_audits"] == []
+            assert output["unknown_stage_evidence"] == 1
+            assert case.reference["public_audit"]["object"] not in requests
         else:
             assert output["score_audits"] == []
             assert output["unavailable_score_audits"] == [{
                 "challenge_id": case.task.challenge_id, "stage": "SCORING",
                 "track_spec_digest": case.track.digest, "reason": "frozen_spec_unavailable",
             }]
-    assert requests.count(spec_name) == 1
+    assert requests.count(spec_name) == (0 if origin == "legacy" else 1)
     assert objects[case.record.object_name] == original  # No history rewrite or re-evaluation.
 
 

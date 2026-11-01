@@ -218,6 +218,15 @@ def verify_public_score_audit(payload: bytes, match_payload: bytes, track: Any, 
             raise ValueError("score audit disclosure differs from its authenticated READY")
     validate_pair_evidence(evidence, body["score"], metrics["incumbent_score"],
                            metrics["paired_gain_lower_bound"], track=track, plan=plan)
+    # Descriptive summaries only, after the original identities/design/statistics pass.
+    differences = [a - b for a, b in zip(evidence["challenger_cells"],
+                                        evidence["incumbent_cells"], strict=True)]
+    center = math.fsum(differences) / len(differences)
+    routes, rollouts, steps = set(), {}, {}
+    for row in evidence["case_order"]:
+        routes.add(row["route"])
+        rollouts.setdefault(row["stratum"], set()).add(row["rollout_id"])
+        steps.setdefault(row["step_window"], set()).add(row["step_index"])
     return {
         "challenge_id": body["challenge_id"], "stage": body["stage"],
         "match_sha256": hashlib.sha256(match_payload).hexdigest(),
@@ -229,6 +238,21 @@ def verify_public_score_audit(payload: bytes, match_payload: bytes, track: Any, 
         "verification_scope": ("statistics-and-authenticated-plan-design" if plan is not None
                                else "statistics-only"),
         "model_inference_reproduced": False,
+        "cell_diagnostics": {
+            "bootstrap": dict(evidence["bootstrap"]),
+            "weighted_mean_difference": body["score"] - metrics["incumbent_score"],
+            "decision_margin": metrics["paired_gain_lower_bound"] - match["minimum_gain"],
+            "design_coverage": {
+                "route_count": len(routes),
+                "rollouts_by_stratum": {key: len(rollouts[key]) for key in sorted(rollouts)},
+                "steps_by_window": {key: len(steps[key]) for key in sorted(steps)},
+            },
+            "descriptive_unweighted_cell_differences": {
+                "minimum": min(differences), "maximum": max(differences),
+                "population_standard_deviation": math.sqrt(
+                    math.fsum((value - center) ** 2 for value in differences) / len(differences)),
+            },
+        },
     }
 
 
