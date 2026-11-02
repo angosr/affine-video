@@ -93,8 +93,10 @@ def _parser() -> argparse.ArgumentParser:
         "upload", help="activate an Ed25519 mailbox and upload privately before finalized ready",
     )
     upload.add_argument("--model", required=True)
-    upload.add_argument("--mailbox-url", required=True)
-    upload.add_argument("--validator-identity", required=True)
+    upload.add_argument("--mailbox-url", default=DEFAULT_PUBLIC_STATUS_URL.removesuffix(
+        "/status.json") + "/mailbox/v1")
+    upload.add_argument("--validator-identity",
+                        default="5HfGuaU3VP2JhzABtPH5v1PYyzrk5k3VkFid8guMfKhPe53s")
     upload.add_argument("--network", default="finney")
     upload.add_argument("--wallet-name", default="default")
     upload.add_argument("--hotkey", default="default")

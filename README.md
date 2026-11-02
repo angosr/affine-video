@@ -34,7 +34,7 @@ turnkey training pipeline.
 
 ## Submission format
 
-Upload one model artifact, `selector.safetensors`, at the root of a Hugging Face **model** repository.
+Both submission paths use one model artifact, `selector.safetensors`.
 The current track requires:
 
 | Field | Requirement |
@@ -86,7 +86,7 @@ existing output. **It does not check the complete tensor schema or competition e
 The SHA-bound VDA2 workflow is supported by the 2026-11-01 native release; check the
 [changelog](CHANGELOG.md) and live runtime before using it on-chain.
 Upload to an existing private repository and keep it private until the chain commitment
-is finalized:
+is finalized. Place `selector.safetensors` at the root of a Hugging Face **model** repository:
 
 ```bash
 uv run hf auth login
@@ -144,6 +144,29 @@ repository limit and 121-byte payload limit; existing miners and submissions nee
 resubmission. The publication wait applies to future HF observations in either format;
 historical outcomes and missing observation times are not rewritten.
 Private uploads, VDU/VDR and the public weight format are unchanged.
+
+### Private submission
+
+Use an existing registered **Ed25519** hotkey and the same prepared model schema above.
+The command uses the built-in official mailbox and pinned signer defaults; no service
+parameters or storage keys are needed.
+
+```bash
+uv run veda miner upload --model selector.safetensors \
+  --wallet-name YOUR_WALLET --hotkey YOUR_HOTKEY_NAME
+```
+
+Use the returned `upload_id`, `file_sha256` and `manifest_sha256` in the ready commitment:
+
+```bash
+uv run veda miner commit --upload-id YOUR_UPLOAD_ID \
+  --file-sha256 YOUR_FILE_SHA256 --manifest-sha256 YOUR_MANIFEST_SHA256 \
+  --wallet-name YOUR_WALLET --hotkey YOUR_HOTKEY_NAME
+```
+
+Uploading alone is not formal admission. Only the finalized ready commitment enters the
+competition, using the hotkey's one evaluation opportunity. Private losing models are not
+published; the Hugging Face workflow above remains available.
 
 ## Evaluation and rewards
 

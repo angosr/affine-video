@@ -25,7 +25,18 @@ def test_retired_docker_attach_is_not_a_second_owner_path(monkeypatch):
         main(["evaluator", "attach", "--container", "veda-evaluator"])
 
 
-def test_private_upload_cli_uses_chain_mailbox_and_returns_unsigned_ready(monkeypatch, capsys):
+@pytest.mark.parametrize("overrides,mailbox_url,validator_identity", [
+    ([], None, None),
+    (["--mailbox-url", "https://public.example/mailbox/v1"],
+     "https://public.example/mailbox/v1", None),
+    (["--validator-identity", "pinned-validator"], None, "pinned-validator"),
+    (["--mailbox-url", "https://public.example/mailbox/v1",
+      "--validator-identity", "pinned-validator"],
+     "https://public.example/mailbox/v1", "pinned-validator"),
+])
+def test_private_upload_cli_uses_chain_mailbox_and_returns_unsigned_ready(
+    monkeypatch, capsys, overrides, mailbox_url, validator_identity,
+):
     from miner import upload as module
     from miner.submit import PrivateModelSubmission
 
@@ -35,13 +46,18 @@ def test_private_upload_cli_uses_chain_mailbox_and_returns_unsigned_ready(monkey
         return PrivateModelSubmission("ab" * 32, "cd" * 32, "ef" * 32)
     monkeypatch.setattr(module, "upload_model", upload)
     main(["miner", "upload", "--model", "prepared.safetensors",
-          "--mailbox-url", "https://public.example/mailbox/v1",
-          "--validator-identity", "pinned-validator"])
+          "--wallet-name", "miner", "--hotkey", "original", *overrides])
     result = json.loads(capsys.readouterr().out)
     assert result == {"upload_id": "ab" * 32, "file_sha256": "cd" * 32,
                       "manifest_sha256": "ef" * 32, "uploaded": True, "accepted": False}
-    assert calls[0][1]["mailbox_url"] == "https://public.example/mailbox/v1"
-    assert calls[0][1]["validator_identity"] == "pinned-validator"
+    assert calls == [("prepared.safetensors", {
+        "mailbox_url": mailbox_url or cli_module.DEFAULT_PUBLIC_STATUS_URL.removesuffix(
+            "/status.json") + "/mailbox/v1",
+        "validator_identity": validator_identity or (
+            "5HfGuaU3VP2JhzABtPH5v1PYyzrk5k3VkFid8guMfKhPe53s"),
+        "network": "finney", "wallet_name": "miner", "hotkey_name": "original",
+        "wallet_path": None,
+    })]
 
 
 def test_retired_loopback_upload_service_and_http_url_flags_are_not_aliases():
