@@ -9,14 +9,12 @@ description = "Sparse selector training competition for a Bittensor subnet"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "bittensor==11.3.0",
+    "boto3>=1.40,<2",
     "httpx==0.28.1",
     "huggingface-hub==2.2.0",
     "numpy==2.5.1",
     "safetensors==0.8.0",
 ]
-
-[project.optional-dependencies]
-storage = ["boto3>=1.40,<2"]
 
 [project.scripts]
 veda = "cli:main"

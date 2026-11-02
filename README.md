@@ -152,10 +152,9 @@ Private uploads, VDU/VDR and the public weight format are unchanged.
 Use an existing registered **Ed25519** hotkey and the same prepared model schema above.
 The command uses the built-in official mailbox and pinned signer defaults; no service
 parameters or storage keys are needed.
-The `storage` extra enables the dependencies needed for private uploads.
 
 ```bash
-uv run --extra storage veda miner upload --model selector.safetensors \
+uv run veda miner upload --model selector.safetensors \
   --wallet-name YOUR_WALLET --hotkey YOUR_HOTKEY_NAME
 ```
 
@@ -180,7 +179,6 @@ published; the Hugging Face workflow above remains available.
    duplicate tensors. Re-signing an earlier model or copying the baseline is not a new model.
 3. Challenger and champion are evaluated on the same data: 16 videos across four strata,
    eight sampled layer/head routes and three denoising steps, giving 384 paired cases.
-   The earliest-expiring eligible batch is selected; retries retain that allocation.
    Data must have completed before the original
    finalized submission and still have been secret and not yet due for disclosure then.
    The same hidden data can serve multiple models; it is not produced separately for each model.
@@ -208,12 +206,11 @@ published; the Hugging Face workflow above remains available.
 Maintenance preserves confirmed champions, spent submission opportunities and original match
 records; it does not rejudge past results under new rules.
 
-Infrastructure failures defer and retry the original challenge; they do not count as miner
-losses. Retries preserve already-bound evaluation data and archived stage results rather than
-selecting replacement data. Quality metrics, budgets and thresholds are defined by the live track,
+Infrastructure failures defer the original challenge without a miner loss or resubmission.
+Quality metrics, budgets and thresholds are defined by the live track,
 not adjustable per submission. Scores from different batches are not directly comparable;
 promotion uses the paired comparison with the incumbent.
-After the existing retry budget is exhausted, SYSTEM_BLOCKED waits for an explicit `veda evaluator retry` operation. Time alone does not restart model or GPU work. Recovery preserves the original submission, allocation and FIFO order; public blocked status has no automatic retry ETA.
+SYSTEM_BLOCKED requires operator recovery; miners do not need to resubmit.
 
 Public immutable match records bind the submitted model, stage scores and evaluation data by
 their recorded hashes. When replay data is available, reproduce a match using its original
@@ -322,7 +319,7 @@ Operator commands are documented by `uv run veda evaluator --help`.
 
 ```bash
 uv run ruff check src tests
-uv run --extra storage pytest
+uv run pytest
 ```
 
 GPU-dependent validation needs the frozen runtime described by

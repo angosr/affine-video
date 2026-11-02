@@ -20,7 +20,7 @@ RUN git init /tmp/Miowtion \
     && rm -rf /tmp/Miowtion
 
 COPY . /tmp/veda
-RUN python -m pip install --no-cache-dir "/tmp/veda[storage]" \
+RUN python -m pip install --no-cache-dir "/tmp/veda" \
     && rm -rf /tmp/veda
 
 # The pinned Miowtion Top-k did not specify tie order. Match the authoritative
