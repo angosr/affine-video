@@ -81,6 +81,15 @@ uv run veda miner prepare \
 This copies tensor values unchanged and sets ownership metadata. It refuses to overwrite an
 existing output. **It does not check the complete tensor schema or competition eligibility.**
 
+**Each hotkey has one VEDA evaluation opportunity; maintenance does not reset it.** A malformed
+submission, invalid model or lost challenge consumes that opportunity. Only an explicit
+`SYSTEM_NOT_ADMITTED` outcome for missing eligible pre-submission data preserves it for a later
+submission. Ordinary infrastructure retries are not permission to submit a replacement.
+Changing hotkey metadata does not change the duplicate-model fingerprint.
+
+Choose one submission path: follow steps 3–4 for Hugging Face, or skip to
+[Private submission](#private-submission).
+
 ### 3. Stage an immutable Hugging Face revision
 
 The SHA-bound VDA2 workflow is supported by the 2026-11-01 native release; check the
@@ -93,8 +102,6 @@ uv run hf auth login
 uv run hf upload YOUR_ACCOUNT/YOUR_MODEL selector.safetensors selector.safetensors
 ```
 
-Changing hotkey metadata does not change the duplicate-model fingerprint.
-
 Obtain the upload's **complete 40-character commit SHA** from the repository's commit history.
 Use that immutable revision, not `main`, a tag or a shortened hash. Do not modify the selected
 file after choosing the revision.
@@ -105,11 +112,6 @@ sha256sum selector.safetensors
 ```
 
 ### 4. Commit on-chain, then make that revision public
-
-**Each hotkey has one VEDA evaluation opportunity; maintenance does not reset it.** A malformed
-submission, invalid model or lost challenge consumes that opportunity. Only an explicit
-`SYSTEM_NOT_ADMITTED` outcome for missing eligible pre-submission data preserves it for a later
-submission. Ordinary infrastructure retries are not permission to submit a replacement.
 
 ```bash
 uv run veda miner commit \
@@ -150,9 +152,10 @@ Private uploads, VDU/VDR and the public weight format are unchanged.
 Use an existing registered **Ed25519** hotkey and the same prepared model schema above.
 The command uses the built-in official mailbox and pinned signer defaults; no service
 parameters or storage keys are needed.
+The `storage` extra enables the dependencies needed for private uploads.
 
 ```bash
-uv run veda miner upload --model selector.safetensors \
+uv run --extra storage veda miner upload --model selector.safetensors \
   --wallet-name YOUR_WALLET --hotkey YOUR_HOTKEY_NAME
 ```
 
@@ -176,8 +179,9 @@ published; the Hugging Face workflow above remains available.
 2. Admission checks registration, competition eligibility, model format, hotkey binding and
    duplicate tensors. Re-signing an earlier model or copying the baseline is not a new model.
 3. Challenger and champion are evaluated on the same data: 16 videos across four strata,
-   eight sampled layer/head routes and three denoising steps, giving 384 paired cases. Retries
-   retain the already-bound evaluation data. Data must have completed before the original
+   eight sampled layer/head routes and three denoising steps, giving 384 paired cases.
+   The earliest-expiring eligible batch is selected; retries retain that allocation.
+   Data must have completed before the original
    finalized submission and still have been secret and not yet due for disclosure then.
    The same hidden data can serve multiple models; it is not produced separately for each model.
 
@@ -318,7 +322,7 @@ Operator commands are documented by `uv run veda evaluator --help`.
 
 ```bash
 uv run ruff check src tests
-uv run pytest
+uv run --extra storage pytest
 ```
 
 GPU-dependent validation needs the frozen runtime described by
