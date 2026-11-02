@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-11-02 — Native deployment of 27b4777
+
+Operator-reported acceptance: application commit
+`27b4777101fcc83f5aebf8e39a5dc71ab6b7d7f3`, native installation.
+Annotated application tag: `release-2026-11-02-27b4777`.
+
+| Installed identity | SHA-256 |
+| --- | --- |
+| Application source | `a85f59971d288f6c18f0c3f8abf0f3076e4824f920e4ada08b7bcdf9632bb1ee` |
+| Native dependency lock | `f8e488384063a6e71b651a2cb0c4d57860b94bd9424e92809c4e5a28ad9636e8` |
+| Runtime manifest | `22f91fe96f426a459feeeab81a7481ac4d82c312a984d1087f6ba3ac277879bf` |
+| Accepted release | `33c1c06cb768241bc655b362d249eb4223d084ca463b7ccae2699f0b4138c418` |
+| Computational dependency environment | `760c0f5eb73df2da4916caade6bcff625416eee7f52167cb2f5a8dfe55d7bf16` |
+
+Public status/summary/weights advanced together to block 9416518 with this runtime identity.
+The 12 successful challenges and 12 stages were preserved, with eight READY batches.
+
+- Reuse existing operator disclosure decisions to stop redundant automatic regeneration
+  before local content reads, attempt reservations or worker startup. Ordinary missing-content
+  repair and PLANNED production continue through their existing paths.
+
+Rules r10/a971, data4e, original READY batches, S, claims, C/R and 24-hour validity remain
+unchanged. Numerical code is unchanged; no GPU experiment was performed for this maintenance.
+E2/E3/E16 retain their original frozen identities.
+
 ## 2026-11-01 — Native deployment of 51c36db
 
 Operator-reported acceptance: application commit

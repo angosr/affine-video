@@ -17,7 +17,7 @@ Earlier repository templates remain historical Git versions. Synchronizing this 
 not change live rules, start, data or runtime identity; application release tags identify
 the installed application commit, independently of later configuration/documentation commits.
 Use `git show track-a971c2714bf1:track.json` to read the tagged rules. That configuration
-tag targets the synchronization commit; `release-2026-11-01-51c36db` targets the installed
+tag targets the synchronization commit; `release-2026-11-02-27b4777` targets the installed
 application commit. Neither tag authenticates unrecorded historical execution details.
 
 ## What to train
