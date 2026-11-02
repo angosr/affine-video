@@ -57,6 +57,7 @@ from validator.production.plan import (
     select_source_proofs,
     validate_source_selection_sequence,
 )
+from validator.production.retries import PrivateRetryStore
 from validator.production.runtime import trajectory_tensor_key
 from validator.production.storage import (
     ARTIFACT_MANIFEST_OBJECT,
@@ -720,6 +721,9 @@ class ProducerService:
 
     def _needs_regeneration(self, plan: BatchPlan) -> bool:
         if self.objects.get_optional(f"disclosed/{plan.plan_digest}.json") is not None:
+            return False
+        retries = PrivateRetryStore(self.objects, track_spec_digest=self.track.digest)
+        if retries.disclosure_status(plan.plan_digest, now_ms=0)["state"] == "WAIVED":
             return False
         try:
             for item in ready_objects(plan):

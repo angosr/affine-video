@@ -30,7 +30,7 @@ from validator.production.commitment import (
     canonical_json,
     verify_source_proof,
 )
-from validator.production.inventory import Inventory
+from validator.production.inventory import ALLOCATION_OBJECT, Inventory
 from validator.production.plan import (
     BatchPlan,
     DenseReference,
@@ -45,6 +45,7 @@ from validator.production.plan import (
     select_source_proofs,
     validate_source_selection_sequence,
 )
+from validator.production.retries import PrivateRetryStore
 from validator.production.runtime import DenseRolloutRuntime, trajectory_tensor_key
 from validator.production.service import (
     ProducerService,
@@ -891,11 +892,15 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
     )
     assert ready.state == "READY"
     assert not service._needs_regeneration(ready)
-    Inventory(objects, plan.track_spec_digest).claim(
-        challenge_id="a1" * 32, stage="SCORING", file_sha256="b2" * 32,
-        model_digest="c3" * 32, plans=(ready,),
-        submission_block=200, submission_timestamp_ms=200_000, disclosure_delay_seconds=1800,
-    )
+    # Original legacy allocation: this byte-repair fixture has no frozen source pool.
+    objects.create_plan(ALLOCATION_OBJECT, canonical_json({
+        "format": "veda-inventory-allocations-v1", "track_spec_digest": plan.track_spec_digest,
+        "claims": [{"ordinal": 1, "challenge_id": "a1" * 32, "stage": "SCORING",
+                    "plan_digest": ready.plan_digest,
+                    "ready_sha256": hashlib.sha256(ready.encode()).hexdigest(),
+                    "file_sha256": "b2" * 32, "model_digest": "c3" * 32,
+                    "submission_block": 200, "submission_timestamp_ms": 200_000}],
+    }))
     immutable_ready = objects.get("plans/120.json")
     objects.create_plan("stages/challenge/SCORING.json", b"immutable scored result")
     shutil.rmtree(service.content.root)
@@ -939,6 +944,152 @@ def test_gpu_local_ready_regeneration_preserves_binding_and_recovers_original_by
     assert objects.get(f"interruptions/{plan.plan_digest}.json") == interruption
     assert objects.get("plans/120.json") == immutable_ready
     assert objects.get("stages/challenge/SCORING.json").body == b"immutable scored result"
+
+
+@pytest.mark.parametrize("prior_failure", [False, True])
+def test_waived_ready_never_reserves_or_starts_automatic_regeneration(
+    local_producer, tmp_path, monkeypatch, prior_failure,
+):
+    from validator.production import environment
+
+    # New selection evidence in this metadata-only fixture cannot hash a missing teacher package.
+    monkeypatch.setattr(environment, "evaluation_source_digest", lambda: "c0" * 32)
+    service, plan, objects, workers, _payload = local_producer
+    ready = service._execute(
+        "plans/120.json", objects.get("plans/120.json"), plan, workers,
+        deadline=time.monotonic() + 30,
+    )
+    service.rule_track = SimpleNamespace(digest="ef" * 32)  # Rules differ from the data authority.
+    Inventory(objects, service.track.digest).claim(
+        challenge_id="a1" * 32, stage="SCORING", file_sha256="b2" * 32,
+        model_digest="c3" * 32, plans=(ready,), submission_block=200,
+        submission_timestamp_ms=200_000, disclosure_delay_seconds=1800,
+    )
+    objects.create_plan("stages/challenge/SCORING.json", b"immutable stage")
+    now = ready.completed_at_ms + 1_800_000
+    retries = PrivateRetryStore(objects, track_spec_digest=service.track.digest)
+    retries.disclosure_attempt(ready.plan_digest, now_ms=now, lease_ms=1000)
+    if prior_failure:
+        retries.disclosure_attempt(ready.plan_digest, now_ms=now + 1, lease_ms=1000,
+                                   completed_attempt=1, error="original failure")
+    assert _reserve_plan_attempt(objects, ready, now_ms=now) == 1
+    shutil.rmtree(service.content.root)
+    assert service._needs_regeneration(ready)  # A real missing-body candidate before the decision.
+    retries.waive_disclosure(ready.plan_digest, now_ms=now + 2, reason="Operator decision")
+    before = dict(objects.values)
+    monkeypatch.setattr(service.content, "get",
+                        lambda **_k: pytest.fail("waived plan read local body"))
+    monkeypatch.setattr(production_service, "WorkerPool",
+                        lambda *_a: pytest.fail("waived plan started workers"))
+    monkeypatch.setattr(production_service, "_reserve_plan_attempt",
+                        lambda *_a: pytest.fail("waived plan reserved another attempt"))
+
+    rows = [("plans/120.json", objects.get("plans/120.json"), ready)]
+
+    class Coordinator:
+        def __init__(self, **_kwargs):
+            pass
+
+        def create_next(self, **_kwargs):
+            return None
+
+        def plans(self):
+            return tuple(rows)
+
+    monkeypatch.setattr(production_service, "PlanCoordinator", Coordinator)
+    retained = []
+    monkeypatch.setattr(production_service, "_prune_local_work",
+                        lambda _root, keep: retained.append(keep))
+    service.config = SimpleNamespace(validator_database=tmp_path / "producer.db",
+                                     work_dir=service.config.work_dir, poll_seconds=.01)
+    service.pool, service.alert, service.attempt_timeout_seconds = None, None, 10
+    for _ in range(2):
+        cold = object.__new__(ProducerService)
+        cold.__dict__.update(service.__dict__)
+        assert not cold._needs_regeneration(ready)
+        cold._run_locked(once=True)
+    assert retained == [frozenset({ready.plan_digest})] * 2
+    assert objects.values == before  # READY, claim, stage, retry and producer attempts unchanged.
+    assert _plan_attempt_count(objects, ready) == 1
+    assert objects.get_optional(f"disclosed/{ready.plan_digest}.json") is None
+
+    # A new PLANNED batch still takes the ordinary producer path, ahead of old READY rows.
+    planned = build_plan(
+        secret="d1" * 32, inventory_slot=1, track_spec_digest=service.track.digest,
+        generation_block=130, block_hash="0x" + "ee" * 32,
+        source_proofs=plan.source_proofs, scoring=scoring(),
+        available_routes=("route-0", "route-1", "route-2"),
+    )
+    objects.create_plan("plans/130.json", planned.encode())
+    rows.append(("plans/130.json", objects.get("plans/130.json"), planned))
+    executions, worker_starts = [], []
+    monkeypatch.setattr(production_service, "_reserve_plan_attempt", _reserve_plan_attempt)
+    monkeypatch.setattr(production_service, "WorkerPool", lambda *_a: (
+        worker_starts.append(True) or SimpleNamespace(close=lambda: None)))
+    monkeypatch.setattr(cold, "_execute", lambda _name, _stored, candidate, _workers, **_k: (
+        executions.append(candidate.plan_digest) or candidate))
+    cold._run_locked(once=True)
+    assert executions == [planned.plan_digest] and worker_starts == [True]
+    assert _plan_attempt_count(objects, planned) == _plan_attempt_count(objects, ready) == 1
+    assert all(objects.values[name] == payload for name, payload in before.items())
+    assert retained[-1] == frozenset({ready.plan_digest, planned.plan_digest})
+
+
+@pytest.mark.parametrize("failure", ["wrong_identity", "unreadable"])
+def test_regeneration_waiver_read_fails_closed(local_producer, monkeypatch, failure):
+    service, plan, objects, workers, _payload = local_producer
+    ready = service._execute(
+        "plans/120.json", objects.get("plans/120.json"), plan, workers,
+        deadline=time.monotonic() + 30,
+    )
+    retries = PrivateRetryStore(objects, track_spec_digest=service.track.digest)
+    retries.waive_disclosure(ready.plan_digest, now_ms=1_921_000, reason="Operator decision")
+    name = f"retry_state/disclosures/{ready.plan_digest}.json"
+    if failure == "wrong_identity":
+        row = json.loads(objects.get(name).body)
+        row["track_spec_digest"] = "00" * 32
+        objects.values[name] = canonical_json(row)
+    else:
+        get_optional = objects.get_optional
+
+        def unavailable(key):
+            if key == name:
+                raise production_service.StorageError("retry authority unavailable")
+            return get_optional(key)
+
+        monkeypatch.setattr(objects, "get_optional", unavailable)
+    before = dict(objects.values)
+    monkeypatch.setattr(service.content, "get",
+                        lambda **_k: pytest.fail("invalid authority touched local body"))
+    error, message = ((RuntimeError, "authority is invalid") if failure == "wrong_identity"
+                      else (production_service.StorageError, "authority unavailable"))
+    with pytest.raises(error, match=message):
+        service._needs_regeneration(ready)
+    assert objects.values == before
+
+
+def test_disclosed_ready_short_circuits_retry_and_content(local_producer, monkeypatch):
+    service, plan, objects, workers, _payload = local_producer
+    ready = service._execute(
+        "plans/120.json", objects.get("plans/120.json"), plan, workers,
+        deadline=time.monotonic() + 30,
+    )
+    marker = f"disclosed/{ready.plan_digest}.json"
+    objects.create_plan(marker, canonical_json({
+        "plan_digest": ready.plan_digest, "exact_sha256": ready.exact.sha256,
+    }))
+    before = dict(objects.values)
+    get_optional = objects.get_optional
+
+    def only_receipt(key):
+        assert key == marker  # Retry authority may be unavailable; the real receipt wins first.
+        return get_optional(key)
+
+    monkeypatch.setattr(objects, "get_optional", only_receipt)
+    monkeypatch.setattr(service.content, "get",
+                        lambda **_k: pytest.fail("disclosed plan read local body"))
+    assert not service._needs_regeneration(ready)
+    assert objects.values == before
 
 
 @pytest.mark.parametrize("state", ["PLANNED", "READY"])
