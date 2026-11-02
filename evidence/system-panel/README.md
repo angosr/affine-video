@@ -147,6 +147,7 @@ GPU recomputation of an old authenticated cache is not restored as a consumer ga
 explicit runtime manifest in a locked, resumable off-GPU mirror. It is an operator tool, not a
 service or publication authority. The mirror host needs SSH and `/usr/bin/rsync`. Its regression
 tests remain in the normal suite; the real rsync integration case runs only where rsync is installed.
+Pass the required `--source SSH_ALIAS:/absolute/root`; no source host or directory is assumed.
 
 Historical research runners, one-off scripts and their results belong in private development
 archives, not the maintained source tree. Removing a retired runner does not alter published

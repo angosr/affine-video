@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -50,6 +51,21 @@ def checked_path(path):
     if any(part.is_symlink() for part in (path, *path.parents)):
         raise ValueError("local paths must not contain symlinks")
     return path
+
+
+def checked_source(value):
+    host, separator, root = value.partition(":")
+    if (
+        not separator
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", host) is None
+        or not root.startswith("/")
+        or "\\" in root
+        or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
+        or any(part in {"", ".", ".."} for part in root.rstrip("/").split("/")[1:])
+        or root.startswith("//")
+    ):
+        raise ValueError("source must be SSH_ALIAS:/absolute/root without whitespace or traversal")
+    return value
 
 
 def destination_file(destination, name):
@@ -104,7 +120,7 @@ def local_paths(artifacts, destination, reuse):
     return paths
 
 
-def rsync_command(artifact, target):
+def rsync_command(artifact, target, source):
     return [
         "/usr/bin/rsync",
         "--times",
@@ -121,19 +137,22 @@ def rsync_command(artifact, target):
         "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 "
         "-o ServerAliveCountMax=3",
         "--",
-        "gpu:/workspace/" + safe_name(artifact["logical_name"]),
+        source.rstrip("/") + "/" + safe_name(artifact["logical_name"]),
         str(target),
     ]
 
 
-def transfer_artifact(artifact, target, stopped):
+def transfer_artifact(artifact, target, stopped, source):
+    source = checked_source(source)
     target = checked_path(target)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     checked_path(target.parent / ".rsync-partial" / target.name)
     for attempt in range(1, ATTEMPTS + 1):
         if stopped.is_set():
             raise RuntimeError("preservation stopped; no new transfer attempt")
-        with subprocess.Popen(rsync_command(artifact, target), start_new_session=True) as process:
+        with subprocess.Popen(
+            rsync_command(artifact, target, source), start_new_session=True,
+        ) as process:
             emit(
                 "TRANSFER_STARTED",
                 logical_name=artifact["logical_name"],
@@ -212,6 +231,7 @@ def save_current(current, document):
 
 
 def run(args):
+    source = checked_source(args.source)
     artifacts = read_artifacts(args.manifest, args.manifest_sha256)
     destination = checked_path(args.destination)
     current = checked_path(args.current)
@@ -290,7 +310,7 @@ def run(args):
                             pending, key=lambda row: (-row["size_bytes"], row["logical_name"])
                         ):
                             future = workers.submit(
-                                transfer_artifact, row, paths[row["logical_name"]], stopped
+                                transfer_artifact, row, paths[row["logical_name"]], stopped, source
                             )
                             futures[future] = row
                         pending_names = {row["logical_name"] for row in pending}
@@ -329,6 +349,8 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", required=True, type=checked_source,
+                        help="SSH_ALIAS:/absolute/root containing the manifest logical paths")
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--destination", type=Path, required=True)

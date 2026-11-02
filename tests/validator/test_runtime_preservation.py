@@ -39,6 +39,7 @@ def arguments(tmp_path, rows, reuse=()):
     destination = tmp_path / "mirror"
     destination.mkdir(exist_ok=True)
     return SimpleNamespace(
+        source="fixture-source:/runtime/assets",
         manifest=manifest,
         manifest_sha256=hashlib.sha256(raw).hexdigest(),
         destination=destination,
@@ -47,11 +48,50 @@ def arguments(tmp_path, rows, reuse=()):
     )
 
 
-def transfer(group, target, stopped):
+def transfer(group, target, stopped, source):
     assert not stopped.is_set()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"frozen")
     preservation.verify_artifact(target, group, stopped=stopped)
+
+
+def test_source_is_required_before_cli_starts_work(tmp_path, monkeypatch, capsys):
+    args = arguments(tmp_path, [artifact("model")])
+    monkeypatch.setattr(sys, "argv", [
+        str(path), "--manifest", str(args.manifest),
+        "--manifest-sha256", args.manifest_sha256,
+        "--destination", str(args.destination), "--current", str(args.current),
+    ])
+    monkeypatch.setattr(preservation, "run", lambda *_a: pytest.fail("started without source"))
+    with pytest.raises(SystemExit) as stopped:
+        preservation.main()
+    assert stopped.value.code == 2 and "--source" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source", [
+    "", "fixture-source", "fixture-source:", "fixture-source:relative",
+    "-option:/assets", "user@fixture-source:/assets", "fixture source:/assets",
+    "fixture-source:/assets/../outside", "fixture-source:/assets/./model",
+    "fixture-source:/assets//model", "fixture-source://assets",
+    "fixture-source:/asset space", "fixture-source:/asset\nline",
+    "fixture-source:/asset\tline", "fixture-source:/asset\x00line",
+    "fixture-source:/asset\\line",
+])
+def test_invalid_source_cannot_read_manifest_write_or_spawn(tmp_path, monkeypatch, source):
+    args = arguments(tmp_path, [artifact("model")])
+    args.source = source
+    before = set(tmp_path.rglob("*"))
+    monkeypatch.setattr(preservation, "read_artifacts",
+                        lambda *_a: pytest.fail("invalid source read manifest"))
+    monkeypatch.setattr(preservation.subprocess, "Popen",
+                        lambda *_a, **_k: pytest.fail("invalid source spawned transfer"))
+    with pytest.raises(ValueError, match="source must be"):
+        preservation.run(args)
+    with pytest.raises(ValueError, match="source must be"):
+        preservation.transfer_artifact(
+            artifact("model"), tmp_path / "new-target/model", threading.Event(), source,
+        )
+    assert set(tmp_path.rglob("*")) == before
 
 
 def test_scope_is_exactly_the_authenticated_manifest_not_an_old_prefix_or_file_count(tmp_path):
@@ -114,10 +154,11 @@ def test_aliases_preserve_old_partial_paths_without_adding_old_artifacts(tmp_pat
     args.reuse = [f"current={old.parent}", f"runtime/image={image}"]
     calls = []
 
-    def record(row, target, stopped):
+    def record(row, target, stopped, source):
+        assert source == args.source
         calls.append((row["logical_name"], target))
         assert partial.read_bytes() == b"fro"
-        transfer(row, target, stopped)
+        transfer(row, target, stopped, source)
 
     monkeypatch.setattr(preservation, "transfer_artifact", record)
     preservation.run(args)
@@ -194,7 +235,10 @@ def test_verification_is_streaming_and_preserves_partial_and_corrupt_bytes(tmp_p
     assert partial.stat().st_size == 7 and target.stat().st_size == 6
 
 
-def test_transfer_has_bounded_retries_and_keeps_exact_partial_destination(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source", ["fixture-one:/assets", "fixture-two:/archive/runtime/"])
+def test_transfer_has_bounded_retries_and_keeps_exact_partial_destination(
+    tmp_path, monkeypatch, source,
+):
     calls = []
 
     class Process:
@@ -220,16 +264,16 @@ def test_transfer_has_bounded_retries_and_keeps_exact_partial_destination(tmp_pa
     stopped = SimpleNamespace(is_set=lambda: False, wait=lambda _seconds: False)
     target = tmp_path / "old/model"
     with pytest.raises(RuntimeError, match="bounded"):
-        preservation.transfer_artifact(artifact("new/model"), target, stopped)
+        preservation.transfer_artifact(artifact("new/model"), target, stopped, source)
     assert len(calls) == 5
-    assert calls[0][-2:] == ["gpu:/workspace/new/model", str(target)]
+    assert calls[0][-3:] == ["--", source.rstrip("/") + "/new/model", str(target)]
     assert "--partial-dir=.rsync-partial" in calls[0] and "--protect-args" in calls[0]
     assert "--bwlimit=6144" in calls[0] and "--timeout=120" in calls[0]
     assert not any("delete" in option or "inplace" in option for option in calls[0])
     event = threading.Event()
     event.set()
     with pytest.raises(RuntimeError, match="stopped"):
-        preservation.transfer_artifact(artifact("new/model"), target, event)
+        preservation.transfer_artifact(artifact("new/model"), target, event, source)
     assert len(calls) == 5
 
 
@@ -237,7 +281,9 @@ def test_partial_symlinks_are_rejected_before_spawning_rsync(tmp_path, monkeypat
     (tmp_path / ".rsync-partial").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
     monkeypatch.setattr(preservation.subprocess, "Popen", lambda *_a, **_k: pytest.fail("spawned"))
     with pytest.raises(ValueError, match="symlink"):
-        preservation.transfer_artifact(artifact("model"), tmp_path / "model", threading.Event())
+        preservation.transfer_artifact(
+            artifact("model"), tmp_path / "model", threading.Event(), "fixture-source:/assets",
+        )
 
 
 def test_same_destination_lock_rejects_a_second_real_process_writer(tmp_path, monkeypatch):
@@ -287,7 +333,7 @@ def test_resume_disk_budget_keeps_partial_and_reserve_but_excludes_complete(tmp_
 def test_corrupt_transfer_cannot_be_counted_as_completed(tmp_path, monkeypatch):
     args = arguments(tmp_path, [artifact("model")])
 
-    def corrupt(row, target, stopped):
+    def corrupt(row, target, stopped, source):
         target.write_bytes(b"broken")
         preservation.verify_artifact(target, row, stopped=stopped)
 
@@ -332,7 +378,9 @@ def test_stop_terminates_only_its_private_transfer_process_group(tmp_path, monke
     monkeypatch.setattr(preservation.subprocess, "Popen", Process)
     monkeypatch.setattr(preservation.os, "killpg", kill)
     with pytest.raises(RuntimeError, match="stopped during transfer"):
-        preservation.transfer_artifact(artifact("model"), tmp_path / "model", stopped)
+        preservation.transfer_artifact(
+            artifact("model"), tmp_path / "model", stopped, "fixture-source:/assets",
+        )
     assert killed == [(31415, signal.SIGTERM)]
 
 
@@ -351,15 +399,15 @@ def test_real_rsync_resumes_the_existing_partial_in_the_same_mirror(tmp_path, mo
     row = artifact("current/model", payload)
     original = preservation.rsync_command
 
-    def local_command(artifact, destination):
-        command = original(artifact, destination)
+    def local_command(artifact, destination, remote_source):
+        command = original(artifact, destination, remote_source)
         command[-2] = str(source)
         command.insert(1, "--no-whole-file")  # Remote transfers already use delta by default.
         return command
 
     monkeypatch.setenv("LC_ALL", "C")
     monkeypatch.setattr(preservation, "rsync_command", local_command)
-    preservation.transfer_artifact(row, target, threading.Event())
+    preservation.transfer_artifact(row, target, threading.Event(), "fixture-source:/assets")
     assert target.read_bytes() == payload
     matched = re.search(r"Matched data: ([\d,]+)", capfd.readouterr().out)
     assert matched is not None and int(matched.group(1).replace(",", "")) > 0
@@ -401,7 +449,7 @@ def test_second_submit_failure_stops_and_joins_the_first_transfer(tmp_path, monk
                 raise RuntimeError("injected second submit failure")
             return self.executor.submit(*args)
 
-    def waiting(_row, _target, stopped):
+    def waiting(_row, _target, stopped, _source):
         started.set()
         assert stopped.wait(2)
         joined.set()
